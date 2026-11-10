@@ -43,8 +43,12 @@ scripts/validate.sh verify   # prove the limits are enforced
 scripts/validate.sh          # fmt, Clippy, tests and docs
 scripts/validate.sh full     # also the large-allocation boundary tests
 scripts/validate.sh bench    # block and run size, timing and allocations
+scripts/validate.sh geometry # run block size and codec comparison
 colima stop
 ```
+
+Benchmark method, reproduction steps and findings are in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 Each step gets a 3 GiB cgroup with no swap, 2 CPUs, 256 processes, 2 build jobs,
 2 test threads and a timeout. Use `scripts/validate.sh exec SECONDS CMD...` for

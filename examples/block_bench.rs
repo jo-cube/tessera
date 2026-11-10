@@ -1,5 +1,7 @@
 //! Repeatable block and run measurements on deterministic datasets.
 //!
+//! With the argument `geometry`, instead compares run block sizes and codecs.
+//!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
 //! fixed bound, so a broken reader or builder cannot run away. Allocation counts come
@@ -11,6 +13,8 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crc32fast::Hasher;
+use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Value};
 use tessera::run::{Codec, ReadWorkspace, Run, RunBuilder};
 
@@ -427,9 +431,12 @@ fn build_run(codec: Codec, records: &[Owned]) -> Run<Vec<u8>> {
     builder.finish()
 }
 
-/// The `(codec, decoded length, stored bytes)` of each frame, from the
-/// documented layout, so codec costs can be timed apart from the reader.
-fn frames(bytes: &[u8]) -> Vec<(u8, usize, &[u8])> {
+/// One frame's codec, decoded length, stored bytes and checksummed header.
+type StoredFrame<'a> = (u8, usize, &'a [u8], &'a [u8]);
+
+/// Every frame of a run, from the documented layout, so codec costs can be
+/// timed apart from the reader.
+fn frames(bytes: &[u8]) -> Vec<StoredFrame<'_>> {
     let footer = bytes.len() - 28;
     let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
@@ -443,7 +450,12 @@ fn frames(bytes: &[u8]) -> Vec<(u8, usize, &[u8])> {
             } else {
                 table
             };
-            (bytes[start], u32_at(start + 4), &bytes[start + 12..end])
+            (
+                bytes[start],
+                u32_at(start + 4),
+                &bytes[start + 12..end],
+                &bytes[start..start + 8],
+            )
         })
         .collect()
 }
@@ -514,12 +526,12 @@ fn measure_run(
     let mut out = vec![0; largest];
     let mut zstd = zstd_safe::DCtx::create();
     let checksum_ns = timed(stored.len(), &mut || {
-        for (_, _, payload) in &stored {
+        for (_, _, payload, _) in &stored {
             black_box(crc32fast::hash(black_box(payload)));
         }
     });
     let decompress_ns = timed(stored.len(), &mut || {
-        for (id, len, payload) in &stored {
+        for (id, len, payload, _) in &stored {
             match id {
                 1 => {
                     lz4_flex::block::decompress_into(payload, &mut out[..*len]).unwrap();
@@ -568,7 +580,488 @@ fn measure_run(
     total
 }
 
+/// Versions of one key that differ in a few fields, as successive updates do.
+fn version_heavy(target: usize) -> Vec<Owned> {
+    const STATE: [&str; 4] = ["created", "paid", "shipped", "delivered"];
+
+    let mut rng = Rng(6);
+    fill(target, |i| {
+        let key = format!("order:{i:012}").into_bytes();
+        let customer = rng.next() % 100_000;
+        let total = rng.next() % 100_000;
+        let versions = 4 + rng.next() % 9;
+        (0..versions)
+            .map(|version| Owned {
+                key: key.clone(),
+                seq: BASE_SEQ + 1000 - version,
+                value: (!rng.next().is_multiple_of(16)).then(|| {
+                    format!(
+                        r#"{{"customer":{customer},"total":{total},"state":"{}","updated":{},"rev":{}}}"#,
+                        STATE[(rng.next() % 4) as usize],
+                        1_700_000_000 + rng.next() % 86_400,
+                        versions - version,
+                    )
+                    .into_bytes()
+                }),
+            })
+            .collect()
+    })
+}
+
+type Fixture = fn(usize) -> Vec<Owned>;
+
+const GEOMETRY_BYTES: usize = 32 << 20;
+const GEOMETRY_KIB: [usize; 6] = [4, 8, 16, 32, 64, 128];
+const GEOMETRY_ROUNDS: usize = 9;
+const GEOMETRY_PROBES: usize = 2000;
+
+fn build_run_with(codec: Codec, target: usize, records: &[Owned]) -> Run<Vec<u8>> {
+    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    for record in records {
+        builder
+            .add(&record.key, record.seq, record.value())
+            .unwrap();
+    }
+    builder.finish()
+}
+
+/// Decompresses one frame through its library, with no reader involved.
+fn decode_frame(zstd: &mut zstd_safe::DCtx<'_>, id: u8, payload: &[u8], out: &mut [u8]) {
+    match id {
+        1 => {
+            lz4::decompress_into(payload, out).unwrap();
+        }
+        2 => {
+            zstd.decompress(out, payload).unwrap();
+        }
+        _ => out.copy_from_slice(payload),
+    }
+}
+
+/// Measures one dataset, block target and codec.
+///
+/// `get` has no decoded-block cache, so every lookup verifies and decompresses
+/// its candidate block, including when two probes land in the same block. The
+/// four cost components time each step alone over the same probes.
+fn measure_geometry(
+    dataset: &str,
+    kib: usize,
+    label: &str,
+    codec: Codec,
+    records: &[Owned],
+    probes: &[&[u8]],
+) {
+    let target = kib << 10;
+    let run = build_run_with(codec, target, records);
+    let bytes = run.as_bytes();
+    let view = run.view();
+    let stored = frames(bytes);
+    let timed = |ops, round: &mut dyn FnMut()| median_ns_of(GEOMETRY_ROUNDS, ops, round);
+
+    let mut zstd = zstd_safe::DCtx::create();
+    let decoded: Vec<Vec<u8>> = stored
+        .iter()
+        .map(|(id, len, payload, _)| {
+            let mut out = vec![0; *len];
+            decode_frame(&mut zstd, *id, payload, &mut out);
+            out
+        })
+        .collect();
+    let candidates: Vec<usize> = probes
+        .iter()
+        .map(|key| view.locate(key).unwrap().expect("probes are stored keys"))
+        .collect();
+
+    let build_ns = timed(records.len(), &mut || {
+        black_box(build_run_with(codec, target, black_box(records)));
+    });
+    let validate_ns = timed(records.len(), &mut || {
+        black_box(Run::new(black_box(bytes)).unwrap());
+    });
+
+    let mut workspace = ReadWorkspace::new();
+    let mut scan = || {
+        let mut cursor = run.cursor(&mut workspace);
+        let mut total = 0usize;
+        for _ in 0..records.len() {
+            total += cursor.next_record().unwrap().expect("record").key.len();
+        }
+        black_box(total);
+    };
+    let scan_ns = timed(records.len(), &mut || scan());
+
+    let locate_ns = timed(probes.len(), &mut || {
+        for key in probes {
+            black_box(view.locate(black_box(key)).unwrap());
+        }
+    });
+    // Reads verify only frames they decode, so uncompressed lookups pay none.
+    let checksum_ns = if codec == Codec::None {
+        0.0
+    } else {
+        timed(probes.len(), &mut || {
+            for &block in &candidates {
+                let (_, _, payload, header) = stored[block];
+                let mut hasher = Hasher::new();
+                hasher.update(black_box(header));
+                hasher.update(black_box(payload));
+                black_box(hasher.finalize());
+            }
+        })
+    };
+    let largest = stored.iter().map(|f| f.1).max().unwrap_or(0);
+    let mut out = vec![0; largest];
+    let decompress_ns = if codec == Codec::None {
+        0.0
+    } else {
+        timed(probes.len(), &mut || {
+            for &block in &candidates {
+                let (id, len, payload, _) = stored[block];
+                decode_frame(&mut zstd, id, payload, &mut out[..len]);
+                black_box(&out);
+            }
+        })
+    };
+    let search_ns = timed(probes.len(), &mut || {
+        for (key, &block) in probes.iter().zip(&candidates) {
+            let found = BlockView::open(&decoded[block])
+                .unwrap()
+                .get(black_box(key));
+            black_box(found.unwrap());
+        }
+    });
+
+    let get_ns = timed(probes.len(), &mut || {
+        for key in probes {
+            black_box(run.get(black_box(key), &mut workspace).unwrap());
+        }
+    });
+    let mut latencies = Vec::with_capacity(GEOMETRY_ROUNDS * probes.len());
+    for _ in 0..GEOMETRY_ROUNDS {
+        for key in probes {
+            let start = Instant::now();
+            black_box(run.get(black_box(key), &mut workspace).unwrap());
+            latencies.push(start.elapsed().as_nanos() as u64);
+        }
+    }
+    latencies.sort_unstable();
+    let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+    let misses: Vec<Vec<u8>> = probes.iter().map(|k| [*k, &[0][..]].concat()).collect();
+    let miss_ns = timed(misses.len(), &mut || {
+        for key in &misses {
+            black_box(run.get(black_box(key), &mut workspace).unwrap());
+        }
+    });
+
+    // The scans above have grown the workspace to the largest block.
+    let warm_allocs = allocations_during(|| {
+        for key in probes {
+            black_box(run.get(key, &mut workspace).unwrap());
+        }
+    });
+    let build_peak = peak_during(|| drop(build_run_with(codec, target, records)));
+
+    let blocks = stored.len();
+    let stored_bytes: usize = stored.iter().map(|f| f.2.len()).sum();
+    let headers = 12 * blocks;
+    let index = view.index_len() + 28;
+    println!(
+        "| {dataset} | {kib} | {label} | {} | {} | {blocks} | {} | {stored_bytes} | {headers} | {index} | {build_ns:.1} | {validate_ns:.1} | {scan_ns:.1} | {locate_ns:.0} | {checksum_ns:.0} | {decompress_ns:.0} | {search_ns:.0} | {get_ns:.0} | {} | {} | {} | {} | {miss_ns:.0} | {warm_allocs} | {build_peak} |",
+        records.len(),
+        bytes.len(),
+        stored.iter().map(|f| f.1).sum::<usize>() / blocks,
+        percentile(0.5),
+        percentile(0.9),
+        percentile(0.99),
+        percentile(0.999),
+    );
+}
+
+/// What a Zstandard block spends its bytes on.
+#[derive(Default)]
+struct ZstdAnatomy {
+    blocks: usize,
+    raw_or_rle_blocks: usize,
+    literals: usize,
+    entropy_coded_literals: usize,
+    sequences: usize,
+}
+
+/// Parses the documented Zstandard frame layout of one frame into `anatomy`.
+fn zstd_anatomy(frame: &[u8], anatomy: &mut ZstdAnatomy) {
+    let descriptor = frame[4];
+    let single_segment = descriptor & 0x20 != 0;
+    let dictionary = [0, 1, 2, 4][(descriptor & 3) as usize];
+    let content_size = match descriptor >> 6 {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut at = 5 + usize::from(!single_segment) + dictionary + content_size;
+    loop {
+        let header = u32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], 0]);
+        let (last, kind, size) = (header & 1 == 1, (header >> 1) & 3, (header >> 3) as usize);
+        at += 3;
+        anatomy.blocks += 1;
+        if kind == 2 {
+            let block = &frame[at..at + size];
+            let first = block[0] as usize;
+            let literal_kind = first & 3;
+            let format = (first >> 2) & 3;
+            let (regenerated, section) = if literal_kind < 2 {
+                match format {
+                    0 | 2 => (first >> 3, 1 + (first >> 3)),
+                    1 => {
+                        let n = (first >> 4) | (block[1] as usize) << 4;
+                        (n, 2 + n)
+                    }
+                    _ => {
+                        let n = (first >> 4) | (block[1] as usize) << 4 | (block[2] as usize) << 12;
+                        (n, 3 + n)
+                    }
+                }
+            } else {
+                let word =
+                    u64::from_le_bytes([block[0], block[1], block[2], block[3], block[4], 0, 0, 0])
+                        as usize;
+                let (bits, header_len) = match format {
+                    0 | 1 => (10, 3),
+                    2 => (14, 4),
+                    _ => (18, 5),
+                };
+                let mask = (1 << bits) - 1;
+                (
+                    (word >> 4) & mask,
+                    header_len + ((word >> (4 + bits)) & mask),
+                )
+            };
+            let section = if literal_kind == 1 {
+                section - regenerated + 1
+            } else {
+                section
+            };
+            anatomy.literals += regenerated;
+            if literal_kind >= 2 {
+                anatomy.entropy_coded_literals += regenerated;
+            }
+            let count = block[section] as usize;
+            anatomy.sequences += match count {
+                0..128 => count,
+                128..255 => ((count - 128) << 8) + block[section + 1] as usize,
+                _ => block[section + 1] as usize + ((block[section + 2] as usize) << 8) + 0x7f00,
+            };
+            at += size;
+        } else {
+            anatomy.raw_or_rle_blocks += 1;
+            at += if kind == 1 { 1 } else { size };
+        }
+        if last {
+            // The whole frame was consumed, so the fields above were read
+            // from where the format puts them.
+            assert_eq!(at, frame.len());
+            break;
+        }
+    }
+}
+
+/// Prints both codecs' cost on the blocks of `records` at one target size.
+fn report_dataset_blocks(dataset: &str, kib: usize, records: &[Owned]) {
+    let run = build_run_with(Codec::None, kib << 10, records);
+    let blocks: Vec<Vec<u8>> = frames(run.as_bytes())
+        .iter()
+        .map(|f| f.2.to_vec())
+        .collect();
+    report_codec_costs(&format!("{dataset} {kib}"), &blocks);
+}
+
+/// Prints compress and decompress cost per block for both codecs, and what
+/// each Zstandard block is made of. Every block is timed a similar number of
+/// times regardless of how many there are.
+fn report_codec_costs(name: &str, blocks: &[Vec<u8>]) {
+    let largest = blocks.iter().map(Vec::len).max().unwrap();
+    let total: usize = blocks.iter().map(Vec::len).sum();
+    let repeats = ((2 << 20) / total).max(1);
+    let mut cctx = zstd_safe::CCtx::create();
+    let mut dctx = zstd_safe::DCtx::create();
+    let timed = |round: &mut dyn FnMut()| {
+        median_ns_of(GEOMETRY_ROUNDS, blocks.len() * repeats, round) / 1000.0
+    };
+
+    let mut anatomy = ZstdAnatomy::default();
+    let mut zstd_frames = Vec::new();
+    let mut lz4_frames = Vec::new();
+    for block in blocks {
+        let mut out = vec![0; zstd_safe::compress_bound(block.len())];
+        let n = cctx.compress(&mut out[..], block, 3).unwrap();
+        out.truncate(n);
+        zstd_anatomy(&out, &mut anatomy);
+        zstd_frames.push(out);
+        let mut out = vec![0; lz4::get_maximum_output_size(block.len())];
+        let n = lz4::compress_into(block, &mut out).unwrap();
+        out.truncate(n);
+        lz4_frames.push(out);
+    }
+    let mut output =
+        vec![0; zstd_safe::compress_bound(largest).max(lz4::get_maximum_output_size(largest))];
+    let zstd_c = timed(&mut || {
+        for _ in 0..repeats {
+            for block in blocks {
+                black_box(cctx.compress(&mut output[..], black_box(block), 3).unwrap());
+            }
+        }
+    });
+    let lz4_c = timed(&mut || {
+        for _ in 0..repeats {
+            for block in blocks {
+                black_box(lz4::compress_into(black_box(block), &mut output).unwrap());
+            }
+        }
+    });
+    let zstd_d = timed(&mut || {
+        for _ in 0..repeats {
+            for (frame, block) in zstd_frames.iter().zip(blocks) {
+                let out = &mut output[..block.len()];
+                black_box(dctx.decompress(out, black_box(frame)).unwrap());
+            }
+        }
+    });
+    let lz4_d = timed(&mut || {
+        for _ in 0..repeats {
+            for (frame, block) in lz4_frames.iter().zip(blocks) {
+                let out = &mut output[..block.len()];
+                black_box(lz4::decompress_into(black_box(frame), out).unwrap());
+            }
+        }
+    });
+    let n = blocks.len() as f64;
+    let size = |f: &[Vec<u8>]| f.iter().map(Vec::len).sum::<usize>() as f64 / total as f64;
+    println!(
+        "| {name} | {} | {:.3} | {zstd_c:.1} | {zstd_d:.2} | {:.3} | {lz4_c:.1} | {lz4_d:.2} | {:.0} | {:.0} | {:.0} | {}/{} |",
+        total / blocks.len(),
+        size(&zstd_frames),
+        size(&lz4_frames),
+        anatomy.sequences as f64 / n,
+        anatomy.entropy_coded_literals as f64 / n,
+        (anatomy.literals - anatomy.entropy_coded_literals) as f64 / n,
+        anatomy.raw_or_rle_blocks,
+        anatomy.blocks,
+    );
+}
+
+/// Blocks that vary one property at a fixed decoded length, each case holding
+/// many distinct blocks so the branch predictor cannot learn a single one.
+fn controlled_blocks() {
+    const LEN: usize = 64 << 10;
+    const COUNT: usize = 16;
+
+    let mut rng = Rng(11);
+    let mut cases: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    cases.push((
+        "random bytes".into(),
+        (0..COUNT).map(|_| rng.bytes(LEN)).collect(),
+    ));
+    for bits in [2u32, 4, 6] {
+        let blocks = (0..COUNT)
+            .map(|_| {
+                (0..LEN)
+                    .map(|_| b'!' + (rng.next() % (1 << bits)) as u8)
+                    .collect()
+            })
+            .collect();
+        cases.push((format!("{bits}-bit symbols, no structure"), blocks));
+    }
+    for motif in [8usize, 16, 32, 64, 128, 256] {
+        let blocks = (0..COUNT)
+            .map(|_| {
+                let motifs: Vec<Vec<u8>> = (0..64).map(|_| rng.bytes(motif)).collect();
+                let mut block = Vec::with_capacity(LEN + motif);
+                while block.len() < LEN {
+                    block.extend_from_slice(&motifs[(rng.next() % 64) as usize]);
+                }
+                block.truncate(LEN);
+                block
+            })
+            .collect();
+        cases.push((format!("{motif}-byte random motifs"), blocks));
+    }
+    for (name, blocks) in &cases {
+        report_codec_costs(name, blocks);
+    }
+}
+
+fn geometry() {
+    println!(
+        "run geometry; {} MiB of logical data per dataset; {GEOMETRY_ROUNDS} rounds, {GEOMETRY_PROBES} uniform probes per round",
+        GEOMETRY_BYTES >> 20
+    );
+    println!("every get verifies and decompresses its candidate block; there is no block cache");
+    println!(
+        "ns per record (build, validate, scan) or lookup; percentiles pool per-operation samples"
+    );
+    println!();
+    println!(
+        "| dataset | kib | codec | records | total | blocks | avg decoded | stored | headers | index | build | validate | scan | locate | checksum | decompress | search | get | p50 | p90 | p99 | p999 | miss | warm allocs | build peak |"
+    );
+    println!(
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    );
+    let datasets: [(&str, Fixture); 5] = [
+        ("json-like", json_like),
+        ("small-value", small_values),
+        ("structured", structured_keys),
+        ("version-heavy", version_heavy),
+        ("incompressible", random_keys),
+    ];
+    let mut anatomy: Vec<(&str, Vec<Owned>)> = Vec::new();
+    for (name, make) in datasets {
+        let records = make(GEOMETRY_BYTES);
+        let mut keys: Vec<&[u8]> = records.iter().map(|r| r.key.as_slice()).collect();
+        keys.dedup();
+        let mut rng = Rng(123);
+        let probes: Vec<&[u8]> = (0..GEOMETRY_PROBES)
+            .map(|_| keys[(rng.next() % keys.len() as u64) as usize])
+            .collect();
+        for kib in GEOMETRY_KIB {
+            for (codec, label) in CODECS {
+                measure_geometry(name, kib, label, codec, &records, &probes);
+            }
+        }
+        drop(probes);
+        drop(keys);
+        // A 2 MiB sample is enough to characterize a dataset's blocks.
+        let mut sample = records;
+        sample.truncate(sample.len() / 16);
+        anatomy.push((name, sample));
+    }
+
+    const HEADER: &str = "| data | decoded | zstd ratio | zstd c | zstd d | lz4 ratio | lz4 c | lz4 d | sequences | entropy literals | other literals | raw blocks |";
+    const RULE: &str = "|---|---|---|---|---|---|---|---|---|---|---|---|";
+
+    println!();
+    println!("codec cost on real blocks; us per block, then what a Zstandard block holds");
+    println!();
+    println!("{HEADER}");
+    println!("{RULE}");
+    for (name, records) in &anatomy {
+        for kib in GEOMETRY_KIB {
+            report_dataset_blocks(name, kib, records);
+        }
+    }
+    println!();
+    println!("controlled blocks of 64 KiB");
+    println!();
+    println!("{HEADER}");
+    println!("{RULE}");
+    controlled_blocks();
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("geometry") {
+        geometry();
+        return;
+    }
+
     println!("median of {ROUNDS} rounds; ns per record (build, validate, scan) or per lookup");
     println!(
         "raw = key + value + 8 byte seq + 1 byte kind; key+meta = (encoded - value bytes) / record"

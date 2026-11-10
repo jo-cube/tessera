@@ -7,6 +7,7 @@
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
 #   scripts/validate.sh bench              the block and run benchmark
+#   scripts/validate.sh geometry           run block size and codec comparison
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -138,6 +139,10 @@ bench() {
   bounded bench 900 cargo run --locked --release --example block_bench
 }
 
+geometry() {
+  bounded geometry 900 cargo run --locked --release --example block_bench -- geometry
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -191,7 +196,8 @@ case "$command" in
   limits) limits ;;
   full) check; limits ;;
   bench) bench ;;
+  geometry) geometry ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,11p' "$0"; exit 2 ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
 esac
