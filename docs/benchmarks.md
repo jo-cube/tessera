@@ -239,3 +239,58 @@ At 16 runs, with times in microseconds and blocks decoded per query:
 - A seek in a physical merge of 16 disjoint runs falls from 33.0 to 10.3 us.
 - Ranges reduce the runs consulted, not the cost of the runs that remain, so
   fully overlapping runs need fan-in control or Bloom filters.
+
+## Memtable
+
+`block_bench memtable` measures three datasets through `Memtable` and
+`FrozenMemtable`: `json` (173,536 records, about 100 bytes each), `tiny` (428,865
+records with 8-byte values) and `large` (4,084 records with 4 KiB values). Run it
+with `scripts/validate.sh memtable`. Each memory row is a fresh process.
+`requested` is what Rust asks the allocator for, and RSS is the growth of the
+process's resident memory, so it includes allocator rounding and headers. It is
+a baseline, not a target. Times include the counting allocator.
+
+### Findings
+
+Same reference environment, three passes. Times differ between passes by a
+median of 5.5% and by up to 41%, the largest being `json` traversal. Freezing is
+at or below the timer's resolution, about 40 ns, and allocates nothing.
+
+| dataset, random order | payload MiB | charged MiB | requested MiB | RSS MiB | RSS after overwrite | RSS/charged |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| json | 17.1 | 38.2 | 27.4 | 32.0 | 33.3 | 0.84 |
+| tiny | 10.6 | 63.0 | 36.1 | 52.1 | 55.4 | 0.83 |
+| large | 16.0 | 16.5 | 16.3 | 16.4 | 16.4 | 0.99 |
+
+| ns per operation | sequential insert | random insert | random overwrite | random delete | get hit | get miss | traversal per record |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| json | 216 | 744 | 556 | 542 | 475 | 469 | 8.6 |
+| tiny | 216 | 882 | 669 | 658 | 606 | 618 | 13.4 |
+| large | 286 | 512 | 451 | 149 | 109 | 104 | 2.1 |
+
+| flush | target MiB | runs | stored/payload | ms | payload MiB/s | peak collected MiB | peak streamed MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| json | 64 | 1 | 0.202 | 34 | 498 | 7.6 | 7.6 |
+| json | 4 | 5 | 0.202 | 34 | 502 | 4.5 | 1.8 |
+| tiny | 64 | 1 | 0.547 | 58 | 183 | 14.0 | 14.0 |
+| tiny | 4 | 5 | 0.547 | 58 | 185 | 7.5 | 3.4 |
+| large | 64 | 1 | 0.507 | 12 | 1329 | 24.4 | 24.4 |
+| large | 4 | 5 | 0.507 | 12 | 1364 | 10.1 | 4.1 |
+
+- Measured RSS growth stayed at or below the charge in all six insert cases,
+  including after overwriting. The margins are small: `large` reached 16.5 MiB
+  against 16.5 charged and `tiny` in sorted order 62.0 against 63.0. That is an
+  observation on these datasets and this allocator, not a limit. The 128-byte
+  entry charge is calculated for a worst-case `BTreeMap` occupancy that no
+  dataset here reaches.
+- Amplification is a small-record problem. Requested memory is 1.02 times the
+  payload at 4 KiB values, 1.6 to 1.8 at 100 bytes and 3.4 to 4.0 at 26 bytes.
+- An insert makes 2.13 to 2.17 allocations: its key, its value and a share of
+  a `BTreeMap` node. An overwrite makes one, a delete, a lookup and a traversal
+  none, and a freeze none.
+- Splitting costs nothing measurable in flush time. It does bound what is held: for `large`, the 24.4 MiB peak
+  of one run falls to 10.1 MiB when all five runs are kept and 4.1 MiB when each
+  is released as it is produced. These peaks are on top of the frozen table and
+  leave out Zstandard's own context.
+- Dropping a frozen table takes 11 ms for `json` and 28 ms for `tiny`, because
+  each entry is freed individually.

@@ -1,0 +1,1027 @@
+//! Memtable updates, budget accounting, freezing and flushing.
+//!
+//! Expected results come from plain vectors and hash maps maintained by the
+//! tests, never from the structure under test.
+
+use std::collections::HashMap;
+
+use tessera::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
+use tessera::memtable::{
+    ENTRY_OVERHEAD, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable, TARGET_RUN_LEN,
+    WriteError,
+};
+use tessera::run::{
+    LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunSet, RunView,
+};
+
+type Entry = (Vec<u8>, u64, Option<Vec<u8>>);
+
+const ROOMY: usize = 1 << 24;
+
+fn table() -> Memtable {
+    Memtable::new(ROOMY, None)
+}
+
+fn charge(key: &[u8], value: &[u8]) -> usize {
+    key.len() + value.len() + ENTRY_OVERHEAD
+}
+
+fn owned(record: Record<'_>) -> Entry {
+    let value = match record.value {
+        Value::Bytes(bytes) => Some(bytes.to_vec()),
+        Value::Tombstone => None,
+    };
+    (record.key.to_vec(), record.seq, value)
+}
+
+fn contents(table: &Memtable) -> Vec<Entry> {
+    table.iter().map(owned).collect()
+}
+
+fn frozen_contents(table: &FrozenMemtable) -> Vec<Entry> {
+    table.iter().map(owned).collect()
+}
+
+fn run_contents(run: &Run<Vec<u8>>) -> Vec<Entry> {
+    let mut workspace = ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    let mut out = Vec::new();
+    while let Some(record) = cursor.next_record().unwrap() {
+        out.push(owned(record));
+    }
+    out
+}
+
+fn put(key: &[u8], seq: u64, value: &[u8]) -> Entry {
+    (key.to_vec(), seq, Some(value.to_vec()))
+}
+
+fn del(key: &[u8], seq: u64) -> Entry {
+    (key.to_vec(), seq, None)
+}
+
+/// Everything a rejected update must leave untouched.
+fn state(table: &Memtable) -> (Vec<Entry>, MemoryUsage, Option<u64>, usize) {
+    (
+        contents(table),
+        table.memory(),
+        table.last_seq(),
+        table.len(),
+    )
+}
+
+#[track_caller]
+fn assert_rejected(table: &mut Memtable, expected: WriteError, key: &[u8], seq: u64, value: &[u8]) {
+    let before = state(table);
+    assert_eq!(table.put(key, seq, value), Err(expected));
+    assert_eq!(state(table), before);
+}
+
+// Updates.
+
+#[test]
+fn an_absent_key_reads_as_nothing() {
+    let mut table = table();
+    assert_eq!(table.get(b"a"), None);
+    assert!(table.is_empty());
+    table.put(b"a", 1, b"v").unwrap();
+    assert_eq!(table.get(b"b"), None);
+    assert_eq!(table.len(), 1);
+    assert!(!table.is_empty());
+}
+
+#[test]
+fn a_put_is_read_back_with_its_sequence_number() {
+    let mut table = table();
+    table.put(b"a", 7, b"value").unwrap();
+    assert_eq!(
+        table.get(b"a"),
+        Some(Version {
+            seq: 7,
+            value: Value::Bytes(b"value")
+        })
+    );
+}
+
+#[test]
+fn a_delete_is_read_as_a_tombstone_not_as_absence() {
+    let mut table = table();
+    table.put(b"a", 1, b"v").unwrap();
+    table.delete(b"a", 2).unwrap();
+    assert_eq!(
+        table.get(b"a"),
+        Some(Version {
+            seq: 2,
+            value: Value::Tombstone
+        })
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn deleting_an_absent_key_stores_a_tombstone() {
+    let mut table = table();
+    table.delete(b"a", 1).unwrap();
+    assert_eq!(contents(&table), [del(b"a", 1)]);
+}
+
+#[test]
+fn an_overwrite_keeps_only_the_latest_update() {
+    let mut table = table();
+    table.put(b"a", 1, b"old").unwrap();
+    table.put(b"a", 2, b"new").unwrap();
+    assert_eq!(contents(&table), [put(b"a", 2, b"new")]);
+}
+
+#[test]
+fn a_key_can_be_reinserted_after_a_delete() {
+    let mut table = table();
+    table.put(b"a", 1, b"old").unwrap();
+    table.delete(b"a", 2).unwrap();
+    table.put(b"a", 3, b"back").unwrap();
+    assert_eq!(contents(&table), [put(b"a", 3, b"back")]);
+}
+
+#[test]
+fn iteration_is_bytewise_ascending_whatever_the_write_order() {
+    let keys: [&[u8]; 7] = [b"", b"\x00", b"a", b"a\x00", b"ab", b"b", b"\xFF"];
+    let mut table = table();
+    for (seq, key) in keys.iter().rev().enumerate() {
+        table.put(key, seq as u64, b"").unwrap();
+    }
+    let seen: Vec<Vec<u8>> = table.iter().map(|record| record.key.to_vec()).collect();
+    assert_eq!(seen, keys.map(<[u8]>::to_vec));
+}
+
+#[test]
+fn an_empty_key_and_binary_values_are_ordinary() {
+    let binary = [0, 0xFF, b'\n', 0, 0x80];
+    let mut table = table();
+    table.put(b"", 1, &binary).unwrap();
+    table.put(b"\x00\xFF", 2, &binary).unwrap();
+    assert_eq!(table.get(b"").unwrap().value, Value::Bytes(&binary));
+    assert_eq!(table.get(b"\x00\xFF").unwrap().value, Value::Bytes(&binary));
+}
+
+#[test]
+fn an_empty_value_is_not_a_tombstone() {
+    let mut table = table();
+    table.put(b"a", 1, b"").unwrap();
+    assert_eq!(table.get(b"a").unwrap().value, Value::Bytes(b""));
+}
+
+// Sequence numbers.
+
+#[test]
+fn the_first_update_may_use_sequence_number_zero() {
+    let mut table = table();
+    table.put(b"a", 0, b"v").unwrap();
+    assert_eq!(table.last_seq(), Some(0));
+    let expected = WriteError::SequenceNotIncreasing { seq: 0, last: 0 };
+    assert_rejected(&mut table, expected, b"b", 0, b"v");
+}
+
+#[test]
+fn sequence_numbers_may_have_gaps() {
+    let mut table = table();
+    table.put(b"a", 1, b"v").unwrap();
+    table.put(b"b", 1000, b"v").unwrap();
+    assert_eq!(table.last_seq(), Some(1000));
+}
+
+#[test]
+fn a_repeated_or_lower_sequence_number_is_rejected_on_any_key() {
+    let mut table = table();
+    table.put(b"a", 5, b"v").unwrap();
+    for (key, seq) in [(&b"a"[..], 5), (b"a", 4), (b"b", 5), (b"b", 0)] {
+        let expected = WriteError::SequenceNotIncreasing { seq, last: 5 };
+        assert_rejected(&mut table, expected, key, seq, b"new");
+    }
+}
+
+#[test]
+fn a_rejected_delete_keeps_the_previous_value() {
+    let mut table = table();
+    table.put(b"a", 5, b"v").unwrap();
+    let before = state(&table);
+    assert_eq!(
+        table.delete(b"a", 5),
+        Err(WriteError::SequenceNotIncreasing { seq: 5, last: 5 })
+    );
+    assert_eq!(state(&table), before);
+}
+
+#[test]
+fn the_starting_bound_is_exclusive() {
+    let mut table = Memtable::new(ROOMY, Some(10));
+    assert_eq!(table.last_seq(), Some(10));
+    for seq in [9, 10] {
+        let expected = WriteError::SequenceNotIncreasing { seq, last: 10 };
+        assert_rejected(&mut table, expected, b"a", seq, b"v");
+    }
+    table.put(b"a", 11, b"v").unwrap();
+}
+
+#[test]
+fn the_largest_sequence_number_is_usable_and_ends_the_table() {
+    let mut table = table();
+    table.put(b"a", u64::MAX, b"v").unwrap();
+    for seq in [u64::MAX, u64::MAX - 1, 0] {
+        let expected = WriteError::SequenceNotIncreasing {
+            seq,
+            last: u64::MAX,
+        };
+        assert_rejected(&mut table, expected, b"b", seq, b"v");
+    }
+    assert_eq!(table.last_seq(), Some(u64::MAX));
+    assert_eq!(table.get(b"a").unwrap().seq, u64::MAX);
+}
+
+#[test]
+fn a_table_after_the_largest_sequence_number_accepts_nothing() {
+    let mut table = Memtable::new(ROOMY, Some(u64::MAX));
+    let expected = WriteError::SequenceNotIncreasing {
+        seq: u64::MAX,
+        last: u64::MAX,
+    };
+    assert_rejected(&mut table, expected, b"a", u64::MAX, b"v");
+    assert!(table.is_empty());
+}
+
+#[test]
+fn a_rejected_sequence_number_stays_unused_and_can_be_retried() {
+    let key = b"k";
+    let value = [1; 64];
+    let mut table = Memtable::new(charge(key, &value) - 1, None);
+    assert!(table.put(key, 9, &value).is_err());
+    assert_eq!(table.last_seq(), None);
+    table.put(key, 9, b"").unwrap();
+    assert_eq!(table.last_seq(), Some(9));
+}
+
+// Limits.
+
+#[test]
+fn a_key_at_the_limit_is_accepted_and_one_byte_more_is_rejected() {
+    let long = vec![b'k'; MAX_KEY_LEN + 1];
+    let mut table = table();
+    table.put(&long[..MAX_KEY_LEN], 1, b"v").unwrap();
+    let expected = WriteError::KeyTooLong {
+        len: MAX_KEY_LEN + 1,
+    };
+    assert_rejected(&mut table, expected, &long, 2, b"v");
+    let before = state(&table);
+    assert_eq!(table.delete(&long, 2), Err(expected));
+    assert_eq!(state(&table), before);
+}
+
+#[test]
+fn an_oversized_value_is_rejected_before_it_is_copied() {
+    // Never written or read, so its pages are not touched.
+    let huge = vec![0; MAX_VALUE_LEN + 1];
+    let mut table = table();
+    let expected = WriteError::ValueTooLong {
+        len: MAX_VALUE_LEN + 1,
+    };
+    assert_rejected(&mut table, expected, b"a", 1, &huge);
+}
+
+#[test]
+fn limits_are_reported_before_sequence_order_and_budget() {
+    let long_key = vec![b'k'; MAX_KEY_LEN + 1];
+    let huge = vec![0; MAX_VALUE_LEN + 1];
+    let mut table = Memtable::new(0, Some(5));
+    assert_eq!(
+        table.put(&long_key, 1, &huge),
+        Err(WriteError::KeyTooLong {
+            len: MAX_KEY_LEN + 1
+        })
+    );
+    assert_eq!(
+        table.put(b"a", 1, &huge),
+        Err(WriteError::ValueTooLong {
+            len: MAX_VALUE_LEN + 1
+        })
+    );
+    assert_eq!(
+        table.put(b"a", 1, b"v"),
+        Err(WriteError::SequenceNotIncreasing { seq: 1, last: 5 })
+    );
+    assert_eq!(
+        table.put(b"a", 6, b"v"),
+        Err(WriteError::RecordExceedsBudget {
+            charge: charge(b"a", b"v"),
+            budget: 0
+        })
+    );
+}
+
+// Budget.
+
+#[test]
+fn an_entry_is_charged_its_key_value_and_overhead() {
+    let mut table = table();
+    table.put(b"key", 1, b"value").unwrap();
+    table.delete(b"gone", 2).unwrap();
+    assert_eq!(
+        table.memory(),
+        MemoryUsage {
+            payload: 3 + 5 + 4,
+            charged: 3 + 5 + 4 + 2 * ENTRY_OVERHEAD,
+            budget: ROOMY
+        }
+    );
+}
+
+#[test]
+fn a_record_that_exactly_fills_the_budget_is_admitted() {
+    let mut table = Memtable::new(charge(b"k", b"value"), None);
+    table.put(b"k", 1, b"value").unwrap();
+    let memory = table.memory();
+    assert_eq!(memory.charged, memory.budget);
+}
+
+#[test]
+fn a_record_one_byte_over_the_budget_can_never_be_admitted() {
+    let budget = charge(b"k", b"value") - 1;
+    let mut table = Memtable::new(budget, None);
+    let expected = WriteError::RecordExceedsBudget {
+        charge: budget + 1,
+        budget,
+    };
+    assert_rejected(&mut table, expected, b"k", 1, b"value");
+}
+
+#[test]
+fn a_new_entry_that_does_not_fit_reports_what_it_needs() {
+    let first = charge(b"a", b"v");
+    let second = charge(b"b", b"v");
+    let mut table = Memtable::new(first + second - 1, None);
+    table.put(b"a", 1, b"v").unwrap();
+    let expected = WriteError::BudgetExceeded {
+        needed: second,
+        available: second - 1,
+    };
+    assert_rejected(&mut table, expected, b"b", 2, b"v");
+}
+
+#[test]
+fn a_new_entry_may_use_exactly_the_remaining_budget() {
+    let first = charge(b"a", b"v");
+    let mut table = Memtable::new(first + charge(b"b", b"v"), None);
+    table.put(b"a", 1, b"v").unwrap();
+    table.put(b"b", 2, b"v").unwrap();
+    assert_eq!(table.memory().charged, table.memory().budget);
+}
+
+#[test]
+fn a_replacement_is_charged_only_the_change_in_value_length() {
+    let mut table = table();
+    table.put(b"k", 1, b"abc").unwrap();
+    let before = table.memory().charged;
+    table.put(b"k", 2, b"abcdefg").unwrap();
+    assert_eq!(table.memory().charged, before + 4);
+    table.put(b"k", 3, b"a").unwrap();
+    assert_eq!(table.memory().charged, before - 2);
+    assert_eq!(table.memory().payload, 1 + 1);
+}
+
+#[test]
+fn a_replacement_of_equal_size_is_admitted_at_a_full_budget() {
+    let mut table = Memtable::new(charge(b"k", b"abc"), None);
+    table.put(b"k", 1, b"abc").unwrap();
+    table.put(b"k", 2, b"xyz").unwrap();
+    assert_eq!(table.get(b"k").unwrap().value, Value::Bytes(b"xyz"));
+}
+
+#[test]
+fn a_replacement_may_use_the_budget_its_old_value_releases() {
+    let budget = charge(b"k", b"abc") + 1;
+    let mut table = Memtable::new(budget, None);
+    table.put(b"k", 1, b"abc").unwrap();
+    table.put(b"k", 2, b"abcd").unwrap();
+    assert_eq!(table.memory().charged, budget);
+}
+
+#[test]
+fn a_replacement_that_grows_too_far_keeps_the_old_value() {
+    let budget = charge(b"k", b"abc") + charge(b"other", b"");
+    let mut table = Memtable::new(budget, None);
+    table.put(b"k", 1, b"abc").unwrap();
+    table.put(b"other", 2, b"").unwrap();
+    let expected = WriteError::BudgetExceeded {
+        needed: 4,
+        available: 3,
+    };
+    assert_rejected(&mut table, expected, b"k", 3, b"abcd");
+    assert_eq!(table.get(b"k").unwrap().value, Value::Bytes(b"abc"));
+}
+
+#[test]
+fn a_delete_releases_the_value_and_keeps_the_key_charged() {
+    let mut table = table();
+    table.put(b"k", 1, b"value").unwrap();
+    table.delete(b"k", 2).unwrap();
+    assert_eq!(table.memory().charged, charge(b"k", b""));
+    assert_eq!(table.memory().payload, 1);
+}
+
+#[test]
+fn a_delete_of_a_held_key_is_admitted_at_a_full_budget() {
+    let mut table = Memtable::new(charge(b"k", b"v"), None);
+    table.put(b"k", 1, b"v").unwrap();
+    table.delete(b"k", 2).unwrap();
+    assert_eq!(table.get(b"k").unwrap().value, Value::Tombstone);
+}
+
+#[test]
+fn a_tombstone_replacing_a_tombstone_costs_nothing() {
+    let mut table = table();
+    table.delete(b"k", 1).unwrap();
+    let before = table.memory();
+    table.delete(b"k", 2).unwrap();
+    assert_eq!(table.memory(), before);
+    assert_eq!(table.get(b"k").unwrap().seq, 2);
+}
+
+#[test]
+fn a_delete_of_an_absent_key_is_subject_to_the_budget() {
+    let first = charge(b"a", b"");
+    let mut table = Memtable::new(first, None);
+    table.put(b"a", 1, b"").unwrap();
+    let before = state(&table);
+    assert_eq!(
+        table.delete(b"b", 2),
+        Err(WriteError::BudgetExceeded {
+            needed: charge(b"b", b""),
+            available: 0
+        })
+    );
+    assert_eq!(state(&table), before);
+}
+
+#[test]
+fn a_reinsertion_is_charged_only_its_value() {
+    let mut table = table();
+    table.put(b"k", 1, b"").unwrap();
+    table.delete(b"k", 2).unwrap();
+    let before = table.memory().charged;
+    table.put(b"k", 3, b"abc").unwrap();
+    assert_eq!(table.memory().charged, before + 3);
+}
+
+#[test]
+fn a_zero_budget_admits_nothing() {
+    let mut table = Memtable::new(0, None);
+    let expected = WriteError::RecordExceedsBudget {
+        charge: charge(b"", b""),
+        budget: 0,
+    };
+    assert_rejected(&mut table, expected, b"", 1, b"");
+}
+
+#[test]
+fn an_extreme_budget_does_not_overflow_the_accounting() {
+    let mut table = Memtable::new(usize::MAX, None);
+    table.put(b"k", 1, b"abc").unwrap();
+    table.put(b"k", 2, b"abcdef").unwrap();
+    assert_eq!(table.memory().charged, charge(b"k", b"abcdef"));
+}
+
+// Freezing.
+
+fn sample() -> (Memtable, Vec<Entry>) {
+    let mut table = table();
+    table.put(b"b", 1, b"two").unwrap();
+    table.delete(b"c", 2).unwrap();
+    table.put(b"a", 3, b"one").unwrap();
+    let expected = vec![put(b"a", 3, b"one"), put(b"b", 1, b"two"), del(b"c", 2)];
+    (table, expected)
+}
+
+#[test]
+fn freezing_preserves_contents_and_accounting() {
+    let (table, expected) = sample();
+    let memory = table.memory();
+    let frozen = table.freeze();
+    assert_eq!(frozen_contents(&frozen), expected);
+    assert_eq!(frozen.memory(), memory);
+    assert_eq!(frozen.last_seq(), Some(3));
+    assert_eq!(frozen.len(), 3);
+    assert!(!frozen.is_empty());
+    assert_eq!(frozen.get(b"a").unwrap().value, Value::Bytes(b"one"));
+    assert_eq!(frozen.get(b"c").unwrap().value, Value::Tombstone);
+    assert_eq!(frozen.get(b"d"), None);
+}
+
+#[test]
+fn a_frozen_table_traverses_the_same_way_every_time() {
+    let (table, expected) = sample();
+    let frozen = table.freeze();
+    for _ in 0..3 {
+        assert_eq!(frozen_contents(&frozen), expected);
+    }
+}
+
+#[test]
+fn a_frozen_table_can_be_shared_between_threads_by_type() {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<FrozenMemtable>();
+}
+
+#[test]
+fn a_successor_cannot_reuse_a_frozen_tables_sequence_numbers() {
+    let (table, _) = sample();
+    let frozen = table.freeze();
+    let mut next = Memtable::new(ROOMY, frozen.last_seq());
+    let expected = WriteError::SequenceNotIncreasing { seq: 3, last: 3 };
+    assert_rejected(&mut next, expected, b"z", 3, b"v");
+    next.put(b"z", 4, b"v").unwrap();
+}
+
+#[test]
+fn an_empty_table_passes_its_starting_bound_to_a_successor() {
+    let frozen = Memtable::new(ROOMY, Some(40)).freeze();
+    assert!(frozen.is_empty());
+    assert_eq!(frozen.last_seq(), Some(40));
+}
+
+// Flushing.
+
+#[test]
+fn an_empty_table_flushes_to_no_runs() {
+    let frozen = table().freeze();
+    assert_eq!(frozen.flush(TARGET_RUN_LEN).count(), 0);
+}
+
+#[test]
+fn a_flush_matches_a_run_built_directly_with_the_defaults() {
+    let (table, expected) = sample();
+    let frozen = table.freeze();
+    let mut builder = RunBuilder::default();
+    for (key, seq, value) in &expected {
+        let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
+        builder.add(key, *seq, value).unwrap();
+    }
+    let runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].as_bytes(), builder.finish().as_bytes());
+}
+
+#[test]
+fn flushed_runs_pass_full_validation_and_equal_the_table() {
+    let mut table = table();
+    for i in 0..2000u32 {
+        let key = format!("key{:05}", i * 7 % 2000);
+        table
+            .put(key.as_bytes(), u64::from(i), &[i as u8; 40])
+            .unwrap();
+    }
+    let frozen = table.freeze();
+    let runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    let mut flushed = Vec::new();
+    for run in &runs {
+        Run::new(run.as_bytes().to_vec()).unwrap();
+        flushed.extend(run_contents(run));
+    }
+    assert_eq!(flushed, frozen_contents(&frozen));
+}
+
+#[test]
+fn every_tombstone_is_flushed_with_its_sequence_number() {
+    let mut table = table();
+    table.delete(b"never-held", 4).unwrap();
+    table.put(b"replaced", 5, b"v").unwrap();
+    table.delete(b"replaced", 6).unwrap();
+    let frozen = table.freeze();
+    let runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    assert_eq!(
+        run_contents(&runs[0]),
+        [del(b"never-held", 4), del(b"replaced", 6)]
+    );
+}
+
+fn numbered(count: u32, value_len: usize) -> FrozenMemtable {
+    let mut table = table();
+    for i in 0..count {
+        let key = format!("key{i:05}");
+        table
+            .put(key.as_bytes(), u64::from(i), &vec![i as u8; value_len])
+            .unwrap();
+    }
+    table.freeze()
+}
+
+#[test]
+fn a_flush_splits_at_the_target_into_ordered_disjoint_runs() {
+    // Each record counts 8 + 100 + 16 = 124 bytes of input, so ten records
+    // reach the target and the 95 records make nine runs of ten and one of five.
+    let frozen = numbered(95, 100);
+    let runs: Vec<_> = frozen.flush(1240).collect();
+    let sizes: Vec<usize> = runs.iter().map(Run::len).collect();
+    assert_eq!(sizes, [10, 10, 10, 10, 10, 10, 10, 10, 10, 5]);
+    let mut flushed = Vec::new();
+    for pair in runs.windows(2) {
+        let first = pair[0].key_range().unwrap().unwrap();
+        let second = pair[1].key_range().unwrap().unwrap();
+        assert!(first.max < second.min);
+    }
+    for run in &runs {
+        flushed.extend(run_contents(run));
+    }
+    assert_eq!(flushed, frozen_contents(&frozen));
+}
+
+#[test]
+fn a_run_ends_only_when_the_target_is_reached() {
+    let frozen = numbered(20, 100);
+    let sizes: Vec<usize> = frozen.flush(1241).map(|run| run.len()).collect();
+    assert_eq!(sizes, [11, 9]);
+}
+
+#[test]
+fn a_zero_target_makes_one_run_per_record() {
+    let frozen = numbered(5, 8);
+    assert_eq!(
+        frozen.flush(0).map(|run| run.len()).collect::<Vec<_>>(),
+        [1; 5]
+    );
+}
+
+#[test]
+fn an_oversized_target_is_reduced_and_still_makes_one_run() {
+    let frozen = numbered(5, 8);
+    assert_eq!(frozen.flush(usize::MAX).count(), 1);
+    assert_eq!(frozen.flush(MAX_TARGET_RUN_LEN).count(), 1);
+    let limit = format!("target: {MAX_TARGET_RUN_LEN}");
+    assert!(format!("{:?}", frozen.flush(usize::MAX)).contains(&limit));
+}
+
+#[test]
+fn a_finished_flush_stays_finished() {
+    let frozen = numbered(3, 8);
+    let mut flush = frozen.flush(TARGET_RUN_LEN);
+    assert!(flush.next().is_some());
+    assert!(flush.next().is_none());
+    assert!(flush.next().is_none());
+}
+
+#[test]
+fn an_abandoned_flush_leaves_the_table_intact_for_an_identical_retry() {
+    let frozen = numbered(200, 64);
+    let expected = frozen_contents(&frozen);
+    let memory = frozen.memory();
+
+    // A consumer that cannot use the second run gives up on the flush.
+    let kept = {
+        let mut failed = frozen.flush(2000);
+        let kept = failed.next().unwrap();
+        failed.next().unwrap();
+        kept
+    };
+    assert_eq!(frozen_contents(&frozen), expected);
+    assert_eq!(frozen.memory(), memory);
+
+    let retried: Vec<_> = frozen.flush(2000).collect();
+    assert_eq!(retried[0].as_bytes(), kept.as_bytes());
+    let flushed: Vec<Entry> = retried.iter().flat_map(run_contents).collect();
+    assert_eq!(flushed, expected);
+}
+
+#[test]
+fn a_table_can_be_read_while_a_flush_is_in_progress() {
+    let frozen = numbered(50, 32);
+    let mut flush = frozen.flush(600);
+    flush.next().unwrap();
+    assert_eq!(frozen.get(b"key00049").unwrap().seq, 49);
+    assert_eq!(frozen.iter().count(), 50);
+    assert!(flush.next().is_some());
+}
+
+// Composition with existing runs.
+
+fn older_run(records: &[Entry]) -> Run<Vec<u8>> {
+    let mut builder = RunBuilder::default();
+    for (key, seq, value) in records {
+        let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
+        builder.add(key, *seq, value).unwrap();
+    }
+    builder.finish()
+}
+
+fn views(runs: &[Run<Vec<u8>>]) -> Vec<RunView<'_>> {
+    runs.iter().map(Run::view).collect()
+}
+
+fn live(runs: &[Run<Vec<u8>>]) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+    let views = views(runs);
+    let mut workspace = LogicalWorkspace::new();
+    let mut cursor = RunSet::new(&views).cursor(&mut workspace);
+    let mut out = Vec::new();
+    while let Some(record) = cursor.next_record().unwrap() {
+        out.push((record.key.to_vec(), record.seq, record.value.to_vec()));
+    }
+    out
+}
+
+#[test]
+fn flushed_updates_supersede_older_runs_in_logical_reads() {
+    let older = older_run(&[
+        put(b"changed", 1, b"old"),
+        put(b"deleted", 2, b"old"),
+        put(b"kept", 3, b"old"),
+    ]);
+    let mut table = Memtable::new(ROOMY, Some(3));
+    table.put(b"changed", 4, b"new").unwrap();
+    table.delete(b"deleted", 5).unwrap();
+    table.put(b"fresh", 6, b"").unwrap();
+
+    let frozen = table.freeze();
+    let mut runs = vec![older];
+    runs.extend(frozen.flush(TARGET_RUN_LEN));
+    assert_eq!(
+        live(&runs),
+        [
+            (b"changed".to_vec(), 4, b"new".to_vec()),
+            (b"fresh".to_vec(), 6, b"".to_vec()),
+            (b"kept".to_vec(), 3, b"old".to_vec()),
+        ]
+    );
+    let views = views(&runs);
+    let mut workspace = LogicalWorkspace::new();
+    assert_eq!(
+        RunSet::new(&views).get(b"deleted", &mut workspace),
+        Ok(None)
+    );
+}
+
+#[test]
+fn a_flushed_run_merges_physically_in_internal_key_order() {
+    let older = older_run(&[put(b"a", 1, b"old"), put(b"b", 2, b"old")]);
+    let mut table = Memtable::new(ROOMY, Some(2));
+    table.delete(b"a", 3).unwrap();
+    table.put(b"c", 4, b"new").unwrap();
+    let frozen = table.freeze();
+    let mut runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    runs.push(older);
+
+    let mut workspace = MergeWorkspace::new();
+    let mut cursor = MergeCursor::new(views(&runs), &mut workspace);
+    let mut merged = Vec::new();
+    while let Some(record) = cursor.next_record().unwrap() {
+        merged.push(owned(record));
+    }
+    assert_eq!(
+        merged,
+        [
+            del(b"a", 3),
+            put(b"a", 1, b"old"),
+            put(b"b", 2, b"old"),
+            put(b"c", 4, b"new"),
+        ]
+    );
+}
+
+#[test]
+fn flushing_twice_yields_copies_that_logical_reads_count_once() {
+    let frozen = numbered(30, 16);
+    let mut runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    runs.extend(frozen.flush(300));
+    assert_eq!(live(&runs).len(), 30);
+}
+
+// Reference model.
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+type Model = HashMap<Vec<u8>, (u64, Option<Vec<u8>>)>;
+
+fn key_pool() -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![0xFF],
+        vec![0xFF, 0xFF],
+        b"a".to_vec(),
+        b"a\x00".to_vec(),
+    ];
+    keys.extend((0..40u8).map(|i| vec![b'k', i, 0xFF - i]));
+    keys
+}
+
+fn entry_charge(key: &[u8], value: Option<&[u8]>) -> usize {
+    key.len() + value.map_or(0, <[u8]>::len) + ENTRY_OVERHEAD
+}
+
+fn total_charge(model: &Model) -> usize {
+    model
+        .iter()
+        .map(|(key, (_, value))| entry_charge(key, value.as_deref()))
+        .sum()
+}
+
+/// What the rules say an update should do, from the model alone.
+fn expected_outcome(
+    model: &Model,
+    key: &[u8],
+    seq: u64,
+    value: Option<&[u8]>,
+    last: Option<u64>,
+    budget: usize,
+) -> Result<(), &'static str> {
+    if key.len() > MAX_KEY_LEN {
+        return Err("key");
+    }
+    if value.is_some_and(|value| value.len() > MAX_VALUE_LEN) {
+        return Err("value");
+    }
+    if last.is_some_and(|last| seq <= last) {
+        return Err("sequence");
+    }
+    let entry = entry_charge(key, value);
+    if entry > budget {
+        return Err("record");
+    }
+    let held = model
+        .get(key)
+        .map_or(0, |(_, old)| entry_charge(key, old.as_deref()));
+    if total_charge(model) - held + entry > budget {
+        return Err("budget");
+    }
+    Ok(())
+}
+
+fn kind(error: WriteError) -> &'static str {
+    match error {
+        WriteError::KeyTooLong { .. } => "key",
+        WriteError::ValueTooLong { .. } => "value",
+        WriteError::SequenceNotIncreasing { .. } => "sequence",
+        WriteError::RecordExceedsBudget { .. } => "record",
+        WriteError::BudgetExceeded { .. } => "budget",
+    }
+}
+
+fn sorted_entries(model: &Model) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = model
+        .iter()
+        .map(|(key, (seq, value))| (key.clone(), *seq, value.clone()))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn assert_table_matches(table: &Memtable, model: &Model, pool: &[Vec<u8>]) {
+    assert_eq!(contents(table), sorted_entries(model));
+    for key in pool {
+        let found = table.get(key).map(|version| {
+            let value = match version.value {
+                Value::Bytes(bytes) => Some(bytes.to_vec()),
+                Value::Tombstone => None,
+            };
+            (version.seq, value)
+        });
+        assert_eq!(found.as_ref(), model.get(key));
+    }
+    let memory = table.memory();
+    assert_eq!(memory.charged, total_charge(model));
+    assert_eq!(
+        memory.payload,
+        total_charge(model) - model.len() * ENTRY_OVERHEAD
+    );
+    assert!(memory.charged <= memory.budget);
+}
+
+fn assert_runs_match(runs: &[Run<Vec<u8>>], history: &Model, pool: &[Vec<u8>]) {
+    let mut expected: Vec<(Vec<u8>, u64, Vec<u8>)> = history
+        .iter()
+        .filter_map(|(key, (seq, value))| Some((key.clone(), *seq, value.clone()?)))
+        .collect();
+    expected.sort();
+    assert_eq!(live(runs), expected);
+
+    let views = views(runs);
+    let set = RunSet::new(&views);
+    let mut workspace = LogicalWorkspace::new();
+    for key in pool {
+        let found = set
+            .get(key, &mut workspace)
+            .unwrap()
+            .map(|live| (live.seq, live.value.to_vec()));
+        let wanted = history
+            .get(key)
+            .and_then(|(seq, value)| Some((*seq, value.clone()?)));
+        assert_eq!(found, wanted);
+    }
+}
+
+/// Several generations of updates, each frozen and flushed, checked after
+/// every operation against maps maintained only by this test.
+#[test]
+fn randomized_updates_match_an_independent_model_across_flushes() {
+    const SEEDS: u64 = 48;
+    const GENERATIONS: usize = 4;
+    const OPERATIONS: usize = 250;
+
+    let pool = key_pool();
+    let long_key = vec![b'x'; MAX_KEY_LEN + 1];
+    let huge = vec![0u8; MAX_VALUE_LEN + 1];
+    let mut rejected = HashMap::new();
+    let mut accepted = 0;
+
+    for seed in 0..SEEDS {
+        let mut rng = Rng(seed);
+        let mut history = Model::new();
+        let mut runs: Vec<Run<Vec<u8>>> = Vec::new();
+        let mut last = None;
+        let mut next_seq = 0u64;
+
+        for generation in 0..GENERATIONS {
+            let budget = [600, 2_000, 8_000, 40_000][rng.below(4)];
+            let mut table = Memtable::new(budget, last);
+            let mut model = Model::new();
+
+            for _ in 0..OPERATIONS {
+                let roll = rng.below(100);
+                let key: &[u8] = if roll == 0 {
+                    &long_key
+                } else {
+                    &pool[rng.below(pool.len())]
+                };
+                let value_bytes: Vec<u8>;
+                let value: Option<&[u8]> = if rng.below(4) == 0 {
+                    None
+                } else if roll == 1 {
+                    Some(&huge)
+                } else {
+                    let len = if rng.below(10) == 0 {
+                        rng.below(1500)
+                    } else {
+                        rng.below(32)
+                    };
+                    value_bytes = (0..len).map(|_| rng.next() as u8).collect();
+                    Some(&value_bytes)
+                };
+                let seq = match last {
+                    Some(last) if roll < 12 => last.saturating_sub(rng.below(3) as u64),
+                    _ => {
+                        next_seq += 1 + rng.below(3) as u64;
+                        next_seq
+                    }
+                };
+
+                let want = expected_outcome(&model, key, seq, value, last, budget);
+                let got = match value {
+                    Some(value) => table.put(key, seq, value),
+                    None => table.delete(key, seq),
+                };
+                assert_eq!(got.map_err(kind), want, "seed {seed}");
+
+                match want {
+                    Ok(()) => {
+                        accepted += 1;
+                        let update = (seq, value.map(<[u8]>::to_vec));
+                        model.insert(key.to_vec(), update.clone());
+                        history.insert(key.to_vec(), update);
+                        last = Some(seq);
+                    }
+                    Err(reason) => *rejected.entry(reason).or_insert(0) += 1,
+                }
+                assert_eq!(table.last_seq(), last);
+                assert_table_matches(&table, &model, &pool);
+            }
+
+            let frozen = table.freeze();
+            assert_eq!(frozen_contents(&frozen), sorted_entries(&model));
+            let target = [1, 256, 4096, TARGET_RUN_LEN][generation];
+            let flushed: Vec<_> = frozen.flush(target).collect();
+            let mut in_runs = Vec::new();
+            for run in &flushed {
+                Run::new(run.as_bytes().to_vec()).unwrap();
+                in_runs.extend(run_contents(run));
+            }
+            assert_eq!(in_runs, sorted_entries(&model));
+            runs.extend(flushed);
+            assert_runs_match(&runs, &history, &pool);
+        }
+    }
+
+    // The sequence must have exercised every outcome to mean anything.
+    assert!(accepted > 10_000, "{accepted}");
+    for reason in ["key", "value", "sequence", "record", "budget"] {
+        assert!(rejected.get(reason).copied().unwrap_or(0) > 0, "{reason}");
+    }
+}

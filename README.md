@@ -3,9 +3,9 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 4C
+## Status: Milestone 5A
 
-Two physical storage layers exist.
+Two physical storage layers exist, with mutable storage above them.
 
 A **block** stores versioned records, ordered by user key ascending then
 sequence number descending, with prefix-compressed keys and a restart point
@@ -48,8 +48,15 @@ Key ranges exclude runs that cannot hold a key or prefix, without decoding them.
 The byte formats and their invariants are documented in
 [`src/block/mod.rs`](src/block/mod.rs) and [`src/run/mod.rs`](src/run/mod.rs).
 
-There is no Bloom filter, memtable, compaction, MVCC, write-ahead log or
-persistence yet.
+A **memtable** holds the latest update of each key in memory, in key order,
+under a memory budget. The caller supplies strictly increasing sequence numbers
+and a rejected update changes nothing. Freezing consumes the table, and a
+`FrozenMemtable` builds compressed runs on demand, one at a time, keeping every
+tombstone. A frozen table is only borrowed by a flush, so a flush can be
+repeated. Memtables are not yet read through `RunSet`.
+
+There is no Bloom filter, compaction, MVCC, write-ahead log, persistence or
+database API yet. Concurrent access is not implemented.
 
 ## Validate
 
@@ -69,6 +76,7 @@ scripts/validate.sh prefix   # prefix scan comparison
 scripts/validate.sh merge    # multi-run merge measurements
 scripts/validate.sh logical  # latest-state read measurements
 scripts/validate.sh ranges   # key-range pruning measurements
+scripts/validate.sh memtable # memtable and flush measurements
 colima stop
 ```
 

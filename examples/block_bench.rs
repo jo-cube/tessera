@@ -20,6 +20,7 @@ use std::time::Instant;
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
+use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
 use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
     RunBuilder, RunCursor, RunSet, RunView,
@@ -2402,6 +2403,339 @@ fn range_reads() {
     }
 }
 
+const MEMTABLE_ROUNDS: usize = 3;
+const MEMTABLE_BUDGET: usize = 1 << 34;
+
+fn large_values(target: usize) -> Vec<Owned> {
+    let mut rng = Rng(23);
+    fill(target, |i| {
+        let mut value = rng.bytes(2048);
+        value.resize(4096, 0);
+        vec![Owned {
+            key: format!("record/{i:012}").into_bytes(),
+            seq: BASE_SEQ + i,
+            value: Some(value),
+        }]
+    })
+}
+
+fn memtable_dataset(name: &str) -> Vec<Owned> {
+    match name {
+        "json" => tree_json(16 << 20),
+        "tiny" => tree_small(8 << 20),
+        "large" => large_values(16 << 20),
+        _ => panic!("unknown dataset {name}"),
+    }
+}
+
+fn shuffled(count: usize, seed: u64) -> Vec<usize> {
+    let mut rng = Rng(seed);
+    let mut order: Vec<usize> = (0..count).collect();
+    for at in (1..count).rev() {
+        order.swap(at, (rng.next() % (at as u64 + 1)) as usize);
+    }
+    order
+}
+
+fn insert_all(records: &[Owned], order: &[usize], table: &mut Memtable, next_seq: &mut u64) {
+    for &index in order {
+        let record = &records[index];
+        *next_seq += 1;
+        table
+            .put(&record.key, *next_seq, record.value.as_deref().unwrap())
+            .unwrap();
+    }
+}
+
+fn filled(records: &[Owned], order: &[usize]) -> (Memtable, u64) {
+    let mut table = Memtable::new(MEMTABLE_BUDGET, None);
+    let mut next_seq = 0;
+    insert_all(records, order, &mut table, &mut next_seq);
+    (table, next_seq)
+}
+
+/// Returns the median nanoseconds per operation of `measure`, excluding
+/// `setup` and dropping the state, and allocations per operation from one more
+/// pass.
+fn timed<T>(
+    operations: usize,
+    mut setup: impl FnMut() -> T,
+    mut measure: impl FnMut(&mut T),
+) -> (f64, f64) {
+    let mut samples: Vec<f64> = (0..MEMTABLE_ROUNDS)
+        .map(|_| {
+            let mut state = setup();
+            let start = Instant::now();
+            measure(&mut state);
+            let elapsed = start.elapsed().as_nanos() as f64;
+            black_box(&state);
+            elapsed / operations as f64
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    let mut state = setup();
+    let allocations = allocations_during(|| measure(&mut state));
+    (
+        samples[samples.len() / 2],
+        allocations as f64 / operations as f64,
+    )
+}
+
+fn vm_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
+}
+
+const MIB: f64 = (1 << 20) as f64;
+
+fn flush_row(name: &str, frozen: &FrozenMemtable, target: usize, payload: usize) {
+    let records = frozen.len();
+    let (mut runs, mut stored) = (0, 0);
+    let mut peak_collected = 0;
+    let (flush_ns, flush_allocs) = timed(
+        records,
+        || (),
+        |()| {
+            let before = LIVE.load(Ordering::Relaxed);
+            PEAK.store(before, Ordering::Relaxed);
+            let output: Vec<_> = frozen.flush(target).collect();
+            peak_collected = PEAK.load(Ordering::Relaxed) - before;
+            runs = output.len();
+            stored = output.iter().map(|run| run.as_bytes().len()).sum();
+        },
+    );
+    let peak_streamed = peak_during(|| {
+        for run in frozen.flush(target) {
+            black_box(run.as_bytes().len());
+        }
+    });
+    println!(
+        "| {name} | {} | {runs} | {:.2} | {:.3} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} |",
+        target >> 20,
+        stored as f64 / MIB,
+        stored as f64 / payload as f64,
+        flush_ns * records as f64 / 1e6,
+        payload as f64 / MIB / (flush_ns * records as f64 / 1e9),
+        flush_allocs,
+        peak_collected as f64 / MIB,
+        peak_streamed as f64 / MIB,
+    );
+}
+
+/// Runs in its own process, so that resident memory is not hidden by what an
+/// earlier dataset left in the allocator.
+fn memtable_memory() {
+    let args: Vec<String> = std::env::args().collect();
+    let (name, order_name) = (args[2].as_str(), args[3].as_str());
+    let records = memtable_dataset(name);
+    let order: Vec<usize> = match order_name {
+        "sorted" => (0..records.len()).collect(),
+        _ => shuffled(records.len(), 91),
+    };
+
+    let live_before = LIVE.load(Ordering::Relaxed);
+    let rss_before = vm_rss_bytes();
+    let mut table = Memtable::new(MEMTABLE_BUDGET, None);
+    let mut next_seq = 0;
+    let peak = peak_during(|| insert_all(&records, &order, &mut table, &mut next_seq));
+    let requested = LIVE.load(Ordering::Relaxed) - live_before;
+    let rss = vm_rss_bytes();
+    let memory = table.memory();
+
+    insert_all(
+        &records,
+        &shuffled(records.len(), 92),
+        &mut table,
+        &mut next_seq,
+    );
+    let rss_churned = vm_rss_bytes();
+
+    let delete_order = shuffled(records.len(), 93);
+    for &index in &delete_order {
+        next_seq += 1;
+        table.delete(&records[index].key, next_seq).unwrap();
+    }
+    let requested_deleted = LIVE.load(Ordering::Relaxed) - live_before;
+
+    let delta = |after: Option<u64>| match (after, rss_before) {
+        (Some(after), Some(before)) => format!("{:.1}", (after - before) as f64 / MIB),
+        _ => "n/a".to_string(),
+    };
+    let payload = memory.payload as f64;
+    let rss_ratio = match (rss, rss_before) {
+        (Some(after), Some(before)) => format!("{:.2}", (after - before) as f64 / payload),
+        _ => "n/a".to_string(),
+    };
+    println!(
+        "| {name} | {order_name} | {} | {:.1} | {:.1} | {:.1} | {} | {:.2} | {:.2} | {} | {:.2} | {:.1} | {} | {:.1} |",
+        records.len(),
+        payload / MIB,
+        memory.charged as f64 / MIB,
+        requested as f64 / MIB,
+        delta(rss),
+        memory.charged as f64 / payload,
+        requested as f64 / payload,
+        rss_ratio,
+        requested as f64 / memory.charged as f64,
+        peak as f64 / MIB,
+        delta(rss_churned),
+        requested_deleted as f64 / MIB,
+    );
+}
+
+fn memtable_baseline() {
+    const DATASETS: [&str; 3] = ["json", "tiny", "large"];
+
+    println!("memory; each row is one fresh process; requested counts Rust heap bytes");
+    println!(
+        "| dataset | insert order | records | payload MiB | charged MiB | requested MiB | RSS MiB | charged/payload | requested/payload | RSS/payload | requested/charged | peak MiB | RSS after overwrite | requested after delete MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let program = std::env::current_exe().unwrap();
+    for name in DATASETS {
+        for order in ["sorted", "random"] {
+            let status = std::process::Command::new(&program)
+                .args(["memtable-memory", name, order])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    println!();
+    println!("median of {MEMTABLE_ROUNDS} rounds; allocations from one further round");
+    println!("| dataset | workload | ns/op | million ops/s | allocs/op |");
+    println!("|---|---|---|---|---|");
+    for name in DATASETS {
+        let records = memtable_dataset(name);
+        let count = records.len();
+        let sorted: Vec<usize> = (0..count).collect();
+        let random = shuffled(count, 91);
+        let second = shuffled(count, 92);
+        let row = |workload: &str, (ns, allocs): (f64, f64)| {
+            println!(
+                "| {name} | {workload} | {ns:.1} | {:.2} | {allocs:.2} |",
+                1e3 / ns
+            );
+        };
+
+        row(
+            "sequential insert",
+            timed(
+                count,
+                || (Memtable::new(MEMTABLE_BUDGET, None), 0),
+                |(table, seq)| insert_all(&records, &sorted, table, seq),
+            ),
+        );
+        row(
+            "random insert",
+            timed(
+                count,
+                || (Memtable::new(MEMTABLE_BUDGET, None), 0),
+                |(table, seq)| insert_all(&records, &random, table, seq),
+            ),
+        );
+        row(
+            "random overwrite",
+            timed(
+                count,
+                || filled(&records, &random),
+                |(table, seq)| insert_all(&records, &second, table, seq),
+            ),
+        );
+        row(
+            "random delete",
+            timed(
+                count,
+                || filled(&records, &random),
+                |(table, seq)| {
+                    for &index in &second {
+                        *seq += 1;
+                        table.delete(&records[index].key, *seq).unwrap();
+                    }
+                },
+            ),
+        );
+
+        let (table, _) = filled(&records, &random);
+        let misses: Vec<Vec<u8>> = records
+            .iter()
+            .map(|record| [record.key.as_slice(), b"~"].concat())
+            .collect();
+        row(
+            "get hit",
+            timed(
+                count,
+                || (),
+                |()| {
+                    for &index in &second {
+                        black_box(table.get(&records[index].key));
+                    }
+                },
+            ),
+        );
+        row(
+            "get miss",
+            timed(
+                count,
+                || (),
+                |()| {
+                    for &index in &second {
+                        black_box(table.get(&misses[index]));
+                    }
+                },
+            ),
+        );
+        row(
+            "ordered traversal",
+            timed(
+                count,
+                || (),
+                |()| {
+                    for record in table.iter() {
+                        black_box(record);
+                    }
+                },
+            ),
+        );
+        drop(table);
+        row(
+            "freeze (per table)",
+            timed(
+                1,
+                || (Some(filled(&records, &random).0), None),
+                |(table, frozen)| *frozen = table.take().map(Memtable::freeze),
+            ),
+        );
+        row(
+            "drop frozen (per table)",
+            timed(
+                1,
+                || Some(filled(&records, &random).0.freeze()),
+                |frozen| drop(frozen.take()),
+            ),
+        );
+    }
+
+    println!();
+    println!("flush; peaks are Rust heap above the frozen table, excluding Zstandard contexts");
+    println!(
+        "| dataset | target MiB | runs | stored MiB | stored/payload | flush ms | payload MiB/s | allocs/record | peak collected MiB | peak streamed MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for name in DATASETS {
+        let records = memtable_dataset(name);
+        let order = shuffled(records.len(), 91);
+        let (table, _) = filled(&records, &order);
+        let payload = table.memory().payload;
+        let frozen = table.freeze();
+        flush_row(name, &frozen, TARGET_RUN_LEN, payload);
+        flush_row(name, &frozen, 4 << 20, payload);
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
@@ -2409,6 +2743,8 @@ fn main() {
         Some("merge") => return merge_scans(),
         Some("logical") => return logical_reads(),
         Some("ranges") => return range_reads(),
+        Some("memtable") => return memtable_baseline(),
+        Some("memtable-memory") => return memtable_memory(),
         _ => {}
     }
 

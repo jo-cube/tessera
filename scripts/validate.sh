@@ -12,6 +12,7 @@
 #   scripts/validate.sh merge              multi-run merge measurements
 #   scripts/validate.sh logical            latest-state read measurements
 #   scripts/validate.sh ranges             key-range pruning measurements
+#   scripts/validate.sh memtable           memtable and flush measurements
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -163,6 +164,10 @@ ranges() {
   bounded ranges 900 cargo run --locked --release --example block_bench -- ranges
 }
 
+memtable() {
+  bounded memtable 900 cargo run --locked --release --example block_bench -- memtable
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -221,7 +226,8 @@ case "$command" in
   merge) merge ;;
   logical) logical ;;
   ranges) ranges ;;
+  memtable) memtable ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,16p' "$0"; exit 2 ;;
+  *) sed -n '2,17p' "$0"; exit 2 ;;
 esac

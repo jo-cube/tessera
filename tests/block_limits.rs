@@ -8,6 +8,7 @@ use tessera::block::{
     Block, BlockBuilder, BuildError, MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL,
     Value,
 };
+use tessera::memtable::{Memtable, TARGET_RUN_LEN};
 use tessera::run::{Codec, MAX_TARGET_BLOCK_LEN, ReadWorkspace, Run, RunBuilder};
 
 #[test]
@@ -101,4 +102,24 @@ fn run_never_reports_a_full_block() {
         assert_eq!((found.seq, found.value), (2, Value::Bytes(&largest)));
         assert_eq!(validated.get(b"b", &mut workspace).unwrap().unwrap().seq, 2);
     }
+}
+
+#[test]
+#[ignore = "large allocations; run with scripts/validate.sh limits"]
+fn largest_allowed_update_flushes_into_a_valid_run() {
+    let key = vec![b'k'; MAX_KEY_LEN];
+    let value = vec![7; MAX_VALUE_LEN];
+    let mut table = Memtable::new(MAX_VALUE_LEN * 2, None);
+    table.put(&key, u64::MAX, &value).unwrap();
+    let frozen = table.freeze();
+
+    let mut runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
+    assert_eq!(runs.len(), 1);
+    let run = Run::new(runs.pop().unwrap().as_bytes().to_vec()).unwrap();
+    let mut workspace = ReadWorkspace::new();
+    let found = run.get(&key, &mut workspace).unwrap().unwrap();
+    assert_eq!(
+        (found.seq, found.value),
+        (u64::MAX, Value::Bytes(&value[..]))
+    );
 }
