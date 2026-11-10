@@ -53,7 +53,8 @@
 //! operation then panics too. No write section is expected to panic short of a
 //! bug, and the engine does not try to recover from one. A panic anywhere else,
 //! including in a caller holding a [`ReadGuard`] or a flush job, leaves the
-//! engine usable.
+//! engine usable, and so does a panic in the background worker, which stops
+//! it. [`Engine::new`] panics if the worker's thread cannot be created.
 //!
 //! # Flushing
 //!
@@ -86,6 +87,28 @@
 //! Publication checks that every input is still published, and a compaction
 //! that fails at any stage changes nothing.
 //!
+//! # Background compaction
+//!
+//! With [`EngineOptions::background_compaction`] set, the engine owns one
+//! worker thread. Each flush publication and each change to the run limits
+//! asks it for a pass; requests made while it is busy are counted as one, so
+//! nothing queues. A pass runs [`Engine::compact`] with those options until
+//! nothing is eligible, so the selection, limits and publication checks are
+//! the synchronous ones, and it competes with manual compactions only for
+//! the same one-at-a-time slot. The worker sleeps on a condition variable
+//! between passes.
+//!
+//! A failed compaction ends its pass. It is recorded in
+//! [`Engine::background_status`] and not retried until the next request, so
+//! a lasting failure is reported once per flush, never in a loop.
+//! [`Engine::wait_for_compaction`] requests a pass, waits for it and returns
+//! its failure. A panic in the worker stops it for good and is reported the
+//! same way; the engine stays usable without it.
+//!
+//! Dropping the engine stops the worker after the compaction it is running,
+//! which is published, and joins the thread. The thread holds the engine's
+//! shared core, not the engine, so nothing keeps the engine alive.
+//!
 //! # Memory
 //!
 //! Mutable memory is limited by two memtable budgets, the active and at most
@@ -98,13 +121,25 @@
 //! limits.
 //!
 //! A compaction adds, until it publishes, its output and workspace, each
-//! limited by [`CompactionOptions`]. Its inputs stay allocated until it
-//! publishes and any reader holding them is done, so the run bytes can briefly
-//! be the published total plus the output. Run limits are checked against the
-//! total after replacement.
+//! limited by [`CompactionOptions`]. Only one compaction builds at a time,
+//! whether in the background or not. Its inputs stay published until it
+//! publishes, and are freed as it releases the lock: a reader holding the lock
+//! delays publication rather than keeping old runs. Run bytes can therefore
+//! briefly be the published total plus one output, beside two memtable
+//! budgets and one workspace. A compaction is refused only if it would leave
+//! more runs or bytes than both the limits and what it replaces.
+//!
+//! When flushes outpace compaction, the run limits reject flushes, the
+//! memtables fill and writes are rejected with
+//! [`WriteError::BudgetExceeded`]. Nothing waits on its own. A caller can
+//! [`Engine::wait_for_compaction`] and retry.
 //!
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
+
+mod worker;
+
+pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -150,10 +185,14 @@ pub struct EngineOptions {
     pub max_run_bytes: usize,
     /// The sequence number to continue after. The first write uses the next.
     pub last_seq: u64,
+    /// Starts a background worker that compacts with these options whenever
+    /// a flush publishes runs. See [Background compaction](self#background-compaction).
+    pub background_compaction: Option<CompactionOptions>,
 }
 
 impl Default for EngineOptions {
-    /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs.
+    /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs, and no
+    /// background compaction.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -161,6 +200,7 @@ impl Default for EngineOptions {
             max_runs: 64,
             max_run_bytes: 4 << 30,
             last_seq: 0,
+            background_compaction: None,
         }
     }
 }
@@ -239,6 +279,9 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
+    /// The most published runs whose key ranges share one key: the most
+    /// blocks a point read of a key absent from the memtables decodes.
+    pub max_overlap: usize,
 }
 
 struct State {
@@ -254,9 +297,8 @@ struct State {
     max_run_bytes: usize,
 }
 
-/// A minimal key-value engine. See the [module documentation](self) for its
-/// consistency and flushing rules.
-pub struct Engine {
+/// Everything an engine shares with its background worker.
+struct Core {
     state: RwLock<State>,
     /// Gives writers priority. A writer holds it while waiting for the state
     /// lock, and a reader passes through it first, so new readers cannot keep
@@ -269,53 +311,43 @@ pub struct Engine {
     compacting: Mutex<()>,
     memtable_budget: usize,
     target_run_len: usize,
+    /// Present when a background worker compacts this engine.
+    background: Option<worker::Signal>,
+    /// Makes the worker panic at the start of its next pass.
+    #[cfg(test)]
+    panic_worker: std::sync::atomic::AtomicBool,
+    /// Runs between building a compaction and returning it.
+    #[cfg(test)]
+    after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// A minimal key-value engine. See the [module documentation](self) for its
+/// consistency, flushing and compaction rules.
+pub struct Engine {
+    core: Arc<Core>,
+    /// Joined when the engine is dropped.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Engine {
-    /// Creates an empty engine.
+    /// Creates an empty engine, starting a background compaction worker if
+    /// [`EngineOptions::background_compaction`] is set.
     pub fn new(options: EngineOptions) -> Self {
-        Self {
-            state: RwLock::new(State {
-                last_seq: options.last_seq,
-                active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
-                frozen: None,
-                runs: Vec::new(),
-                run_bytes: 0,
-                max_runs: options.max_runs,
-                max_run_bytes: options.max_run_bytes,
-            }),
-            gate: Mutex::new(()),
-            flushing: Mutex::new(()),
-            compacting: Mutex::new(()),
-            memtable_budget: options.memtable_budget,
-            target_run_len: options.target_run_len,
-        }
+        let core = Arc::new(Core::new(&options));
+        let worker = options
+            .background_compaction
+            .map(|compaction| worker::start(Arc::clone(&core), compaction));
+        Self { core, worker }
     }
 
     /// Sets `key` to `value` and returns the update's sequence number.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
-        self.update(key, Value::Bytes(value))
+        self.core.put(key, value)
     }
 
     /// Deletes `key` and returns the update's sequence number.
     pub fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
-        self.update(key, Value::Tombstone)
-    }
-
-    fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
-        let mut state = self.write_state();
-        let seq = state
-            .last_seq
-            .checked_add(1)
-            .ok_or(UpdateError::SequencesExhausted)?;
-        let written = match value {
-            Value::Bytes(bytes) => state.active.put(key, seq, bytes),
-            Value::Tombstone => state.active.delete(key, seq),
-        };
-        written.map_err(UpdateError::Rejected)?;
-        // Set only now: a rejected write must not use up a number.
-        state.last_seq = seq;
-        Ok(seq)
+        self.core.delete(key)
     }
 
     /// Returns the latest value of `key`, or `None` if it is absent or
@@ -325,15 +357,7 @@ impl Engine {
         key: &[u8],
         workspace: &'w mut EngineWorkspace,
     ) -> Result<Option<LiveValue<'w>>, ReadError> {
-        let EngineWorkspace { logical, value, .. } = workspace;
-        let state = self.read_state();
-        let Some(found) = lookup(&state, key, logical)? else {
-            return Ok(None);
-        };
-        let seq = found.seq;
-        value.clear();
-        value.extend_from_slice(found.value);
-        Ok(Some(LiveValue { seq, value }))
+        self.core.get(key, workspace)
     }
 
     /// Takes the shared lock and returns a stable view of the engine.
@@ -341,7 +365,7 @@ impl Engine {
     /// Writers and flush publication wait until it is dropped. See the
     /// [module documentation](self) for what must not be done while holding it.
     pub fn read(&self) -> ReadGuard<'_> {
-        ReadGuard(self.read_state())
+        self.core.read()
     }
 
     /// Flushes until everything written before this call is in runs.
@@ -349,19 +373,7 @@ impl Engine {
     /// A frozen table left by an earlier flush is flushed first, then the
     /// active table. An empty engine does nothing.
     pub fn flush(&self) -> Result<FlushReport, FlushError> {
-        let mut total = FlushReport::default();
-        while let Some(job) = self.begin_flush() {
-            let includes_active = !job.retried;
-            let report = job.build().publish()?;
-            total.tables += report.tables;
-            total.records += report.records;
-            total.runs += report.runs;
-            total.run_bytes += report.run_bytes;
-            if includes_active {
-                break;
-            }
-        }
-        Ok(total)
+        self.core.flush()
     }
 
     /// Starts a flush, freezing the active table unless a frozen table is
@@ -370,27 +382,7 @@ impl Engine {
     /// Waits for any flush already in progress, including one this thread
     /// holds, so drop or publish a job before starting another.
     pub fn begin_flush(&self) -> Option<FlushJob<'_>> {
-        // This mutex guards no data, so a panic elsewhere leaves nothing to
-        // distrust, and the flush must stay retryable.
-        let serial = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut state = self.write_state();
-        let (frozen, retried) = match &state.frozen {
-            Some(frozen) => (Arc::clone(frozen), true),
-            None if state.active.is_empty() => return None,
-            None => {
-                let successor = Memtable::new(self.memtable_budget, Some(state.last_seq));
-                let frozen = Arc::new(std::mem::replace(&mut state.active, successor).freeze());
-                state.frozen = Some(Arc::clone(&frozen));
-                (frozen, false)
-            }
-        };
-        drop(state);
-        Some(FlushJob {
-            engine: self,
-            _serial: serial,
-            frozen,
-            retried,
-        })
+        self.core.begin_flush()
     }
 
     /// Compacts once with [`Engine::begin_compaction`]'s policy, building in
@@ -400,10 +392,7 @@ impl Engine {
         options: CompactionOptions,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        match self.begin_compaction(options)? {
-            Some(job) => job.build(workspace)?.publish().map(Some),
-            None => Ok(None),
-        }
+        self.core.compact(options, workspace)
     }
 
     /// Selects runs to compact, or returns `None` if nothing needs it.
@@ -428,6 +417,166 @@ impl Engine {
     ///
     /// Waits for any compaction in progress, including one this thread holds.
     pub fn begin_compaction(
+        &self,
+        options: CompactionOptions,
+    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
+        self.core.begin_compaction(options)
+    }
+
+    /// Replaces the limits on published runs.
+    pub fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
+        self.core.set_run_limits(max_runs, max_run_bytes)
+    }
+
+    /// Returns a summary of the current state.
+    pub fn stats(&self) -> EngineStats {
+        self.core.stats()
+    }
+
+    /// Asks the background worker to compact everything now eligible and
+    /// waits until a pass that started after this call has finished.
+    ///
+    /// Use it to drain pending compaction, or after a flush rejected at the
+    /// run limits: on success the flush can be retried, and a failure says
+    /// compaction cannot make room. The wait lasts one pass, which ends once
+    /// nothing is eligible; flushes during it can extend it, until the run
+    /// limits stop them. Do not call it while holding a [`ReadGuard`] or a
+    /// compaction job, which the worker would wait for.
+    pub fn wait_for_compaction(&self) -> Result<(), BackgroundError> {
+        match &self.core.background {
+            Some(signal) => signal.wait(),
+            None => Err(BackgroundError::Disabled),
+        }
+    }
+
+    /// Returns what the background worker has done, or `None` if the engine
+    /// has none.
+    pub fn background_status(&self) -> Option<BackgroundStatus> {
+        self.core.background.as_ref().map(worker::Signal::status)
+    }
+}
+
+impl Core {
+    fn new(options: &EngineOptions) -> Self {
+        Self {
+            state: RwLock::new(State {
+                last_seq: options.last_seq,
+                active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
+                frozen: None,
+                runs: Vec::new(),
+                run_bytes: 0,
+                max_runs: options.max_runs,
+                max_run_bytes: options.max_run_bytes,
+            }),
+            gate: Mutex::new(()),
+            flushing: Mutex::new(()),
+            compacting: Mutex::new(()),
+            memtable_budget: options.memtable_budget,
+            target_run_len: options.target_run_len,
+            background: options.background_compaction.map(|_| worker::Signal::new()),
+            #[cfg(test)]
+            panic_worker: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            after_build: Mutex::new(None),
+        }
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
+        self.update(key, Value::Bytes(value))
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
+        self.update(key, Value::Tombstone)
+    }
+
+    fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
+        let mut state = self.write_state();
+        let seq = state
+            .last_seq
+            .checked_add(1)
+            .ok_or(UpdateError::SequencesExhausted)?;
+        let written = match value {
+            Value::Bytes(bytes) => state.active.put(key, seq, bytes),
+            Value::Tombstone => state.active.delete(key, seq),
+        };
+        written.map_err(UpdateError::Rejected)?;
+        // Set only now: a rejected write must not use up a number.
+        state.last_seq = seq;
+        Ok(seq)
+    }
+
+    fn get<'w>(
+        &self,
+        key: &[u8],
+        workspace: &'w mut EngineWorkspace,
+    ) -> Result<Option<LiveValue<'w>>, ReadError> {
+        let EngineWorkspace { logical, value, .. } = workspace;
+        let state = self.read_state();
+        let Some(found) = lookup(&state, key, logical)? else {
+            return Ok(None);
+        };
+        let seq = found.seq;
+        value.clear();
+        value.extend_from_slice(found.value);
+        Ok(Some(LiveValue { seq, value }))
+    }
+
+    fn read(&self) -> ReadGuard<'_> {
+        ReadGuard(self.read_state())
+    }
+
+    fn flush(&self) -> Result<FlushReport, FlushError> {
+        let mut total = FlushReport::default();
+        while let Some(job) = self.begin_flush() {
+            let includes_active = !job.retried;
+            let report = job.build().publish()?;
+            total.tables += report.tables;
+            total.records += report.records;
+            total.runs += report.runs;
+            total.run_bytes += report.run_bytes;
+            if includes_active {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn begin_flush(&self) -> Option<FlushJob<'_>> {
+        // This mutex guards no data, so a panic elsewhere leaves nothing to
+        // distrust, and the flush must stay retryable.
+        let serial = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.write_state();
+        let (frozen, retried) = match &state.frozen {
+            Some(frozen) => (Arc::clone(frozen), true),
+            None if state.active.is_empty() => return None,
+            None => {
+                let successor = Memtable::new(self.memtable_budget, Some(state.last_seq));
+                let frozen = Arc::new(std::mem::replace(&mut state.active, successor).freeze());
+                state.frozen = Some(Arc::clone(&frozen));
+                (frozen, false)
+            }
+        };
+        drop(state);
+        Some(FlushJob {
+            engine: self,
+            _serial: serial,
+            frozen,
+            retried,
+        })
+    }
+
+    fn compact(
+        &self,
+        options: CompactionOptions,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        match self.begin_compaction(options)? {
+            Some(job) => job.build(workspace)?.publish().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn begin_compaction(
         &self,
         options: CompactionOptions,
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
@@ -481,15 +630,22 @@ impl Engine {
         }))
     }
 
-    /// Replaces the limits on published runs.
-    pub fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
+    fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
         let mut state = self.write_state();
         state.max_runs = max_runs;
         state.max_run_bytes = max_run_bytes;
+        drop(state);
+        self.notify_worker();
     }
 
-    /// Returns a summary of the current state.
-    pub fn stats(&self) -> EngineStats {
+    /// Asks the worker, if any, to look for eligible compactions.
+    fn notify_worker(&self) {
+        if let Some(signal) = &self.background {
+            signal.request();
+        }
+    }
+
+    fn stats(&self) -> EngineStats {
         let state = self.read_state();
         EngineStats {
             last_seq: state.last_seq,
@@ -497,6 +653,7 @@ impl Engine {
             frozen: state.frozen.as_ref().map(|frozen| frozen.memory()),
             runs: state.runs.len(),
             run_bytes: state.run_bytes,
+            max_overlap: deepest_overlap(&state.runs),
         }
     }
 
@@ -516,11 +673,49 @@ impl Engine {
     }
 }
 
+/// Returns the most runs whose inclusive key ranges share a key.
+fn deepest_overlap(runs: &[SharedRun]) -> usize {
+    let mut bounds: Vec<(&[u8], bool)> = runs
+        .iter()
+        .flat_map(|run| {
+            let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+            [(range.min, false), (range.max, true)]
+        })
+        .collect();
+    // At one key, starts sort before ends, since ranges include both bounds.
+    bounds.sort_unstable();
+    let (mut depth, mut deepest) = (0usize, 0);
+    for (_, end) in bounds {
+        if end {
+            depth -= 1;
+        } else {
+            depth += 1;
+            deepest = deepest.max(depth);
+        }
+    }
+    deepest
+}
+
 const LOCK: &str = "a write section holding the state lock panicked";
 const BUILT: &str = "published runs were built by the engine";
 /// Flushes publish only non-empty tables, and compaction builds a run only
 /// once it has a record.
 const NOT_EMPTY: &str = "published runs are not empty";
+
+impl Drop for Engine {
+    /// Stops the worker after the compaction it is running, if any, and waits
+    /// for it to exit.
+    fn drop(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            self.core.background.as_ref().expect(WORKER).stop();
+            // A panic has been recorded in the status already; dropping must
+            // not raise it again.
+            let _ = handle.join();
+        }
+    }
+}
+
+const WORKER: &str = "an engine with a worker has its signal";
 
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -535,7 +730,7 @@ impl fmt::Debug for Engine {
 /// Dropping it abandons the flush and keeps the table frozen. Holding it
 /// blocks other flushes, but not reads or writes.
 pub struct FlushJob<'e> {
-    engine: &'e Engine,
+    engine: &'e Core,
     _serial: MutexGuard<'e, ()>,
     frozen: Arc<FrozenMemtable>,
     retried: bool,
@@ -604,6 +799,7 @@ impl BuiltFlush<'_> {
         // `job` holds the last reference, so the table is freed after this
         // releases the lock.
         drop(state);
+        job.engine.notify_worker();
         Ok(report)
     }
 }
@@ -818,10 +1014,12 @@ fn input_limit(input_bytes: usize, options: CompactionOptions) -> CompactionErro
 ///
 /// It holds its inputs and the other runs that overlap them, which stay
 /// allocated until it is dropped even if no longer published. Holding it
-/// blocks other compactions, but not reads, writes or flushes. Dropping it
-/// abandons the compaction and changes nothing.
+/// blocks other compactions, including the background worker's, but not
+/// reads, writes or flushes. Dropping it abandons the compaction and changes
+/// nothing. It stays on the thread that began it; the worker runs whole
+/// compactions on its own thread instead of receiving jobs.
 pub struct CompactionJob<'e> {
-    engine: &'e Engine,
+    engine: &'e Core,
     _serial: MutexGuard<'e, ()>,
     inputs: Vec<SharedRun>,
     /// Unselected runs whose key ranges overlap the inputs' span. They may
@@ -870,6 +1068,13 @@ impl<'e> CompactionJob<'e> {
             max_workspace_bytes: self.options.max_workspace_bytes,
         };
         let output = compact(&views, keep_tombstone, limits, workspace)?;
+        #[cfg(test)]
+        {
+            let hook = self.engine.after_build.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         drop(ranges);
         drop(views);
         Ok(BuiltCompaction { job: self, output })
@@ -1138,7 +1343,7 @@ mod tests {
     use super::*;
 
     fn frozen_handle(engine: &Engine) -> Arc<FrozenMemtable> {
-        Arc::clone(engine.read_state().frozen.as_ref().unwrap())
+        Arc::clone(engine.core.read_state().frozen.as_ref().unwrap())
     }
 
     /// The writer-priority rule: from the moment a writer waits for the state
@@ -1152,18 +1357,18 @@ mod tests {
             let writer = scope.spawn(|| engine.put(b"k", b"new").unwrap());
             // The guard keeps the writer waiting, so once it has the gate it
             // keeps it until the guard is dropped.
-            while engine.gate.try_lock().is_ok() {
+            while engine.core.gate.try_lock().is_ok() {
                 std::thread::yield_now();
             }
             for _ in 0..100 {
-                assert!(engine.gate.try_lock().is_err());
+                assert!(engine.core.gate.try_lock().is_err());
                 assert!(!writer.is_finished());
                 std::thread::yield_now();
             }
             drop(held);
             writer.join().unwrap();
         });
-        assert!(engine.gate.try_lock().is_ok());
+        assert!(engine.core.gate.try_lock().is_ok());
         let mut workspace = EngineWorkspace::new();
         assert_eq!(
             engine.get(b"k", &mut workspace).unwrap().unwrap().value,
@@ -1306,7 +1511,7 @@ mod tests {
             .unwrap()
             .build(&mut MergeWorkspace::new())
             .unwrap();
-        let removed = engine.write_state().runs.remove(1);
+        let removed = engine.core.write_state().runs.remove(1);
         let stats = engine.stats();
         assert_eq!(built.publish(), Err(CompactionError::InputsChanged));
         assert_eq!(engine.stats(), stats);
@@ -1335,7 +1540,7 @@ mod tests {
             });
             held.wait();
             let writer = scope.spawn(|| engine.put(b"m", b"new").unwrap());
-            while engine.gate.try_lock().is_ok() {
+            while engine.core.gate.try_lock().is_ok() {
                 std::thread::yield_now();
             }
             let built = job.build(&mut MergeWorkspace::new()).unwrap();
@@ -1353,7 +1558,7 @@ mod tests {
     fn publication_frees_the_inputs_once_nothing_holds_them() {
         let engine = Engine::new(EngineOptions::default());
         overlapping_runs(&engine);
-        let inputs: Vec<SharedRun> = engine.read_state().runs.clone();
+        let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
         engine
             .compact(options(8, usize::MAX), &mut MergeWorkspace::new())
             .unwrap()
@@ -1385,5 +1590,235 @@ mod tests {
             .unwrap();
         assert!(report.output_bytes < stats.run_bytes);
         assert_eq!(engine.stats().runs, 1);
+    }
+
+    // Background compaction.
+
+    use std::sync::Barrier;
+    use std::sync::atomic::Ordering;
+
+    fn background(max_overlap: usize) -> EngineOptions {
+        EngineOptions {
+            background_compaction: Some(CompactionOptions {
+                max_overlap,
+                ..CompactionOptions::default()
+            }),
+            ..EngineOptions::default()
+        }
+    }
+
+    fn value(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
+        let mut workspace = EngineWorkspace::new();
+        engine
+            .get(key, &mut workspace)
+            .unwrap()
+            .map(|found| found.value.to_vec())
+    }
+
+    /// Pauses the next compaction build after merging, until released.
+    fn pause_after_build(engine: &Engine) -> (Arc<Barrier>, Arc<Barrier>) {
+        let (built, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (b, r) = (Arc::clone(&built), Arc::clone(&release));
+        *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
+            b.wait();
+            r.wait();
+        }));
+        (built, release)
+    }
+
+    fn stop_requested(engine: &Core) -> bool {
+        engine.background.as_ref().unwrap().stop_requested()
+    }
+
+    #[test]
+    fn a_flush_wakes_the_worker_which_compacts_and_goes_idle() {
+        let engine = Engine::new(background(1));
+        assert_eq!(engine.background_status().unwrap().passes, 0);
+        overlapping_runs(&engine);
+        engine.wait_for_compaction().unwrap();
+        let status = engine.background_status().unwrap();
+        assert!(status.running && !status.busy);
+        assert!(status.compactions >= 1);
+        assert!(status.passes <= 4, "{status:?}");
+        assert_eq!(engine.stats().runs, 1);
+        assert_eq!(engine.stats().max_overlap, 1);
+        assert_eq!(value(&engine, b"a").unwrap(), b"3");
+        // With nothing requested, nothing runs.
+        for _ in 0..1000 {
+            std::thread::yield_now();
+        }
+        assert_eq!(engine.background_status().unwrap(), status);
+    }
+
+    /// Requests made while the worker cannot run count as one more pass.
+    #[test]
+    fn requests_coalesce_while_the_worker_is_busy() {
+        let engine = Engine::new(background(1));
+        let slot = engine.core.compacting.lock().unwrap();
+        for round in 0..10 {
+            engine.put(b"a", &[round]).unwrap();
+            engine.put(b"z", &[round]).unwrap();
+            engine.flush().unwrap();
+        }
+        drop(slot);
+        engine.wait_for_compaction().unwrap();
+        let status = engine.background_status().unwrap();
+        // Eleven requests: at most the pass held up by the slot, one for the
+        // flushes after it started, and one for the wait. A worker that wakes
+        // late serves them all in one.
+        assert!((1..=3).contains(&status.passes), "{status:?}");
+        assert_eq!(engine.stats().runs, 1);
+    }
+
+    /// While the worker holds a built compaction, reads see the inputs and a
+    /// flush publishes beside them; publication keeps the flushed run.
+    #[test]
+    fn reads_and_flushes_proceed_while_the_worker_compacts() {
+        let engine = Engine::new(background(2));
+        let (built, release) = pause_after_build(&engine);
+        overlapping_runs(&engine);
+        built.wait();
+        assert_eq!(engine.stats().runs, 3);
+        assert_eq!(value(&engine, b"z").unwrap(), b"3");
+        engine.delete(b"a").unwrap();
+        engine.put(b"m", b"new").unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.stats().runs, 4);
+        *engine.core.after_build.lock().unwrap() = None;
+        release.wait();
+        engine.wait_for_compaction().unwrap();
+
+        assert_eq!(value(&engine, b"a"), None);
+        assert_eq!(value(&engine, b"m").unwrap(), b"new");
+        assert_eq!(value(&engine, b"z").unwrap(), b"3");
+        assert!(engine.stats().max_overlap <= 2);
+    }
+
+    #[test]
+    fn dropping_an_idle_engine_joins_the_worker_and_frees_the_core() {
+        let engine = Engine::new(background(1));
+        overlapping_runs(&engine);
+        engine.wait_for_compaction().unwrap();
+        let core = Arc::clone(&engine.core);
+        assert_eq!(Arc::strong_count(&core), 3);
+        drop(engine);
+        assert_eq!(Arc::strong_count(&core), 1);
+        let status = core.background.as_ref().unwrap().status();
+        assert!(!status.running && !status.panicked);
+    }
+
+    /// Dropping the engine mid-compaction waits for that compaction, which is
+    /// published, and starts no other.
+    #[test]
+    fn dropping_during_a_compaction_publishes_it_and_then_stops() {
+        let engine = Engine::new(background(1));
+        let (built, release) = pause_after_build(&engine);
+        // Held while the runs are flushed, so that one compaction takes all.
+        let slot = engine.core.compacting.lock().unwrap();
+        overlapping_runs(&engine);
+        drop(slot);
+        built.wait();
+        let core = Arc::clone(&engine.core);
+        std::thread::scope(|scope| {
+            let dropper = scope.spawn(move || drop(engine));
+            while !stop_requested(&core) {
+                std::thread::yield_now();
+            }
+            release.wait();
+            dropper.join().unwrap();
+        });
+        assert_eq!(Arc::strong_count(&core), 1);
+        let status = core.background.as_ref().unwrap().status();
+        assert_eq!((status.running, status.compactions), (false, 1));
+        assert_eq!(core.stats().runs, 1);
+    }
+
+    /// A lasting failure ends the pass and waits for the next request: it is
+    /// reported, counted once per request, and cleared by a later success.
+    #[test]
+    fn a_failed_compaction_is_reported_once_per_request_and_recovers() {
+        let engine = Engine::new(EngineOptions {
+            background_compaction: Some(CompactionOptions {
+                max_overlap: 1,
+                max_output_bytes: 30 << 10,
+                ..CompactionOptions::default()
+            }),
+            ..EngineOptions::default()
+        });
+        let mut seed = 7u64;
+        let mut noise = || {
+            (0..2048)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (seed >> 56) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        for _ in 0..3 {
+            for key in 0..20u8 {
+                engine.put(&[key], &noise()).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        let error = engine.wait_for_compaction().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BackgroundError::Failed(CompactionError::Compact(CompactError::OutputLimit { .. }))
+            ),
+            "{error:?}"
+        );
+        let status = engine.background_status().unwrap();
+        // Three flushes and one wait made four requests.
+        assert!(status.failures >= 1, "{status:?}");
+        assert!(
+            status.failures <= status.passes && status.passes <= 4,
+            "{status:?}"
+        );
+        assert_eq!(engine.stats().runs, 3);
+        for _ in 0..1000 {
+            std::thread::yield_now();
+        }
+        assert_eq!(engine.background_status().unwrap(), status);
+
+        for key in 0..20u8 {
+            engine.delete(&[key]).unwrap();
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+        let status = engine.background_status().unwrap();
+        assert_eq!(status.last_failure, None);
+        assert_eq!(engine.stats().runs, 0);
+    }
+
+    /// A panic stops the worker for good and is reported; the engine keeps
+    /// working without it and is still dropped cleanly.
+    #[test]
+    fn a_panicked_worker_is_reported_and_the_engine_stays_usable() {
+        let engine = Engine::new(background(1));
+        engine.core.panic_worker.store(true, Ordering::Relaxed);
+        overlapping_runs(&engine);
+        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Stopped));
+        let status = engine.background_status().unwrap();
+        assert!(!status.running && status.panicked);
+
+        engine.put(b"k", b"v").unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Stopped));
+        engine
+            .compact(options(8, usize::MAX), &mut MergeWorkspace::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(value(&engine, b"k").unwrap(), b"v");
+        let core = Arc::clone(&engine.core);
+        drop(engine);
+        assert_eq!(Arc::strong_count(&core), 1);
+    }
+
+    #[test]
+    fn an_engine_without_a_worker_says_so() {
+        let engine = Engine::new(EngineOptions::default());
+        assert_eq!(engine.background_status(), None);
+        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Disabled));
     }
 }

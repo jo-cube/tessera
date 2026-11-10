@@ -14,7 +14,7 @@
 #   scripts/validate.sh ranges             key-range pruning measurements
 #   scripts/validate.sh memtable           memtable and flush measurements
 #   scripts/validate.sh engine             integrated engine measurements
-#   scripts/validate.sh compaction         sustained writes with compaction
+#   scripts/validate.sh compaction         sustained writes, three compaction modes
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #

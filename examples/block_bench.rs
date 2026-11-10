@@ -3224,338 +3224,320 @@ fn engine_baseline() {
 const SUSTAINED_PASSES: u64 = 6;
 const SUSTAINED_BUDGET: usize = 4 << 20;
 const SUSTAINED_ROUNDS: usize = 3;
-const SUSTAINED_GETS: usize = 2_000;
-const SUSTAINED_SCANS: usize = 200;
+const LATENCY_EVERY: usize = 16;
+const READ_SAMPLES: usize = 200_000;
+const WINDOWS: usize = 16;
+const READ_PACE: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// CPU time of the calling thread, from the Linux scheduler.
-fn thread_cpu_ns() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/schedstat")
+/// CPU time of a thread of this process, from the Linux scheduler.
+fn task_cpu_ns(task: &str) -> u64 {
+    let path = match task {
+        "thread-self" => "/proc/thread-self/schedstat".to_owned(),
+        task => format!("/proc/self/task/{task}/schedstat"),
+    };
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|stat| stat.split_whitespace().next()?.parse().ok())
         .unwrap_or(0)
 }
 
+/// CPU time of the whole process, including threads that have exited.
+fn process_cpu_s() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let fields: Vec<&str> = stat
+        .rsplit_once(") ")
+        .map_or(Vec::new(), |(_, rest)| rest.split(' ').collect());
+    // utime and stime, fields 14 and 15, in clock ticks of 1/100 s.
+    let ticks = |at: usize| {
+        fields
+            .get(at - 3)
+            .and_then(|f| f.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    (ticks(14) + ticks(15)) as f64 / 100.0
+}
+
+fn worker_task() -> Option<String> {
+    std::fs::read_dir("/proc/self/task")
+        .ok()?
+        .flatten()
+        .find_map(|task| {
+            let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            comm.starts_with("tessera-compact")
+                .then(|| task.file_name().to_string_lossy().into_owned())
+        })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    None,
+    Sync,
+    Background,
+}
+
 #[derive(Default)]
 struct Sustained {
-    total_s: f64,
+    write_s: f64,
+    catch_up_s: f64,
     flush_s: f64,
-    compact_s: f64,
-    compact_cpu_s: f64,
     flushes: usize,
-    compactions: usize,
     flushed_bytes: usize,
-    compact_in: usize,
-    compact_out: usize,
-    records_read: usize,
+    compactions: u64,
+    rewritten: u64,
+    foreground_compact_s: f64,
+    compact_cpu_s: f64,
+    process_cpu_s: f64,
+    write_latency: Vec<u64>,
+    overlap: Vec<usize>,
     peak_runs: usize,
-    peak_workspace_estimate: usize,
-    peak_workspace_measured: usize,
+    end_runs: usize,
+    end_overlap: usize,
+    end_run_bytes: usize,
+    pending_runs: usize,
+    pending_overlap: usize,
+    catch_up_compactions: u64,
     peak_heap: u64,
+    stable_heap: u64,
+    gets: Vec<u64>,
+    scans: Vec<u64>,
 }
 
-impl Sustained {
-    fn compact(
-        &mut self,
-        engine: &Engine,
-        options: CompactionOptions,
-        workspace: &mut MergeWorkspace,
-    ) -> bool {
-        let (start, cpu) = (Instant::now(), thread_cpu_ns());
-        let report = engine.compact(options, workspace).unwrap();
-        self.compact_s += start.elapsed().as_secs_f64();
-        self.compact_cpu_s += (thread_cpu_ns() - cpu) as f64 / 1e9;
-        let Some(report) = report else {
-            return false;
-        };
-        self.compactions += 1;
-        self.compact_in += report.input_bytes;
-        self.compact_out += report.output_bytes;
-        self.records_read += report.stats.records_read;
-        self.peak_workspace_estimate = self.peak_workspace_estimate.max(report.workspace_bytes);
-        self.peak_workspace_measured = self
-            .peak_workspace_measured
-            .max(workspace.capacity() + workspace.context_bytes());
-        true
-    }
-
-    fn flush(
-        &mut self,
-        engine: &Engine,
-        compaction: Option<CompactionOptions>,
-        workspace: &mut MergeWorkspace,
-    ) {
-        let start = Instant::now();
-        let report = engine.flush().unwrap();
-        self.flush_s += start.elapsed().as_secs_f64();
-        self.flushes += 1;
-        self.flushed_bytes += report.run_bytes;
-        self.peak_runs = self.peak_runs.max(engine.stats().runs);
-        if let Some(options) = compaction {
-            self.compact(engine, options, workspace);
-        }
-    }
-}
-
-/// Overwrite passes in random order through a 4 MiB memtable, flushing when it
-/// is full and, if enabled, compacting once after each flush.
-fn sustained(
+/// One workload through one configuration: the writing thread puts every
+/// record of each pass, flushing when the memtable is full, while a reader
+/// samples gets and group prefix scans. When writing ends, compaction catches
+/// up to the default overlap, so every configuration ends in the same state.
+fn sustained_run(
     records: &[Owned],
     orders: &[Vec<usize>],
-    compaction: Option<CompactionOptions>,
-) -> (Engine, Sustained) {
+    mode: Mode,
+    probes: &[usize],
+) -> Sustained {
+    let options = CompactionOptions::default();
     let engine = Engine::new(EngineOptions {
         memtable_budget: SUSTAINED_BUDGET,
         max_runs: 4096,
         max_run_bytes: usize::MAX,
+        background_compaction: (mode == Mode::Background).then_some(options),
         ..EngineOptions::default()
     });
-    let mut out = Sustained::default();
+    let mut out = Sustained {
+        write_latency: Vec::with_capacity(records.len() * orders.len() / LATENCY_EVERY + 1),
+        overlap: Vec::with_capacity(4096),
+        ..Sustained::default()
+    };
+    let (mut gets, mut scans) = (
+        Vec::with_capacity(READ_SAMPLES),
+        Vec::with_capacity(READ_SAMPLES),
+    );
     let mut workspace = MergeWorkspace::new();
+    let writing = AtomicU64::new(1);
+    let cpu = process_cpu_s();
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let start = Instant::now();
-    for order in orders {
-        for &index in order {
-            let record = &records[index];
-            let value = record.value.as_deref().unwrap();
-            loop {
-                match engine.put(&record.key, value) {
-                    Ok(_) => break,
-                    Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                        out.flush(&engine, compaction, &mut workspace);
-                    }
-                    Err(error) => panic!("{error}"),
+
+    std::thread::scope(|scope| {
+        let (engine, writing, gets, scans) = (&engine, &writing, &mut gets, &mut scans);
+        scope.spawn(move || {
+            let mut workspace = EngineWorkspace::new();
+            let mut at = 0;
+            while writing.load(Ordering::Acquire) == 1 && gets.len() < READ_SAMPLES {
+                let key = &records[probes[at % probes.len()]].key;
+                at += 1;
+                let begin = Instant::now();
+                if at % 8 == 0 {
+                    black_box(drain_scan(engine, &key[..GROUP_LEN], &mut workspace));
+                    scans.push(begin.elapsed().as_nanos() as u64);
+                } else {
+                    black_box(engine.get(key, &mut workspace).unwrap());
+                    gets.push(begin.elapsed().as_nanos() as u64);
                 }
+                // Paced, so that reads cost writers at most a few percent
+                // even where each takes most of a millisecond.
+                std::thread::sleep(READ_PACE);
+            }
+        });
+
+        let flush = |out: &mut Sustained, workspace: &mut MergeWorkspace| {
+            let begin = Instant::now();
+            let report = engine.flush().unwrap();
+            out.flush_s += begin.elapsed().as_secs_f64();
+            out.flushes += 1;
+            out.flushed_bytes += report.run_bytes;
+            if mode == Mode::Sync {
+                let (begin, cpu) = (Instant::now(), task_cpu_ns("thread-self"));
+                if let Some(report) = engine.compact(options, workspace).unwrap() {
+                    out.compactions += 1;
+                    out.rewritten += report.output_bytes as u64;
+                }
+                out.foreground_compact_s += begin.elapsed().as_secs_f64();
+                out.compact_cpu_s += (task_cpu_ns("thread-self") - cpu) as f64 / 1e9;
+            }
+            let stats = engine.stats();
+            out.peak_runs = out.peak_runs.max(stats.runs);
+            out.overlap.push(stats.max_overlap);
+        };
+        let mut puts = 0;
+        for order in orders {
+            for &index in order {
+                let record = &records[index];
+                let value = record.value.as_deref().unwrap();
+                let sampled = puts % LATENCY_EVERY == 0;
+                let begin = sampled.then(Instant::now);
+                loop {
+                    match engine.put(&record.key, value) {
+                        Ok(_) => break,
+                        Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
+                            flush(&mut out, &mut workspace);
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                if let Some(begin) = begin {
+                    out.write_latency.push(begin.elapsed().as_nanos() as u64);
+                }
+                puts += 1;
             }
         }
+        flush(&mut out, &mut workspace);
+        out.write_s = start.elapsed().as_secs_f64();
+        let stats = engine.stats();
+        (out.pending_runs, out.pending_overlap) = (stats.runs, stats.max_overlap);
+
+        // Catch up to the same end state in every mode.
+        let begin = Instant::now();
+        if mode == Mode::Background {
+            let before = engine.background_status().unwrap().compactions;
+            engine.wait_for_compaction().unwrap();
+            out.catch_up_compactions = engine.background_status().unwrap().compactions - before;
+        } else if mode == Mode::Sync {
+            while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
+                out.catch_up_compactions += 1;
+                out.compactions += 1;
+                out.rewritten += report.output_bytes as u64;
+            }
+        }
+        out.catch_up_s = begin.elapsed().as_secs_f64();
+        writing.store(0, Ordering::Release);
+    });
+    if let Some(status) = engine.background_status() {
+        out.compactions = status.compactions;
+        out.rewritten = status.output_bytes;
+        // The worker's whole life, which is this run.
+        let worker = worker_task().expect("the worker thread is running");
+        out.compact_cpu_s = task_cpu_ns(&worker) as f64 / 1e9;
     }
-    out.flush(&engine, compaction, &mut workspace);
-    out.total_s = start.elapsed().as_secs_f64();
+    out.process_cpu_s = process_cpu_s() - cpu;
     out.peak_heap = PEAK.load(Ordering::Relaxed) - base;
-    (engine, out)
-}
-
-fn sustained_row(name: &str, round: usize, writes: usize, run: &Sustained, engine: &Engine) {
     let stats = engine.stats();
-    let write_only = run.total_s - run.flush_s - run.compact_s;
-    let compact_mib = run.compact_in as f64 / MIB;
+    (out.end_runs, out.end_overlap, out.end_run_bytes) =
+        (stats.runs, stats.max_overlap, stats.run_bytes);
+    drop(workspace);
+    out.stable_heap = LIVE.load(Ordering::Relaxed).saturating_sub(base);
+    out.write_latency.sort_unstable();
+    gets.sort_unstable();
+    scans.sort_unstable();
+    (out.gets, out.scans) = (gets, scans);
+    drop(engine);
+    out
+}
+
+fn sustained_rows(workload: &str, mode: &str, round: usize, puts: usize, run: &Sustained) {
+    let quarter = |at: usize| run.overlap[(run.overlap.len() - 1) * at / 4];
+    let mean_overlap = run.overlap.iter().sum::<usize>() as f64 / run.overlap.len() as f64;
     println!(
-        "| {name} | {round} | {:.2} | {:.2} | {} | {:.0} | {} | {:.0} | {:.0} | {:.2} | {:.1} | {:.3} | {} | {} | {:.1} | {:.1} |",
-        writes as f64 / run.total_s / 1e6,
-        writes as f64 / write_only / 1e6,
-        run.flushes,
-        run.flushed_bytes as f64 / MIB / run.flush_s,
+        "| {workload} | {mode} | {round} | {:.2} | {} | {} | {} | {:.0} | {:.0} | {} | {:.1} | {:.2} | {:.2} | {:.3} | {}, {}, {}, {} | {:.1} | {} | {} | {}/{} | {:.0} | {:.2} | {} | {} | {} | {} | {:.1} | {:.1} |",
+        puts as f64 / run.write_s / 1e6,
+        percentile(&run.write_latency, 0.5),
+        percentile(&run.write_latency, 0.99),
+        run.write_latency.last().copied().unwrap_or(0) / 1000,
+        run.flushed_bytes as f64 / MIB / run.flush_s.max(1e-9),
+        run.flushed_bytes as f64 / MIB,
         run.compactions,
-        if run.compact_s > 0.0 {
-            compact_mib / run.compact_s
-        } else {
-            0.0
-        },
-        if run.compact_s > 0.0 {
-            run.records_read as f64 / run.compact_s / 1e3
-        } else {
-            0.0
-        },
-        if run.compact_s > 0.0 {
-            run.compact_cpu_s / run.compact_s
-        } else {
-            0.0
-        },
-        run.compact_s * 1e3,
-        (run.flushed_bytes + run.compact_out) as f64 / run.flushed_bytes as f64,
+        run.compact_cpu_s,
+        run.foreground_compact_s,
+        run.process_cpu_s,
+        (run.flushed_bytes as u64 + run.rewritten) as f64 / run.flushed_bytes as f64,
+        quarter(1),
+        quarter(2),
+        quarter(3),
+        quarter(4),
+        mean_overlap,
         run.peak_runs,
-        stats.runs,
-        stats.run_bytes as f64 / MIB,
+        run.pending_overlap,
+        run.pending_runs,
+        run.end_runs,
+        run.catch_up_s * 1e3,
+        (run.write_s + run.catch_up_s),
+        percentile(&run.gets, 0.5),
+        percentile(&run.gets, 0.99),
+        percentile(&run.scans, 0.5),
+        percentile(&run.scans, 0.99),
         run.peak_heap as f64 / MIB,
+        run.stable_heap as f64 / MIB,
     );
 }
 
-struct ReadRow {
-    get_p50: u64,
-    get_p99: u64,
-    get_blocks: f64,
-    scan_ns: f64,
-    scan_records: f64,
-    scan_blocks: f64,
-    full_ns: f64,
-}
-
-fn read_row(engine: &Engine, records: &[Owned], keys: &[usize]) -> ReadRow {
-    let mut workspace = EngineWorkspace::new();
-    let mut latencies: Vec<u64> = keys
-        .iter()
-        .map(|&index| {
-            let start = Instant::now();
-            black_box(engine.get(&records[index].key, &mut workspace).unwrap());
-            start.elapsed().as_nanos() as u64
-        })
-        .collect();
-    latencies.sort_unstable();
-    let get_blocks = workspace.blocks_loaded() as f64 / keys.len() as f64;
-
-    let mut workspace = EngineWorkspace::new();
-    let (mut scanned, start) = (0, Instant::now());
-    for &index in &keys[..SUSTAINED_SCANS] {
-        scanned += drain_scan(engine, &records[index].key[..GROUP_LEN], &mut workspace);
-    }
-    let scan_ns = start.elapsed().as_nanos() as f64 / SUSTAINED_SCANS as f64;
-    let scan_blocks = workspace.blocks_loaded() as f64 / SUSTAINED_SCANS as f64;
-
-    let mut workspace = EngineWorkspace::new();
-    let start = Instant::now();
-    let full = drain_scan(engine, b"", &mut workspace);
-    let full_ns = start.elapsed().as_nanos() as f64 / full as f64;
-    assert_eq!(full, records.len());
-    ReadRow {
-        get_p50: percentile(&latencies, 0.5),
-        get_p99: percentile(&latencies, 0.99),
-        get_blocks,
-        scan_ns,
-        scan_records: scanned as f64 / SUSTAINED_SCANS as f64,
-        scan_blocks,
-        full_ns,
-    }
-}
-
-fn print_read_row(name: &str, row: &ReadRow) {
-    println!(
-        "| {name} | {} | {} | {:.1} | {:.1} | {:.0} | {:.1} | {:.1} |",
-        row.get_p50,
-        row.get_p99,
-        row.get_blocks,
-        row.scan_ns / 1e3,
-        row.scan_records,
-        row.scan_blocks,
-        row.full_ns,
-    );
-}
-
-/// Sustained overwrites with and without compaction after each flush, then
-/// reads of the overlapped state, during a compaction to completion, and after.
+/// Writes, flushes and compaction under three schedules, on random overwrites
+/// and on updates confined to a moving key window.
 fn compaction_sustained() {
     let records = tree_json(16 << 20);
     let count = records.len();
-    let orders: Vec<Vec<usize>> = (0..SUSTAINED_PASSES)
+    let puts = count * SUSTAINED_PASSES as usize;
+    let random: Vec<Vec<usize>> = (0..SUSTAINED_PASSES)
         .map(|pass| shuffled(count, 300 + pass))
         .collect();
-    let writes = count * SUSTAINED_PASSES as usize;
-    let keys: Vec<usize> = shuffled(count, 299)
-        .into_iter()
-        .take(SUSTAINED_GETS)
+    // Each phase rewrites one sixteenth of the key space, contiguous in key
+    // order, in random order; the window moves to its neighbour on every
+    // phase, so a flush spanning two phases covers two adjacent windows.
+    let width = count.div_ceil(WINDOWS);
+    let windows = SUSTAINED_PASSES as usize * WINDOWS;
+    let localized: Vec<Vec<usize>> = (0..windows)
+        .map(|phase| {
+            let first = (phase % WINDOWS) * width;
+            let len = width.min(count - first);
+            shuffled(len, 500 + phase as u64)
+                .into_iter()
+                .map(|i| first + i)
+                .collect()
+        })
         .collect();
-    let default = CompactionOptions::default();
-    let eager = CompactionOptions {
-        max_overlap: 1,
-        ..default
-    };
-    let configs = [
-        ("no compaction", None),
-        ("max overlap 1", Some(eager)),
-        ("max overlap 4 (default)", Some(default)),
-        (
-            "max overlap 8",
-            Some(CompactionOptions {
-                max_overlap: 8,
-                ..default
-            }),
-        ),
-    ];
+    assert_eq!(localized.iter().map(Vec::len).sum::<usize>(), puts);
+    let probes: Vec<usize> = shuffled(count, 299).into_iter().take(4096).collect();
     println!(
-        "{count} json keys; {SUSTAINED_PASSES} random overwrite passes = {writes} puts; 4 MiB memtable; one compaction attempt after each flush; default run options; default compaction options: {default:?}"
+        "{count} json keys, {puts} puts per workload; 4 MiB memtable; default run and compaction options: {:?}",
+        CompactionOptions::default()
     );
     println!(
-        "one row per round; write M/s includes flush and compaction, which run on the writing thread"
+        "random: {SUSTAINED_PASSES} passes over every key in random order; localized: {windows} phases, each rewriting the next of {WINDOWS} contiguous key windows"
     );
     println!(
-        "heap = peak requested Rust heap above the start of the round; it excludes Zstandard contexts"
+        "sync compacts once after each flush on the writing thread; background has the worker; sync and background then catch up until nothing is eligible, none is left as it is"
+    );
+    println!(
+        "write latency samples every {LATENCY_EVERY}th put, including any flush and sync compaction it triggers; a reader thread samples a get, or every 8th time a group scan, every {} ms while writing and catching up",
+        READ_PACE.as_millis()
+    );
+    println!(
+        "compaction CPU is the writing thread's for sync, the worker's for background; process CPU covers every thread including the reader"
     );
     println!();
     println!(
-        "| config | round | write M/s | write-only M/s | flushes | flush MiB/s | compactions | compact in MiB/s | compact K records/s | CPU/wall | compact ms | stored written / flushed | peak runs | end runs | end run MiB | peak heap MiB |"
+        "| workload | mode | round | puts M/s | write p50 ns | write p99 ns | write max us | flush stored MiB/s | flushed MiB | compactions | compaction CPU s | foreground compaction s | process CPU s | stored written / flushed | overlap at 1/4, 1/2, 3/4, end of writes | mean overlap | peak runs | overlap left | runs left/after | catch-up ms | total s | get p50 ns | get p99 ns | scan p50 ns | scan p99 ns | peak heap MiB | stable heap MiB |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-    let mut ends = Vec::new();
+    println!("|{}", "---|".repeat(28));
     for round in 0..SUSTAINED_ROUNDS {
-        ends.clear();
-        for (name, options) in configs {
-            let (engine, run) = sustained(&records, &orders, options);
-            sustained_row(name, round, writes, &run, &engine);
-            if options.is_some() {
-                println!(
-                    "|  | workspace: estimate {:.2} MiB, measured {:.2} MiB (decoded blocks + Zstandard contexts) |",
-                    run.peak_workspace_estimate as f64 / MIB,
-                    run.peak_workspace_measured as f64 / MIB
-                );
+        for (workload, orders) in [("random", &random), ("localized", &localized)] {
+            for (name, mode) in [
+                ("none", Mode::None),
+                ("sync", Mode::Sync),
+                ("background", Mode::Background),
+            ] {
+                let run = sustained_run(&records, orders, mode, &probes);
+                sustained_rows(workload, name, round, puts, &run);
             }
-            ends.push((name, engine));
         }
     }
-
-    println!();
-    println!(
-        "reads; {SUSTAINED_GETS} random gets, {SUSTAINED_SCANS} group prefix scans, one full scan; last round's engines"
-    );
-    println!();
-    println!(
-        "| state | get p50 ns | get p99 ns | blocks/get | prefix scan us | records/scan | blocks/scan | full scan ns/record |"
-    );
-    println!("|---|---|---|---|---|---|---|---|");
-    for (name, engine) in &ends {
-        print_read_row(name, &read_row(engine, &records, &keys));
-    }
-    drop(ends);
-    let (plain, _) = sustained(&records, &orders, None);
-
-    // Compaction to completion on the overlapped engine, with a reader beside it.
-    let finished = AtomicU64::new(0);
-    let (during, full) = std::thread::scope(|scope| {
-        let (engine, finished, records, keys) = (&plain, &finished, &records, &keys);
-        let reader = scope.spawn(move || {
-            let mut workspace = EngineWorkspace::new();
-            let mut latencies = Vec::new();
-            let mut at = 0;
-            while finished.load(Ordering::Acquire) == 0 {
-                let key = &records[keys[at % keys.len()]].key;
-                let start = Instant::now();
-                black_box(engine.get(key, &mut workspace).unwrap());
-                latencies.push(start.elapsed().as_nanos() as u64);
-                at += 1;
-            }
-            latencies
-        });
-        let mut workspace = MergeWorkspace::new();
-        let mut full = Sustained::default();
-        let start = Instant::now();
-        while full.compact(&plain, eager, &mut workspace) {}
-        full.total_s = start.elapsed().as_secs_f64();
-        finished.store(1, Ordering::Release);
-        let mut during = reader.join().unwrap();
-        during.sort_unstable();
-        (during, full)
-    });
-    println!(
-        "| no compaction, during compaction to completion at max overlap 1 | {} | {} | | | | | |",
-        percentile(&during, 0.5),
-        percentile(&during, 0.99)
-    );
-    print_read_row(
-        "no compaction, after compaction to completion",
-        &read_row(&plain, &records, &keys),
-    );
-    println!();
-    let stats = plain.stats();
-    println!(
-        "compaction to completion: {} compactions, {:.1} ms wall, {:.0} MiB/s of input, {:.2} CPU/wall on the compacting thread with a reader beside it, {} gets during; {} runs of {:.1} MiB remain; {:.1} MiB read and {:.1} MiB written",
-        full.compactions,
-        full.total_s * 1e3,
-        full.compact_in as f64 / MIB / full.compact_s,
-        full.compact_cpu_s / full.compact_s,
-        during.len(),
-        stats.runs,
-        stats.run_bytes as f64 / MIB,
-        full.compact_in as f64 / MIB,
-        full.compact_out as f64 / MIB,
-    );
 }
 
 fn main() {

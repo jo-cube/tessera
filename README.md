@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 5C
+## Status: Milestone 5D
 
 Two physical storage layers exist, with mutable storage above them.
 
@@ -77,9 +77,16 @@ policy merges the smallest runs covering the most deeply overlapped key once
 more than `max_overlap` runs share a key, and merges neighbouring short runs
 once there are many disjoint runs. It is not leveled.
 
+With `EngineOptions::background_compaction` set, the engine owns one worker
+thread that runs the same compaction whenever a flush publishes runs. Requests
+made while it is busy coalesce into one pass, it sleeps when nothing is
+eligible, and a failed compaction is reported in `background_status` and not
+retried until the next flush. `wait_for_compaction` asks for a pass and waits
+for its outcome; dropping the engine finishes the compaction in progress and
+joins the thread.
+
 There is no Bloom filter, MVCC, snapshot older than the present, write-ahead
-log or persistence, and neither flushing nor compaction happens in the
-background.
+log or persistence, and flushing never happens in the background.
 
 ## Validate
 
@@ -101,7 +108,7 @@ scripts/validate.sh logical  # latest-state read measurements
 scripts/validate.sh ranges   # key-range pruning measurements
 scripts/validate.sh memtable # memtable and flush measurements
 scripts/validate.sh engine   # integrated engine measurements
-scripts/validate.sh compaction # sustained writes with and without compaction
+scripts/validate.sh compaction # sustained writes: none, sync and background compaction
 colima stop
 ```
 

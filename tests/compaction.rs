@@ -398,9 +398,9 @@ fn a_compaction_over_any_limit_changes_nothing() {
     assert_eq!(everything(&engine), contents);
 }
 
-/// A writer, a flusher and a compactor run beside a reader. Each key's value
-/// only moves forward, a deleted key never returns, and the final state is
-/// exactly what was written.
+/// Writers, a flusher, a manual compactor and the background worker run
+/// beside a reader. Each key's value only moves forward, a deleted key never
+/// returns, and the final state is exactly what was written.
 #[test]
 fn concurrent_compaction_loses_and_resurrects_nothing() {
     const WRITERS: usize = 2;
@@ -411,6 +411,10 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
         target_run_len: 4 << 10,
         max_runs: usize::MAX,
         max_run_bytes: usize::MAX,
+        background_compaction: Some(CompactionOptions {
+            max_overlap: 2,
+            ..CompactionOptions::default()
+        }),
         ..EngineOptions::default()
     });
     let key = |writer: usize, i: usize| format!("w{writer}/{i:03}").into_bytes();
@@ -433,6 +437,10 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
                             };
                             assert!(!matches!(result, Err(UpdateError::SequencesExhausted)));
                             result.unwrap();
+                        }
+                        // Overlapping runs accumulate while writing goes on.
+                        if round % 10 == 0 {
+                            engine.flush().unwrap();
                         }
                     }
                 })
@@ -490,6 +498,9 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
     });
 
     engine.flush().unwrap();
+    engine.wait_for_compaction().unwrap();
+    assert!(engine.stats().max_overlap <= 2);
+    assert!(engine.background_status().unwrap().compactions > 0);
     compact_fully(&engine);
     let expected: Vec<_> = (0..WRITERS)
         .flat_map(|writer| (0..KEYS).step_by(2).map(move |i| (writer, i)))
@@ -500,7 +511,11 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
     assert_eq!(everything(&engine), expected);
     assert_eq!(engine.stats().runs, 1);
     // The compactor is not guaranteed a turn; record whether it had one.
-    eprintln!("compactions during writing: {}", compactions.into_inner());
+    eprintln!(
+        "manual compactions during writing: {}; background: {:?}",
+        compactions.into_inner(),
+        engine.background_status()
+    );
 }
 
 // Reference model.
@@ -534,6 +549,7 @@ enum Stage<'e> {
 fn randomized_compactions_match_an_independent_model() {
     const SEEDS: u64 = 30;
     const OPERATIONS: usize = 400;
+    const BACKGROUND_SEEDS: u64 = 10;
 
     let pool: Vec<Vec<u8>> = (0..40u8)
         .map(|i| vec![b'k', i / 4, i])
@@ -541,12 +557,19 @@ fn randomized_compactions_match_an_independent_model() {
         .collect();
     let (mut compactions, mut incomplete, mut dropped_tombstones) = (0, 0, 0);
 
-    for seed in 0..SEEDS {
+    // Then a few seeds again with a background worker compacting beside the
+    // staged manual compactions. Counts come from the manual seeds only.
+    let runs = (0..SEEDS).map(|seed| (seed, false));
+    for (seed, background) in runs.chain((0..BACKGROUND_SEEDS).map(|seed| (seed, true))) {
         let mut rng = Rng(seed);
         let engine = Engine::new(EngineOptions {
             target_run_len: [64, 1_024, 1 << 20][rng.below(3)],
             max_runs: usize::MAX,
             max_run_bytes: usize::MAX,
+            background_compaction: background.then(|| CompactionOptions {
+                max_overlap: 1 + seed as usize % 3,
+                ..CompactionOptions::default()
+            }),
             ..EngineOptions::default()
         });
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -607,30 +630,48 @@ fn randomized_compactions_match_an_independent_model() {
                                     + stats.versions_dropped
                                     + stats.copies_collapsed
                                     + stats.tombstones_dropped,
-                                "seed {seed}"
+                                "seed {seed}, background {background}"
                             );
-                            compactions += 1;
-                            incomplete += usize::from(!report.complete);
-                            dropped_tombstones += stats.tombstones_dropped;
+                            if !background {
+                                compactions += 1;
+                                incomplete += usize::from(!report.complete);
+                                dropped_tombstones += stats.tombstones_dropped;
+                            }
                             Stage::Idle
                         }
                     };
                 }
             }
             let expected: Vec<_> = model.clone().into_iter().collect();
-            assert_eq!(everything(&engine), expected, "seed {seed}");
+            assert_eq!(
+                everything(&engine),
+                expected,
+                "seed {seed}, background {background}"
+            );
             for key in &pool {
-                assert_eq!(get(&engine, key), model.get(key).cloned(), "seed {seed}");
+                assert_eq!(
+                    get(&engine, key),
+                    model.get(key).cloned(),
+                    "seed {seed}, background {background}"
+                );
             }
         }
         drop(stage);
         engine.flush().unwrap();
+        if background {
+            engine.wait_for_compaction().unwrap();
+            assert!(engine.background_status().unwrap().compactions > 0);
+        }
         compact_fully(&engine);
         // Fully compacted: nothing overlaps and no two tails are adjacent.
         let done = options(usize::MAX);
         assert!(engine.compact(done, &mut workspace).unwrap().is_none());
         let expected: Vec<_> = model.into_iter().collect();
-        assert_eq!(everything(&engine), expected, "seed {seed}");
+        assert_eq!(
+            everything(&engine),
+            expected,
+            "seed {seed}, background {background}"
+        );
     }
     assert!(compactions > 300, "{compactions}");
     assert!(incomplete > 50, "{incomplete}");

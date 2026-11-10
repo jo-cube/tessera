@@ -1034,6 +1034,7 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
             max_runs: 100_000,
             max_run_bytes: usize::MAX,
             last_seq: 0,
+            background_compaction: None,
         });
         let mut model = Model::new();
         // Charged per key in the active table, and whether one table is frozen.

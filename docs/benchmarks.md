@@ -348,42 +348,64 @@ median of 2.9% and at most 15.9%.
 
 ## Compaction
 
-`block_bench compaction` overwrites every key of the `json` dataset (173,536
-keys) six times in random order, 1,041,216 puts, through a 4 MiB memtable. The
-writing thread flushes when the table is full and, when compaction is enabled,
-then makes one compaction attempt with the default options except
-`max_overlap`. Every flush covers the whole key space, so each new run overlaps
-every older one: the worst case for overlap. Reads use the last round's engines.
-Run it with `scripts/validate.sh compaction`.
+`block_bench compaction` writes 1,041,216 puts over the 173,536 keys of the
+`json` dataset through a 4 MiB memtable, in two workloads:
+
+- **random**: six passes over every key in random order. Every flush covers
+  the whole key space, the worst case for overlap.
+- **localized**: 96 phases, each rewriting one sixteenth of the key space,
+  contiguous in key order, with the window moving to its neighbour each phase.
+
+The same workload runs in three modes. **none** never compacts. **sync**
+compacts once after each flush on the writing thread, with default options.
+**background** has the worker, with the same options. When writing ends,
+sync and background compact until nothing is eligible; none is left as it is.
+A reader thread samples a get, or every eighth time a 200-key group scan,
+every 5 ms throughout, so that slow reads cost writers little. Every 16th
+put's latency is sampled, including any flush or synchronous compaction it
+triggers. Run it with `scripts/validate.sh compaction`.
 
 ### Findings
 
-Reference environment, three rounds in one pass. Rounds differ by under 2%;
-counts and bytes are identical in every round.
+Reference environment (2 CPUs), three rounds in one pass. Rounds 0 and 1
+agree within 2%. Round 2 ran about 20% slower in every mode, including none,
+and is left out. Counts and bytes are identical in every round except the
+background ones, which depend on when the worker runs.
 
-| max overlap | write M/s | compactions | compaction ms | stored written per byte flushed | peak runs | get p50 | blocks per get | group scan | full scan ns per record | peak heap MiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| no compaction | 1.68 | 0 | 0 | 1.00 | 58 | 595 us | 58 | 821 us | 1,161 | 25.1 |
-| 1 | 0.33 | 57 | 2,519 | 9.49 | 2 | 10.2 us | 1 | 28 us | 93 | 11.4 |
-| 4 (default) | 0.74 | 14 | 779 | 3.13 | 5 | 18.3 us | 2 | 38 us | 100 | 12.6 |
-| 8 | 0.94 | 8 | 484 | 2.19 | 9 | 20.0 us | 2 | 57 us | 185 | 17.2 |
+| workload | mode | puts M/s | write max | compaction CPU s | process CPU s | stored written per byte flushed | mean overlap while writing | overlap when writing ends | catch-up ms | total s | get p50 | get p99 | peak heap MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| random | none | 1.62 | 3.8 ms | 0 | 0.65 | 1.00 | 29.5 | 58 | | 0.64 | 270 us | 560 us | 25.9 |
+| random | sync | 0.75 | 61 ms | 0.8 | 1.38 | 3.13 | 2.5 | 2 | 0 | 1.38 | 49 us | 64 us | 12.7 |
+| random | background | 1.60 | 3.8 ms | 0.6 | 1.29 | 2.66 | 8.5 | 8 to 13 | 52 to 66 | 0.72 | 89 us | 135 us | 18.9 |
+| localized | none | 2.13 | 4.0 ms | 0 | 0.49 | 1.00 | 8.3 | 15 | | 0.49 | 62 us | 155 us | 24.4 |
+| localized | sync | 1.02 | 56 ms | 0.5 | 1.03 | 2.76 | 3.4 | 4 | 0 | 1.02 | 30 us | 57 us | 16.2 |
+| localized | background | 2.09 | 3.8 ms | 0.5 | 1.01 | 2.59 | 5.5 | 6 to 7 | 143 | 0.64 | 44 us | 80 us | 22.0 |
 
-- Without compaction, 58 overlapping runs make every get decode 58 blocks and
-  every 200-key group scan 65. Any compaction brings gets to one or two blocks.
-- The cost is rewriting. With any overlap merged, each flush rewrites the
-  whole dataset, 9.5 bytes stored per byte flushed, and writes slow by five
-  times because compaction runs on the writing thread. Allowing four overlapping
-  runs rewrites a third as much for one extra block per get.
-- Compaction reads about 80 MiB of stored runs, about 4 million records, per
-  second on one thread, with CPU time equal to wall time.
-- Writing without flushes or compactions runs at 2.5 million puts per second
-  in every configuration.
-- Compacting the 58 runs to one took 9 compactions and 454 ms. A reader beside
-  it made 4,929 gets: p50 21 us, p99 595 us, the uncompacted cost. Reads were
-  not blocked, only slow until the inputs they needed were replaced.
-- Heap peaks are lower with compaction because the obsolete versions are freed.
-  The peak counts Rust allocations only.
-- The workspace estimate checked before merging was 3.1 to 9.2 MiB. Measured
-  decoded blocks and Zstandard contexts were 0.2 to 0.9 MiB: the estimate
-  allows 1 MiB per context, and the measured contexts are much smaller.
+Write p50 and p99 were the same in every mode, 250 to 334 ns and 459 to
+542 ns: almost every put touches only the memtable. Flushes ran at 101 to
+106 MiB/s of stored output in every mode.
 
+- Background compaction gives foreground writes the speed of no compaction,
+  and its worst write, about 3.8 ms, is a flush. Synchronous compaction halves
+  write throughput and puts a compaction of up to 61 ms in front of a write.
+- The work is not free. The process used about twice the CPU of none in both
+  compacting modes. Background used slightly less than sync, because it
+  lagged and so merged more runs at once, rewriting less: 2.66 bytes stored
+  per byte flushed against 3.13 on random.
+- On 2 CPUs the worker nearly keeps up. Overlap during random writes averaged
+  8.5 against the limit of 4 and did not grow over time. When writing ended,
+  50 to 150 ms of compaction remained. Counting that, background reached the
+  caught-up state in about half the time of sync.
+- Reads pay for the lag. Gets during writing were 1.8 times slower than with
+  sync, and 3 times faster than with no compaction.
+- Heap peaks are higher with background than sync, because more runs wait
+  for compaction. The peaks count Rust allocations only.
+- In the localized workload, runs left after catch-up (4 to 10) are adjacent
+  and do not overlap. There are fewer than 16, so they are not merged.
+
+An earlier version of the localized workload moved the window seven
+sixteenths of the key space each phase. A flush spanning two phases then had a
+key range covering everything between the two windows, so the overlap
+measured from key ranges was as high as for random writes (56 runs without
+compaction), and compaction cost as much. Key ranges cannot describe a run
+that is dense in two separate places.
