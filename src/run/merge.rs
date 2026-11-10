@@ -26,6 +26,14 @@ impl MergeWorkspace {
     pub fn blocks_loaded(&self) -> u64 {
         self.runs.iter().map(ReadWorkspace::blocks_loaded).sum()
     }
+
+    /// Returns one read workspace per input, creating any that are missing.
+    pub(super) fn reads(&mut self, inputs: usize) -> &mut [ReadWorkspace] {
+        if self.runs.len() < inputs {
+            self.runs.resize_with(inputs, ReadWorkspace::default);
+        }
+        &mut self.runs[..inputs]
+    }
 }
 
 /// An ordered stream over several runs, which may overlap and may use
@@ -40,9 +48,10 @@ impl MergeWorkspace {
 /// prevents two runs from holding the same key and sequence number, even with
 /// different values. A merge does not compare values or report conflicts. A
 /// user key and sequence number must name one logical record; a caller that
-/// needs to enforce this can compare neighboring records, and a caller writing
-/// a merged stream to a new run must resolve duplicates first, because a run
-/// rejects them.
+/// needs one record per user key should read through a
+/// [`RunSet`](super::RunSet), which collapses identical copies and rejects
+/// conflicting ones. A caller writing a merged stream to a new run must
+/// resolve duplicates first, because a run rejects them.
 ///
 /// This is a lending cursor like [`RunCursor`]. Each input holds its head, the
 /// next record it would yield, decoded in its own workspace, and the merge
@@ -89,14 +98,12 @@ impl<'a> MergeCursor<'a> {
         I: IntoIterator<Item = RunView<'a>>,
         I::IntoIter: ExactSizeIterator,
     {
+        let runs = runs.into_iter();
+        workspace.reads(runs.len());
         let MergeWorkspace {
             runs: workspaces,
             heap,
         } = workspace;
-        let runs = runs.into_iter();
-        if workspaces.len() < runs.len() {
-            workspaces.resize_with(runs.len(), ReadWorkspace::default);
-        }
         Self {
             cursors: runs
                 .zip(workspaces.iter_mut())
@@ -159,8 +166,43 @@ impl<'a> MergeCursor<'a> {
             self.failure = Some(error);
             return Err(error);
         }
-        let head = self.heap.first();
-        Ok(head.and_then(|&input| self.cursors[input].head_record()))
+        Ok(self.current())
+    }
+
+    /// Returns the record most recently returned by `next_record`.
+    pub(super) fn current(&self) -> Option<Record<'_>> {
+        let input = *self.heap.first()?;
+        self.cursors[input].head_record()
+    }
+
+    /// Finds another copy of the current record: the same user key and
+    /// sequence number, held by another input. Returns its heap position.
+    ///
+    /// Every entry equal to the root has only equal entries above it, so if
+    /// any copy exists, one of the root's children is a copy. Sequence numbers
+    /// are compared first, so distinct records cost no key comparison unless
+    /// their sequence numbers happen to match.
+    pub(super) fn next_copy(&self) -> Option<usize> {
+        let (key, seq) = self.cursors[*self.heap.first()?].head_key()?;
+        (1..self.heap.len().min(3)).find(|&at| {
+            let copy = self.cursors[self.heap[at]].head_key();
+            copy.is_some_and(|(copy_key, copy_seq)| copy_seq == seq && copy_key == key)
+        })
+    }
+
+    /// Returns the current record and the copy at heap position `at`, each
+    /// with its input position.
+    pub(super) fn copies(&self, at: usize) -> Option<[(usize, Record<'_>); 2]> {
+        let [first, other] = [self.heap[0], self.heap[at]];
+        Some([
+            (first, self.cursors[first].head_record()?),
+            (other, self.cursors[other].head_record()?),
+        ])
+    }
+
+    /// Removes the copy at heap position `at` from the stream.
+    pub(super) fn drop_copy(&mut self, at: usize) -> Result<(), CorruptRun> {
+        self.advance_at(at)
     }
 
     /// Makes the heap's first entry the record to return.
@@ -169,7 +211,7 @@ impl<'a> MergeCursor<'a> {
             self.positioned = true;
             self.build_heap()?;
         } else if self.yielded {
-            self.advance_first()?;
+            self.advance_at(0)?;
         }
         self.yielded = !self.heap.is_empty();
         Ok(())
@@ -189,13 +231,15 @@ impl<'a> MergeCursor<'a> {
         Ok(())
     }
 
-    fn advance_first(&mut self) -> Result<(), CorruptRun> {
-        let input = self.heap[0];
+    /// Advances the input at heap position `at`, which must be the root or a
+    /// child of it, so an entry moved here never needs to rise.
+    fn advance_at(&mut self, at: usize) -> Result<(), CorruptRun> {
+        let input = self.heap[at];
         self.cursors[input].advance_head()?;
         if self.cursors[input].head_key().is_none() {
-            self.heap.swap_remove(0);
+            self.heap.swap_remove(at);
         }
-        sift_down(self.heap, &self.cursors, 0);
+        sift_down(self.heap, &self.cursors, at);
         Ok(())
     }
 }

@@ -3,6 +3,7 @@
 //! With the argument `geometry`, instead compares run block sizes and codecs.
 //! With the argument `prefix`, instead compares prefix scans over those sizes.
 //! With the argument `merge`, instead measures merged iteration over many runs.
+//! With the argument `logical`, instead measures latest-state reads over runs.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -18,7 +19,10 @@ use std::time::Instant;
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
-use tessera::run::{Codec, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunCursor};
+use tessera::run::{
+    Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
+    RunBuilder, RunCursor, RunSet, RunView,
+};
 
 struct CountingAllocator;
 
@@ -1781,11 +1785,421 @@ fn merge_scans() {
     }
 }
 
+const LOGICAL_FANS: [usize; 4] = [1, 4, 8, 16];
+
+/// Half the records stay in contiguous ranges and half are dealt evenly, so
+/// inputs overlap only partly.
+fn assign_partial(index: usize, fan: usize, total: usize) -> usize {
+    if index.is_multiple_of(2) {
+        assign_disjoint(index, fan, total)
+    } else {
+        assign_overlapping(index, fan, total)
+    }
+}
+
+/// One key in four has been deleted, keeping the value the tombstone hides.
+fn tree_tombstones(target: usize) -> Vec<Owned> {
+    let mut rng = Rng(24);
+    fill(target, |i| {
+        let key = tree_key(i, FLAT_TREE);
+        let value = format!(r#"{{"id":{i},"payload":"{:016x}"}}"#, rng.next()).into_bytes();
+        let old = Owned {
+            key: key.clone(),
+            seq: BASE_SEQ + 1000,
+            value: Some(value),
+        };
+        if i.is_multiple_of(4) {
+            vec![
+                Owned {
+                    key,
+                    seq: BASE_SEQ + 2000,
+                    value: None,
+                },
+                old,
+            ]
+        } else {
+            vec![old]
+        }
+    })
+}
+
+/// The latest live record per key, from sorted records alone.
+fn latest_live(records: &[Owned]) -> (Vec<&Owned>, Vec<&Owned>) {
+    let (mut live, mut deleted) = (Vec::new(), Vec::new());
+    let mut previous: Option<&[u8]> = None;
+    for record in records {
+        if previous != Some(record.key.as_slice()) {
+            if record.value.is_some() {
+                live.push(record);
+            } else {
+                deleted.push(record);
+            }
+        }
+        previous = Some(&record.key);
+    }
+    (live, deleted)
+}
+
+fn drain_logical(cursor: &mut LogicalCursor<'_>) -> usize {
+    let (mut count, mut consumed) = (0, 0u64);
+    while let Some(record) = cursor.next_record().unwrap() {
+        count += 1;
+        let last = record.key.last().map_or(0, |&b| u64::from(b));
+        let value = record.value.first().map_or(0, |&b| u64::from(b));
+        consumed = consumed.wrapping_add(record.seq ^ last ^ value);
+    }
+    black_box(consumed);
+    count
+}
+
+/// Each input's first and last key, from which a range filter would work.
+fn input_bounds<'r>(records: &'r [Owned], fan: usize, assign: Assign) -> Vec<(&'r [u8], &'r [u8])> {
+    let mut bounds: Vec<Option<(&'r [u8], &'r [u8])>> = vec![None; fan];
+    for (index, record) in records.iter().enumerate() {
+        let slot = &mut bounds[assign(index, fan, records.len())];
+        let first = slot.map_or(record.key.as_slice(), |(first, _)| first);
+        *slot = Some((first, &record.key));
+    }
+    bounds.into_iter().map(Option::unwrap).collect()
+}
+
+/// The views a filter holding each run's key range would still consult, for
+/// comparison only: no such metadata exists.
+fn ranged<'v>(
+    views: &[RunView<'v>],
+    bounds: &[(&[u8], &[u8])],
+    overlaps: impl Fn(&[u8], &[u8]) -> bool,
+) -> Vec<RunView<'v>> {
+    views
+        .iter()
+        .zip(bounds)
+        .filter(|(_, (first, last))| overlaps(first, last))
+        .map(|(view, _)| *view)
+        .collect()
+}
+
+struct LogicalTables {
+    point: Vec<String>,
+    prefix: Vec<String>,
+}
+
+fn measure_logical(
+    config: &MergeConfig<'_>,
+    records: &[Owned],
+    buckets: &[(&'static str, Vec<Vec<u8>>)],
+    tables: &mut LogicalTables,
+) {
+    let MergeConfig {
+        dataset,
+        layout,
+        shape,
+        fan,
+        assign,
+        shapes,
+    } = *config;
+    let timed = |ops, round: &mut dyn FnMut()| median_ns_of(MERGE_ROUNDS, ops, round);
+    let runs = build_inputs(records, fan, assign, shapes);
+    let views: Vec<RunView<'_>> = runs.iter().map(Run::view).collect();
+    let set = RunSet::new(&views);
+    let bounds = input_bounds(records, fan, assign);
+    let (live, deleted) = latest_live(records);
+
+    // A checked pass from a cold workspace: the stream must be exactly the
+    // latest live records, which also gives what the reader retains.
+    let before_live = LIVE.load(Ordering::Relaxed);
+    let mut workspace = LogicalWorkspace::new();
+    let retained = {
+        let mut cursor = set.cursor(&mut workspace);
+        let mut expected = live.iter();
+        while let Some(record) = cursor.next_record().unwrap() {
+            let want = expected.next().expect("no extra keys");
+            assert_eq!((record.key, record.seq), (want.key.as_slice(), want.seq));
+            assert_eq!(Some(record.value), want.value.as_deref());
+        }
+        assert!(expected.next().is_none(), "no missing keys");
+        LIVE.load(Ordering::Relaxed) - before_live
+    };
+    let decoded = workspace.capacity();
+
+    let physical = records.len();
+    let mut single = ReadWorkspace::new();
+    let bare_ns = timed(physical, &mut || {
+        let total: usize = runs
+            .iter()
+            .map(|run| drain_run(&mut run.cursor(&mut single)))
+            .sum();
+        assert_eq!(total, physical);
+    });
+    let mut merge_workspace = MergeWorkspace::new();
+    let merge_ns = merged(&runs, &mut merge_workspace, |cursor| {
+        timed(physical, &mut || {
+            cursor.seek(b"").unwrap();
+            assert_eq!(drain_merge(cursor), physical);
+        })
+    });
+    let (logical_ns, scan_allocs) = {
+        let mut cursor = set.cursor(&mut workspace);
+        let ns = timed(physical, &mut || {
+            cursor.seek(b"").unwrap();
+            assert_eq!(drain_logical(&mut cursor), live.len());
+        });
+        let allocs = allocations_during(|| {
+            cursor.seek(b"").unwrap();
+            black_box(drain_logical(&mut cursor));
+        });
+        (ns, allocs)
+    };
+    let live_ns = logical_ns * physical as f64 / live.len() as f64;
+    println!(
+        "| {dataset} | {layout} | {fan} | {shape} | {physical} | {} | {:.2} | {bare_ns:.1} | {merge_ns:.1} | {logical_ns:.1} | {:.1} | {live_ns:.1} | {:.0} | {scan_allocs} | {decoded} | {} |",
+        live.len(),
+        physical as f64 / live.len() as f64,
+        logical_ns - merge_ns,
+        1e9 / live_ns,
+        retained - decoded as u64,
+    );
+
+    // Point lookups, including what a per-run key range would save.
+    let mut rng = Rng(53);
+    let mut pick = |from: &[&Owned]| -> Vec<Vec<u8>> {
+        (0..MERGE_PROBES)
+            .map(|_| from[(rng.next() % from.len() as u64) as usize].key.clone())
+            .collect()
+    };
+    let hits = pick(&live);
+    let misses: Vec<Vec<u8>> = pick(&live)
+        .into_iter()
+        .map(|key| [key.as_slice(), b"~"].concat())
+        .collect();
+    let mut kinds = vec![("hit", hits, true), ("miss", misses, false)];
+    if !deleted.is_empty() {
+        kinds.push(("deleted", pick(&deleted), false));
+    }
+    for (kind, probes, present) in &kinds {
+        for key in probes {
+            assert_eq!(set.get(key, &mut workspace).unwrap().is_some(), *present);
+        }
+        let before = workspace.blocks_loaded();
+        for key in probes {
+            black_box(set.get(key, &mut workspace).unwrap());
+        }
+        let blocks = (workspace.blocks_loaded() - before) as f64 / probes.len() as f64;
+        let ns = timed(probes.len(), &mut || {
+            for key in probes {
+                black_box(set.get(black_box(key), &mut workspace).unwrap());
+            }
+        });
+        let allocs = allocations_during(|| {
+            for key in probes {
+                black_box(set.get(key, &mut workspace).unwrap());
+            }
+        });
+        let narrowed: Vec<Vec<RunView<'_>>> = probes
+            .iter()
+            .map(|key| {
+                ranged(&views, &bounds, |first, last| {
+                    first <= key.as_slice() && key.as_slice() <= last
+                })
+            })
+            .collect();
+        let before = workspace.blocks_loaded();
+        for (key, runs) in probes.iter().zip(&narrowed) {
+            black_box(RunSet::new(runs).get(key, &mut workspace).unwrap());
+        }
+        let ranged_blocks = (workspace.blocks_loaded() - before) as f64 / probes.len() as f64;
+        let ranged_ns = timed(probes.len(), &mut || {
+            for (key, runs) in probes.iter().zip(&narrowed) {
+                black_box(
+                    RunSet::new(runs)
+                        .get(black_box(key), &mut workspace)
+                        .unwrap(),
+                );
+            }
+        });
+        tables.point.push(format!(
+            "| {dataset} | {layout} | {fan} | {shape} | {kind} | {ns:.0} | {blocks:.2} | {ranged_ns:.0} | {ranged_blocks:.2} | {allocs} |"
+        ));
+    }
+
+    let matching_live = |prefix: &[u8]| {
+        let start = live.partition_point(|r| r.key.as_slice() < prefix);
+        live[start..].partition_point(|r| r.key.starts_with(prefix))
+    };
+    for (bucket, all_probes) in buckets {
+        let probes = &all_probes[..MERGE_PROBES];
+        let visited: usize = probes.iter().map(|prefix| matching(records, prefix)).sum();
+        let expected: usize = probes.iter().map(|prefix| matching_live(prefix)).sum();
+        let before = workspace.blocks_loaded();
+        let (scan_ns, allocs, mut latencies) = {
+            let mut cursor = set.cursor(&mut workspace);
+            let mut returned = 0;
+            for prefix in probes {
+                cursor.seek_prefix(prefix).unwrap();
+                returned += drain_logical(&mut cursor);
+            }
+            assert_eq!(returned, expected, "{dataset} {layout} {fan} {bucket}");
+            let scan_ns = timed(probes.len(), &mut || {
+                for prefix in probes {
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_logical(&mut cursor));
+                }
+            });
+            let allocs = allocations_during(|| {
+                for prefix in probes {
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_logical(&mut cursor));
+                }
+            });
+            let mut latencies = Vec::with_capacity(MERGE_ROUNDS * probes.len());
+            for _ in 0..MERGE_ROUNDS {
+                for prefix in probes {
+                    let start = Instant::now();
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_logical(&mut cursor));
+                    latencies.push(start.elapsed().as_nanos() as u64);
+                }
+            }
+            (scan_ns, allocs, latencies)
+        };
+        // One checked pass of the loop above loaded these; the timed passes
+        // repeat it, so divide by all of them.
+        let passes = MERGE_ROUNDS + MERGE_ROUNDS + 2;
+        let blocks = (workspace.blocks_loaded() - before) as f64 / (probes.len() * passes) as f64;
+        latencies.sort_unstable();
+        let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+        let physical_ns = merged(&runs, &mut merge_workspace, |cursor| {
+            timed(probes.len(), &mut || {
+                for prefix in probes {
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_merge(cursor));
+                }
+            })
+        });
+        let narrowed: Vec<Vec<RunView<'_>>> = probes
+            .iter()
+            .map(|prefix| {
+                ranged(&views, &bounds, |first, last| {
+                    last >= prefix.as_slice()
+                        && (first <= prefix.as_slice() || first.starts_with(prefix))
+                })
+            })
+            .collect();
+        let before = workspace.blocks_loaded();
+        for (prefix, runs) in probes.iter().zip(&narrowed) {
+            let mut cursor = RunSet::new(runs).cursor(&mut workspace);
+            cursor.seek_prefix(prefix).unwrap();
+            black_box(drain_logical(&mut cursor));
+        }
+        let ranged_blocks = (workspace.blocks_loaded() - before) as f64 / probes.len() as f64;
+        let ranged_ns = timed(probes.len(), &mut || {
+            for (prefix, runs) in probes.iter().zip(&narrowed) {
+                let mut cursor = RunSet::new(runs).cursor(&mut workspace);
+                cursor.seek_prefix(black_box(prefix)).unwrap();
+                black_box(drain_logical(&mut cursor));
+            }
+        });
+        let queries = probes.len() as f64;
+        tables.prefix.push(format!(
+            "| {dataset} | {layout} | {fan} | {shape} | {bucket} | {:.1} | {:.1} | {blocks:.2} | {physical_ns:.0} | {scan_ns:.0} | {:.2} | {} | {} | {ranged_ns:.0} | {ranged_blocks:.2} | {allocs} |",
+            expected as f64 / queries,
+            visited as f64 / queries,
+            scan_ns / physical_ns,
+            percentile(0.5),
+            percentile(0.99),
+        ));
+    }
+}
+
+fn logical_reads() {
+    println!(
+        "latest-state reads; {} MiB of logical data per dataset split across the inputs; {MERGE_ROUNDS} rounds, {MERGE_PROBES} seeded probes per round",
+        GEOMETRY_BYTES >> 20
+    );
+    println!(
+        "bare = each input iterated alone; merge = physical merge; logical = latest-state scan; times per physical record unless stated"
+    );
+    println!(
+        "ranged = the same reads consulting only runs whose key range could hold the target, a comparison with no implementation behind it"
+    );
+    println!();
+    let datasets: [(&str, Fixture); 3] = [
+        ("unique", tree_json),
+        ("versions", tree_versions),
+        ("tombstones", tree_tombstones),
+    ];
+    let layouts: [(&str, Assign); 3] = [
+        ("disjoint", assign_disjoint),
+        ("partial", assign_partial),
+        ("overlap", assign_overlapping),
+    ];
+    let mixed: &[RunShape] = &[(Codec::None, 64), (Codec::Lz4, 16), (Codec::Zstd, 4)];
+
+    println!(
+        "| dataset | layout | runs | shape | physical | live | physical per live | bare | merge | logical | filter | ns per live | live per s | allocs scan | decoded bytes | state bytes |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut tables = LogicalTables {
+        point: Vec::new(),
+        prefix: Vec::new(),
+    };
+    for (dataset, make) in datasets {
+        let records = make(GEOMETRY_BYTES);
+        let buckets = prefix_buckets(&records);
+        for (layout, assign) in layouts {
+            for fan in LOGICAL_FANS {
+                measure_logical(
+                    &MergeConfig {
+                        dataset,
+                        layout,
+                        shape: "zstd-16",
+                        fan,
+                        assign,
+                        shapes: &[ZSTD_16],
+                    },
+                    &records,
+                    &buckets,
+                    &mut tables,
+                );
+            }
+        }
+        measure_logical(
+            &MergeConfig {
+                dataset,
+                layout: "overlap",
+                shape: "mixed",
+                fan: MERGE_VARIANT_FAN,
+                assign: assign_overlapping,
+                shapes: mixed,
+            },
+            &records,
+            &buckets,
+            &mut tables,
+        );
+    }
+    println!();
+    println!(
+        "| dataset | layout | runs | shape | lookup | ns | blocks | ranged ns | ranged blocks | allocs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for row in &tables.point {
+        println!("{row}");
+    }
+    println!();
+    println!(
+        "| dataset | layout | runs | shape | bucket | live | physical | blocks | physical scan | logical scan | ratio | p50 | p99 | ranged scan | ranged blocks | allocs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for row in &tables.prefix {
+        println!("{row}");
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
         Some("prefix") => return prefix_scans(),
         Some("merge") => return merge_scans(),
+        Some("logical") => return logical_reads(),
         _ => {}
     }
 

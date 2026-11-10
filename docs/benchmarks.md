@@ -147,3 +147,49 @@ are not reliable.
   would alone: the merge's own overhead stays near 44 ns at fan-in 8. Zstandard
   at 64 KiB makes a seek about 3 times more expensive than at 16 KiB (254 vs
   81 us).
+
+## Latest-state reads
+
+`block_bench logical` splits 32 MiB of logical data across 1, 4, 8 and 16 runs
+of Zstandard at 16 KiB, plus a mix of codecs and block sizes at 8. Run it with
+`scripts/validate.sh logical` and summarize three passes as above.
+
+- `unique` has one version per key, `versions` holds version chains (3.28
+  physical records per live key), and `tombstones` deletes one key in four
+  (1.67).
+- `disjoint` gives each input a range, `overlap` deals records in turn, and
+  `partial` does half of each.
+- `bare`, `merge` and `logical` time the same records alone, physically merged
+  and filtered. `filter` is `logical` minus `merge`, per physical record.
+- `ranged` repeats a read over only the runs whose key range could hold the
+  target. It is a comparison from the benchmark's own knowledge of the data;
+  no such metadata exists.
+- Every result is checked against the input records.
+
+### Findings
+
+Same reference environment, three passes. Full-scan times differ between passes
+by a median of under 1.5% and at most 7.4%. `filter` is a difference of two
+medians, so treat it as a range: it differs by a median of 12%. Tails are
+unreliable, with p99 varying by up to 154%.
+
+- Latest-state filtering costs 2 to 19 ns per physical record, so a logical
+  scan takes 1.03 to 1.20 times the physical merge. Decompression and merging
+  dominate it.
+- At 16 runs, unique keys scan at 10.7 million live records per second when
+  disjoint and 6.3 million with full overlap. Version chains cost more per
+  result because older versions must be visited: 3.28 physical records per
+  live key gives 2.2 to 4.4 million live keys per second.
+- Warm scans, seeks, prefixes and lookups allocate nothing. Creating a cursor
+  allocates once.
+- A point lookup costs one block decode per run that might hold the key: 10 us
+  at one run and 170 to 189 us at 16 overlapping runs. Hits, misses and deleted
+  keys cost the same, since every run must be consulted.
+- A prefix returning a few keys costs about the same as a lookup. The logical
+  scan is within 1% of the physical one until scans are long.
+- Knowing each run's key range would matter for disjoint and partly overlapping
+  runs and not at all for full overlap. At 16 runs a disjoint lookup falls from
+  77 to 10 us (9 blocks to 1) and a short prefix from 70 to 10 us. Partial
+  overlap improves from 119 to 89 us. Long prefix scans gain 15 to 22%.
+- Retained buffers grow with fan-in: 257 KiB decoded and 5 KiB of state at 16
+  runs, plus the 94 KiB Zstandard context per input outside these figures.

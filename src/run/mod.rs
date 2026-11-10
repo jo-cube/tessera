@@ -127,6 +127,7 @@
 mod builder;
 mod codec;
 mod frame;
+mod logical;
 mod merge;
 mod reader;
 
@@ -136,6 +137,9 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
+pub use logical::{
+    ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunSet,
+};
 pub use merge::{MergeCursor, MergeWorkspace};
 pub use reader::{ReadWorkspace, Run, RunCursor, RunView};
 

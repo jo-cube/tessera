@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 4A
+## Status: Milestone 4B
 
 Two physical storage layers exist.
 
@@ -33,11 +33,18 @@ every copy of an internal key found in more than one run, in input order. Only
 `MergeWorkspace` holds its state, one decoded block per input, and returned
 records borrow from it, so iteration copies no values and allocates nothing.
 
+`RunSet` reads a fixed collection of runs as the latest state of each key:
+`get` for one key, and a cursor with `seek` and `seek_prefix` for live keys in
+order. The newest sequence number decides a key, and a tombstone hides it.
+Identical copies of a record count once. Copies that differ fail the read
+with `ReadError::ConflictingCopies`, because run order must not choose a winner.
+There are no snapshots: a reader sees the newest version only.
+
 The byte formats and their invariants are documented in
 [`src/block/mod.rs`](src/block/mod.rs) and [`src/run/mod.rs`](src/run/mod.rs).
 
-There is no latest-value filtering, Bloom filter, memtable, compaction, MVCC,
-write-ahead log or persistence yet.
+There is no Bloom filter, memtable, compaction, MVCC, write-ahead log or
+persistence yet.
 
 ## Validate
 
@@ -55,6 +62,7 @@ scripts/validate.sh bench    # block and run size, timing and allocations
 scripts/validate.sh geometry # run block size and codec comparison
 scripts/validate.sh prefix   # prefix scan comparison
 scripts/validate.sh merge    # multi-run merge measurements
+scripts/validate.sh logical  # latest-state read measurements
 colima stop
 ```
 
