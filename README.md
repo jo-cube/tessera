@@ -3,22 +3,30 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 1
+## Status: Milestone 2
 
-Only the immutable data block exists. It stores versioned records, ordered by
-user key ascending then sequence number descending, with prefix-compressed keys
-and a restart point every 16 records. `BlockBuilder` encodes records and rejects
-invalid input. `Block` validates untrusted bytes once, then provides allocation
-free newest-version lookup and an ordered cursor over every stored version.
-`BlockView` opens bytes already known to be valid in constant time, for example
-a block decompressed again into a reusable buffer, and `BlockPosition` walks a
-block without borrowing it.
+Two physical storage layers exist.
 
-The byte format and its invariants are documented in
-[`src/block/mod.rs`](src/block/mod.rs).
+A **block** stores versioned records, ordered by user key ascending then
+sequence number descending, with prefix-compressed keys and a restart point
+every 16 records. `BlockBuilder` encodes records and `Block` validates bytes
+once, then provides allocation-free newest-version lookup and an ordered cursor
+over every stored version. `BlockView` opens bytes already known to be valid in
+constant time, and `BlockPosition` walks a block without borrowing it.
 
-There is no compression, multi-block run, Bloom filter, memtable, compaction,
-MVCC, write-ahead log or persistence yet.
+A **run** is a self-contained sequence of blocks in contiguous bytes with a
+sparse index of each block's last user key. `RunBuilder` consumes records in
+internal-key order, cuts blocks near 64 KiB and keeps ordinary version chains
+whole. `Run` provides exact-key lookup of the newest version, including
+tombstones, and ordered iteration across blocks. `RunView` and `RunPosition`
+are the constant-time, fallible counterparts for bytes already known to be
+valid.
+
+The byte formats and their invariants are documented in
+[`src/block/mod.rs`](src/block/mod.rs) and [`src/run/mod.rs`](src/run/mod.rs).
+
+There is no compression, Bloom filter, memtable, compaction, MVCC, write-ahead
+log or persistence yet.
 
 ## Validate
 
@@ -31,7 +39,7 @@ scripts/validate.sh image    # once, adds rustfmt and Clippy (uses the network)
 scripts/validate.sh verify   # prove the limits are enforced
 scripts/validate.sh          # fmt, Clippy, tests and docs
 scripts/validate.sh full     # also the large-allocation boundary tests
-scripts/validate.sh bench    # encoded size, timing and allocations
+scripts/validate.sh bench    # block and run size, timing and allocations
 colima stop
 ```
 

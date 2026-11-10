@@ -82,6 +82,7 @@ mod varint;
 use std::cmp::Ordering;
 
 pub use builder::{BlockBuilder, BuildError};
+pub(crate) use reader::RecordWalk;
 pub use reader::{
     Block, BlockPosition, BlockView, CorruptBlock, Corruption, Cursor, Record, Version,
 };
@@ -124,7 +125,7 @@ pub enum Value<'a> {
 
 /// Compares internal keys: user key ascending, then sequence number
 /// descending. This is the single definition of block order.
-fn cmp_internal(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -> Ordering {
+pub(crate) fn cmp_internal(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -> Ordering {
     a_key.cmp(b_key).then(b_seq.cmp(&a_seq))
 }
 

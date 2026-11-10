@@ -5,7 +5,7 @@
 #   scripts/validate.sh [check]            fmt, Clippy, tests and docs (default)
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
-#   scripts/validate.sh bench              the block benchmark
+#   scripts/validate.sh bench              the block and run benchmark
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #

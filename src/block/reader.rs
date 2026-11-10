@@ -28,11 +28,12 @@ impl<B: AsRef<[u8]>> Block<B> {
     /// Validates `data` in full and wraps it. This costs O(block length) and
     /// reports the first structural problem found.
     pub fn new(data: B) -> Result<Self, CorruptBlock> {
-        let (entries_len, record_count) = validate(data.as_ref())?;
+        let mut walk = RecordWalk::default();
+        let entries_len = walk.validate_block(data.as_ref())?;
         Ok(Self {
             data,
             entries_len,
-            record_count,
+            record_count: walk.record_count,
         })
     }
 
@@ -401,55 +402,72 @@ fn decode_record<'a>(input: &mut &'a [u8]) -> Result<RawRecord<'a>, Corruption> 
     })
 }
 
-/// Checks every format invariant and returns the length of the record region
-/// and the record count.
-fn validate(bytes: &[u8]) -> Result<(usize, usize), CorruptBlock> {
-    let corrupt = |offset, kind| CorruptBlock { offset, kind };
+/// Full validation state, which can continue across adjacent blocks.
+///
+/// The first record of a block has `shared == 0`, so walking a second block
+/// with the same state also orders it against the previous block's last key.
+/// The one key buffer is bounded by [`MAX_KEY_LEN`], whatever the input claims.
+#[derive(Debug, Default)]
+pub(crate) struct RecordWalk {
+    /// The most recently walked user key.
+    pub(crate) key: Vec<u8>,
+    seq: u64,
+    /// Records walked so far, across every block.
+    pub(crate) record_count: usize,
+}
 
-    let BlockView { entries, restarts } = BlockView::open(bytes)?;
-    let mut pending_restarts = restarts
-        .iter()
-        .map(|&restart| restart_offset(restart))
-        .peekable();
+impl RecordWalk {
+    /// Checks every format invariant of one block and returns the length of
+    /// its record region.
+    pub(crate) fn validate_block(&mut self, bytes: &[u8]) -> Result<usize, CorruptBlock> {
+        let corrupt = |offset, kind| CorruptBlock { offset, kind };
 
-    // The one key buffer is bounded by MAX_KEY_LEN, whatever the input claims.
-    let mut key = Vec::new();
-    let mut seq = 0;
-    let mut record_count = 0;
-    let mut rest = entries;
-    while !rest.is_empty() {
-        let offset = entries.len() - rest.len();
-        let record = decode_record(&mut rest).map_err(|kind| corrupt(offset, kind))?;
+        let BlockView { entries, restarts } = BlockView::open(bytes)?;
+        let mut pending_restarts = restarts
+            .iter()
+            .map(|&restart| restart_offset(restart))
+            .peekable();
 
-        let is_restart = pending_restarts.next_if_eq(&offset).is_some();
-        if is_restart && record.shared != 0 {
-            return Err(corrupt(offset, Corruption::InvalidRestarts));
-        }
-        record
-            .check_key_len(key.len())
-            .map_err(|kind| corrupt(offset, kind))?;
-        if record_count > 0 {
-            // Both keys share their first `shared` bytes, so comparing what
-            // follows orders the whole keys.
-            match cmp_internal(&key[record.shared..], seq, record.suffix, record.seq) {
-                Ordering::Less => {}
-                Ordering::Equal => return Err(corrupt(offset, Corruption::DuplicateKey)),
-                Ordering::Greater => return Err(corrupt(offset, Corruption::OutOfOrder)),
+        let mut rest = entries;
+        while !rest.is_empty() {
+            let offset = entries.len() - rest.len();
+            let record = decode_record(&mut rest).map_err(|kind| corrupt(offset, kind))?;
+
+            let is_restart = pending_restarts.next_if_eq(&offset).is_some();
+            if is_restart && record.shared != 0 {
+                return Err(corrupt(offset, Corruption::InvalidRestarts));
             }
+            record
+                .check_key_len(self.key.len())
+                .map_err(|kind| corrupt(offset, kind))?;
+            if self.record_count > 0 {
+                // Both keys share their first `shared` bytes, so comparing
+                // what follows orders the whole keys.
+                match cmp_internal(
+                    &self.key[record.shared..],
+                    self.seq,
+                    record.suffix,
+                    record.seq,
+                ) {
+                    Ordering::Less => {}
+                    Ordering::Equal => return Err(corrupt(offset, Corruption::DuplicateKey)),
+                    Ordering::Greater => return Err(corrupt(offset, Corruption::OutOfOrder)),
+                }
+            }
+
+            self.key.truncate(record.shared);
+            self.key.extend_from_slice(record.suffix);
+            self.seq = record.seq;
+            self.record_count += 1;
         }
 
-        key.truncate(record.shared);
-        key.extend_from_slice(record.suffix);
-        seq = record.seq;
-        record_count += 1;
+        // Offsets that are unsorted, repeated, past the end or off a record
+        // boundary are never consumed by the walk above.
+        if pending_restarts.next().is_some() {
+            return Err(corrupt(entries.len(), Corruption::InvalidRestarts));
+        }
+        Ok(entries.len())
     }
-
-    // Offsets that are unsorted, repeated, past the end or off a record
-    // boundary are never consumed by the walk above.
-    if pending_restarts.next().is_some() {
-        return Err(corrupt(entries.len(), Corruption::InvalidRestarts));
-    }
-    Ok((entries.len(), record_count))
 }
 
 /// Why bytes were rejected by [`Block::new`] or a [`BlockView`] read.
@@ -484,20 +502,25 @@ pub enum Corruption {
     DuplicateKey,
 }
 
+impl fmt::Display for Corruption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Truncated => "truncated field",
+            Self::InvalidVarint => "invalid varint",
+            Self::KeyTooLong => "key exceeds limit",
+            Self::ValueTooLong => "value exceeds limit",
+            Self::BlockTooLong => "block exceeds limit",
+            Self::InvalidPrefix => "shared prefix exceeds previous key",
+            Self::InvalidRestarts => "restart directory does not match records",
+            Self::OutOfOrder => "record out of order",
+            Self::DuplicateKey => "duplicate user key and sequence number",
+        })
+    }
+}
+
 impl fmt::Display for CorruptBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self.kind {
-            Corruption::Truncated => "truncated field",
-            Corruption::InvalidVarint => "invalid varint",
-            Corruption::KeyTooLong => "key exceeds limit",
-            Corruption::ValueTooLong => "value exceeds limit",
-            Corruption::BlockTooLong => "block exceeds limit",
-            Corruption::InvalidPrefix => "shared prefix exceeds previous key",
-            Corruption::InvalidRestarts => "restart directory does not match records",
-            Corruption::OutOfOrder => "record out of order",
-            Corruption::DuplicateKey => "duplicate user key and sequence number",
-        };
-        write!(f, "corrupt block at offset {}: {reason}", self.offset)
+        write!(f, "corrupt block at offset {}: {}", self.offset, self.kind)
     }
 }
 

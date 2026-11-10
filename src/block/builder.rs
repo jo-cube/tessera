@@ -29,19 +29,26 @@ impl BlockBuilder {
 
     /// Appends one record.
     pub fn add(&mut self, user_key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
+        self.check(user_key, seq, value)?;
+        self.append(user_key, seq, value)
+    }
+
+    /// Checks limits and order against the previous record.
+    pub(crate) fn check(
+        &self,
+        user_key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+    ) -> Result<(), BuildError> {
         if user_key.len() > MAX_KEY_LEN {
             return Err(BuildError::KeyTooLong {
                 len: user_key.len(),
             });
         }
-        let (value_tag, value_bytes): (u64, &[u8]) = match value {
-            Value::Tombstone => (0, &[]),
-            Value::Bytes(bytes) => (bytes.len() as u64 + 1, bytes),
-        };
-        if value_bytes.len() > MAX_VALUE_LEN {
-            return Err(BuildError::ValueTooLong {
-                len: value_bytes.len(),
-            });
+        if let Value::Bytes(bytes) = value
+            && bytes.len() > MAX_VALUE_LEN
+        {
+            return Err(BuildError::ValueTooLong { len: bytes.len() });
         }
         if self.record_count > 0 {
             match cmp_internal(&self.last_key, self.last_seq, user_key, seq) {
@@ -50,6 +57,20 @@ impl BlockBuilder {
                 Ordering::Greater => return Err(BuildError::OutOfOrder),
             }
         }
+        Ok(())
+    }
+
+    /// Encodes a record that has passed [`check`](Self::check).
+    pub(crate) fn append(
+        &mut self,
+        user_key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+    ) -> Result<(), BuildError> {
+        let (value_tag, value_bytes): (u64, &[u8]) = match value {
+            Value::Tombstone => (0, &[]),
+            Value::Bytes(bytes) => (bytes.len() as u64 + 1, bytes),
+        };
 
         let is_restart = self.record_count.is_multiple_of(RESTART_INTERVAL);
         let shared = if is_restart {
@@ -112,12 +133,32 @@ impl BlockBuilder {
     pub fn finish(self) -> Vec<u8> {
         let mut block = self.entries;
         block.reserve_exact(self.restarts.len() * U32_LEN + U32_LEN);
-        for offset in &self.restarts {
-            block.extend_from_slice(&offset.to_le_bytes());
-        }
-        block.extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
+        write_directory(&self.restarts, &mut block);
         block
     }
+
+    /// Appends the finished block to `out` and empties this builder, keeping
+    /// its buffers. The last key stays readable until the next record.
+    pub(crate) fn flush_into(&mut self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        out.extend_from_slice(&self.entries);
+        write_directory(&self.restarts, out);
+        self.entries.clear();
+        self.restarts.clear();
+        self.record_count = 0;
+    }
+
+    /// Returns the user key of the most recently added record.
+    pub(crate) fn last_key(&self) -> &[u8] {
+        &self.last_key
+    }
+}
+
+fn write_directory(restarts: &[u32], out: &mut Vec<u8>) {
+    for offset in restarts {
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&(restarts.len() as u32).to_le_bytes());
 }
 
 /// Why a record was rejected by [`BlockBuilder::add`].
@@ -140,6 +181,8 @@ pub enum BuildError {
     DuplicateKey,
     /// Accepting the record would exceed [`MAX_BLOCK_LEN`].
     BlockFull,
+    /// The run's block table or key area would exceed its 32-bit limits.
+    RunFull,
 }
 
 impl fmt::Display for BuildError {
@@ -154,6 +197,7 @@ impl fmt::Display for BuildError {
             Self::OutOfOrder => f.write_str("record sorts before the previous record"),
             Self::DuplicateKey => f.write_str("duplicate user key and sequence number"),
             Self::BlockFull => write!(f, "record would exceed block limit of {MAX_BLOCK_LEN}"),
+            Self::RunFull => f.write_str("run index would exceed its limits"),
         }
     }
 }
