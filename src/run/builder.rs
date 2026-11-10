@@ -108,6 +108,18 @@ impl RunBuilder {
         self.record_count == 0
     }
 
+    /// Returns the length the run would have if finished now, not counting
+    /// the open block.
+    pub fn stored_len(&self) -> usize {
+        self.frames.len() + self.table.len() + self.keys.len() + FOOTER_LEN
+    }
+
+    /// Returns the bytes held by a compression context, which Zstandard
+    /// allocates outside the Rust heap.
+    pub fn context_bytes(&self) -> usize {
+        self.compressor.context_bytes()
+    }
+
     /// Writes the index and footer and returns the finished run, which is
     /// valid by construction and is not walked again.
     pub fn finish(mut self) -> Run<Vec<u8>> {

@@ -28,6 +28,12 @@ impl MergeWorkspace {
         self.runs.iter().map(ReadWorkspace::blocks_loaded).sum()
     }
 
+    /// Returns the bytes held by decompression contexts, which Zstandard
+    /// allocates outside the Rust heap.
+    pub fn context_bytes(&self) -> usize {
+        self.runs.iter().map(ReadWorkspace::context_bytes).sum()
+    }
+
     /// Returns one read workspace per input, creating any that are missing.
     pub(super) fn reads(&mut self, inputs: usize) -> &mut [ReadWorkspace] {
         if self.runs.len() < inputs {

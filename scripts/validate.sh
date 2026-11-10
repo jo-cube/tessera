@@ -14,6 +14,7 @@
 #   scripts/validate.sh ranges             key-range pruning measurements
 #   scripts/validate.sh memtable           memtable and flush measurements
 #   scripts/validate.sh engine             integrated engine measurements
+#   scripts/validate.sh compaction         sustained writes with compaction
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -173,6 +174,10 @@ engine() {
   bounded engine 900 cargo run --locked --release --example block_bench -- engine
 }
 
+compaction() {
+  bounded compaction 900 cargo run --locked --release --example block_bench -- compaction
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -233,7 +238,8 @@ case "$command" in
   ranges) ranges ;;
   memtable) memtable ;;
   engine) engine ;;
+  compaction) compaction ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,18p' "$0"; exit 2 ;;
+  *) sed -n '2,19p' "$0"; exit 2 ;;
 esac

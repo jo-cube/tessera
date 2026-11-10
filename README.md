@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 5B
+## Status: Milestone 5C
 
 Two physical storage layers exist, with mutable storage above them.
 
@@ -65,9 +65,21 @@ compresses outside the lock, and publishes its runs while removing the frozen
 table in one step; an abandoned or rejected flush leaves the table readable for
 a retry. Memtable budgets and limits on run count and bytes bound what is kept.
 
-There is no compaction, so runs only accumulate up to their limits. There is no
-Bloom filter, MVCC, snapshot older than the present, write-ahead log or
-persistence, and flushing never happens in the background.
+**Compaction** is explicit and synchronous. `compact` merges runs into new
+disjoint runs that keep only the newest version of each key, collapse identical
+copies, fail on copies that differ at any version, and drop a tombstone only
+when the caller says no older value can lie outside the merge. Workspace and
+output are limited and checked, the workspace before anything is decoded.
+`Engine::compact` selects inputs under the shared lock, merges without the lock,
+and replaces exactly its inputs in one step, after checking they are still
+published; runs flushed meanwhile and the memtables are newer and stay. The
+policy merges the smallest runs covering the most deeply overlapped key once
+more than `max_overlap` runs share a key, and merges neighbouring short runs
+once there are many disjoint runs. It is not leveled.
+
+There is no Bloom filter, MVCC, snapshot older than the present, write-ahead
+log or persistence, and neither flushing nor compaction happens in the
+background.
 
 ## Validate
 
@@ -89,6 +101,7 @@ scripts/validate.sh logical  # latest-state read measurements
 scripts/validate.sh ranges   # key-range pruning measurements
 scripts/validate.sh memtable # memtable and flush measurements
 scripts/validate.sh engine   # integrated engine measurements
+scripts/validate.sh compaction # sustained writes with and without compaction
 colima stop
 ```
 

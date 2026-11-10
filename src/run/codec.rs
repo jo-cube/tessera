@@ -62,6 +62,12 @@ impl Compressor {
         self.codec
     }
 
+    /// Returns the bytes Zstandard holds for this compressor, allocated outside
+    /// the Rust heap.
+    pub(super) fn context_bytes(&self) -> usize {
+        self.zstd.as_ref().map_or(0, CCtx::sizeof)
+    }
+
     /// Appends the compressed form of `block` to `out`, with no intermediate
     /// buffer. `out` briefly holds the worst-case compressed length.
     ///
@@ -112,6 +118,12 @@ pub(super) struct Decompressor {
 }
 
 impl Decompressor {
+    /// Returns the bytes Zstandard holds for this decompressor, allocated
+    /// outside the Rust heap.
+    pub(super) fn context_bytes(&self) -> usize {
+        self.zstd.as_ref().map_or(0, DCtx::sizeof)
+    }
+
     /// Decompresses `stored` into `output`, which bounds what can be written,
     /// and returns the decoded length. `None` means the bytes are corrupt.
     pub(super) fn decompress(

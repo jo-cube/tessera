@@ -115,7 +115,7 @@ impl std::error::Error for ReadError {}
 
 /// Both callers find the lower input first: a lookup walks inputs in order,
 /// and the merge orders identical internal keys by input.
-fn conflict(key: &[u8], seq: u64, lower: usize, higher: usize) -> ReadError {
+pub(super) fn conflict(key: &[u8], seq: u64, lower: usize, higher: usize) -> ReadError {
     ReadError::ConflictingCopies(ConflictingCopies {
         key: key.to_vec(),
         seq,

@@ -69,7 +69,7 @@ use std::fmt;
 use std::ops::Bound;
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
-use crate::run::{Run, RunBuilder};
+use crate::run::{RECORD_INPUT_OVERHEAD, Run, RunBuilder};
 
 /// Bytes charged per entry beyond its key and value.
 ///
@@ -82,13 +82,7 @@ pub const ENTRY_OVERHEAD: usize = 128;
 /// Input per output run suggested for [`FrozenMemtable::flush`].
 pub const TARGET_RUN_LEN: usize = 64 << 20;
 
-/// The largest input per output run. It keeps every run far enough inside the
-/// run format's 32-bit index limits that building one cannot fail.
-pub const MAX_TARGET_RUN_LEN: usize = 1 << 30;
-
-/// Input counted per record beyond its key and value, so that the number of
-/// records in a run is bounded as well as their bytes.
-const FLUSH_RECORD_OVERHEAD: usize = 16;
+pub use crate::run::MAX_TARGET_RUN_LEN;
 
 const FLUSHABLE: &str = "records are ordered, within the limits, and fit in one run";
 
@@ -453,7 +447,7 @@ impl Iterator for Flush<'_> {
         let mut input = 0;
         loop {
             builder.add(key, slot.seq, slot.value()).expect(FLUSHABLE);
-            input += key.len() + slot.value_len() + FLUSH_RECORD_OVERHEAD;
+            input += key.len() + slot.value_len() + RECORD_INPUT_OVERHEAD;
             if input >= self.target {
                 break;
             }

@@ -136,6 +136,13 @@ impl ReadWorkspace {
         self.scratch.capacity()
     }
 
+    /// Returns the bytes held by a decompression context, which Zstandard
+    /// allocates outside the Rust heap. It is zero until a Zstandard frame has
+    /// been read.
+    pub fn context_bytes(&self) -> usize {
+        self.decompressor.context_bytes()
+    }
+
     /// Returns how many blocks reads through this workspace have loaded, each
     /// of which is a decompression for a compressed run.
     ///
@@ -556,6 +563,15 @@ impl<'a> RunView<'a> {
     /// Returns the number of blocks.
     pub fn block_count(self) -> usize {
         self.table.len()
+    }
+
+    /// Returns the decoded length of the largest block, which is the most a
+    /// reader of this run must hold for one block. Reads each frame header and
+    /// decodes nothing.
+    pub fn largest_block_len(self) -> Result<usize, CorruptRun> {
+        (0..self.table.len()).try_fold(0, |largest, block| {
+            Ok(largest.max(self.frame(block)?.decoded_len))
+        })
     }
 
     /// Returns the bytes used by the table and key area.

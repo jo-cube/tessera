@@ -20,8 +20,8 @@ use std::time::Instant;
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
-use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
+use tessera::engine::{CompactionOptions, Engine, EngineOptions, EngineWorkspace, UpdateError};
+use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN, WriteError};
 use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
     RunBuilder, RunCursor, RunSet, RunView,
@@ -3221,6 +3221,343 @@ fn engine_baseline() {
     );
 }
 
+const SUSTAINED_PASSES: u64 = 6;
+const SUSTAINED_BUDGET: usize = 4 << 20;
+const SUSTAINED_ROUNDS: usize = 3;
+const SUSTAINED_GETS: usize = 2_000;
+const SUSTAINED_SCANS: usize = 200;
+
+/// CPU time of the calling thread, from the Linux scheduler.
+fn thread_cpu_ns() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|stat| stat.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+#[derive(Default)]
+struct Sustained {
+    total_s: f64,
+    flush_s: f64,
+    compact_s: f64,
+    compact_cpu_s: f64,
+    flushes: usize,
+    compactions: usize,
+    flushed_bytes: usize,
+    compact_in: usize,
+    compact_out: usize,
+    records_read: usize,
+    peak_runs: usize,
+    peak_workspace_estimate: usize,
+    peak_workspace_measured: usize,
+    peak_heap: u64,
+}
+
+impl Sustained {
+    fn compact(
+        &mut self,
+        engine: &Engine,
+        options: CompactionOptions,
+        workspace: &mut MergeWorkspace,
+    ) -> bool {
+        let (start, cpu) = (Instant::now(), thread_cpu_ns());
+        let report = engine.compact(options, workspace).unwrap();
+        self.compact_s += start.elapsed().as_secs_f64();
+        self.compact_cpu_s += (thread_cpu_ns() - cpu) as f64 / 1e9;
+        let Some(report) = report else {
+            return false;
+        };
+        self.compactions += 1;
+        self.compact_in += report.input_bytes;
+        self.compact_out += report.output_bytes;
+        self.records_read += report.stats.records_read;
+        self.peak_workspace_estimate = self.peak_workspace_estimate.max(report.workspace_bytes);
+        self.peak_workspace_measured = self
+            .peak_workspace_measured
+            .max(workspace.capacity() + workspace.context_bytes());
+        true
+    }
+
+    fn flush(
+        &mut self,
+        engine: &Engine,
+        compaction: Option<CompactionOptions>,
+        workspace: &mut MergeWorkspace,
+    ) {
+        let start = Instant::now();
+        let report = engine.flush().unwrap();
+        self.flush_s += start.elapsed().as_secs_f64();
+        self.flushes += 1;
+        self.flushed_bytes += report.run_bytes;
+        self.peak_runs = self.peak_runs.max(engine.stats().runs);
+        if let Some(options) = compaction {
+            self.compact(engine, options, workspace);
+        }
+    }
+}
+
+/// Overwrite passes in random order through a 4 MiB memtable, flushing when it
+/// is full and, if enabled, compacting once after each flush.
+fn sustained(
+    records: &[Owned],
+    orders: &[Vec<usize>],
+    compaction: Option<CompactionOptions>,
+) -> (Engine, Sustained) {
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: SUSTAINED_BUDGET,
+        max_runs: 4096,
+        max_run_bytes: usize::MAX,
+        ..EngineOptions::default()
+    });
+    let mut out = Sustained::default();
+    let mut workspace = MergeWorkspace::new();
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    let start = Instant::now();
+    for order in orders {
+        for &index in order {
+            let record = &records[index];
+            let value = record.value.as_deref().unwrap();
+            loop {
+                match engine.put(&record.key, value) {
+                    Ok(_) => break,
+                    Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
+                        out.flush(&engine, compaction, &mut workspace);
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+    }
+    out.flush(&engine, compaction, &mut workspace);
+    out.total_s = start.elapsed().as_secs_f64();
+    out.peak_heap = PEAK.load(Ordering::Relaxed) - base;
+    (engine, out)
+}
+
+fn sustained_row(name: &str, round: usize, writes: usize, run: &Sustained, engine: &Engine) {
+    let stats = engine.stats();
+    let write_only = run.total_s - run.flush_s - run.compact_s;
+    let compact_mib = run.compact_in as f64 / MIB;
+    println!(
+        "| {name} | {round} | {:.2} | {:.2} | {} | {:.0} | {} | {:.0} | {:.0} | {:.2} | {:.1} | {:.3} | {} | {} | {:.1} | {:.1} |",
+        writes as f64 / run.total_s / 1e6,
+        writes as f64 / write_only / 1e6,
+        run.flushes,
+        run.flushed_bytes as f64 / MIB / run.flush_s,
+        run.compactions,
+        if run.compact_s > 0.0 {
+            compact_mib / run.compact_s
+        } else {
+            0.0
+        },
+        if run.compact_s > 0.0 {
+            run.records_read as f64 / run.compact_s / 1e3
+        } else {
+            0.0
+        },
+        if run.compact_s > 0.0 {
+            run.compact_cpu_s / run.compact_s
+        } else {
+            0.0
+        },
+        run.compact_s * 1e3,
+        (run.flushed_bytes + run.compact_out) as f64 / run.flushed_bytes as f64,
+        run.peak_runs,
+        stats.runs,
+        stats.run_bytes as f64 / MIB,
+        run.peak_heap as f64 / MIB,
+    );
+}
+
+struct ReadRow {
+    get_p50: u64,
+    get_p99: u64,
+    get_blocks: f64,
+    scan_ns: f64,
+    scan_records: f64,
+    scan_blocks: f64,
+    full_ns: f64,
+}
+
+fn read_row(engine: &Engine, records: &[Owned], keys: &[usize]) -> ReadRow {
+    let mut workspace = EngineWorkspace::new();
+    let mut latencies: Vec<u64> = keys
+        .iter()
+        .map(|&index| {
+            let start = Instant::now();
+            black_box(engine.get(&records[index].key, &mut workspace).unwrap());
+            start.elapsed().as_nanos() as u64
+        })
+        .collect();
+    latencies.sort_unstable();
+    let get_blocks = workspace.blocks_loaded() as f64 / keys.len() as f64;
+
+    let mut workspace = EngineWorkspace::new();
+    let (mut scanned, start) = (0, Instant::now());
+    for &index in &keys[..SUSTAINED_SCANS] {
+        scanned += drain_scan(engine, &records[index].key[..GROUP_LEN], &mut workspace);
+    }
+    let scan_ns = start.elapsed().as_nanos() as f64 / SUSTAINED_SCANS as f64;
+    let scan_blocks = workspace.blocks_loaded() as f64 / SUSTAINED_SCANS as f64;
+
+    let mut workspace = EngineWorkspace::new();
+    let start = Instant::now();
+    let full = drain_scan(engine, b"", &mut workspace);
+    let full_ns = start.elapsed().as_nanos() as f64 / full as f64;
+    assert_eq!(full, records.len());
+    ReadRow {
+        get_p50: percentile(&latencies, 0.5),
+        get_p99: percentile(&latencies, 0.99),
+        get_blocks,
+        scan_ns,
+        scan_records: scanned as f64 / SUSTAINED_SCANS as f64,
+        scan_blocks,
+        full_ns,
+    }
+}
+
+fn print_read_row(name: &str, row: &ReadRow) {
+    println!(
+        "| {name} | {} | {} | {:.1} | {:.1} | {:.0} | {:.1} | {:.1} |",
+        row.get_p50,
+        row.get_p99,
+        row.get_blocks,
+        row.scan_ns / 1e3,
+        row.scan_records,
+        row.scan_blocks,
+        row.full_ns,
+    );
+}
+
+/// Sustained overwrites with and without compaction after each flush, then
+/// reads of the overlapped state, during a compaction to completion, and after.
+fn compaction_sustained() {
+    let records = tree_json(16 << 20);
+    let count = records.len();
+    let orders: Vec<Vec<usize>> = (0..SUSTAINED_PASSES)
+        .map(|pass| shuffled(count, 300 + pass))
+        .collect();
+    let writes = count * SUSTAINED_PASSES as usize;
+    let keys: Vec<usize> = shuffled(count, 299)
+        .into_iter()
+        .take(SUSTAINED_GETS)
+        .collect();
+    let default = CompactionOptions::default();
+    let eager = CompactionOptions {
+        max_overlap: 1,
+        ..default
+    };
+    let configs = [
+        ("no compaction", None),
+        ("max overlap 1", Some(eager)),
+        ("max overlap 4 (default)", Some(default)),
+        (
+            "max overlap 8",
+            Some(CompactionOptions {
+                max_overlap: 8,
+                ..default
+            }),
+        ),
+    ];
+    println!(
+        "{count} json keys; {SUSTAINED_PASSES} random overwrite passes = {writes} puts; 4 MiB memtable; one compaction attempt after each flush; default run options; default compaction options: {default:?}"
+    );
+    println!(
+        "one row per round; write M/s includes flush and compaction, which run on the writing thread"
+    );
+    println!(
+        "heap = peak requested Rust heap above the start of the round; it excludes Zstandard contexts"
+    );
+    println!();
+    println!(
+        "| config | round | write M/s | write-only M/s | flushes | flush MiB/s | compactions | compact in MiB/s | compact K records/s | CPU/wall | compact ms | stored written / flushed | peak runs | end runs | end run MiB | peak heap MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut ends = Vec::new();
+    for round in 0..SUSTAINED_ROUNDS {
+        ends.clear();
+        for (name, options) in configs {
+            let (engine, run) = sustained(&records, &orders, options);
+            sustained_row(name, round, writes, &run, &engine);
+            if options.is_some() {
+                println!(
+                    "|  | workspace: estimate {:.2} MiB, measured {:.2} MiB (decoded blocks + Zstandard contexts) |",
+                    run.peak_workspace_estimate as f64 / MIB,
+                    run.peak_workspace_measured as f64 / MIB
+                );
+            }
+            ends.push((name, engine));
+        }
+    }
+
+    println!();
+    println!(
+        "reads; {SUSTAINED_GETS} random gets, {SUSTAINED_SCANS} group prefix scans, one full scan; last round's engines"
+    );
+    println!();
+    println!(
+        "| state | get p50 ns | get p99 ns | blocks/get | prefix scan us | records/scan | blocks/scan | full scan ns/record |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for (name, engine) in &ends {
+        print_read_row(name, &read_row(engine, &records, &keys));
+    }
+    drop(ends);
+    let (plain, _) = sustained(&records, &orders, None);
+
+    // Compaction to completion on the overlapped engine, with a reader beside it.
+    let finished = AtomicU64::new(0);
+    let (during, full) = std::thread::scope(|scope| {
+        let (engine, finished, records, keys) = (&plain, &finished, &records, &keys);
+        let reader = scope.spawn(move || {
+            let mut workspace = EngineWorkspace::new();
+            let mut latencies = Vec::new();
+            let mut at = 0;
+            while finished.load(Ordering::Acquire) == 0 {
+                let key = &records[keys[at % keys.len()]].key;
+                let start = Instant::now();
+                black_box(engine.get(key, &mut workspace).unwrap());
+                latencies.push(start.elapsed().as_nanos() as u64);
+                at += 1;
+            }
+            latencies
+        });
+        let mut workspace = MergeWorkspace::new();
+        let mut full = Sustained::default();
+        let start = Instant::now();
+        while full.compact(&plain, eager, &mut workspace) {}
+        full.total_s = start.elapsed().as_secs_f64();
+        finished.store(1, Ordering::Release);
+        let mut during = reader.join().unwrap();
+        during.sort_unstable();
+        (during, full)
+    });
+    println!(
+        "| no compaction, during compaction to completion at max overlap 1 | {} | {} | | | | | |",
+        percentile(&during, 0.5),
+        percentile(&during, 0.99)
+    );
+    print_read_row(
+        "no compaction, after compaction to completion",
+        &read_row(&plain, &records, &keys),
+    );
+    println!();
+    let stats = plain.stats();
+    println!(
+        "compaction to completion: {} compactions, {:.1} ms wall, {:.0} MiB/s of input, {:.2} CPU/wall on the compacting thread with a reader beside it, {} gets during; {} runs of {:.1} MiB remain; {:.1} MiB read and {:.1} MiB written",
+        full.compactions,
+        full.total_s * 1e3,
+        full.compact_in as f64 / MIB / full.compact_s,
+        full.compact_cpu_s / full.compact_s,
+        during.len(),
+        stats.runs,
+        stats.run_bytes as f64 / MIB,
+        full.compact_in as f64 / MIB,
+        full.compact_out as f64 / MIB,
+    );
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
@@ -3229,6 +3566,7 @@ fn main() {
         Some("logical") => return logical_reads(),
         Some("ranges") => return range_reads(),
         Some("engine") => return engine_baseline(),
+        Some("compaction") => return compaction_sustained(),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}

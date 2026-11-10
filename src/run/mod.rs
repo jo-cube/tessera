@@ -130,6 +130,7 @@
 
 mod builder;
 mod codec;
+mod compact;
 mod frame;
 mod logical;
 mod merge;
@@ -141,6 +142,10 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
+pub use compact::{
+    CONTEXT_ALLOWANCE, CompactError, CompactLimits, CompactStats, Compacted, compact,
+    workspace_bytes,
+};
 pub(crate) use logical::latest_in;
 pub use logical::{
     ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunSet,
@@ -156,6 +161,15 @@ pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 /// at a quarter of the block limit means a soft cut always happens before a
 /// block can become full.
 pub const MAX_TARGET_BLOCK_LEN: usize = crate::block::MAX_BLOCK_LEN / 4;
+
+/// The largest input per output run accepted when flushing or compacting. It
+/// keeps every run far enough inside the format's 32-bit index limits that
+/// building one cannot fail.
+pub const MAX_TARGET_RUN_LEN: usize = 1 << 30;
+
+/// Input counted per record beyond its key and value when splitting output
+/// into runs, so that the number of records in a run is bounded as well.
+pub(crate) const RECORD_INPUT_OVERHEAD: usize = 16;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
 const FORMAT_VERSION: u32 = 3;
