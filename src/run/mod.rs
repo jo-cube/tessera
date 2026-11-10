@@ -127,6 +127,7 @@
 mod builder;
 mod codec;
 mod frame;
+mod merge;
 mod reader;
 
 use std::fmt;
@@ -135,6 +136,7 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
+pub use merge::{MergeCursor, MergeWorkspace};
 pub use reader::{ReadWorkspace, Run, RunCursor, RunView};
 
 /// Encoded block length that [`RunBuilder::new`] aims for. Provisional: see

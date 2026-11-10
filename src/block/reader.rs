@@ -152,6 +152,11 @@ impl BlockPosition {
         self.offset >= block.entries.len()
     }
 
+    /// Returns the key of the record most recently read.
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.key
+    }
+
     /// Returns the offset of the next record in the record region.
     pub(crate) fn offset(&self) -> usize {
         self.offset

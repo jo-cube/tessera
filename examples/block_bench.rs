@@ -2,6 +2,7 @@
 //!
 //! With the argument `geometry`, instead compares run block sizes and codecs.
 //! With the argument `prefix`, instead compares prefix scans over those sizes.
+//! With the argument `merge`, instead measures merged iteration over many runs.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -16,8 +17,8 @@ use std::time::Instant;
 
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
-use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Value};
-use tessera::run::{Codec, ReadWorkspace, Run, RunBuilder};
+use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
+use tessera::run::{Codec, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunCursor};
 
 struct CountingAllocator;
 
@@ -1414,10 +1415,377 @@ fn prefix_scans() {
     }
 }
 
+const MERGE_FANS: [usize; 5] = [1, 2, 4, 8, 16];
+const MERGE_ROUNDS: usize = 9;
+const MERGE_PROBES: usize = 200;
+const MERGE_VARIANT_FAN: usize = 8;
+const ZSTD_16: RunShape = (Codec::Zstd, 16);
+
+/// One input's codec and block target in KiB.
+type RunShape = (Codec, usize);
+/// Which input receives a record: `(index, fan, total)`.
+type Assign = fn(usize, usize, usize) -> usize;
+
+/// Every input spans the whole key space and each neighbor comes from another
+/// input, the worst case for the heap. Version chains are split across runs.
+fn assign_overlapping(index: usize, fan: usize, _: usize) -> usize {
+    index % fan
+}
+
+/// Inputs hold contiguous ranges, as a leveled store's runs would.
+fn assign_disjoint(index: usize, fan: usize, total: usize) -> usize {
+    index * fan / total
+}
+
+fn build_inputs(
+    records: &[Owned],
+    fan: usize,
+    assign: Assign,
+    shapes: &[RunShape],
+) -> Vec<Run<Vec<u8>>> {
+    let mut builders: Vec<RunBuilder> = (0..fan)
+        .map(|input| {
+            let (codec, kib) = shapes[input % shapes.len()];
+            RunBuilder::with_target_block_len(codec, kib << 10)
+        })
+        .collect();
+    for (index, record) in records.iter().enumerate() {
+        builders[assign(index, fan, records.len())]
+            .add(&record.key, record.seq, record.value())
+            .unwrap();
+    }
+    builders.into_iter().map(RunBuilder::finish).collect()
+}
+
+fn digest(record: Record<'_>) -> u64 {
+    let value = match record.value {
+        Value::Bytes(bytes) => bytes
+            .first()
+            .map_or(0, |&b| u64::from(b) + bytes.len() as u64),
+        Value::Tombstone => 1,
+    };
+    record.seq ^ record.key.last().map_or(0, |&b| u64::from(b)) ^ value
+}
+
+fn drain_merge(cursor: &mut MergeCursor<'_>) -> usize {
+    let (mut count, mut consumed) = (0, 0u64);
+    while let Some(record) = cursor.next_record().unwrap() {
+        count += 1;
+        consumed = consumed.wrapping_add(digest(record));
+    }
+    black_box(consumed);
+    count
+}
+
+fn drain_run(cursor: &mut RunCursor<'_>) -> usize {
+    let (mut count, mut consumed) = (0, 0u64);
+    while let Some(record) = cursor.next_record().unwrap() {
+        count += 1;
+        consumed = consumed.wrapping_add(digest(record));
+    }
+    black_box(consumed);
+    count
+}
+
+fn merged<R>(
+    runs: &[Run<Vec<u8>>],
+    workspace: &mut MergeWorkspace,
+    operation: impl FnOnce(&mut MergeCursor<'_>) -> R,
+) -> R {
+    operation(&mut MergeCursor::new(runs.iter().map(Run::view), workspace))
+}
+
+/// Seeded keys that exist in the data, the same for every configuration.
+fn seek_probes(records: &[Owned]) -> Vec<&[u8]> {
+    let mut rng = Rng(47);
+    (0..MERGE_PROBES)
+        .map(|_| {
+            records[(rng.next() % records.len() as u64) as usize]
+                .key
+                .as_slice()
+        })
+        .collect()
+}
+
+struct MergeConfig<'a> {
+    dataset: &'a str,
+    layout: &'a str,
+    shape: &'a str,
+    fan: usize,
+    assign: Assign,
+    shapes: &'a [RunShape],
+}
+
+/// Measures one configuration: the whole stream, then seeks, then prefixes.
+fn measure_merge(
+    config: &MergeConfig<'_>,
+    records: &[Owned],
+    buckets: &[(&'static str, Vec<Vec<u8>>)],
+    prefix_rows: &mut Vec<String>,
+) {
+    let MergeConfig {
+        dataset,
+        layout,
+        shape,
+        fan,
+        assign,
+        shapes,
+    } = *config;
+    let runs = build_inputs(records, fan, assign, shapes);
+    let stored: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
+    let blocks: usize = runs.iter().map(Run::block_count).sum();
+    let timed = |ops, round: &mut dyn FnMut()| median_ns_of(MERGE_ROUNDS, ops, round);
+    let logical: usize = records
+        .iter()
+        .map(|r| r.key.len() + r.value.as_ref().map_or(0, Vec::len) + 9)
+        .sum();
+
+    // A checked pass from a cold workspace: the stream must be exactly the
+    // input records in order, which also gives what the merge retains.
+    let live = LIVE.load(Ordering::Relaxed);
+    let mut workspace = MergeWorkspace::new();
+    let retained = merged(&runs, &mut workspace, |cursor| {
+        let mut expected = records.iter();
+        while let Some(record) = cursor.next_record().unwrap() {
+            let want = expected.next().expect("no extra records");
+            assert_eq!((record.key, record.seq), (want.key.as_slice(), want.seq));
+            assert_eq!(record.value, want.value());
+        }
+        assert!(expected.next().is_none(), "no missing records");
+        LIVE.load(Ordering::Relaxed) - live
+    });
+    let decoded = workspace.capacity();
+    assert_eq!(workspace.blocks_loaded(), blocks as u64);
+
+    let mut single = ReadWorkspace::new();
+    let bare_ns = timed(records.len(), &mut || {
+        let mut total = 0;
+        for run in &runs {
+            total += drain_run(&mut run.cursor(&mut single));
+        }
+        assert_eq!(total, records.len());
+    });
+    let merge_ns = merged(&runs, &mut workspace, |cursor| {
+        timed(records.len(), &mut || {
+            cursor.seek(b"").unwrap();
+            assert_eq!(drain_merge(cursor), records.len());
+        })
+    });
+    let scan_allocs = merged(&runs, &mut workspace, |cursor| {
+        cursor.seek(b"").unwrap();
+        allocations_during(|| {
+            cursor.seek(b"").unwrap();
+            black_box(drain_merge(cursor));
+        })
+    });
+    let new_allocs = allocations_during(|| {
+        merged(&runs, &mut workspace, |cursor| {
+            black_box(cursor);
+        });
+    });
+
+    let seeks = seek_probes(records);
+    let seek_ns = merged(&runs, &mut workspace, |cursor| {
+        timed(seeks.len(), &mut || {
+            for key in &seeks {
+                cursor.seek(black_box(key)).unwrap();
+                black_box(&mut *cursor);
+            }
+        })
+    });
+    let before = workspace.blocks_loaded();
+    let seek_allocs = merged(&runs, &mut workspace, |cursor| {
+        allocations_during(|| {
+            for key in &seeks {
+                cursor.seek(black_box(key)).unwrap();
+            }
+        })
+    });
+    let seek_blocks = (workspace.blocks_loaded() - before) as f64 / seeks.len() as f64;
+
+    println!(
+        "| {dataset} | {layout} | {fan} | {shape} | {} | {:.1} | {blocks} | {bare_ns:.1} | {merge_ns:.1} | {:.2} | {:.0} | {seek_ns:.0} | {seek_blocks:.2} | {new_allocs} | {seek_allocs} | {scan_allocs} | {decoded} | {} |",
+        records.len(),
+        stored as f64 / (1 << 20) as f64,
+        merge_ns / bare_ns,
+        (logical as f64 / (1 << 20) as f64) / (merge_ns * records.len() as f64 / 1e9),
+        retained - decoded as u64,
+    );
+
+    for (bucket, all_probes) in buckets {
+        let probes = &all_probes[..MERGE_PROBES];
+        let expected: usize = probes.iter().map(|prefix| matching(records, prefix)).sum();
+        let before = workspace.blocks_loaded();
+        let returned = merged(&runs, &mut workspace, |cursor| {
+            let mut returned = 0;
+            for prefix in probes {
+                cursor.seek_prefix(prefix).unwrap();
+                returned += drain_merge(cursor);
+            }
+            returned
+        });
+        assert_eq!(
+            returned, expected,
+            "{dataset} {layout} {fan} {shape} {bucket}"
+        );
+        let loads = workspace.blocks_loaded() - before;
+
+        let (prefix_seek_ns, scan_ns, query_allocs, mut latencies) =
+            merged(&runs, &mut workspace, |cursor| {
+                let seek = timed(probes.len(), &mut || {
+                    for prefix in probes {
+                        cursor.seek_prefix(black_box(prefix)).unwrap();
+                        black_box(&mut *cursor);
+                    }
+                });
+                let scan = timed(probes.len(), &mut || {
+                    for prefix in probes {
+                        cursor.seek_prefix(black_box(prefix)).unwrap();
+                        black_box(drain_merge(cursor));
+                    }
+                });
+                let allocs = allocations_during(|| {
+                    for prefix in probes {
+                        cursor.seek_prefix(black_box(prefix)).unwrap();
+                        black_box(drain_merge(cursor));
+                    }
+                });
+                let mut latencies = Vec::with_capacity(MERGE_ROUNDS * probes.len());
+                for _ in 0..MERGE_ROUNDS {
+                    for prefix in probes {
+                        let start = Instant::now();
+                        cursor.seek_prefix(black_box(prefix)).unwrap();
+                        black_box(drain_merge(cursor));
+                        latencies.push(start.elapsed().as_nanos() as u64);
+                    }
+                }
+                (seek, scan, allocs, latencies)
+            });
+        latencies.sort_unstable();
+        let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+        let bare_query_ns = timed(probes.len(), &mut || {
+            for prefix in probes {
+                for run in &runs {
+                    let mut cursor = run.cursor(&mut single);
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_run(&mut cursor));
+                }
+            }
+        });
+        let count = expected as f64 / probes.len() as f64;
+        let ns_per_record = if expected == 0 { 0.0 } else { scan_ns / count };
+        prefix_rows.push(format!(
+            "| {dataset} | {layout} | {fan} | {shape} | {bucket} | {count:.1} | {:.2} | {prefix_seek_ns:.0} | {scan_ns:.0} | {bare_query_ns:.0} | {:.2} | {} | {} | {ns_per_record:.1} | {query_allocs} |",
+            loads as f64 / probes.len() as f64,
+            scan_ns / bare_query_ns,
+            percentile(0.5),
+            percentile(0.99),
+        ));
+    }
+}
+
+fn merge_scans() {
+    println!(
+        "merged iteration; {} MiB of logical data per dataset split across the inputs; {MERGE_ROUNDS} rounds, {MERGE_PROBES} seeded probes per round",
+        GEOMETRY_BYTES >> 20
+    );
+    println!("bare = each input iterated alone; ratio = merged / bare");
+    println!(
+        "cursors are reused and repositioned; decoded = block buffers retained; state = everything else the merge retains on the Rust heap"
+    );
+
+    // Zstandard's contexts live on the C heap, outside the counting allocator.
+    let sample = tree_json(1 << 20);
+    let run = build_run_with(Codec::Zstd, 16 << 10, &sample);
+    let mut context = zstd_safe::DCtx::create();
+    let (id, len, payload, _) = frames(run.as_bytes())[0];
+    decode_frame(&mut context, id, payload, &mut vec![0; len]);
+    println!(
+        "one Zstandard context per Zstandard input: {} bytes on the C heap",
+        context.sizeof()
+    );
+    println!();
+
+    let datasets: [(&str, Fixture); 2] =
+        [("json-tree", tree_json), ("version-tree", tree_versions)];
+    let layouts: [(&str, Assign); 2] = [
+        ("overlap", assign_overlapping),
+        ("disjoint", assign_disjoint),
+    ];
+    let variants: [(&str, &[RunShape]); 6] = [
+        ("none-16", &[(Codec::None, 16)]),
+        ("lz4-16", &[(Codec::Lz4, 16)]),
+        ("zstd-64", &[(Codec::Zstd, 64)]),
+        (
+            "mixed-codecs-16",
+            &[(Codec::None, 16), (Codec::Lz4, 16), (Codec::Zstd, 16)],
+        ),
+        (
+            "zstd-mixed-4-16-64",
+            &[(Codec::Zstd, 4), (Codec::Zstd, 16), (Codec::Zstd, 64)],
+        ),
+        (
+            "mixed-both",
+            &[(Codec::None, 64), (Codec::Lz4, 16), (Codec::Zstd, 4)],
+        ),
+    ];
+
+    println!(
+        "| dataset | layout | runs | shape | records | stored MiB | blocks | bare ns/record | merged ns/record | ratio | MiB/s | seek ns | blocks per seek | allocs new | allocs seeks | allocs scan | decoded bytes | state bytes |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut prefix_rows = Vec::new();
+    for (dataset, make) in datasets {
+        let records = make(GEOMETRY_BYTES);
+        let buckets = prefix_buckets(&records);
+        for (layout, assign) in layouts {
+            for fan in MERGE_FANS {
+                measure_merge(
+                    &MergeConfig {
+                        dataset,
+                        layout,
+                        shape: "zstd-16",
+                        fan,
+                        assign,
+                        shapes: &[ZSTD_16],
+                    },
+                    &records,
+                    &buckets,
+                    &mut prefix_rows,
+                );
+            }
+        }
+        for (shape, shapes) in variants {
+            measure_merge(
+                &MergeConfig {
+                    dataset,
+                    layout: "overlap",
+                    shape,
+                    fan: MERGE_VARIANT_FAN,
+                    assign: assign_overlapping,
+                    shapes,
+                },
+                &records,
+                &buckets,
+                &mut prefix_rows,
+            );
+        }
+    }
+    println!();
+    println!(
+        "| dataset | layout | runs | shape | bucket | records | blocks | seek | scan | bare scan | ratio | p50 | p99 | ns per record | allocs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for row in &prefix_rows {
+        println!("{row}");
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
         Some("prefix") => return prefix_scans(),
+        Some("merge") => return merge_scans(),
         _ => {}
     }
 

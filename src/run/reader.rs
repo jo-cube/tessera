@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Version};
+use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::frame::{self, Frame};
@@ -215,6 +215,16 @@ pub struct RunCursor<'a> {
     next_block: usize,
     loaded: Option<LoadedBlock<'a>>,
     failure: Option<CorruptRun>,
+    /// The next record, already decoded by a peek. Its key is in the position's
+    /// buffer and its value ends at the position's offset, so holding it
+    /// borrows and copies nothing.
+    head: Option<Head>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Head {
+    seq: u64,
+    value_len: Option<usize>,
 }
 
 /// The block a cursor is walking.
@@ -259,6 +269,7 @@ impl<'a> RunCursor<'a> {
 
     fn reposition(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.failure = None;
+        self.head = None;
         let result = self.position_at(target);
         if let Err(error) = result {
             self.failure = Some(error);
@@ -286,6 +297,7 @@ impl<'a> RunCursor<'a> {
 
     /// Moves past the last record of the run.
     fn finish(&mut self) {
+        self.head = None;
         self.loaded = None;
         self.next_block = self.view.table.len();
     }
@@ -293,28 +305,86 @@ impl<'a> RunCursor<'a> {
     /// Advances to the next record, or returns `None` at the end of the run or
     /// of the prefix. After `None`, it keeps returning `None` until a seek.
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
+        self.fill_head()?;
+        let head = self.head.take();
+        Ok(head.map(|head| self.record_of(head)))
+    }
+
+    /// Returns the record [`next_record`](Self::next_record) would return,
+    /// without advancing. Repeated peeks decode nothing further.
+    pub fn peek(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
+        self.fill_head()?;
+        Ok(self.head.map(|head| self.record_of(head)))
+    }
+
+    /// Decodes the next record into the head, unless one is already held.
+    pub(super) fn fill_head(&mut self) -> Result<(), CorruptRun> {
+        if self.head.is_some() {
+            return Ok(());
+        }
         if let Some(error) = self.failure {
             return Err(error);
         }
         let Some(block) = self.block_with_records()? else {
-            return Ok(None);
+            return Ok(());
         };
         let workspace = &mut *self.workspace;
         let bytes = loaded_bytes(&workspace.scratch, &block.frame);
         let view = BlockView::open(bytes).map_err(|error| block.frame.block_error(error))?;
-        let record = workspace
+        let Some(record) = workspace
             .position
             .next_record(view)
-            .map_err(|error| block.frame.block_error(error))?;
-        match record {
-            // Spelled out rather than `finish`, because the record borrows the
-            // workspace in the other arm.
-            Some(record) if !record.key.starts_with(&workspace.prefix) => {
-                self.loaded = None;
-                self.next_block = self.view.table.len();
-                Ok(None)
-            }
-            record => Ok(record),
+            .map_err(|error| block.frame.block_error(error))?
+        else {
+            return Ok(());
+        };
+        let head = Head {
+            seq: record.seq,
+            value_len: match record.value {
+                Value::Bytes(bytes) => Some(bytes.len()),
+                Value::Tombstone => None,
+            },
+        };
+        if record.key.starts_with(&workspace.prefix) {
+            self.head = Some(head);
+        } else {
+            self.finish();
+        }
+        Ok(())
+    }
+
+    /// Consumes the head and decodes the record after it.
+    pub(super) fn advance_head(&mut self) -> Result<(), CorruptRun> {
+        self.head = None;
+        self.fill_head()
+    }
+
+    /// Returns the head's user key and sequence number, if a head is held.
+    pub(super) fn head_key(&self) -> Option<(&[u8], u64)> {
+        self.head
+            .map(|head| (self.workspace.position.key(), head.seq))
+    }
+
+    /// Returns the held head, if any.
+    pub(super) fn head_record(&self) -> Option<Record<'_>> {
+        self.head.map(|head| self.record_of(head))
+    }
+
+    /// Rebuilds a head as a record. A head belongs to the loaded block.
+    fn record_of(&self, head: Head) -> Record<'_> {
+        let block = self
+            .loaded
+            .expect("a head is decoded from the loaded block");
+        let workspace = &*self.workspace;
+        let bytes = loaded_bytes(&workspace.scratch, &block.frame);
+        let end = workspace.position.offset();
+        let value = head
+            .value_len
+            .map_or(Value::Tombstone, |len| Value::Bytes(&bytes[end - len..end]));
+        Record {
+            key: workspace.position.key(),
+            seq: head.seq,
+            value,
         }
     }
 
@@ -501,6 +571,7 @@ impl<'a> RunView<'a> {
             next_block: 0,
             loaded: None,
             failure: None,
+            head: None,
         }
     }
 

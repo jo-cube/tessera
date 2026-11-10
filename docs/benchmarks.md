@@ -96,3 +96,54 @@ transient slowdowns in one pass.
   80% more memory. Zstandard stays much smaller at every size.
 - Sparse-index overhead stays below 3% even at 8 KiB and halves with each
   doubling of block size.
+
+## Merged iteration
+
+`block_bench merge` splits 32 MiB of logical data across 1, 2, 4, 8 and 16 runs
+of Zstandard at 16 KiB, and at fan-in 8 also compares other codecs, block sizes
+and mixtures. Run it with `scripts/validate.sh merge` and summarize three passes
+as above.
+
+- `overlap` deals records to inputs in turn, so neighbors come from different
+  runs and version chains are split: the worst case for the merge. `disjoint`
+  gives each input a contiguous range.
+- `bare` iterates each input alone, so `ratio` isolates the merge from the cost
+  of decoding the same runs. Each configuration splits the same records, and a
+  checked pass requires the merged stream to equal them exactly.
+- Cursors are reused and repositioned. `allocs` are totals for a warm workspace.
+- `decoded` is block buffers retained, and `state` is everything else the merge
+  retains on the Rust heap. Each Zstandard input also keeps one 94 KiB context
+  on the C heap, outside both figures.
+
+### Findings
+
+Same reference environment, three passes. Full-scan time differs between passes
+by a median of 0.7% and at most 4.6%. Seek and scan medians agree within about
+1%; single rows reach 40%, and p99 latency varies by up to 280%, so tails here
+are not reliable.
+
+- The merge adds about 3 to 6 ns per record at fan-in 1 or 2 and, with overlap,
+  19, 44 and 62 ns at 4, 8 and 16. Disjoint inputs add at most 9 ns, since the
+  same input keeps winning. Uncompressed, the same 42 ns at fan-in 8 triples the
+  cost because decoding no longer hides it.
+- Warm iteration, repositioning and prefix scans allocate nothing at any fan-in.
+  Creating a cursor allocates once.
+- Retained buffers are one block per input: 257 KiB decoded and 5 KiB of state
+  at fan-in 16, plus 1.5 MiB of Zstandard contexts, which dominate.
+- Seeks and short prefixes cost one block decode per input that can hold the
+  target: on JSON with overlap, 10 us at one run, 81 us at 8 and 170 us at 16. The merge
+  itself is negligible here, and `ratio` is 1.0 to 1.1.
+- Disjoint inputs show the limit of the index, which records only each block's
+  last key. A run entirely below the target is skipped, but a run entirely above
+  it must decode a block to find its first key. So a prefix decodes about half
+  the inputs (8.8 of 16) rather than one. Metadata holding each run's first key
+  would remove this; the format is unchanged for now.
+  Repeated plain seeks on one cursor look cheaper when disjoint (3.7 blocks at
+  16) because a run above the target keeps its first block loaded between
+  seeks. A prefix that ends releases its block, so it decodes again.
+- Long scans are 1.4 to 1.6 times the bare cost at fan-in 8 and 16 under overlap
+  and within 6% when disjoint.
+- Mixed codecs and block sizes merge correctly, and each input costs what it
+  would alone: the merge's own overhead stays near 44 ns at fan-in 8. Zstandard
+  at 64 KiB makes a seek about 3 times more expensive than at 16 KiB (254 vs
+  81 us).

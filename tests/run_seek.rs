@@ -644,3 +644,115 @@ fn cursors_match_a_reference_model() {
         }
     }
 }
+
+#[test]
+fn peek_shows_the_next_record_without_advancing() {
+    let records = numbered(300);
+    for codec in CODECS {
+        let run = build(codec, &records, SMALL_BLOCK);
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = run.cursor(&mut workspace);
+        for expected in &records {
+            let first = owned(cursor.peek().unwrap().unwrap());
+            assert_eq!(&first, expected);
+            assert_eq!(owned(cursor.peek().unwrap().unwrap()), first, "repeatable");
+            assert_eq!(owned(cursor.next_record().unwrap().unwrap()), first);
+        }
+        assert_eq!(cursor.peek().unwrap(), None);
+        assert_eq!(cursor.next_record().unwrap(), None);
+        assert_eq!(workspace.blocks_loaded(), run.block_count() as u64);
+    }
+}
+
+#[test]
+fn peek_observes_seeks_and_prefix_bounds() {
+    let records = numbered(100);
+    for codec in CODECS {
+        let run = build(codec, &records, SMALL_BLOCK);
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = run.cursor(&mut workspace);
+        cursor.seek(b"key:0050").unwrap();
+        assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[50]);
+
+        // A seek discards a head that was peeked earlier.
+        cursor.seek(b"key:0010").unwrap();
+        assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[10]);
+
+        cursor.seek_prefix(b"key:0099").unwrap();
+        assert_eq!(owned(cursor.next_record().unwrap().unwrap()), records[99]);
+        assert_eq!(cursor.peek().unwrap(), None, "the bound ends a peek");
+        assert_eq!(cursor.next_record().unwrap(), None);
+    }
+}
+
+#[test]
+fn peek_preserves_tombstones_and_empty_values() {
+    let records = vec![
+        rec(b"a", 2, None),
+        rec(b"a", 1, Some(b"")),
+        rec(b"b", 1, Some(b"v")),
+    ];
+    for codec in CODECS {
+        let run = build(codec, &records, SMALL_BLOCK);
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = run.cursor(&mut workspace);
+        for expected in &records {
+            assert_eq!(&owned(cursor.peek().unwrap().unwrap()), expected);
+            assert_eq!(&owned(cursor.next_record().unwrap().unwrap()), expected);
+        }
+    }
+}
+
+#[test]
+fn peek_reports_a_corrupt_frame_and_leaves_a_seek_able_to_recover() {
+    let records = numbered(300);
+    for codec in COMPRESSED {
+        let run = build(codec, &records, SMALL_BLOCK);
+        let mut bytes = run.as_bytes().to_vec();
+        let starts = frame_starts(&bytes);
+        bytes[starts[1] + 12] ^= 0xFF;
+        let view = RunView::open(&bytes).unwrap();
+        let bad = records
+            .iter()
+            .position(|r| view.locate(&r.0).unwrap() == Some(1))
+            .unwrap();
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = view.cursor(&mut workspace);
+        for expected in &records[..bad] {
+            assert_eq!(&owned(cursor.next_record().unwrap().unwrap()), expected);
+        }
+        assert!(cursor.peek().is_err());
+        cursor.seek(&records[0].0).unwrap();
+        assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[0]);
+    }
+}
+
+#[test]
+fn a_finished_prefix_reads_nothing_further_however_often_it_is_polled() {
+    let records = numbered(300);
+    let run = build(Codec::Zstd, &records, SMALL_BLOCK);
+    assert!(run.block_count() > 2);
+    let mut workspace = ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    cursor.seek_prefix(&records[0].0).unwrap();
+    assert_eq!(owned(cursor.next_record().unwrap().unwrap()), records[0]);
+    for _ in 0..2 * records.len() {
+        assert_eq!(cursor.peek().unwrap(), None);
+        assert_eq!(cursor.next_record().unwrap(), None);
+    }
+    assert_eq!(workspace.blocks_loaded(), 1);
+}
+
+#[test]
+fn an_oversized_prefix_discards_a_peeked_record() {
+    let records = numbered(10);
+    let run = build(Codec::Lz4, &records, SMALL_BLOCK);
+    let mut workspace = ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[0]);
+    cursor
+        .seek_prefix(&vec![b'k'; tessera::block::MAX_KEY_LEN + 1])
+        .unwrap();
+    assert_eq!(cursor.peek().unwrap(), None);
+    assert_eq!(cursor.next_record().unwrap(), None);
+}

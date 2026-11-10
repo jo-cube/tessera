@@ -9,6 +9,7 @@
 #   scripts/validate.sh bench              the block and run benchmark
 #   scripts/validate.sh geometry           run block size and codec comparison
 #   scripts/validate.sh prefix             prefix scan comparison
+#   scripts/validate.sh merge              multi-run merge measurements
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -148,6 +149,10 @@ prefix() {
   bounded prefix 900 cargo run --locked --release --example block_bench -- prefix
 }
 
+merge() {
+  bounded merge 900 cargo run --locked --release --example block_bench -- merge
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -203,7 +208,8 @@ case "$command" in
   bench) bench ;;
   geometry) geometry ;;
   prefix) prefix ;;
+  merge) merge ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,13p' "$0"; exit 2 ;;
+  *) sed -n '2,14p' "$0"; exit 2 ;;
 esac
