@@ -26,7 +26,7 @@ const RECORD_BOUND: usize = 200_000;
 const RETAINED_BOUND: usize = 512 << 20;
 const HEADER: usize = 12;
 const ENTRY: usize = 12;
-const FOOTER: usize = 28;
+const FOOTER: usize = 32;
 
 fn rec(key: &[u8], seq: u64, value: Option<&[u8]>) -> Owned {
     (key.to_vec(), seq, value.map(<[u8]>::to_vec))
@@ -256,14 +256,50 @@ fn raw_block(records: &[Owned]) -> Vec<u8> {
 
 /// Assembles a run by hand from `(codec byte, decoded length, stored bytes)`
 /// frames and index keys, with correct checksums.
+///
+/// The minimum key is taken to be the first block's last key, which suits
+/// frames whose first block has a single user key or that are not decodable.
 fn assemble_frames(
     frames: &[(u8, u32, Vec<u8>)],
     last_keys: &[&[u8]],
     record_count: u64,
 ) -> Vec<u8> {
+    let min_key = last_keys.first().copied().unwrap_or(b"");
+    assemble_frames_with_min(frames, min_key, last_keys, record_count)
+}
+
+/// Reads the first user key of an encoded block. A first record shares no
+/// prefix, so this needs only its leading varints.
+fn first_key_of(block: &[u8]) -> Option<&[u8]> {
+    fn varint(rest: &mut &[u8]) -> Option<usize> {
+        let (mut value, mut shift) = (0, 0);
+        loop {
+            let (&byte, tail) = rest.split_first()?;
+            *rest = tail;
+            value |= usize::from(byte & 0x7F).checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+    }
+    let mut rest = block;
+    varint(&mut rest)?;
+    let suffix_len = varint(&mut rest)?;
+    varint(&mut rest)?;
+    varint(&mut rest)?;
+    rest.get(..suffix_len)
+}
+
+fn assemble_frames_with_min(
+    frames: &[(u8, u32, Vec<u8>)],
+    min_key: &[u8],
+    last_keys: &[&[u8]],
+    record_count: u64,
+) -> Vec<u8> {
     let mut run = Vec::new();
     let mut table = Vec::new();
-    let mut keys = Vec::new();
+    let mut keys = min_key.to_vec();
     for ((codec, decoded_len, stored), key) in frames.iter().zip(last_keys) {
         table.extend_from_slice(&(run.len() as u64).to_le_bytes());
         let mut header = vec![*codec, 0, 0, 0];
@@ -281,7 +317,8 @@ fn assemble_frames(
     run.extend_from_slice(&index_offset.to_le_bytes());
     run.extend_from_slice(&record_count.to_le_bytes());
     run.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-    run.extend_from_slice(&2u32.to_le_bytes());
+    run.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
+    run.extend_from_slice(&3u32.to_le_bytes());
     run.extend_from_slice(b"TSRA");
     run
 }
@@ -298,7 +335,15 @@ fn assemble(codec: Codec, blocks: &[Vec<u8>], last_keys: &[&[u8]], record_count:
             )
         })
         .collect();
-    assemble_frames(&frames, last_keys, record_count)
+    // A first key above the index key would be refused on open. Clamping it
+    // lets tests of malformed blocks reach the block checks.
+    let last = last_keys.first().copied();
+    let first = blocks.first().and_then(|block| first_key_of(block));
+    let min_key = first
+        .filter(|&key| Some(key) <= last)
+        .or(last)
+        .unwrap_or(b"");
+    assemble_frames_with_min(&frames, min_key, last_keys, record_count)
 }
 
 fn three_blocks() -> Vec<Vec<u8>> {
@@ -381,15 +426,16 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
         &checksum(&header1, block1).to_le_bytes(),
         block1,
         // table: frame_offset, key_end
-        &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-        &[26, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
-        // key area
-        b"ab",
-        // footer: index_offset, record_count, block_count, version, magic
+        &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+        &[26, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
+        // key area: the minimum key, then each block's last key
+        b"aab",
+        // footer: index_offset, record_count, block_count, min_key_len, version, magic
         &[51, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0],
-        &[2, 0, 0, 0],
+        &[1, 0, 0, 0],
+        &[3, 0, 0, 0],
         b"TSRA",
     ]
     .concat();
@@ -1120,9 +1166,9 @@ fn malformed_structures_are_rejected() {
 
     #[rustfmt::skip]
     let cases: &[(&str, Mutation, RunCorruption)] = &[
-        ("magic", |b, l| b[l.footer + 27] ^= 1, InvalidMagic),
-        ("version 1", |b, l| put_u32(b, l.footer + 20, 1), UnsupportedVersion),
-        ("version 3", |b, l| put_u32(b, l.footer + 20, 3), UnsupportedVersion),
+        ("magic", |b, l| b[l.footer + 31] ^= 1, InvalidMagic),
+        ("version 2", |b, l| put_u32(b, l.footer + 24, 2), UnsupportedVersion),
+        ("version 4", |b, l| put_u32(b, l.footer + 24, 4), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),
         ("block count too large", |b, l| put_u32(b, l.footer + 16, u32::MAX), InvalidFooter),
@@ -1138,7 +1184,10 @@ fn malformed_structures_are_rejected() {
         ("key end past area", |b, l| put_u32(b, l.table + 2 * ENTRY + 8, 1 << 20), InvalidIndex),
         ("key ends decrease", |b, l| put_u32(b, l.table + ENTRY + 8, 1), InvalidIndex),
         ("key area has trailing bytes", |b, l| b.insert(l.footer, 0), InvalidIndex),
-        ("last key differs", |b, l| b[l.keys] ^= 1, InvalidIndex),
+        // The key area starts with the five bytes of the minimum key, "apple".
+        ("minimum key differs", |b, l| b[l.keys] ^= 1, InvalidKeyRange),
+        ("last key differs", |b, l| b[l.keys + 9] += 1, InvalidIndex),
+        ("last key below minimum", |b, l| b[l.keys + 5] ^= 1, InvalidKeyRange),
         ("final key differs", |b, l| b[l.footer - 1] ^= 1, InvalidIndex),
         ("record count low", |b, l| put_u64(b, l.footer + 8, 4), RecordCountMismatch),
         ("record count high", |b, l| put_u64(b, l.footer + 8, 6), RecordCountMismatch),
@@ -1520,7 +1569,8 @@ fn view_trusts_the_index_and_full_validation_does_not() {
         let l = layout(&base);
         let mut lying = base.clone();
         // "mango" becomes "aango", which is below its block's real last key.
-        lying[l.keys + 5] = b'a';
+        // It follows the minimum key and the first block's key, both "apple".
+        lying[l.keys + 10] = b'a';
 
         let view = RunView::open(&lying).unwrap();
         let mut workspace = ReadWorkspace::new();

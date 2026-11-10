@@ -119,7 +119,7 @@ fn interleave(records: &[Owned], count: usize) -> Vec<Vec<Owned>> {
 }
 
 fn frame_start(bytes: &[u8], frame: usize) -> usize {
-    let footer = bytes.len() - 28;
+    let footer = bytes.len() - 32;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let at = table + frame * 12;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
@@ -502,8 +502,9 @@ fn iteration_stops_at_a_damaged_input_without_misordering() {
 fn a_first_read_of_a_damaged_input_fails_and_keeps_failing() {
     let records = numbered(0..200);
     let inputs = interleave(&records, 2);
-    let good = build(Codec::Lz4, &inputs[0], SMALL_BLOCK);
-    let bytes = corrupt_run(Codec::Zstd, &inputs[1], 0);
+    // The damaged input holds the first key, so the first read must reach it.
+    let good = build(Codec::Lz4, &inputs[1], SMALL_BLOCK);
+    let bytes = corrupt_run(Codec::Zstd, &inputs[0], 0);
     let damaged = RunView::open(&bytes).unwrap();
     let expected = CorruptRun {
         offset: frame_start(&bytes, 0),

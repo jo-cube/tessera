@@ -115,7 +115,7 @@ fn model_live(latest: &BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>) -> Vec<Live> {
 }
 
 fn frame_start(bytes: &[u8], frame: usize) -> usize {
-    let footer = bytes.len() - 28;
+    let footer = bytes.len() - 32;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let at = table + frame * 12;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize

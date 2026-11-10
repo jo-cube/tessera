@@ -9,6 +9,7 @@ use super::reader::{ReadWorkspace, RunCursor, RunView};
 pub struct MergeWorkspace {
     runs: Vec<ReadWorkspace>,
     heap: Vec<usize>,
+    pending: Vec<usize>,
 }
 
 impl MergeWorkspace {
@@ -82,6 +83,9 @@ pub struct MergeCursor<'a> {
     /// A binary min-heap of input positions holding a head. Heads live in the
     /// cursors, so the heap holds no keys of its own.
     heap: &'a mut Vec<usize>,
+    /// Inputs not decoded yet, largest first key first. Each joins the heap
+    /// when the merge reaches its first key.
+    pending: &'a mut Vec<usize>,
     positioned: bool,
     /// Whether the heap's first entry has been yielded and not yet advanced.
     yielded: bool,
@@ -103,6 +107,7 @@ impl<'a> MergeCursor<'a> {
         let MergeWorkspace {
             runs: workspaces,
             heap,
+            pending,
         } = workspace;
         Self {
             cursors: runs
@@ -110,6 +115,7 @@ impl<'a> MergeCursor<'a> {
                 .map(|(run, workspace)| run.cursor(workspace))
                 .collect(),
             heap,
+            pending,
             positioned: false,
             yielded: false,
             failure: None,
@@ -119,10 +125,11 @@ impl<'a> MergeCursor<'a> {
     /// Moves every input before its first record at or above `target` and
     /// iterates without a bound.
     ///
-    /// An input whose keys are all below `target` is skipped without decoding,
-    /// and every other input decodes one block to read its head. If this
-    /// fails, [`next_record`](Self::next_record) reports the same error until a
-    /// later seek succeeds.
+    /// An input whose keys are all below `target` is skipped without decoding.
+    /// An input whose keys are all at or above `target` waits, undecoded, until
+    /// the merge reaches its first key. Any other input decodes one block. If
+    /// this fails, [`next_record`](Self::next_record) reports the same error
+    /// until a later seek succeeds.
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.reposition(|cursor| cursor.seek(target))
     }
@@ -213,13 +220,19 @@ impl<'a> MergeCursor<'a> {
         } else if self.yielded {
             self.advance_at(0)?;
         }
+        self.admit_pending()?;
         self.yielded = !self.heap.is_empty();
         Ok(())
     }
 
     fn build_heap(&mut self) -> Result<(), CorruptRun> {
         self.heap.clear();
+        self.pending.clear();
         for (input, cursor) in self.cursors.iter_mut().enumerate() {
+            if cursor.deferred_key().is_some() {
+                self.pending.push(input);
+                continue;
+            }
             cursor.fill_head()?;
             if cursor.head_key().is_some() {
                 self.heap.push(input);
@@ -227,6 +240,34 @@ impl<'a> MergeCursor<'a> {
         }
         for at in (0..self.heap.len() / 2).rev() {
             sift_down(self.heap, &self.cursors, at);
+        }
+        let cursors = &self.cursors;
+        self.pending
+            .sort_unstable_by(|&a, &b| cursors[b].deferred_key().cmp(&cursors[a].deferred_key()));
+        Ok(())
+    }
+
+    /// Decodes every waiting input whose first key could sort before or tie
+    /// with the current first record. A tie matters: the waiting input may hold
+    /// a newer version of that key.
+    fn admit_pending(&mut self) -> Result<(), CorruptRun> {
+        while let Some(&input) = self.pending.last() {
+            let first = self.cursors[input].deferred_key();
+            let root = self.heap.first();
+            let waits = root.is_some_and(|&root| {
+                let key = self.cursors[root].head_key().map(|(key, _)| key);
+                first > key
+            });
+            if waits {
+                break;
+            }
+            self.pending.pop();
+            self.cursors[input].fill_head()?;
+            if self.cursors[input].head_key().is_some() {
+                let at = self.heap.len();
+                self.heap.push(input);
+                sift_up(self.heap, &self.cursors, at);
+            }
         }
         Ok(())
     }
@@ -241,6 +282,18 @@ impl<'a> MergeCursor<'a> {
         }
         sift_down(self.heap, &self.cursors, at);
         Ok(())
+    }
+}
+
+/// Restores the heap above `at`. Every entry must hold a head.
+fn sift_up(heap: &mut [usize], cursors: &[RunCursor<'_>], mut at: usize) {
+    while at > 0 {
+        let parent = (at - 1) / 2;
+        if !precedes(cursors, heap[at], heap[parent]) {
+            return;
+        }
+        heap.swap(at, parent);
+        at = parent;
     }
 }
 

@@ -39,6 +39,7 @@ pub struct RunBuilder {
     frames: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
+    min_key_len: usize,
     record_count: usize,
 }
 
@@ -67,6 +68,7 @@ impl RunBuilder {
             frames: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
+            min_key_len: 0,
             record_count: 0,
         }
     }
@@ -87,6 +89,11 @@ impl RunBuilder {
         // the target and the record is below the target. The target is at most
         // a quarter of the block limit, so BlockFull cannot occur here.
         self.block.append(user_key, seq, value)?;
+        if self.record_count == 0 {
+            // Records arrive in key order, so the first is the smallest.
+            self.keys.extend_from_slice(user_key);
+            self.min_key_len = user_key.len();
+        }
         self.record_count += 1;
         Ok(())
     }
@@ -118,6 +125,8 @@ impl RunBuilder {
         data.extend_from_slice(&(self.record_count as u64).to_le_bytes());
         // has_room_for_block keeps the block count within u32.
         data.extend_from_slice(&(block_count as u32).to_le_bytes());
+        // A key is at most MAX_KEY_LEN.
+        data.extend_from_slice(&(self.min_key_len as u32).to_le_bytes());
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         data.shrink_to_fit();

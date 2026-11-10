@@ -11,6 +11,7 @@
 #   scripts/validate.sh prefix             prefix scan comparison
 #   scripts/validate.sh merge              multi-run merge measurements
 #   scripts/validate.sh logical            latest-state read measurements
+#   scripts/validate.sh ranges             key-range pruning measurements
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -158,6 +159,10 @@ logical() {
   bounded logical 900 cargo run --locked --release --example block_bench -- logical
 }
 
+ranges() {
+  bounded ranges 900 cargo run --locked --release --example block_bench -- ranges
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -215,7 +220,8 @@ case "$command" in
   prefix) prefix ;;
   merge) merge ;;
   logical) logical ;;
+  ranges) ranges ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
 esac

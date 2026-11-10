@@ -379,7 +379,7 @@ fn prefix_scans_stop_without_loading_later_blocks() {
 }
 
 fn frame_starts(bytes: &[u8]) -> Vec<usize> {
-    let footer = bytes.len() - 28;
+    let footer = bytes.len() - 32;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let count = u32::from_le_bytes(bytes[footer + 16..footer + 20].try_into().unwrap()) as usize;
     (0..count)
@@ -503,13 +503,15 @@ fn an_unknown_codec_fails_a_seek_in_any_run() {
         let view = RunView::open(&bytes).unwrap();
         let mut workspace = ReadWorkspace::new();
         let mut cursor = view.cursor(&mut workspace);
-        assert_eq!(
-            cursor.seek(&records[0].0),
-            Err(CorruptRun {
-                offset: starts[0],
-                kind: RunCorruption::UnsupportedCodec
-            })
-        );
+        let expected = CorruptRun {
+            offset: starts[0],
+            kind: RunCorruption::UnsupportedCodec,
+        };
+        // A seek at the first key decodes nothing, so the read reports it.
+        cursor.seek(&records[0].0).unwrap();
+        assert_eq!(cursor.next_record(), Err(expected));
+        // A target inside the block has to read it during the seek.
+        assert_eq!(cursor.seek(&records[1].0), Err(expected));
     }
 }
 
@@ -755,4 +757,16 @@ fn an_oversized_prefix_discards_a_peeked_record() {
         .unwrap();
     assert_eq!(cursor.peek().unwrap(), None);
     assert_eq!(cursor.next_record().unwrap(), None);
+}
+
+#[test]
+fn seeking_to_the_first_key_reuses_a_first_block_already_held() {
+    let records = numbered(100);
+    let run = build(Codec::Zstd, &records, SMALL_BLOCK);
+    let mut workspace = ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    assert_eq!(owned(cursor.next_record().unwrap().unwrap()), records[0]);
+    cursor.seek(&records[0].0).unwrap();
+    assert_eq!(owned(cursor.next_record().unwrap().unwrap()), records[0]);
+    assert_eq!(workspace.blocks_loaded(), 1);
 }

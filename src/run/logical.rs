@@ -149,10 +149,10 @@ impl<'a> RunSet<'a> {
     /// Returns the latest value of `key`, or `None` if it is absent or its
     /// newest version is a tombstone.
     ///
-    /// Every run is consulted, because any of them may hold the newest
-    /// version. A run whose keys are all below `key` decodes nothing and every
-    /// other run decodes one block. Once the workspace has grown to the largest
-    /// block read, this performs no heap allocation.
+    /// Every run whose key range holds `key` decodes one block, because any
+    /// of them may hold the newest version. A run outside that range decodes
+    /// nothing, so damage in it cannot fail this lookup. Once the workspace has
+    /// grown to the largest block read, this performs no heap allocation.
     pub fn get<'r>(
         self,
         key: &[u8],

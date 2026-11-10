@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 4B
+## Status: Milestone 4C
 
 Two physical storage layers exist.
 
@@ -24,7 +24,10 @@ at most one block. `Run::cursor` iterates across blocks; `RunCursor::seek` moves
 to the first key at or above a target and `RunCursor::seek_prefix` iterates only
 while keys share a prefix, both yielding every stored version. `Run::new`
 validates untrusted bytes completely. `RunView` offers the same reads on bytes
-already known to be valid.
+already known to be valid. Each run stores its smallest key once, beside the index,
+and reuses the last block's index key as its largest, so `key_range`
+reports both bounds without decoding anything. `Run::new` checks them against
+the records.
 
 `MergeCursor` merges several runs, which may overlap and use different codecs
 and block sizes, into one stream in internal-key order, with the same `seek` and
@@ -32,6 +35,7 @@ and block sizes, into one stream in internal-key order, with the same `seek` and
 every copy of an internal key found in more than one run, in input order. Only
 `MergeWorkspace` holds its state, one decoded block per input, and returned
 records borrow from it, so iteration copies no values and allocates nothing.
+An input is not decoded until the merge reaches its smallest key.
 
 `RunSet` reads a fixed collection of runs as the latest state of each key:
 `get` for one key, and a cursor with `seek` and `seek_prefix` for live keys in
@@ -39,6 +43,7 @@ order. The newest sequence number decides a key, and a tombstone hides it.
 Identical copies of a record count once. Copies that differ fail the read
 with `ReadError::ConflictingCopies`, because run order must not choose a winner.
 There are no snapshots: a reader sees the newest version only.
+Key ranges exclude runs that cannot hold a key or prefix, without decoding them.
 
 The byte formats and their invariants are documented in
 [`src/block/mod.rs`](src/block/mod.rs) and [`src/run/mod.rs`](src/run/mod.rs).
@@ -63,6 +68,7 @@ scripts/validate.sh geometry # run block size and codec comparison
 scripts/validate.sh prefix   # prefix scan comparison
 scripts/validate.sh merge    # multi-run merge measurements
 scripts/validate.sh logical  # latest-state read measurements
+scripts/validate.sh ranges   # key-range pruning measurements
 colima stop
 ```
 

@@ -59,11 +59,18 @@ impl<B: AsRef<[u8]>> Run<B> {
         self.view().block_count()
     }
 
+    /// Returns the smallest and largest user keys, or `None` for an empty run.
+    /// Decodes nothing.
+    pub fn key_range(&self) -> Result<Option<KeyRange<'_>>, CorruptRun> {
+        self.view().key_range()
+    }
+
     /// Returns the newest version of `user_key`, which may be a tombstone, or
     /// `None` if the run has no record for that key.
     ///
-    /// Decodes at most one block. Once the workspace has grown to the largest
-    /// block read, this performs no heap allocation.
+    /// Decodes at most one block, and none for a key outside the run's range.
+    /// Once the workspace has grown to the largest block read, this performs
+    /// no heap allocation.
     pub fn get<'r>(
         &'r self,
         user_key: &[u8],
@@ -88,6 +95,15 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_ref()
     }
+}
+
+/// A run's smallest and largest user keys, bytewise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyRange<'a> {
+    /// The user key of the run's first record.
+    pub min: &'a [u8],
+    /// The user key of the run's last record.
+    pub max: &'a [u8],
 }
 
 /// Reusable storage for reading runs, created once per reader.
@@ -255,10 +271,14 @@ impl<'a> RunCursor<'a> {
     /// `0xFF` bytes needs no special handling. That key must be read to be
     /// seen, so a prefix whose last match ends a block loads the next block.
     /// A seek clears any bound set earlier.
+    ///
+    /// A run whose keys all sort below or above the prefix's interval decodes
+    /// nothing, so damage in that run is not noticed by this scan.
     pub fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
         self.workspace.prefix.clear();
-        if prefix.len() > MAX_KEY_LEN {
-            // No stored key is that long, and the buffer stays bounded.
+        if prefix.len() > MAX_KEY_LEN || self.view.min_above_prefix(prefix) {
+            // No key in this run can match. An oversized prefix is refused
+            // here so the buffer stays bounded.
             self.failure = None;
             self.finish();
             return Ok(());
@@ -278,6 +298,16 @@ impl<'a> RunCursor<'a> {
     }
 
     fn position_at(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
+        let first_block_held = self.loaded.is_some() && self.next_block == 1;
+        if !self.view.table.is_empty() && target <= self.view.min_key && !first_block_held {
+            // The whole run is at or above the target, so its first record is
+            // the answer and no block has to be decoded to find that out.
+            self.head = None;
+            self.loaded = None;
+            self.next_block = 0;
+            self.workspace.position.reset();
+            return Ok(());
+        }
         let Some(index) = self.view.locate(target)? else {
             self.finish();
             return Ok(());
@@ -365,6 +395,14 @@ impl<'a> RunCursor<'a> {
             .map(|head| (self.workspace.position.key(), head.seq))
     }
 
+    /// Returns the run's first key if nothing has been decoded since the
+    /// cursor stood before its first record, so that decoding can wait until
+    /// the merge reaches that key.
+    pub(super) fn deferred_key(&self) -> Option<&'a [u8]> {
+        // Loading any block advances `next_block`, so zero means none has been.
+        (self.next_block == 0).then_some(self.view.min_key)
+    }
+
     /// Returns the held head, if any.
     pub(super) fn head_record(&self) -> Option<Record<'_>> {
         self.head.map(|head| self.record_of(head))
@@ -445,21 +483,22 @@ pub struct RunView<'a> {
     frames: &'a [u8],
     table: &'a [[u8; TABLE_ENTRY_LEN]],
     keys: &'a [u8],
+    min_key: &'a [u8],
     record_count: usize,
 }
 
 impl<'a> RunView<'a> {
-    /// Checks the footer and the ends of the index in constant time and
-    /// returns a view of `bytes`.
+    /// Checks the footer and the ends of the index and returns a view of
+    /// `bytes`. The cost does not depend on the run's length.
     pub fn open(bytes: &'a [u8]) -> Result<Self, CorruptRun> {
         let Some((body, footer)) = bytes.split_last_chunk::<FOOTER_LEN>() else {
             return Err(corrupt(0, RunCorruption::Truncated));
         };
         let footer_offset = body.len();
-        if read_u32(footer, 24) != MAGIC {
+        if read_u32(footer, 28) != MAGIC {
             return Err(corrupt(footer_offset, RunCorruption::InvalidMagic));
         }
-        if read_u32(footer, 20) != FORMAT_VERSION {
+        if read_u32(footer, 24) != FORMAT_VERSION {
             return Err(corrupt(footer_offset, RunCorruption::UnsupportedVersion));
         }
 
@@ -474,11 +513,16 @@ impl<'a> RunView<'a> {
             .and_then(|table_len| index.split_at_checked(table_len))
             .ok_or(invalid_footer)?;
         let table: &[[u8; TABLE_ENTRY_LEN]] = table.as_chunks().0;
+        let min_key = Some(read_u32(footer, 20) as usize)
+            .filter(|&len| len <= MAX_KEY_LEN)
+            .and_then(|len| keys.get(..len))
+            .ok_or(invalid_footer)?;
 
         let view = Self {
             frames,
             table,
             keys,
+            min_key,
             record_count,
         };
         match (table.first(), table.last()) {
@@ -488,6 +532,9 @@ impl<'a> RunView<'a> {
                 }
                 if key_end(last) != keys.len() {
                     return Err(view.invalid_index(table.len() - 1));
+                }
+                if view.last_key(0)? < min_key {
+                    return Err(view.invalid_key_range());
                 }
             }
             _ if frames.is_empty() && keys.is_empty() && record_count == 0 => {}
@@ -516,6 +563,27 @@ impl<'a> RunView<'a> {
         size_of_val(self.table) + self.keys.len()
     }
 
+    /// Returns the smallest and largest user keys, or `None` for an empty run.
+    /// Decodes nothing.
+    pub fn key_range(self) -> Result<Option<KeyRange<'a>>, CorruptRun> {
+        let Some(last) = self.table.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        Ok(Some(KeyRange {
+            min: self.min_key,
+            max: self.last_key(last)?,
+        }))
+    }
+
+    /// Returns whether every key sorts above all keys with `prefix`.
+    ///
+    /// Keys with a prefix are contiguous. A key above the prefix that does not
+    /// start with it is above that whole interval, which needs no successor
+    /// of the prefix, so a prefix of `0xFF` bytes needs no special case.
+    fn min_above_prefix(self, prefix: &[u8]) -> bool {
+        !self.table.is_empty() && self.min_key > prefix && !self.min_key.starts_with(prefix)
+    }
+
     /// Returns the index of the only block that can contain `target`, or
     /// `None` if `target` sorts after every key in the run.
     ///
@@ -538,8 +606,10 @@ impl<'a> RunView<'a> {
     /// Returns the newest version of `target`, which may be a tombstone, or
     /// `None` if the run has no record for that key.
     ///
-    /// Decodes at most one block and never walks it. Once the workspace has
-    /// grown to the largest block read, this performs no heap allocation.
+    /// Decodes at most one block and never walks it, and none for a key
+    /// outside the run's range, so damage in such a run is not noticed by this
+    /// lookup. Once the workspace has grown to the largest block read, this
+    /// performs no heap allocation.
     pub fn get<'r>(
         self,
         target: &[u8],
@@ -548,6 +618,9 @@ impl<'a> RunView<'a> {
     where
         'a: 'r,
     {
+        if target < self.min_key {
+            return Ok(None);
+        }
         let Some(block) = self.locate(target)? else {
             return Ok(None);
         };
@@ -579,7 +652,7 @@ impl<'a> RunView<'a> {
     fn last_key(self, block: usize) -> Result<&'a [u8], CorruptRun> {
         let start = match block.checked_sub(1) {
             Some(previous) => key_end(self.table[previous]),
-            None => 0,
+            None => self.min_key.len(),
         };
         self.keys
             .get(start..key_end(self.table[block]))
@@ -600,6 +673,13 @@ impl<'a> RunView<'a> {
             .and_then(<[u8]>::split_first_chunk::<{ frame::HEADER_LEN }>)
             .ok_or(self.invalid_index(block))?;
         Frame::parse(start, header, stored)
+    }
+
+    fn invalid_key_range(self) -> CorruptRun {
+        corrupt(
+            self.frames.len() + size_of_val(self.table),
+            RunCorruption::InvalidKeyRange,
+        )
     }
 
     fn invalid_index(self, block: usize) -> CorruptRun {
@@ -646,6 +726,16 @@ fn validate(bytes: &[u8]) -> Result<(), CorruptRun> {
             .map_err(|error| frame.block_error(error))?;
         if walk.record_count == records_before {
             return Err(frame.error(RunCorruption::EmptyBlock));
+        }
+        if block == 0 {
+            let opened = BlockView::open(decoded).map_err(|error| frame.block_error(error))?;
+            let mut position = BlockPosition::new();
+            let first = position
+                .next_record(opened)
+                .map_err(|error| frame.block_error(error))?;
+            if first.map(|record| record.key) != Some(view.min_key) {
+                return Err(view.invalid_key_range());
+            }
         }
         if view.last_key(block)? != walk.key {
             return Err(view.invalid_index(block));

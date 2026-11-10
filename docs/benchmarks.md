@@ -162,8 +162,8 @@ of Zstandard at 16 KiB, plus a mix of codecs and block sizes at 8. Run it with
 - `bare`, `merge` and `logical` time the same records alone, physically merged
   and filtered. `filter` is `logical` minus `merge`, per physical record.
 - `ranged` repeats a read over only the runs whose key range could hold the
-  target. It is a comparison from the benchmark's own knowledge of the data;
-  no such metadata exists.
+  target, using the benchmark's own knowledge of the data. It predates key
+  range metadata; `ranges` below measures the real thing.
 - Every result is checked against the input records.
 
 ### Findings
@@ -187,9 +187,55 @@ unreliable, with p99 varying by up to 154%.
   keys cost the same, since every run must be consulted.
 - A prefix returning a few keys costs about the same as a lookup. The logical
   scan is within 1% of the physical one until scans are long.
-- Knowing each run's key range would matter for disjoint and partly overlapping
-  runs and not at all for full overlap. At 16 runs a disjoint lookup falls from
-  77 to 10 us (9 blocks to 1) and a short prefix from 70 to 10 us. Partial
-  overlap improves from 119 to 89 us. Long prefix scans gain 15 to 22%.
+- These figures were taken before runs stored a key range. A simulation of
+  pruning at 16 runs predicted a disjoint lookup falling from 77 to 10 us;
+  `ranges` below confirms it.
 - Retained buffers grow with fan-in: 257 KiB decoded and 5 KiB of state at 16
   runs, plus the 94 KiB Zstandard context per input outside these figures.
+
+## Key-range pruning
+
+`block_bench ranges` splits 32 MiB of logical data across 1, 2, 4, 8 and 16 runs
+of Zstandard at 16 KiB, with unique keys and with version chains, in the
+`disjoint`, `partial` and `overlap` layouts above. It measures hits, misses,
+short and medium prefixes and forward seeks through `RunSet`, using only API that
+existed before runs stored a key range, so the same harness runs on older code.
+Run it with `scripts/validate.sh ranges`.
+
+### Findings
+
+Same reference environment, three alternating passes of format 2 and format 3
+code. Medians differ between passes by a median of 3.5% and at most 9.8%. Warm
+reads allocate nothing in any cell.
+
+At 16 runs, with times in microseconds and blocks decoded per query:
+
+| layout, unique keys | read | before | after | blocks before | blocks after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| disjoint | hit | 71.9 | 10.3 | 8.43 | 1.00 |
+| disjoint | miss | 66.9 | 10.3 | 7.82 | 1.00 |
+| disjoint | short prefix | 70.1 | 10.5 | 8.17 | 1.00 |
+| disjoint | medium prefix | 89.8 | 28.7 | 9.62 | 2.23 |
+| disjoint | forward seek | 30.0 | 10.5 | 3.31 | 1.00 |
+| partial | hit | 117.0 | 90.3 | 11.98 | 8.54 |
+| partial | miss | 114.4 | 89.2 | 11.63 | 8.45 |
+| partial | forward seek | 99.1 | 89.5 | 9.65 | 8.48 |
+| overlap | hit | 169.3 | 171.5 | 16.00 | 16.00 |
+| overlap | miss | 168.6 | 169.7 | 16.00 | 16.00 |
+| overlap | medium prefix | 200.3 | 202.5 | 16.00 | 16.00 |
+
+- A read of disjoint runs no longer grows with the number of runs: 10.2 to 10.3 us
+  at 4, 8 and 16 runs, against 22.5, 38.5 and 71.9 us before.
+- Version chains behave the same way, with a disjoint hit going from 66.5 to
+  9.5 us.
+- Full overlap gains nothing and costs about 1% at most. One run costs 0 to 4%.
+- A run grows by its smallest key plus 4 bytes: 22 bytes here for unique keys.
+  Stored bytes per record are unchanged at three decimal places.
+- A full physical merge, over three alternating passes, is 0.97 to 1.02 times
+  its earlier time at every fan-in except four overlapping runs, which is 1.08
+  to 1.10 times slower (98.1 to 106.0 ns per record for JSON). Passes do not
+  explain that, and disabling deferred admission did not remove it. Its cause
+  is unknown.
+- A seek in a physical merge of 16 disjoint runs falls from 33.0 to 10.3 us.
+- Ranges reduce the runs consulted, not the cost of the runs that remain, so
+  fully overlapping runs need fan-in control or Bloom filters.

@@ -4,6 +4,7 @@
 //! With the argument `prefix`, instead compares prefix scans over those sizes.
 //! With the argument `merge`, instead measures merged iteration over many runs.
 //! With the argument `logical`, instead measures latest-state reads over runs.
+//! With the argument `ranges`, instead measures reads that key ranges can prune.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -107,6 +108,9 @@ impl Owned {
 
 /// Sequence numbers start high enough to take a realistic six-byte varint.
 const BASE_SEQ: u64 = 1 << 40;
+
+/// A run's footer length, which depends on the format version.
+const FOOTER_LEN: usize = 32;
 
 /// Yields sorted records until the block would reach `target` encoded bytes.
 fn fill(target: usize, mut next: impl FnMut(u64) -> Vec<Owned>) -> Vec<Owned> {
@@ -443,7 +447,7 @@ type StoredFrame<'a> = (u8, usize, &'a [u8], &'a [u8]);
 /// Every frame of a run, from the documented layout, so codec costs can be
 /// timed apart from the reader.
 fn frames(bytes: &[u8]) -> Vec<StoredFrame<'_>> {
-    let footer = bytes.len() - 28;
+    let footer = bytes.len() - FOOTER_LEN;
     let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
     let table = u64_at(footer);
@@ -770,7 +774,7 @@ fn measure_geometry(
     let blocks = stored.len();
     let stored_bytes: usize = stored.iter().map(|f| f.2.len()).sum();
     let headers = 12 * blocks;
-    let index = view.index_len() + 28;
+    let index = view.index_len() + FOOTER_LEN;
     println!(
         "| {dataset} | {kib} | {label} | {} | {} | {blocks} | {} | {stored_bytes} | {headers} | {index} | {build_ns:.1} | {validate_ns:.1} | {scan_ns:.1} | {locate_ns:.0} | {checksum_ns:.0} | {decompress_ns:.0} | {search_ns:.0} | {get_ns:.0} | {} | {} | {} | {} | {miss_ns:.0} | {warm_allocs} | {build_peak} |",
         records.len(),
@@ -1370,7 +1374,7 @@ fn prefix_summary(dataset: &str, kib: usize, label: &str, codec: Codec, records:
         run.as_bytes().len(),
         run.as_bytes().len() as f64 / records.len() as f64,
         run.block_count(),
-        run.view().index_len() + 28,
+        run.view().index_len() + FOOTER_LEN,
         12 * run.block_count(),
         logical as f64 / records.len() as f64 / scan_ns * 1000.0,
         workspace.capacity(),
@@ -2194,12 +2198,217 @@ fn logical_reads() {
     }
 }
 
+const RANGE_FANS: [usize; 5] = [1, 2, 4, 8, 16];
+
+/// Measures one configuration through the public read API alone, so that the
+/// same code can time a build from before key ranges existed.
+fn measure_ranges(
+    config: &MergeConfig<'_>,
+    records: &[Owned],
+    buckets: &[(&'static str, Vec<Vec<u8>>)],
+    queries: &mut Vec<String>,
+) {
+    let MergeConfig {
+        dataset,
+        layout,
+        shape,
+        fan,
+        assign,
+        shapes,
+    } = *config;
+    let runs = build_inputs(records, fan, assign, shapes);
+    let views: Vec<RunView<'_>> = runs.iter().map(Run::view).collect();
+    let set = RunSet::new(&views);
+    let (live, _) = latest_live(records);
+
+    let before_live = LIVE.load(Ordering::Relaxed);
+    let mut workspace = LogicalWorkspace::new();
+    {
+        let mut cursor = set.cursor(&mut workspace);
+        assert_eq!(drain_logical(&mut cursor), live.len());
+    }
+    let retained = LIVE.load(Ordering::Relaxed) - before_live;
+
+    let stored: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
+    let metadata: usize = views.iter().map(|view| view.index_len() + FOOTER_LEN).sum();
+    println!(
+        "| {dataset} | {layout} | {fan} | {shape} | {} | {stored} | {:.1} | {:.3} | {retained} | {:.3} |",
+        records.len(),
+        metadata as f64 / fan as f64,
+        stored as f64 / records.len() as f64,
+        (stored as f64 + retained as f64) / records.len() as f64,
+    );
+
+    let mut rng = Rng(59);
+    let mut pick = || -> Vec<Vec<u8>> {
+        (0..MERGE_PROBES)
+            .map(|_| live[(rng.next() % live.len() as u64) as usize].key.clone())
+            .collect()
+    };
+    let hits = pick();
+    let misses: Vec<Vec<u8>> = pick()
+        .into_iter()
+        .map(|key| [key.as_slice(), b"~"].concat())
+        .collect();
+    let seeks = pick();
+    let bucket = |name: &str| -> &[Vec<u8>] {
+        let (_, probes) = buckets.iter().find(|(label, _)| *label == name).unwrap();
+        &probes[..MERGE_PROBES]
+    };
+
+    let row = |query: &str, ns: f64, blocks: f64, allocs: u64, queries: &mut Vec<String>| {
+        queries.push(format!(
+            "| {dataset} | {layout} | {fan} | {shape} | {query} | {ns:.0} | {blocks:.2} | {allocs} |"
+        ));
+    };
+
+    for (query, probes, present) in [("hit", &hits, true), ("miss", &misses, false)] {
+        for key in probes {
+            assert_eq!(set.get(key, &mut workspace).unwrap().is_some(), present);
+        }
+        let before = workspace.blocks_loaded();
+        for key in probes {
+            black_box(set.get(key, &mut workspace).unwrap());
+        }
+        let blocks = (workspace.blocks_loaded() - before) as f64 / probes.len() as f64;
+        let ns = median_ns_of(MERGE_ROUNDS, probes.len(), || {
+            for key in probes {
+                black_box(set.get(black_box(key), &mut workspace).unwrap());
+            }
+        });
+        let allocs = allocations_during(|| {
+            for key in probes {
+                black_box(set.get(key, &mut workspace).unwrap());
+            }
+        });
+        row(query, ns, blocks, allocs, queries);
+    }
+
+    let matching_live = |prefix: &[u8]| {
+        let start = live.partition_point(|r| r.key.as_slice() < prefix);
+        live[start..].partition_point(|r| r.key.starts_with(prefix))
+    };
+    let prefixes = [
+        ("short prefix", bucket("1-5 records")),
+        ("medium prefix", bucket("100-250 records")),
+    ];
+    for (query, probes) in prefixes {
+        let expected: usize = probes.iter().map(|prefix| matching_live(prefix)).sum();
+        let before = workspace.blocks_loaded();
+        let (ns, allocs) = {
+            let mut cursor = set.cursor(&mut workspace);
+            let mut returned = 0;
+            for prefix in probes {
+                cursor.seek_prefix(prefix).unwrap();
+                returned += drain_logical(&mut cursor);
+            }
+            assert_eq!(returned, expected, "{dataset} {layout} {fan} {query}");
+            let ns = median_ns_of(MERGE_ROUNDS, probes.len(), || {
+                for prefix in probes {
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_logical(&mut cursor));
+                }
+            });
+            let allocs = allocations_during(|| {
+                for prefix in probes {
+                    cursor.seek_prefix(black_box(prefix)).unwrap();
+                    black_box(drain_logical(&mut cursor));
+                }
+            });
+            (ns, allocs)
+        };
+        let passes = (MERGE_ROUNDS + 2) * probes.len();
+        let blocks = (workspace.blocks_loaded() - before) as f64 / passes as f64;
+        row(query, ns, blocks, allocs, queries);
+    }
+
+    // A seek followed by the record it lands on, since a positioned input may
+    // not be decoded until it is read.
+    let before = workspace.blocks_loaded();
+    let (ns, allocs) = {
+        let mut cursor = set.cursor(&mut workspace);
+        for key in &seeks {
+            cursor.seek(key).unwrap();
+            assert_eq!(
+                cursor.next_record().unwrap().map(|r| r.key),
+                Some(key.as_slice())
+            );
+        }
+        let ns = median_ns_of(MERGE_ROUNDS, seeks.len(), || {
+            for key in &seeks {
+                cursor.seek(black_box(key)).unwrap();
+                black_box(cursor.next_record().unwrap());
+            }
+        });
+        let allocs = allocations_during(|| {
+            for key in &seeks {
+                cursor.seek(black_box(key)).unwrap();
+                black_box(cursor.next_record().unwrap());
+            }
+        });
+        (ns, allocs)
+    };
+    let passes = (MERGE_ROUNDS + 2) * seeks.len();
+    let blocks = (workspace.blocks_loaded() - before) as f64 / passes as f64;
+    row("forward seek", ns, blocks, allocs, queries);
+}
+
+fn range_reads() {
+    println!(
+        "reads that key ranges can prune; {} MiB of logical data per dataset; {MERGE_ROUNDS} rounds, {MERGE_PROBES} seeded probes per round",
+        GEOMETRY_BYTES >> 20
+    );
+    println!(
+        "metadata = table, key area and footer per run; resident = stored plus retained Rust heap per record; Zstandard contexts are outside both"
+    );
+    println!();
+    let datasets: [(&str, Fixture); 2] = [("unique", tree_json), ("versions", tree_versions)];
+    let layouts: [(&str, Assign); 3] = [
+        ("disjoint", assign_disjoint),
+        ("partial", assign_partial),
+        ("overlap", assign_overlapping),
+    ];
+    println!(
+        "| dataset | layout | runs | shape | records | stored bytes | metadata bytes per run | stored per record | retained bytes | resident per record |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    let mut queries = Vec::new();
+    for (dataset, make) in datasets {
+        let records = make(GEOMETRY_BYTES);
+        let buckets = prefix_buckets(&records);
+        for (layout, assign) in layouts {
+            for fan in RANGE_FANS {
+                measure_ranges(
+                    &MergeConfig {
+                        dataset,
+                        layout,
+                        shape: "zstd-16",
+                        fan,
+                        assign,
+                        shapes: &[ZSTD_16],
+                    },
+                    &records,
+                    &buckets,
+                    &mut queries,
+                );
+            }
+        }
+    }
+    println!();
+    println!("| dataset | layout | runs | shape | query | ns | blocks | allocs |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for row in &queries {
+        println!("{row}");
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
         Some("prefix") => return prefix_scans(),
         Some("merge") => return merge_scans(),
         Some("logical") => return logical_reads(),
+        Some("ranges") => return range_reads(),
         _ => {}
     }
 

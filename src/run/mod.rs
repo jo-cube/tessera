@@ -87,10 +87,10 @@
 //!
 //! table    := entry*                 one per frame, in key order
 //! entry    := frame_offset:u64 key_end:u32
-//! key_area := the concatenated last user key of each block
+//! key_area := min_key last_key*      min_key_len bytes, then one per block
 //!
 //! footer   := index_offset:u64 record_count:u64 block_count:u32
-//!             version:u32 magic:u32
+//!             min_key_len:u32 version:u32 magic:u32
 //! ```
 //!
 //! `stored` decodes to one block in the [block format](crate::block#format)
@@ -103,8 +103,10 @@
 //!
 //! A frame's stored length is implied by the next frame's offset, or by
 //! `index_offset` for the last frame. Block `i`'s last user key is
-//! `key_area[key_end[i - 1]..key_end[i]]`, with `key_end[-1]` taken as 0. The
-//! footer is last, so a run can be written as a stream.
+//! `key_area[key_end[i - 1]..key_end[i]]`, with `key_end[-1]` taken as
+//! `min_key_len`. The run's smallest user key is `key_area[..min_key_len]` and
+//! its largest is the last block's key, so a run's key range is read without
+//! decoding anything. The footer is last, so a run can be written as a stream.
 //!
 //! Invariants of a valid run, all checked by [`Run::new`]:
 //!
@@ -116,6 +118,8 @@
 //! - Internal keys strictly increase across the entire run, including from the
 //!   last record of one block to the first record of the next.
 //! - Each block's index key equals the user key of its last record.
+//! - `min_key` equals the user key of the first record, and an empty run has
+//!   `min_key_len` zero.
 //! - `record_count` equals the total number of records.
 //!
 //! Where blocks are cut is a builder policy and is not part of the format.
@@ -141,7 +145,7 @@ pub use logical::{
     ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunSet,
 };
 pub use merge::{MergeCursor, MergeWorkspace};
-pub use reader::{ReadWorkspace, Run, RunCursor, RunView};
+pub use reader::{KeyRange, ReadWorkspace, Run, RunCursor, RunView};
 
 /// Encoded block length that [`RunBuilder::new`] aims for. Provisional: see
 /// `docs/benchmarks.md` for the measurements behind it.
@@ -153,9 +157,9 @@ pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 pub const MAX_TARGET_BLOCK_LEN: usize = crate::block::MAX_BLOCK_LEN / 4;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const TABLE_ENTRY_LEN: usize = 12;
-const FOOTER_LEN: usize = 28;
+const FOOTER_LEN: usize = 32;
 
 /// Reads a little-endian `u32` from a fixed-size structure.
 fn read_u32<const N: usize>(bytes: &[u8; N], at: usize) -> u32 {
@@ -191,6 +195,8 @@ pub enum RunCorruption {
     InvalidFooter,
     /// A table entry, or the key it delimits, does not match the frames.
     InvalidIndex,
+    /// The stored minimum key does not match the run's records.
+    InvalidKeyRange,
     /// A frame header is inconsistent with its frame.
     InvalidFrame,
     /// A frame uses a compression codec this build cannot read.
@@ -216,6 +222,7 @@ impl fmt::Display for CorruptRun {
             RunCorruption::UnsupportedVersion => f.write_str("unsupported format version"),
             RunCorruption::InvalidFooter => f.write_str("footer does not match the regions"),
             RunCorruption::InvalidIndex => f.write_str("index does not match the frames"),
+            RunCorruption::InvalidKeyRange => f.write_str("minimum key does not match the records"),
             RunCorruption::InvalidFrame => f.write_str("inconsistent frame header"),
             RunCorruption::UnsupportedCodec => f.write_str("unsupported codec"),
             RunCorruption::ChecksumMismatch => f.write_str("frame checksum mismatch"),
