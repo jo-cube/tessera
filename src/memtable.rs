@@ -66,6 +66,7 @@
 
 use std::collections::{BTreeMap, btree_map};
 use std::fmt;
+use std::ops::Bound;
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::run::{Run, RunBuilder};
@@ -252,12 +253,11 @@ impl Table {
         })
     }
 
-    fn iter(&self) -> impl Iterator<Item = Record<'_>> {
-        self.entries.iter().map(|(key, slot)| Record {
-            key,
-            seq: slot.seq,
-            value: slot.value(),
-        })
+    fn iter_from(&self, start: &[u8]) -> Records<'_> {
+        Records(
+            self.entries
+                .range::<[u8], _>((Bound::Included(start), Bound::Unbounded)),
+        )
     }
 
     fn memory(&self) -> MemoryUsage {
@@ -321,8 +321,14 @@ impl Memtable {
     }
 
     /// Returns each key's latest update, in ascending key order.
-    pub fn iter(&self) -> impl Iterator<Item = Record<'_>> {
-        self.0.iter()
+    pub fn iter(&self) -> Records<'_> {
+        self.0.iter_from(&[])
+    }
+
+    /// Returns each update whose key is at or above `start`, in ascending key
+    /// order.
+    pub fn iter_from(&self, start: &[u8]) -> Records<'_> {
+        self.0.iter_from(start)
     }
 
     /// Returns the number of keys held, including tombstones.
@@ -363,8 +369,14 @@ impl FrozenMemtable {
     }
 
     /// Returns each key's latest update, in ascending key order.
-    pub fn iter(&self) -> impl Iterator<Item = Record<'_>> {
-        self.0.iter()
+    pub fn iter(&self) -> Records<'_> {
+        self.0.iter_from(&[])
+    }
+
+    /// Returns each update whose key is at or above `start`, in ascending key
+    /// order.
+    pub fn iter_from(&self, start: &[u8]) -> Records<'_> {
+        self.0.iter_from(start)
     }
 
     /// Returns the number of keys held, including tombstones.
@@ -402,6 +414,27 @@ impl FrozenMemtable {
             records: self.0.entries.iter(),
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
         }
+    }
+}
+
+/// Iterates a table's latest updates in ascending key order.
+pub struct Records<'a>(btree_map::Range<'a, Box<[u8]>, Slot>);
+
+impl<'a> Iterator for Records<'a> {
+    type Item = Record<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(key, slot)| Record {
+            key,
+            seq: slot.seq,
+            value: slot.value(),
+        })
+    }
+}
+
+impl fmt::Debug for Records<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Records").finish_non_exhaustive()
     }
 }
 

@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 5A
+## Status: Milestone 5B
 
 Two physical storage layers exist, with mutable storage above them.
 
@@ -53,10 +53,21 @@ under a memory budget. The caller supplies strictly increasing sequence numbers
 and a rejected update changes nothing. Freezing consumes the table, and a
 `FrozenMemtable` builds compressed runs on demand, one at a time, keeping every
 tombstone. A frozen table is only borrowed by a flush, so a flush can be
-repeated. Memtables are not yet read through `RunSet`.
+repeated.
 
-There is no Bloom filter, compaction, MVCC, write-ahead log, persistence or
-database API yet. Concurrent access is not implemented.
+An **`Engine`** combines them: `put`, `delete`, `get`, ordered and prefix scans,
+and an explicit synchronous `flush`. It assigns sequence numbers and holds one
+active memtable, at most one frozen memtable and the published runs behind a
+single reader-writer lock, with a gate that keeps readers from starving writers.
+Single-key reads and writes are linearizable. A `ReadGuard` gives a stable view
+for scans and **blocks writers while held**. A flush freezes the active table,
+compresses outside the lock, and publishes its runs while removing the frozen
+table in one step; an abandoned or rejected flush leaves the table readable for
+a retry. Memtable budgets and limits on run count and bytes bound what is kept.
+
+There is no compaction, so runs only accumulate up to their limits. There is no
+Bloom filter, MVCC, snapshot older than the present, write-ahead log or
+persistence, and flushing never happens in the background.
 
 ## Validate
 
@@ -77,6 +88,7 @@ scripts/validate.sh merge    # multi-run merge measurements
 scripts/validate.sh logical  # latest-state read measurements
 scripts/validate.sh ranges   # key-range pruning measurements
 scripts/validate.sh memtable # memtable and flush measurements
+scripts/validate.sh engine   # integrated engine measurements
 colima stop
 ```
 

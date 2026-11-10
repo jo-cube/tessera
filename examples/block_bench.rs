@@ -20,6 +20,7 @@ use std::time::Instant;
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
+use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
 use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
 use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
@@ -2736,6 +2737,490 @@ fn memtable_baseline() {
     }
 }
 
+fn engine_options() -> EngineOptions {
+    EngineOptions {
+        memtable_budget: MEMTABLE_BUDGET,
+        max_runs: 4096,
+        max_run_bytes: usize::MAX,
+        ..EngineOptions::default()
+    }
+}
+
+fn engine_put_all(engine: &Engine, records: &[Owned], order: &[usize]) {
+    for &index in order {
+        let record = &records[index];
+        engine
+            .put(&record.key, record.value.as_deref().unwrap())
+            .unwrap();
+    }
+}
+
+fn engine_filled(records: &[Owned], order: &[usize]) -> Engine {
+    let engine = Engine::new(engine_options());
+    engine_put_all(&engine, records, order);
+    engine
+}
+
+fn drain_scan(engine: &Engine, prefix: &[u8], workspace: &mut EngineWorkspace) -> usize {
+    let reader = engine.read();
+    let mut scan = reader.scan_prefix(prefix, workspace);
+    let mut records = 0;
+    while let Some(record) = scan.next_record().unwrap() {
+        black_box(record);
+        records += 1;
+    }
+    records
+}
+
+fn percentile(sorted: &[u64], at: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[((sorted.len() - 1) as f64 * at) as usize]
+}
+
+/// One read-write interleaving on a table of existing keys. The writer always
+/// performs the same overwrites, and every other thread runs until it is done.
+fn contention_row(
+    name: &str,
+    records: &[Owned],
+    writes: usize,
+    extra: impl FnOnce(&Engine, &AtomicU64) -> u64 + Send,
+) {
+    let random = shuffled(records.len(), 91);
+    let order = shuffled(records.len(), 92);
+    let engine = engine_filled(records, &random);
+    let done = AtomicU64::new(0);
+    let (samples, elapsed, other) = std::thread::scope(|scope| {
+        let (engine_ref, done_ref) = (&engine, &done);
+        let helper = scope.spawn(move || extra(engine_ref, done_ref));
+        let mut samples = Vec::with_capacity(writes / 16 + 1);
+        let start = Instant::now();
+        for write in 0..writes {
+            let record = &records[order[write % order.len()]];
+            let value = record.value.as_deref().unwrap();
+            if write.is_multiple_of(16) {
+                let before = Instant::now();
+                engine.put(&record.key, value).unwrap();
+                samples.push(before.elapsed().as_nanos() as u64);
+            } else {
+                engine.put(&record.key, value).unwrap();
+            }
+            if write.is_multiple_of(64) {
+                done.store(write as u64 + 1, Ordering::Relaxed);
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        done.store(u64::MAX, Ordering::Relaxed);
+        (samples, elapsed, helper.join().unwrap())
+    });
+    let mut samples = samples;
+    samples.sort_unstable();
+    println!(
+        "| {name} | {:.2} | {} | {} | {} | {} | {:.2} |",
+        writes as f64 / elapsed / 1e6,
+        percentile(&samples, 0.5),
+        percentile(&samples, 0.99),
+        percentile(&samples, 0.999),
+        samples.last().copied().unwrap_or(0),
+        other as f64 / elapsed / 1e6,
+    );
+}
+
+fn engine_baseline() {
+    use tessera::run::{LogicalWorkspace, RunSet};
+
+    let records = tree_json(16 << 20);
+    let count = records.len();
+    let sorted: Vec<usize> = (0..count).collect();
+    let random = shuffled(count, 91);
+    let second = shuffled(count, 92);
+    println!(
+        "{count} json records; median of {MEMTABLE_ROUNDS} rounds; allocations from one further round"
+    );
+
+    println!();
+    println!("| write | ns/op | million ops/s | allocs/op |");
+    println!("|---|---|---|---|");
+    let row = |name: &str, (ns, allocs): (f64, f64)| {
+        println!("| {name} | {ns:.1} | {:.2} | {allocs:.2} |", 1e3 / ns);
+    };
+    row(
+        "memtable sequential insert",
+        timed(
+            count,
+            || (Memtable::new(MEMTABLE_BUDGET, None), 0),
+            |(table, seq)| insert_all(&records, &sorted, table, seq),
+        ),
+    );
+    row(
+        "engine sequential put",
+        timed(
+            count,
+            || Engine::new(engine_options()),
+            |engine| engine_put_all(engine, &records, &sorted),
+        ),
+    );
+    row(
+        "memtable random insert",
+        timed(
+            count,
+            || (Memtable::new(MEMTABLE_BUDGET, None), 0),
+            |(table, seq)| insert_all(&records, &random, table, seq),
+        ),
+    );
+    row(
+        "engine random put",
+        timed(
+            count,
+            || Engine::new(engine_options()),
+            |engine| engine_put_all(engine, &records, &random),
+        ),
+    );
+    row(
+        "memtable overwrite",
+        timed(
+            count,
+            || filled(&records, &random),
+            |(table, seq)| insert_all(&records, &second, table, seq),
+        ),
+    );
+    row(
+        "engine overwrite",
+        timed(
+            count,
+            || engine_filled(&records, &random),
+            |engine| engine_put_all(engine, &records, &second),
+        ),
+    );
+    row(
+        "engine delete",
+        timed(
+            count,
+            || engine_filled(&records, &random),
+            |engine| {
+                for &index in &second {
+                    engine.delete(&records[index].key).unwrap();
+                }
+            },
+        ),
+    );
+
+    println!();
+    println!("| read | ns/op | million ops/s | allocs/op | blocks/op |");
+    println!("|---|---|---|---|---|");
+    let read_row = |name: &str, (ns, allocs): (f64, f64), blocks: f64| {
+        println!(
+            "| {name} | {ns:.1} | {:.2} | {allocs:.2} | {blocks:.2} |",
+            1e3 / ns
+        );
+    };
+
+    let (table, _) = filled(&records, &random);
+    read_row(
+        "memtable get",
+        timed(
+            count,
+            || (),
+            |()| {
+                for &index in &second {
+                    black_box(table.get(&records[index].key));
+                }
+            },
+        ),
+        0.0,
+    );
+    let frozen = table.freeze();
+    let direct_runs: Vec<_> = frozen.flush(4 << 20).collect();
+    drop(frozen);
+    let views: Vec<_> = direct_runs.iter().map(|run| run.view()).collect();
+
+    let active = engine_filled(&records, &random);
+    let mut workspace = EngineWorkspace::new();
+    let get_active = timed(
+        count,
+        || (),
+        |()| {
+            for &index in &second {
+                black_box(active.get(&records[index].key, &mut workspace).unwrap());
+            }
+        },
+    );
+    read_row("engine get, active table", get_active, 0.0);
+
+    // A lookup decodes a block for almost every probe here, so use fewer.
+    let probes = (count / 8).max(1);
+    let mut logical = LogicalWorkspace::new();
+    let before = logical.blocks_loaded();
+    let run_get = timed(
+        probes,
+        || (),
+        |()| {
+            for &index in &second[..probes] {
+                let set = RunSet::new(&views);
+                black_box(set.get(&records[index].key, &mut logical).unwrap());
+            }
+        },
+    );
+    let blocks = (logical.blocks_loaded() - before) as f64 / (4 * probes) as f64;
+    read_row("run set get, 5 disjoint runs", run_get, blocks);
+
+    let runs_engine = Engine::new(EngineOptions {
+        target_run_len: 4 << 20,
+        ..engine_options()
+    });
+    engine_put_all(&runs_engine, &records, &random);
+    runs_engine.flush().unwrap();
+    let mut workspace = EngineWorkspace::new();
+    let before = workspace.blocks_loaded();
+    let get_runs = timed(
+        probes,
+        || (),
+        |()| {
+            for &index in &second[..probes] {
+                black_box(
+                    runs_engine
+                        .get(&records[index].key, &mut workspace)
+                        .unwrap(),
+                );
+            }
+        },
+    );
+    let blocks = (workspace.blocks_loaded() - before) as f64 / (4 * probes) as f64;
+    read_row("engine get, 5 disjoint runs", get_runs, blocks);
+
+    let overlapped = Engine::new(engine_options());
+    for batch in 0..8 {
+        let keys: Vec<usize> = (0..count).filter(|i| i % 8 == batch).collect();
+        engine_put_all(&overlapped, &records, &keys);
+        overlapped.flush().unwrap();
+    }
+    let mut workspace = EngineWorkspace::new();
+    let before = workspace.blocks_loaded();
+    let get_overlapped = timed(
+        probes,
+        || (),
+        |()| {
+            for &index in &second[..probes] {
+                black_box(overlapped.get(&records[index].key, &mut workspace).unwrap());
+            }
+        },
+    );
+    let blocks = (workspace.blocks_loaded() - before) as f64 / (4 * probes) as f64;
+    read_row("engine get, 8 overlapping runs", get_overlapped, blocks);
+
+    println!();
+    println!("| scan | ns/record | million records/s | allocs/scan | blocks/scan | records/scan |");
+    println!("|---|---|---|---|---|---|");
+    let scan_row =
+        |name: &str, (ns, allocs): (f64, f64), blocks: f64, per_scan: f64, ops: usize| {
+            println!(
+                "| {name} | {ns:.1} | {:.2} | {:.2} | {blocks:.2} | {per_scan:.1} |",
+                1e3 / ns,
+                allocs * ops as f64,
+            );
+        };
+
+    let half = engine_filled(&records, &random[..count / 2]);
+    half.flush().unwrap();
+    engine_put_all(&half, &records, &random[count / 2..]);
+
+    for (name, engine) in [
+        ("engine scan, active only", &active),
+        ("engine scan, runs only", &runs_engine),
+        ("engine scan, half active half runs", &half),
+    ] {
+        let mut workspace = EngineWorkspace::new();
+        let before = workspace.blocks_loaded();
+        let result = timed(
+            count,
+            || (),
+            |()| {
+                black_box(drain_scan(engine, b"", &mut workspace));
+            },
+        );
+        let blocks = (workspace.blocks_loaded() - before) as f64 / 4.0;
+        scan_row(name, result, blocks, count as f64, count);
+    }
+
+    let mut logical = LogicalWorkspace::new();
+    let before = logical.blocks_loaded();
+    let direct = timed(
+        count,
+        || (),
+        |()| {
+            let set = RunSet::new(&views);
+            let mut cursor = set.cursor(&mut logical);
+            while let Some(record) = cursor.next_record().unwrap() {
+                black_box(record);
+            }
+        },
+    );
+    let blocks = (logical.blocks_loaded() - before) as f64 / 4.0;
+    scan_row(
+        "logical cursor, runs only",
+        direct,
+        blocks,
+        count as f64,
+        count,
+    );
+
+    // Short prefixes over keys held half in the table and half in runs.
+    const PREFIX_SCANS: usize = 2000;
+    let cut = records[0].key.len().saturating_sub(2);
+    let prefixes: Vec<&[u8]> = (0..PREFIX_SCANS)
+        .map(|at| &records[random[at % count]].key[..cut])
+        .collect();
+    let mut workspace = EngineWorkspace::new();
+    let before = workspace.blocks_loaded();
+    let mut found = 0;
+    let (ns, allocs) = timed(
+        PREFIX_SCANS,
+        || (),
+        |()| {
+            found = 0;
+            for prefix in &prefixes {
+                found += drain_scan(&half, prefix, &mut workspace);
+            }
+        },
+    );
+    let blocks = (workspace.blocks_loaded() - before) as f64 / (4 * PREFIX_SCANS) as f64;
+    println!(
+        "| engine prefix scan, half active half runs | {ns:.0} ns per scan | {:.2} million/s | {allocs:.2} | {blocks:.2} | {:.1} |",
+        1e3 / ns,
+        found as f64 / PREFIX_SCANS as f64
+    );
+
+    println!();
+    println!("repeated flushes from a 4 MiB table; requested heap excludes Zstandard contexts");
+    println!(
+        "| flushes | runs | flush ms total | ms/flush | payload MiB/s | payload MiB | stored MiB | write amp (stored/payload) | peak heap MiB | live heap MiB | resident run bytes MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    let live_before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(live_before, Ordering::Relaxed);
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: 4 << 20,
+        ..engine_options()
+    });
+    let (mut flushes, mut flush_ns, mut total_runs, mut payload) = (0, 0u128, 0, 0usize);
+    let mut flush = |engine: &Engine| {
+        let start = Instant::now();
+        let report = engine.flush().unwrap();
+        flush_ns += start.elapsed().as_nanos();
+        flushes += report.tables;
+        total_runs += report.runs;
+    };
+    for &index in &random {
+        let record = &records[index];
+        let value = record.value.as_deref().unwrap();
+        payload += record.key.len() + value.len();
+        if engine.put(&record.key, value).is_err() {
+            flush(&engine);
+            engine.put(&record.key, value).unwrap();
+        }
+    }
+    flush(&engine);
+    let stats = engine.stats();
+    let live = LIVE.load(Ordering::Relaxed) - live_before;
+    let peak = PEAK.load(Ordering::Relaxed) - live_before;
+    println!(
+        "| {flushes} | {total_runs} | {:.1} | {:.2} | {:.1} | {:.1} | {:.2} | {:.3} | {:.1} | {:.1} | {:.2} |",
+        flush_ns as f64 / 1e6,
+        flush_ns as f64 / 1e6 / flushes as f64,
+        payload as f64 / MIB / (flush_ns as f64 / 1e9),
+        payload as f64 / MIB,
+        stats.run_bytes as f64 / MIB,
+        stats.run_bytes as f64 / payload as f64,
+        peak as f64 / MIB,
+        live as f64 / MIB,
+        stats.run_bytes as f64 / MIB,
+    );
+    drop(engine);
+
+    println!();
+    println!(
+        "contention; latencies sample every 16th write; 2 CPUs; other thread in M ops/s, or M records/s for scans"
+    );
+    println!(
+        "| scenario | writes M/s | p50 ns | p99 ns | p99.9 ns | max ns | other thread M ops/s |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    contention_row("writer alone", &records, 200_000, |_, _| 0);
+    contention_row(
+        "writer + point reader",
+        &records,
+        200_000,
+        |engine, done| {
+            let mut workspace = EngineWorkspace::new();
+            let (mut reads, mut at) = (0u64, 0);
+            while done.load(Ordering::Relaxed) != u64::MAX {
+                let index = second[at % count];
+                black_box(engine.get(&records[index].key, &mut workspace).unwrap());
+                reads += 1;
+                at += 1;
+            }
+            reads
+        },
+    );
+    // A write can wait for a whole scan, so this needs far fewer writes.
+    contention_row("writer + full scans", &records, 2_000, |engine, done| {
+        let mut workspace = EngineWorkspace::new();
+        let mut scanned = 0u64;
+        while done.load(Ordering::Relaxed) != u64::MAX {
+            scanned += drain_scan(engine, b"", &mut workspace) as u64;
+        }
+        scanned
+    });
+    contention_row(
+        "writer + flusher every 20k writes",
+        &records,
+        200_000,
+        |engine, done| {
+            let mut flushed_at = 0;
+            let mut flushes = 0;
+            loop {
+                let written = done.load(Ordering::Relaxed);
+                if written == u64::MAX {
+                    return flushes;
+                }
+                if written >= flushed_at + 20_000 {
+                    flushed_at = written;
+                    flushes += engine.flush().unwrap().tables as u64;
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        },
+    );
+
+    let readers = engine_filled(&records, &random);
+    let start = Instant::now();
+    let total: u64 = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|thread| {
+                let (readers, records, second) = (&readers, &records, &second);
+                scope.spawn(move || {
+                    let mut workspace = EngineWorkspace::new();
+                    for at in 0..400_000 {
+                        let index = second[(at + thread * 7919) % count];
+                        black_box(readers.get(&records[index].key, &mut workspace).unwrap());
+                    }
+                    400_000u64
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum()
+    });
+    println!(
+        "| two point readers, no writer | 0 | 0 | 0 | 0 | 0 | {:.2} |",
+        total as f64 / start.elapsed().as_secs_f64() / 1e6
+    );
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
@@ -2743,6 +3228,7 @@ fn main() {
         Some("merge") => return merge_scans(),
         Some("logical") => return logical_reads(),
         Some("ranges") => return range_reads(),
+        Some("engine") => return engine_baseline(),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}

@@ -161,34 +161,7 @@ impl<'a> RunSet<'a> {
     where
         'a: 'r,
     {
-        let reads = workspace.merge.reads(self.runs.len());
-        let mut newest = None;
-        // Held until every run is read: a later run may supersede both copies.
-        let mut disagreement = None;
-        for (input, (run, read)) in self.runs.iter().zip(reads).enumerate() {
-            let Some(version) = run.get(key, read)? else {
-                continue;
-            };
-            match newest {
-                Some((_, seq, _)) if seq > version.seq => {}
-                Some((other, seq, value)) if seq == version.seq => {
-                    if value != version.value && disagreement.is_none() {
-                        disagreement = Some((seq, other, input));
-                    }
-                }
-                _ => {
-                    newest = Some((input, version.seq, version.value));
-                    disagreement = None;
-                }
-            }
-        }
-        if let Some((seq, lower, higher)) = disagreement {
-            return Err(conflict(key, seq, lower, higher));
-        }
-        Ok(newest.and_then(|(_, seq, value)| match value {
-            Value::Bytes(value) => Some(LiveValue { seq, value }),
-            Value::Tombstone => None,
-        }))
+        latest_in(self.runs.iter().copied(), key, workspace)
     }
 
     /// Returns a cursor before the first live key. Nothing is decoded until
@@ -198,14 +171,48 @@ impl<'a> RunSet<'a> {
     where
         'a: 'r,
     {
-        let LogicalWorkspace { merge, key } = workspace;
-        LogicalCursor {
-            merge: MergeCursor::new(self.runs.iter().copied(), merge),
-            key,
-            has_key: false,
-            failure: None,
+        LogicalCursor::over(self.runs.iter().copied(), workspace)
+    }
+}
+
+/// Finds the latest value of `key` across `runs`, as [`RunSet::get`] does.
+pub(crate) fn latest_in<'a, 'r, I>(
+    runs: I,
+    key: &[u8],
+    workspace: &'r mut LogicalWorkspace,
+) -> Result<Option<LiveValue<'r>>, ReadError>
+where
+    I: ExactSizeIterator<Item = RunView<'a>>,
+    'a: 'r,
+{
+    let reads = workspace.merge.reads(runs.len());
+    let mut newest = None;
+    // Held until every run is read: a later run may supersede both copies.
+    let mut disagreement = None;
+    for (input, (run, read)) in runs.zip(reads).enumerate() {
+        let Some(version) = run.get(key, read)? else {
+            continue;
+        };
+        match newest {
+            Some((_, seq, _)) if seq > version.seq => {}
+            Some((other, seq, value)) if seq == version.seq => {
+                if value != version.value && disagreement.is_none() {
+                    disagreement = Some((seq, other, input));
+                }
+            }
+            _ => {
+                newest = Some((input, version.seq, version.value));
+                disagreement = None;
+            }
         }
     }
+    if let Some((seq, lower, higher)) = disagreement {
+        return Err(conflict(key, seq, lower, higher));
+    }
+    Ok(newest.and_then(|(_, seq, value)| match value {
+        Value::Bytes(value) => Some(LiveValue { seq, value }),
+        Value::Tombstone => None,
+    }))
 }
 
 /// Iterates live keys in ascending order, each once with its latest value.
@@ -225,7 +232,22 @@ pub struct LogicalCursor<'a> {
     failure: Option<ReadError>,
 }
 
-impl LogicalCursor<'_> {
+impl<'r> LogicalCursor<'r> {
+    /// Creates a cursor over `runs`, as [`RunSet::cursor`] does.
+    pub(crate) fn over<I>(runs: I, workspace: &'r mut LogicalWorkspace) -> Self
+    where
+        I: IntoIterator<Item = RunView<'r>>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let LogicalWorkspace { merge, key } = workspace;
+        Self {
+            merge: MergeCursor::new(runs, merge),
+            key,
+            has_key: false,
+            failure: None,
+        }
+    }
+
     /// Moves before the first live key at or above `target`, with no bound.
     pub fn seek(&mut self, target: &[u8]) -> Result<(), ReadError> {
         self.reposition(|merge| merge.seek(target))
@@ -294,7 +316,8 @@ impl LogicalCursor<'_> {
         Ok(())
     }
 
-    fn live(&self) -> Option<LiveRecord<'_>> {
+    /// Returns the record the last read stopped on, if it found one.
+    pub(crate) fn live(&self) -> Option<LiveRecord<'_>> {
         let record = self.merge.current()?;
         match record.value {
             Value::Bytes(value) => Some(LiveRecord {

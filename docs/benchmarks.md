@@ -294,3 +294,55 @@ at or below the timer's resolution, about 40 ns, and allocates nothing.
   leave out Zstandard's own context.
 - Dropping a frozen table takes 11 ms for `json` and 28 ms for `tiny`, because
   each entry is freed individually.
+
+## Integrated engine
+
+`block_bench engine` drives `Engine` with the `json` dataset (173,536 records,
+17.1 MiB of payload), beside the memtable and run-set operations it is built on,
+so the engine's own cost shows as the difference. Run it with
+`scripts/validate.sh engine`. Contention rows sample every sixteenth write's
+latency, on the reference environment's 2 CPUs.
+
+### Findings
+
+Same reference environment, three passes. Times differ between passes by a
+median of 2.9% and at most 15.9%.
+
+| operation | direct | engine | blocks per operation |
+| --- | ---: | ---: | ---: |
+| sequential write, ns | 219 | 213 | |
+| random write, ns | 786 | 809 | |
+| overwrite, ns | 567 | 581 | |
+| get from the active table, ns | 508 | 509 | 0 |
+| get from 5 disjoint runs, us | 10.0 | 10.1 | 1 |
+| get from 8 overlapping runs, us | | 76.9 | 8 |
+| scan of runs only, ns per record | 85.9 | 94.9 | |
+| scan of the active table only, ns per record | | 42.3 | |
+| scan half table and half runs, ns per record | | 74.9 | |
+| prefix scan of 20 keys, half table and half runs, us | | 11.2 | 1.05 |
+
+| contention | writes M/s | write p50 ns | write p99 ns | write max |
+| --- | ---: | ---: | ---: | ---: |
+| writer alone | 1.76 | 542 | 834 | 9 us |
+| writer and a point reader | 1.11 | 708 | 2,833 | 15 us |
+| writer and back-to-back full scans | | 1,209 | 5.9 ms | 6.6 ms |
+| writer and a flush every 20,000 writes | 1.22 | 500 | 2,417 | 458 us |
+
+- The lock and the copy of the value cost nothing measurable on point reads
+  and writes. Engine writes are within 3% of direct memtable writes.
+- The scan merge adds about 9 ns per record over the logical cursor on runs.
+  An active-only scan costs 42 ns per record, against 9 ns for iterating the
+  memtable directly, so the merge loop, not the data, dominates it.
+- Two point readers reach 3.83 million reads per second together, about twice
+  one reader. A point reader and a writer share the lock at 1.11 million
+  writes and 0.33 million reads per second.
+- A write waits for at most the scan in progress: its p99 equals one full scan
+  of 173,536 records. Before writers were given priority, a reader starting a
+  scan as soon as one ended kept a write waiting 8 to 21 seconds.
+- A flush every 20,000 writes keeps the write p99 near 2.4 us. Its one 458 us
+  write has not been traced to a cause.
+- Ten flushes from a 4 MiB table take 3.7 ms each, at 464 MiB/s of payload.
+  Runs store 0.212 bytes per payload byte, and since nothing is rewritten that
+  is the whole write amplification. Rust heap peaked 6.8 MiB above its start
+  and kept 3.6 MiB, equal to the stored runs.
+
