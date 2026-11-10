@@ -12,25 +12,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Value};
-use tessera::run::{Run, RunBuilder};
+use tessera::run::{Codec, ReadWorkspace, Run, RunBuilder};
 
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static LIVE: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Records `added` more live bytes. `held` are live only during the call, as
+/// the old buffer is while a reallocation copies it.
+fn note_live(added: u64, held: u64) {
+    let live = LIVE.fetch_add(added, Ordering::Relaxed) + added;
+    PEAK.fetch_max(live + held, Ordering::Relaxed);
+}
 
 // SAFETY: every call forwards unchanged to the system allocator.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_live(layout.size() as u64, 0);
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        note_live(new_size as u64, layout.size() as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -42,6 +55,16 @@ fn allocations_during(operation: impl FnOnce()) -> u64 {
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     operation();
     ALLOCATIONS.load(Ordering::Relaxed) - before
+}
+
+/// Returns the peak live Rust heap above its level at entry. A reallocation
+/// is counted as if it copied, so this is an upper bound. Memory the Zstandard
+/// C library allocates for its contexts is not included.
+fn peak_during(operation: impl FnOnce()) -> u64 {
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    operation();
+    PEAK.load(Ordering::Relaxed) - before
 }
 
 struct Rng(u64);
@@ -146,6 +169,30 @@ fn multi_version(target: usize) -> Vec<Owned> {
                 value: (version != 3).then(|| rng.bytes(32)),
             })
             .collect()
+    })
+}
+
+/// Compressible values, in the style of a JSON document store.
+fn json_like(target: usize) -> Vec<Owned> {
+    const STATUS: [&str; 4] = ["active", "pending", "suspended", "archived"];
+    const REGION: [&str; 4] = ["eu-west-1", "us-east-1", "ap-south-1", "sa-east-1"];
+
+    let mut rng = Rng(5);
+    fill(target, |i| {
+        let value = format!(
+            r#"{{"id":{i},"name":"user_{}","email":"user{}@example.com","status":"{}","region":"{}","score":{},"verified":{}}}"#,
+            rng.next() % 100_000,
+            rng.next() % 100_000,
+            STATUS[(rng.next() % 4) as usize],
+            REGION[(rng.next() % 4) as usize],
+            rng.next() % 1000,
+            rng.next().is_multiple_of(2),
+        );
+        vec![Owned {
+            key: format!("user:{i:012}:profile").into_bytes(),
+            seq: BASE_SEQ + rng.next() % (1 << 20),
+            value: Some(value.into_bytes()),
+        }]
     })
 }
 
@@ -359,13 +406,19 @@ fn measure_reader_paths(name: &str, records: &[Owned]) {
 }
 
 /// Rounds for run measurements, which cover far more bytes per round.
-const RUN_ROUNDS: usize = 31;
+const RUN_ROUNDS: usize = 15;
 
-/// Distinct keys probed per round, drawn evenly from the shuffled key list.
-const RUN_PROBES: usize = 2000;
+/// Distinct keys probed per round, drawn from the shuffled key list.
+const RUN_PROBES: usize = 1000;
 
-fn build_run(records: &[Owned]) -> Run<Vec<u8>> {
-    let mut builder = RunBuilder::new();
+const CODECS: [(Codec, &str); 3] = [
+    (Codec::None, "none"),
+    (Codec::Lz4, "lz4"),
+    (Codec::Zstd, "zstd"),
+];
+
+fn build_run(codec: Codec, records: &[Owned]) -> Run<Vec<u8>> {
+    let mut builder = RunBuilder::new(codec);
     for record in records {
         builder
             .add(&record.key, record.seq, record.value())
@@ -374,13 +427,38 @@ fn build_run(records: &[Owned]) -> Run<Vec<u8>> {
     builder.finish()
 }
 
-fn measure_run(name: &str, records: &[Owned]) {
-    let run = build_run(records);
+/// The `(codec, decoded length, stored bytes)` of each frame, from the
+/// documented layout, so codec costs can be timed apart from the reader.
+fn frames(bytes: &[u8]) -> Vec<(u8, usize, &[u8])> {
+    let footer = bytes.len() - 28;
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    let table = u64_at(footer);
+    let count = u32_at(footer + 16);
+    (0..count)
+        .map(|i| {
+            let start = u64_at(table + i * 12);
+            let end = if i + 1 < count {
+                u64_at(table + (i + 1) * 12)
+            } else {
+                table
+            };
+            (bytes[start], u32_at(start + 4), &bytes[start + 12..end])
+        })
+        .collect()
+}
+
+fn measure_run(
+    name: &str,
+    label: &str,
+    codec: Codec,
+    records: &[Owned],
+    uncompressed: usize,
+) -> usize {
+    let run = build_run(codec, records);
     assert_eq!(run.len(), records.len());
     let bytes = run.as_bytes();
     let view = run.view();
-    let single = build(records);
-    let single = Block::new(single.as_slice()).unwrap();
 
     let mut rng = Rng(77);
     let mut keys: Vec<&[u8]> = records.iter().map(|r| r.key.as_slice()).collect();
@@ -389,26 +467,28 @@ fn measure_run(name: &str, records: &[Owned]) {
         keys.swap(i, (rng.next() % (i as u64 + 1)) as usize);
     }
     keys.truncate(RUN_PROBES);
+    let mut workspace = ReadWorkspace::new();
     let misses: Vec<Vec<u8>> = keys
         .iter()
         .map(|k| [*k, &[0][..]].concat())
-        .filter(|k| run.get(k).is_none())
+        .filter(|k| run.get(k, &mut workspace).unwrap().is_none())
         .collect();
 
     let timed = |operations, round: &mut dyn FnMut()| median_ns_of(RUN_ROUNDS, operations, round);
     let build_ns = timed(records.len(), &mut || {
-        black_box(build_run(black_box(records)));
+        black_box(build_run(codec, black_box(records)));
     });
     let validate_ns = timed(records.len(), &mut || {
         black_box(Run::new(black_box(bytes)).unwrap());
     });
-    let scan = || {
-        let mut cursor = run.cursor();
+    let mut scan_workspace = ReadWorkspace::new();
+    let mut scan = || {
+        let mut cursor = run.cursor(&mut scan_workspace);
         let mut total = 0usize;
         for _ in 0..records.len() {
-            total += cursor.next_record().expect("record").key.len();
+            total += cursor.next_record().unwrap().expect("record").key.len();
         }
-        assert!(cursor.next_record().is_none());
+        assert!(cursor.next_record().unwrap().is_none());
         black_box(total);
     };
     let scan_ns = timed(records.len(), &mut || scan());
@@ -419,53 +499,73 @@ fn measure_run(name: &str, records: &[Owned]) {
     });
     let hit_ns = timed(keys.len(), &mut || {
         for key in &keys {
-            black_box(run.get(black_box(key)));
+            black_box(run.get(black_box(key), &mut workspace).unwrap());
         }
     });
     let miss_ns = timed(misses.len(), &mut || {
         for key in &misses {
-            black_box(run.get(black_box(key)));
+            black_box(run.get(black_box(key), &mut workspace).unwrap());
         }
-    });
-    let single_get_ns = timed(keys.len(), &mut || {
-        for key in &keys {
-            black_box(single.get(black_box(key)));
-        }
-    });
-    let single_scan_ns = timed(records.len(), &mut || {
-        let mut cursor = single.cursor();
-        let mut total = 0usize;
-        for _ in 0..records.len() {
-            total += cursor.next_record().expect("record").key.len();
-        }
-        black_box(total);
     });
 
-    let build_allocs = allocations_during(|| drop(build_run(records)));
-    let validate_allocs = allocations_during(|| {
-        black_box(Run::new(bytes).unwrap());
+    // Codec costs alone, measured on the same frames through the libraries.
+    let stored = frames(bytes);
+    let largest = stored.iter().map(|f| f.1).max().unwrap();
+    let mut out = vec![0; largest];
+    let mut zstd = zstd_safe::DCtx::create();
+    let checksum_ns = timed(stored.len(), &mut || {
+        for (_, _, payload) in &stored {
+            black_box(crc32fast::hash(black_box(payload)));
+        }
     });
-    let scan_allocs = allocations_during(scan);
-    let lookup_allocs = allocations_during(|| {
+    let decompress_ns = timed(stored.len(), &mut || {
+        for (id, len, payload) in &stored {
+            match id {
+                1 => {
+                    lz4_flex::block::decompress_into(payload, &mut out[..*len]).unwrap();
+                }
+                2 => {
+                    zstd.decompress(&mut out[..*len], payload).unwrap();
+                }
+                _ => {}
+            }
+            black_box(&out);
+        }
+    });
+
+    let warm_allocs = allocations_during(|| {
         for key in &keys {
-            black_box(run.get(key));
+            black_box(run.get(key, &mut workspace).unwrap());
         }
         for key in &misses {
-            black_box(run.get(key));
+            black_box(run.get(key, &mut workspace).unwrap());
         }
     });
+    let scan_allocs = allocations_during(&mut scan);
+    let build_allocs = allocations_during(|| drop(build_run(codec, records)));
+    let build_peak = peak_during(|| drop(build_run(codec, records)));
+    let validate_peak = peak_during(|| {
+        black_box(Run::new(bytes).unwrap());
+    });
 
-    let blocks = run.block_count();
-    let index = view.index_len() + 28;
-    let frames = 12 * blocks;
-    let block_bytes = bytes.len() - index - frames;
+    let total = bytes.len();
+    let baseline = if uncompressed == 0 {
+        total
+    } else {
+        uncompressed
+    };
+    let mib = |n: u64| n as f64 / (1 << 20) as f64;
     println!(
-        "| {name} | {} | {} | {blocks} | {} | {frames} | {index} | {:.3}% | {build_ns:.0} | {validate_ns:.1} | {scan_ns:.1} | {locate_ns:.0} | {hit_ns:.0} | {miss_ns:.0} | {single_get_ns:.0} | {single_scan_ns:.1} | {build_allocs}/{validate_allocs}/{scan_allocs}/{lookup_allocs} |",
-        records.len(),
-        bytes.len(),
-        block_bytes / blocks,
-        (frames + index) as f64 / bytes.len() as f64 * 100.0,
+        "| {name} | {label} | {:.2} | {:.3} | {build_ns:.0} | {validate_ns:.1} | {scan_ns:.1} | {locate_ns:.0} | {hit_ns:.0} | {miss_ns:.0} | {:.1} | {:.1} | {} | {:.1} | {:.2} | {build_allocs}/{scan_allocs}/{warm_allocs} |",
+        mib(total as u64),
+        total as f64 / baseline as f64,
+        checksum_ns / 1000.0,
+        decompress_ns / 1000.0,
+        stored.iter().map(|f| f.2.len()).sum::<usize>() / stored.len(),
+        mib(build_peak),
+        mib(validate_peak),
     );
+    total
 }
 
 fn main() {
@@ -505,28 +605,50 @@ fn main() {
 
     println!();
     println!(
-        "runs at the default 64 KiB block target; median of {RUN_ROUNDS} rounds, {RUN_PROBES} probes per round"
+        "runs at the default 64 KiB block target, 16 MiB of uncompressed blocks; median of {RUN_ROUNDS} rounds, {RUN_PROBES} probes per round"
+    );
+    println!("ns per record (build, validate, scan) or per lookup, full path with one workspace");
+    println!("checksum and decompress are us per block through the libraries, without the reader");
+    println!(
+        "peaks are the Rust heap, counting a reallocation as a copy; allocs = build/scan/warm lookups"
     );
     println!(
-        "ns per record (build, validate, scan) or per lookup; one-block = same data as a single block"
+        "runtime descriptor: {} bytes for Run<Vec<u8>>, {} bytes for an empty workspace",
+        size_of::<Run<Vec<u8>>>(),
+        size_of::<ReadWorkspace>()
     );
+    let sample = vec![7; 64 << 10];
+    let mut output = Vec::with_capacity(zstd_safe::compress_bound(sample.len()));
+    let mut compressor = zstd_safe::CCtx::create();
+    compressor.compress(&mut output, &sample, 3).unwrap();
+    let mut decoded = vec![0; sample.len()];
+    let mut decompressor = zstd_safe::DCtx::create();
+    decompressor.decompress(&mut decoded[..], &output).unwrap();
     println!(
-        "index = table + keys + footer; allocs = build/validate/scan/all lookups, each counted once"
-    );
-    println!(
-        "runtime descriptor: {} bytes for Run<Vec<u8>>",
-        size_of::<Run<Vec<u8>>>()
+        "zstd contexts after one 64 KiB block (C heap, not counted above): compress {} KiB, decompress {} KiB",
+        compressor.sizeof() >> 10,
+        decompressor.sizeof() >> 10
     );
     println!();
     println!(
-        "| dataset | records | encoded | blocks | avg block | frame hdrs | index | overhead | build | validate | scan | locate | get hit | get miss | one-block get | one-block scan | allocs |"
+        "| dataset | codec | MiB | ratio | build | validate | scan | locate | get hit | get miss | checksum us | decompress us | avg stored | build peak MiB | validate peak MiB | allocs |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-    for mib in [1, 16] {
-        let target = mib << 20;
-        measure_run(&format!("structured {mib}M"), &structured_keys(target));
-        measure_run(&format!("random {mib}M"), &random_keys(target));
-        measure_run(&format!("small-value {mib}M"), &small_values(target));
-        measure_run(&format!("multi-version {mib}M"), &multi_version(target));
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let target = 16 << 20;
+    let datasets: [(&str, Vec<Owned>); 5] = [
+        ("structured", structured_keys(target)),
+        ("random", random_keys(target)),
+        ("small-value", small_values(target)),
+        ("multi-version", multi_version(target)),
+        ("json-like", json_like(target)),
+    ];
+    for (name, records) in &datasets {
+        let mut uncompressed = 0;
+        for (codec, label) in CODECS {
+            let total = measure_run(name, label, codec, records, uncompressed);
+            if codec == Codec::None {
+                uncompressed = total;
+            }
+        }
     }
 }

@@ -1,9 +1,12 @@
+use std::fmt;
+
 use crate::block::{BlockBuilder, BuildError, MAX_KEY_LEN, Value};
 
+use super::codec::{Codec, Compressor};
+use super::frame;
 use super::reader::Run;
 use super::{
-    CODEC_RAW, FOOTER_LEN, FORMAT_VERSION, FRAME_HEADER_LEN, MAGIC, MAX_TARGET_BLOCK_LEN,
-    TABLE_ENTRY_LEN, TARGET_BLOCK_LEN,
+    FOOTER_LEN, FORMAT_VERSION, MAGIC, MAX_TARGET_BLOCK_LEN, TABLE_ENTRY_LEN, TARGET_BLOCK_LEN,
 };
 
 /// Encodes records, supplied in internal-key order, into an immutable [`Run`].
@@ -11,6 +14,11 @@ use super::{
 /// Records must arrive by user key ascending, then sequence number descending,
 /// across the whole run. A rejected [`add`](Self::add) changes nothing, and
 /// the result does not depend on rejected records.
+///
+/// Each block is compressed independently as it is cut, so the builder holds
+/// at most one uncompressed block beside the frames already written. Block
+/// boundaries depend only on uncompressed sizes, so they are the same for
+/// every codec.
 ///
 /// # Block boundaries
 ///
@@ -22,10 +30,12 @@ use super::{
 ///   ordinary version chains stay whole and exceptionally long ones span
 ///   blocks of bounded size.
 /// - A record at least as large as the target always starts a new block.
-#[derive(Debug)]
 pub struct RunBuilder {
     target: usize,
+    compressor: Compressor,
     block: BlockBuilder,
+    /// One finished block awaiting compression. Unused without a codec.
+    uncompressed: Vec<u8>,
     frames: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
@@ -33,17 +43,20 @@ pub struct RunBuilder {
 }
 
 impl RunBuilder {
-    /// Creates a builder aiming for blocks of [`TARGET_BLOCK_LEN`] bytes.
-    pub fn new() -> Self {
-        Self::with_target_block_len(TARGET_BLOCK_LEN)
+    /// Creates a builder aiming for blocks of [`TARGET_BLOCK_LEN`] bytes
+    /// before compression.
+    pub fn new(codec: Codec) -> Self {
+        Self::with_target_block_len(codec, TARGET_BLOCK_LEN)
     }
 
-    /// Creates a builder aiming for blocks of `target` encoded bytes, reduced
-    /// to [`MAX_TARGET_BLOCK_LEN`] if larger.
-    pub fn with_target_block_len(target: usize) -> Self {
+    /// Creates a builder aiming for blocks of `target` bytes before
+    /// compression, reduced to [`MAX_TARGET_BLOCK_LEN`] if larger.
+    pub fn with_target_block_len(codec: Codec, target: usize) -> Self {
         Self {
             target: target.min(MAX_TARGET_BLOCK_LEN),
+            compressor: Compressor::new(codec),
             block: BlockBuilder::new(),
+            uncompressed: Vec::new(),
             frames: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
@@ -129,18 +142,24 @@ impl RunBuilder {
     }
 
     fn cut_block(&mut self) {
-        let frame_offset = self.frames.len() as u64;
+        let frame_offset = self.frames.len();
         let block_len = self.block.encoded_len();
+        let codec = self.compressor.codec();
 
-        let mut header = [0; FRAME_HEADER_LEN];
-        header[0] = CODEC_RAW;
-        // Blocks are at most MAX_BLOCK_LEN, which fits in u32.
-        header[4..8].copy_from_slice(&(block_len as u32).to_le_bytes());
-        self.frames.extend_from_slice(&header);
-        self.block.flush_into(&mut self.frames);
+        self.frames.resize(frame_offset + frame::HEADER_LEN, 0);
+        if codec == Codec::None {
+            self.block.flush_into(&mut self.frames);
+        } else {
+            self.uncompressed.clear();
+            self.block.flush_into(&mut self.uncompressed);
+            self.compressor
+                .compress(&self.uncompressed, &mut self.frames);
+        }
+        frame::seal(&mut self.frames[frame_offset..], codec, block_len);
 
         self.keys.extend_from_slice(self.block.last_key());
-        self.table.extend_from_slice(&frame_offset.to_le_bytes());
+        self.table
+            .extend_from_slice(&(frame_offset as u64).to_le_bytes());
         // has_room_for_block admitted this block with its key space reserved.
         self.table
             .extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
@@ -156,9 +175,13 @@ fn index_has_room(blocks: usize, key_bytes: usize) -> bool {
     fits(blocks.checked_add(2)) && fits(key_bytes.checked_add(2 * MAX_KEY_LEN))
 }
 
-impl Default for RunBuilder {
-    fn default() -> Self {
-        Self::new()
+impl fmt::Debug for RunBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunBuilder")
+            .field("codec", &self.compressor.codec())
+            .field("target", &self.target)
+            .field("record_count", &self.record_count)
+            .finish_non_exhaustive()
     }
 }
 

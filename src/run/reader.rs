@@ -1,8 +1,12 @@
-use crate::block::{BlockPosition, BlockView, CorruptBlock, Record, RecordWalk, Version};
+use std::fmt;
 
+use crate::block::{BlockPosition, BlockView, Record, RecordWalk, Version};
+
+use super::codec::{Codec, Decompressor, plausible_decoded_len};
+use super::frame::{self, Frame};
 use super::{
-    CODEC_RAW, CorruptRun, FOOTER_LEN, FORMAT_VERSION, FRAME_HEADER_LEN, MAGIC, RunCorruption,
-    TABLE_ENTRY_LEN, read_u32, read_u64,
+    CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, TABLE_ENTRY_LEN, read_u32,
+    read_u64,
 };
 
 /// A valid run over any byte storage, such as `Vec<u8>`, `Arc<[u8]>` or
@@ -10,12 +14,14 @@ use super::{
 ///
 /// Holding a `Run` is proof of validity: it comes from
 /// [`RunBuilder::finish`](super::RunBuilder::finish) or from a full check by
-/// [`new`](Self::new). Reads neither repeat those checks nor return errors. The
-/// storage must keep returning the same bytes from `as_ref`; if it does not,
-/// reads may panic or return wrong data.
+/// [`new`](Self::new). Reads never repeat that check. They still return
+/// errors, because a checksum mismatch in memory is a detectable event and not
+/// a programming error. The storage must keep returning the same bytes from
+/// `as_ref`.
 ///
 /// A run is immutable and has no interior mutability, so it can be shared
-/// between threads whenever its storage can.
+/// between threads whenever its storage can. Each thread needs its own
+/// [`ReadWorkspace`].
 #[derive(Clone, Debug)]
 pub struct Run<B> {
     data: B,
@@ -24,8 +30,11 @@ pub struct Run<B> {
 const VALIDATED: &str = "run bytes were validated or built by this crate";
 
 impl<B: AsRef<[u8]>> Run<B> {
-    /// Validates `data` in full and wraps it. This costs O(run length) and
-    /// reports the first structural problem found.
+    /// Validates `data` in full and wraps it.
+    ///
+    /// This costs O(run length) and reports the first problem found. Temporary
+    /// memory is one decoded block, at most
+    /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         validate(data.as_ref())?;
         Ok(Self { data })
@@ -53,20 +62,23 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the newest version of `user_key`, which may be a tombstone, or
     /// `None` if the run has no record for that key.
     ///
-    /// Performs no heap allocation.
-    pub fn get(&self, user_key: &[u8]) -> Option<Version<'_>> {
-        self.view().get(user_key).expect(VALIDATED)
+    /// Decodes at most one block. Once the workspace has grown to the largest
+    /// block read, this performs no heap allocation.
+    pub fn get<'r>(
+        &'r self,
+        user_key: &[u8],
+        workspace: &'r mut ReadWorkspace,
+    ) -> Result<Option<Version<'r>>, CorruptRun> {
+        self.view().get(user_key, workspace)
     }
 
-    /// Returns a cursor positioned before the first record.
-    pub fn cursor(&self) -> RunCursor<'_> {
-        RunCursor {
-            view: self.view(),
-            position: RunPosition::new(),
-        }
+    /// Returns a cursor positioned before the first record, which holds the
+    /// workspace for as long as it lives.
+    pub fn cursor<'r>(&'r self, workspace: &'r mut ReadWorkspace) -> RunCursor<'r> {
+        self.view().cursor(workspace)
     }
 
-    /// Returns a view of this run's bytes for use with a [`RunPosition`].
+    /// Returns a view of this run's bytes.
     pub fn view(&self) -> RunView<'_> {
         RunView::open(self.data.as_ref()).expect(VALIDATED)
     }
@@ -77,68 +89,133 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 }
 
-/// Ordered traversal of every record in a [`Run`].
+/// Reusable storage for reading runs, created once per reader.
 ///
-/// This is a lending cursor rather than an [`Iterator`]: each [`Record`]
-/// borrows the key rebuilt in the cursor's single reusable buffer.
-#[derive(Clone, Debug)]
-pub struct RunCursor<'a> {
-    view: RunView<'a>,
-    position: RunPosition,
+/// One workspace serves any number of runs and codecs, and its results are
+/// borrowed from it, so the borrow checker prevents overwriting a value that
+/// is still in use. It retains the capacity of the largest block it has
+/// decoded and a Zstandard context once it has read a Zstandard frame.
+#[derive(Default)]
+pub struct ReadWorkspace {
+    scratch: Vec<u8>,
+    decompressor: Decompressor,
 }
 
-impl RunCursor<'_> {
-    /// Advances to the next record, or returns `None` at the end of the run.
-    pub fn next_record(&mut self) -> Option<Record<'_>> {
-        self.position.next_record(self.view).expect(VALIDATED)
-    }
-}
-
-/// Resumable traversal state that does not borrow the run it walks.
-///
-/// A position holds a block index and a [`BlockPosition`], so it can be owned
-/// beside the storage being read. Every step must be given the same run bytes.
-/// Passing different bytes is safe but yields an error or meaningless records.
-#[derive(Clone, Debug, Default)]
-pub struct RunPosition {
-    block: usize,
-    inner: BlockPosition,
-}
-
-impl RunPosition {
-    /// Creates a position before the first record of a run.
+impl ReadWorkspace {
+    /// Creates an empty workspace, which allocates nothing until it decodes a
+    /// compressed block.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Moves before the first record, keeping the key buffer's capacity.
-    pub fn reset(&mut self) {
-        self.block = 0;
-        self.inner.reset();
+    /// Returns the bytes retained for decoded blocks.
+    pub fn capacity(&self) -> usize {
+        self.scratch.capacity()
     }
 
-    /// Advances to the next record of `run`, moving across block boundaries,
-    /// or returns `None` at its end.
-    ///
-    /// Each step costs one bounds-checked frame lookup. On error the position
-    /// does not advance past the record that failed.
-    pub fn next_record<'p>(
-        &'p mut self,
-        run: RunView<'p>,
-    ) -> Result<Option<Record<'p>>, CorruptRun> {
-        while self.block < run.table.len() {
-            let (payload_start, view) = run.block_view(self.block)?;
-            if self.inner.is_finished(view) {
-                self.block += 1;
-                self.inner.reset();
-                continue;
-            }
-            return self
-                .inner
-                .next_record(view)
-                .map_err(|error| in_block(payload_start, error));
+    /// Returns a frame's block, decoding and verifying it if it is compressed.
+    fn load<'r>(&'r mut self, frame: &Frame<'r>) -> Result<&'r [u8], CorruptRun> {
+        if frame.codec == Codec::None {
+            return Ok(frame.stored);
         }
-        Ok(None)
+        frame.verify_checksum()?;
+
+        // Both checks precede sizing the buffer from a declared length.
+        let len = frame.decoded_len;
+        if !plausible_decoded_len(frame.codec, frame.stored, len) {
+            return Err(frame.error(RunCorruption::InvalidFrame));
+        }
+        // Only growth needs initializing, and stale bytes past `len` are never
+        // exposed.
+        if self.scratch.len() < len {
+            self.scratch.reserve_exact(len - self.scratch.len());
+            self.scratch.resize(len, 0);
+        }
+        let written =
+            self.decompressor
+                .decompress(frame.codec, frame.stored, &mut self.scratch[..len]);
+        if written != Some(len) {
+            return Err(frame.error(RunCorruption::CorruptPayload));
+        }
+        Ok(&self.scratch[..len])
+    }
+
+    /// Returns a block already decoded by [`load`](Self::load).
+    fn loaded<'r>(&'r self, frame: &Frame<'r>) -> &'r [u8] {
+        if frame.codec == Codec::None {
+            frame.stored
+        } else {
+            &self.scratch[..frame.decoded_len]
+        }
+    }
+}
+
+impl fmt::Debug for ReadWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadWorkspace")
+            .field("capacity", &self.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ordered traversal of every record in a run, across block boundaries.
+///
+/// This is a lending cursor rather than an [`Iterator`]: each [`Record`]
+/// borrows the key rebuilt in the cursor's single reusable buffer, and its
+/// value from the run or the workspace. Each compressed block is decoded once.
+/// Because the cursor holds the workspace exclusively, its decoded block
+/// cannot be replaced between steps; a concurrent lookup uses a second
+/// workspace.
+#[derive(Debug)]
+pub struct RunCursor<'a> {
+    view: RunView<'a>,
+    workspace: &'a mut ReadWorkspace,
+    next_block: usize,
+    loaded: Option<LoadedBlock<'a>>,
+    position: BlockPosition,
+}
+
+/// The block a cursor is walking.
+#[derive(Clone, Copy, Debug)]
+struct LoadedBlock<'a> {
+    frame: Frame<'a>,
+    entries_len: usize,
+}
+
+impl<'a> RunCursor<'a> {
+    /// Advances to the next record, or returns `None` at the end of the run.
+    pub fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
+        let Some(block) = self.block_with_records()? else {
+            return Ok(None);
+        };
+        let bytes = self.workspace.loaded(&block.frame);
+        let view = BlockView::open(bytes).map_err(|error| block.frame.block_error(error))?;
+        self.position
+            .next_record(view)
+            .map_err(|error| block.frame.block_error(error))
+    }
+
+    /// Returns the block holding the next record, decoding blocks as needed.
+    fn block_with_records(&mut self) -> Result<Option<LoadedBlock<'a>>, CorruptRun> {
+        loop {
+            if let Some(block) = self.loaded {
+                if self.position.offset() < block.entries_len {
+                    return Ok(Some(block));
+                }
+                self.loaded = None;
+                self.position.reset();
+            }
+            if self.next_block >= self.view.table.len() {
+                return Ok(None);
+            }
+            let frame = self.view.frame(self.next_block)?;
+            let bytes = self.workspace.load(&frame)?;
+            let entries_len = BlockView::open(bytes)
+                .map_err(|error| frame.block_error(error))?
+                .entries_len();
+            self.next_block += 1;
+            self.loaded = Some(LoadedBlock { frame, entries_len });
+        }
     }
 }
 
@@ -148,11 +225,14 @@ impl RunPosition {
 ///
 /// # Trust contract
 ///
-/// Reads are memory safe, panic free and bounded by the run length on every
-/// input, and report any malformed footer, table entry, frame or record they
-/// touch as [`CorruptRun`]. They cannot see what they do not touch: on invalid
-/// bytes, such as an index key that disagrees with its block or blocks in the
-/// wrong order, a read may return a wrong answer instead of an error.
+/// Reads are memory safe, panic free and bounded by the run length and
+/// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN) on every input, and report
+/// any malformed footer, table entry, frame or record they touch as
+/// [`CorruptRun`]. Compressed frames are checksummed before they are decoded.
+///
+/// Reads cannot see what they do not touch: on invalid bytes, such as an index
+/// key that disagrees with its block or blocks in the wrong order, a read may
+/// return a wrong answer instead of an error.
 ///
 /// A correct answer therefore requires bytes known to be a valid run: built by
 /// [`RunBuilder`](super::RunBuilder), or accepted once by [`Run::new`], and
@@ -253,17 +333,41 @@ impl<'a> RunView<'a> {
         Ok((low < self.table.len()).then_some(low))
     }
 
-    /// Returns the newest version of `user_key`, which may be a tombstone, or
+    /// Returns the newest version of `target`, which may be a tombstone, or
     /// `None` if the run has no record for that key.
     ///
-    /// Reads one block without walking it, and performs no heap allocation.
-    pub fn get(self, target: &[u8]) -> Result<Option<Version<'a>>, CorruptRun> {
+    /// Decodes at most one block and never walks it. Once the workspace has
+    /// grown to the largest block read, this performs no heap allocation.
+    pub fn get<'r>(
+        self,
+        target: &[u8],
+        workspace: &'r mut ReadWorkspace,
+    ) -> Result<Option<Version<'r>>, CorruptRun>
+    where
+        'a: 'r,
+    {
         let Some(block) = self.locate(target)? else {
             return Ok(None);
         };
-        let (payload_start, view) = self.block_view(block)?;
-        view.get(target)
-            .map_err(|error| in_block(payload_start, error))
+        let frame = self.frame(block)?;
+        let bytes = workspace.load(&frame)?;
+        BlockView::open(bytes)
+            .and_then(|view| view.get(target))
+            .map_err(|error| frame.block_error(error))
+    }
+
+    /// Returns a cursor positioned before the first record.
+    pub fn cursor<'r>(self, workspace: &'r mut ReadWorkspace) -> RunCursor<'r>
+    where
+        'a: 'r,
+    {
+        RunCursor {
+            view: self,
+            workspace,
+            next_block: 0,
+            loaded: None,
+            position: BlockPosition::new(),
+        }
     }
 
     /// Returns a block's index key. `block` must be below the block count.
@@ -277,36 +381,20 @@ impl<'a> RunView<'a> {
             .ok_or(self.invalid_index(block))
     }
 
-    /// Returns a block's bytes and their offset in the run, after checking
-    /// its frame header. `block` must be below the block count.
-    fn payload(self, block: usize) -> Result<(usize, &'a [u8]), CorruptRun> {
+    /// Finds a frame and checks its header. `block` must be below the block
+    /// count.
+    fn frame(self, block: usize) -> Result<Frame<'a>, CorruptRun> {
         let start = frame_offset(self.table[block]);
         let end = self
             .table
             .get(block + 1)
             .map_or(self.frames.len(), |&next| frame_offset(next));
-        let (header, payload) = self
+        let (header, stored) = self
             .frames
             .get(start..end)
-            .and_then(<[u8]>::split_first_chunk::<FRAME_HEADER_LEN>)
+            .and_then(<[u8]>::split_first_chunk::<{ frame::HEADER_LEN }>)
             .ok_or(self.invalid_index(block))?;
-
-        if header[0] != CODEC_RAW {
-            return Err(corrupt(start, RunCorruption::UnsupportedCodec));
-        }
-        let declared_len = read_u32(header, 4) as usize;
-        if header[1..4] != [0; 3] || declared_len != payload.len() || read_u32(header, 8) != 0 {
-            return Err(corrupt(start, RunCorruption::InvalidFrame));
-        }
-        Ok((start + FRAME_HEADER_LEN, payload))
-    }
-
-    /// Opens a block's view in constant time. `block` must be below the block
-    /// count.
-    fn block_view(self, block: usize) -> Result<(usize, BlockView<'a>), CorruptRun> {
-        let (payload_start, payload) = self.payload(block)?;
-        let view = BlockView::open(payload).map_err(|error| in_block(payload_start, error))?;
-        Ok((payload_start, view))
+        Frame::parse(start, header, stored)
     }
 
     fn invalid_index(self, block: usize) -> CorruptRun {
@@ -319,13 +407,6 @@ impl<'a> RunView<'a> {
 
 fn corrupt(offset: usize, kind: RunCorruption) -> CorruptRun {
     CorruptRun { offset, kind }
-}
-
-fn in_block(payload_start: usize, error: CorruptBlock) -> CorruptRun {
-    corrupt(
-        payload_start + error.offset,
-        RunCorruption::Block(error.kind),
-    )
 }
 
 /// An offset too large for `usize` becomes one that no slice can satisfy.
@@ -345,14 +426,21 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// index checks.
 fn validate(bytes: &[u8]) -> Result<(), CorruptRun> {
     let view = RunView::open(bytes)?;
+    let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
     for block in 0..view.table.len() {
-        let (payload_start, payload) = view.payload(block)?;
+        let frame = view.frame(block)?;
+        // Decoding verifies compressed frames.
+        if frame.codec == Codec::None {
+            frame.verify_checksum()?;
+        }
+        let decoded = workspace.load(&frame)?;
+
         let records_before = walk.record_count;
-        walk.validate_block(payload)
-            .map_err(|error| in_block(payload_start, error))?;
+        walk.validate_block(decoded)
+            .map_err(|error| frame.block_error(error))?;
         if walk.record_count == records_before {
-            return Err(corrupt(payload_start, RunCorruption::EmptyBlock));
+            return Err(frame.error(RunCorruption::EmptyBlock));
         }
         if view.last_key(block)? != walk.key {
             return Err(view.invalid_index(block));

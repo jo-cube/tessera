@@ -152,6 +152,11 @@ impl BlockPosition {
         self.offset >= block.entries.len()
     }
 
+    /// Returns the offset of the next record in the record region.
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// Advances to the next record of `block`, or returns `None` at its end.
     ///
     /// On error the position is unchanged.
@@ -253,6 +258,11 @@ impl<'a> BlockView<'a> {
             return Err(corrupt(entries_len, Corruption::InvalidRestarts));
         }
         Ok(Self { entries, restarts })
+    }
+
+    /// Returns the length of the record region.
+    pub(crate) fn entries_len(self) -> usize {
+        self.entries.len()
     }
 
     /// Returns the newest version of `user_key`, which may be a tombstone, or

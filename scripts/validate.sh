@@ -2,6 +2,7 @@
 # Runs Tessera's validation inside a resource-limited Linux container.
 #
 #   scripts/validate.sh image              build the toolchain image (online)
+#   scripts/validate.sh deps               resolve and fetch crates (online)
 #   scripts/validate.sh [check]            fmt, Clippy, tests and docs (default)
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
@@ -18,9 +19,10 @@
 # Anything that can loop or allocate without bound, including tests of
 # deliberately broken code, belongs in this script and not in a host shell.
 #
-# Validation is offline. Only `image` reaches the network, and it runs inside
-# the same 4 GiB VM. The crate has no dependencies; the first one should be
-# fetched by a similar explicit step, never by a build on the host.
+# Validation is offline. Only `image` and `deps` reach the network, and both
+# run inside the same 4 GiB VM. `deps` downloads crates and updates Cargo.lock
+# without compiling anything, so dependency build scripts only ever run in the
+# offline container. Every other step uses the locked crates read-only.
 
 set -euo pipefail
 
@@ -31,12 +33,17 @@ docker=(docker --context "${TESSERA_DOCKER_CONTEXT:-colima}")
 
 # Cargo fingerprints by path and mtime, and every source mounts at /work, so a
 # modified copy must never share the repository's build cache. An anonymous
-# volume is removed with its container.
+# volume is removed with its container. Downloaded crates are the same for
+# every source and live in their own volume.
 if [ -n "${TESSERA_SOURCE:-}" ]; then
   cache_mount=/cache
 else
   cache_mount=tessera-cache:/cache
 fi
+crates_mount=tessera-crates:/crates:ro
+network=none
+offline=true
+extra_mounts=()
 
 memory=3g
 cpus=2
@@ -94,14 +101,25 @@ exit $status
 bounded() {
   local label=$1 seconds=$2
   shift 2
-  "${docker[@]}" run --rm --init --pull never --network none \
+  "${docker[@]}" run --rm --init --pull never --network "$network" \
     --label "$run_label" \
     --memory "$memory" --memory-swap "$memory" --cpus "$cpus" --pids-limit "$pids" \
     --ulimit core=0 --cap-drop ALL --security-opt no-new-privileges \
-    --volume "$source_dir:/work:ro" --volume "$cache_mount" --workdir /work \
-    --env STEP="$label" --env CARGO_HOME=/cache/cargo --env CARGO_TARGET_DIR=/cache/target \
-    --env CARGO_BUILD_JOBS=2 --env RUST_TEST_THREADS=2 --env CARGO_NET_OFFLINE=true \
+    --volume "$source_dir:/work:ro" --volume "$cache_mount" --volume "$crates_mount" \
+    ${extra_mounts[@]+"${extra_mounts[@]}"} --workdir /work \
+    --env STEP="$label" --env CARGO_HOME=/crates --env CARGO_TARGET_DIR=/cache/target \
+    --env CARGO_BUILD_JOBS=2 --env RUST_TEST_THREADS=2 --env CARGO_NET_OFFLINE="$offline" \
     "$image" sh -c "$INNER" sh "$seconds" "$@"
+}
+
+# The one writable path in the repository is Cargo.lock, mounted over the
+# read-only source. `cargo fetch` honours existing pins and never compiles.
+fetch_crates() {
+  network=bridge
+  offline=false
+  crates_mount=tessera-crates:/crates
+  extra_mounts=(--volume "$repo/Cargo.lock:/work/Cargo.lock")
+  bounded deps 300 cargo fetch
 }
 
 check() {
@@ -168,11 +186,12 @@ command="${1:-check}"
 [ "$command" = image ] || require_image
 case "$command" in
   image) build_image ;;
+  deps) fetch_crates ;;
   check) check ;;
   limits) limits ;;
   full) check; limits ;;
   bench) bench ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,10p' "$0"; exit 2 ;;
+  *) sed -n '2,11p' "$0"; exit 2 ;;
 esac

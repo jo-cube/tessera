@@ -8,7 +8,7 @@ use tessera::block::{
     Block, BlockBuilder, BuildError, MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL,
     Value,
 };
-use tessera::run::{MAX_TARGET_BLOCK_LEN, Run, RunBuilder};
+use tessera::run::{Codec, MAX_TARGET_BLOCK_LEN, ReadWorkspace, Run, RunBuilder};
 
 #[test]
 #[ignore = "large allocations; run with scripts/validate.sh limits"]
@@ -76,25 +76,29 @@ fn block_may_fill_exactly_to_the_length_limit() {
     }
 }
 
-/// Even at the largest target, a block is always cut before it can fill.
+/// Even at the largest target, a block is always cut before it can fill, and
+/// maximum-sized blocks round trip through every codec.
 #[test]
 #[ignore = "large allocations; run with scripts/validate.sh limits"]
 fn run_never_reports_a_full_block() {
-    let mut builder = RunBuilder::with_target_block_len(usize::MAX);
     let largest = vec![1; MAX_VALUE_LEN];
-    builder.add(b"a", 2, Value::Bytes(&largest)).unwrap();
-    builder.add(b"a", 1, Value::Bytes(&largest)).unwrap();
-
     // Just below the target, so these are not treated as oversized.
     let near_target = vec![2; MAX_TARGET_BLOCK_LEN - 2];
-    for seq in (0..3).rev() {
-        builder.add(b"b", seq, Value::Bytes(&near_target)).unwrap();
-    }
-    drop(largest);
 
-    let run = builder.finish();
-    assert_eq!(run.len(), 5);
-    let validated = Run::new(run.as_bytes()).unwrap();
-    assert_eq!(validated.get(b"a").unwrap().seq, 2);
-    assert_eq!(validated.get(b"b").unwrap().seq, 2);
+    for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
+        let mut builder = RunBuilder::with_target_block_len(codec, usize::MAX);
+        builder.add(b"a", 2, Value::Bytes(&largest)).unwrap();
+        builder.add(b"a", 1, Value::Bytes(&largest)).unwrap();
+        for seq in (0..3).rev() {
+            builder.add(b"b", seq, Value::Bytes(&near_target)).unwrap();
+        }
+
+        let run = builder.finish();
+        assert_eq!(run.len(), 5);
+        let validated = Run::new(run.as_bytes()).unwrap();
+        let mut workspace = ReadWorkspace::new();
+        let found = validated.get(b"a", &mut workspace).unwrap().unwrap();
+        assert_eq!((found.seq, found.value), (2, Value::Bytes(&largest)));
+        assert_eq!(validated.get(b"b", &mut workspace).unwrap().unwrap().seq, 2);
+    }
 }
