@@ -1,6 +1,7 @@
 //! Repeatable block and run measurements on deterministic datasets.
 //!
 //! With the argument `geometry`, instead compares run block sizes and codecs.
+//! With the argument `prefix`, instead compares prefix scans over those sizes.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -1056,10 +1057,368 @@ fn geometry() {
     controlled_blocks();
 }
 
+// Prefix scans over hierarchical keys.
+
+/// A key `t0000:g00:s00:d000` of the given groups, subgroups and documents, so
+/// each key level names a prefix of known size.
+fn tree_key(doc: u64, (groups, subs, docs): (u64, u64, u64)) -> Vec<u8> {
+    let (d, doc) = (doc % docs, doc / docs);
+    let (s, doc) = (doc % subs, doc / subs);
+    let (g, t) = (doc % groups, doc / groups);
+    format!("t{t:04}:g{g:02}:s{s:02}:d{d:03}").into_bytes()
+}
+
+const TREE_KEY_LEN: usize = 18;
+const TENANT_LEN: usize = 6;
+const GROUP_LEN: usize = 10;
+const SUB_LEN: usize = 14;
+/// 4000 records per tenant, 200 per group and 20 per subgroup.
+const FLAT_TREE: (u64, u64, u64) = (20, 10, 20);
+/// With about three versions a document, the same shape as `FLAT_TREE`.
+const VERSIONED_TREE: (u64, u64, u64) = (20, 8, 8);
+/// Keys sorting before the tree, each with a chain that spans small blocks.
+const CHAINS: u64 = 64;
+const CHAIN_VERSIONS: u64 = 200;
+
+fn tree_json(target: usize) -> Vec<Owned> {
+    const PLANS: [&str; 4] = ["free", "team", "business", "enterprise"];
+    const REGIONS: [&str; 3] = ["us-east", "eu-west", "ap-south"];
+
+    let mut rng = Rng(21);
+    fill(target, |i| {
+        let value = format!(
+            r#"{{"customer":{},"plan":"{}","active":{},"region":"{}","balance":{}}}"#,
+            rng.next() % 100_000,
+            PLANS[(rng.next() % 4) as usize],
+            rng.next().is_multiple_of(2),
+            REGIONS[(rng.next() % 3) as usize],
+            rng.next() % 1_000_000,
+        );
+        vec![Owned {
+            key: tree_key(i, FLAT_TREE),
+            seq: BASE_SEQ + i,
+            value: Some(value.into_bytes()),
+        }]
+    })
+}
+
+fn tree_small(target: usize) -> Vec<Owned> {
+    let mut rng = Rng(22);
+    fill(target, |i| {
+        vec![Owned {
+            key: tree_key(i, FLAT_TREE),
+            seq: BASE_SEQ + i,
+            value: Some(rng.bytes(8)),
+        }]
+    })
+}
+
+fn tree_versions(target: usize) -> Vec<Owned> {
+    const STATE: [&str; 4] = ["created", "paid", "shipped", "delivered"];
+
+    let mut rng = Rng(23);
+    fill(target, |i| {
+        let (key, versions) = if i < CHAINS {
+            (format!("h{i:04}").into_bytes(), CHAIN_VERSIONS)
+        } else {
+            (tree_key(i - CHAINS, VERSIONED_TREE), 1 + rng.next() % 5)
+        };
+        let customer = rng.next() % 100_000;
+        (0..versions)
+            .map(|version| Owned {
+                key: key.clone(),
+                seq: BASE_SEQ + 1000 - version,
+                value: (!rng.next().is_multiple_of(16)).then(|| {
+                    format!(
+                        r#"{{"customer":{customer},"state":"{}","updated":{}}}"#,
+                        STATE[(rng.next() % 4) as usize],
+                        1_700_000_000 + rng.next() % 86_400,
+                    )
+                    .into_bytes()
+                }),
+            })
+            .collect()
+    })
+}
+
+const PREFIX_KIB: [usize; 4] = [8, 16, 32, 64];
+const PREFIX_ROUNDS: usize = 9;
+const PREFIX_PROBES: usize = 400;
+
+/// Runs one prefix query on a fresh cursor, consuming every record. A fresh
+/// cursor shares no decoded block with the previous query.
+fn scan_query(run: &Run<Vec<u8>>, workspace: &mut ReadWorkspace, prefix: &[u8]) -> usize {
+    let mut cursor = run.cursor(workspace);
+    cursor.seek_prefix(black_box(prefix)).unwrap();
+    let (mut count, mut consumed) = (0, 0u64);
+    while let Some(record) = cursor.next_record().unwrap() {
+        count += 1;
+        let value = match record.value {
+            Value::Bytes(bytes) => bytes
+                .first()
+                .map_or(0, |&b| u64::from(b) + bytes.len() as u64),
+            Value::Tombstone => 1,
+        };
+        let last = record.key.last().map_or(0, |&b| u64::from(b));
+        consumed = consumed.wrapping_add(record.seq ^ last ^ value);
+    }
+    black_box(consumed);
+    count
+}
+
+/// The records a prefix selects, by the reference ordering of the input.
+fn matching(records: &[Owned], prefix: &[u8]) -> usize {
+    let start = records.partition_point(|r| r.key.as_slice() < prefix);
+    records[start..].partition_point(|r| r.key.starts_with(prefix))
+}
+
+/// One dataset's prefixes at each scale, the same for every configuration.
+fn prefix_buckets(records: &[Owned]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+    let mut keys: Vec<&[u8]> = records.iter().map(|r| r.key.as_slice()).collect();
+    keys.dedup();
+    let (chains, tree): (Vec<&[u8]>, Vec<&[u8]>) = keys
+        .iter()
+        .copied()
+        .partition(|key| key.len() != TREE_KEY_LEN);
+    let mut rng = Rng(31);
+    let mut sample = |len: usize, keys: &[&[u8]], suffix: &[u8]| -> Vec<Vec<u8>> {
+        let mut levels: Vec<&[u8]> = keys.iter().map(|key| &key[..len.min(key.len())]).collect();
+        levels.dedup();
+        (0..PREFIX_PROBES)
+            .map(|_| {
+                let level = levels[(rng.next() % levels.len() as u64) as usize];
+                [level, suffix].concat()
+            })
+            .collect()
+    };
+    let mut buckets = vec![
+        ("0 records", sample(SUB_LEN, &tree, b"~")),
+        ("1-5 records", sample(TREE_KEY_LEN, &tree, b"")),
+        ("10-25 records", sample(SUB_LEN, &tree, b"")),
+        ("100-250 records", sample(GROUP_LEN, &tree, b"")),
+        ("1000-5000 records", sample(TENANT_LEN, &tree, b"")),
+    ];
+    if !chains.is_empty() {
+        buckets.push(("version chain", sample(usize::MAX, &chains, b"")));
+    }
+    buckets
+}
+
+/// Prefixes at block edges, which depend on the block target: the whole last
+/// key of a block, whose scan must load the next block to end, and the prefix
+/// of a subgroup that continues into that next block.
+fn boundary_buckets(decoded: &[Vec<u8>]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+    let mut last_keys: Vec<Vec<u8>> = Vec::with_capacity(decoded.len());
+    let mut position = BlockPosition::new();
+    for block in &decoded[..decoded.len().saturating_sub(1)] {
+        let view = BlockView::open(block).unwrap();
+        position.reset();
+        let mut last = Vec::new();
+        while let Some(record) = position.next_record(view).unwrap() {
+            last.clear();
+            last.extend_from_slice(record.key);
+        }
+        if last.len() == TREE_KEY_LEN {
+            last_keys.push(last);
+        }
+    }
+    let mut rng = Rng(32);
+    let (mut ends, mut crossing) = (Vec::new(), Vec::new());
+    for _ in 0..PREFIX_PROBES.min(last_keys.len()) {
+        let key = &last_keys[(rng.next() % last_keys.len() as u64) as usize];
+        ends.push(key.clone());
+        crossing.push(key[..SUB_LEN].to_vec());
+    }
+    vec![("block end", ends), ("block crossing", crossing)]
+}
+
+fn measure_prefix_config(
+    dataset: &str,
+    kib: usize,
+    label: &str,
+    codec: Codec,
+    records: &[Owned],
+    buckets: &[(&'static str, Vec<Vec<u8>>)],
+) {
+    let run = build_run_with(codec, kib << 10, records);
+    let bytes = run.as_bytes();
+    let view = run.view();
+    let stored = frames(bytes);
+    let timed = |ops, round: &mut dyn FnMut()| median_ns_of(PREFIX_ROUNDS, ops, round);
+
+    let mut zstd = zstd_safe::DCtx::create();
+    let decoded: Vec<Vec<u8>> = stored
+        .iter()
+        .map(|(id, len, payload, _)| {
+            let mut out = vec![0; *len];
+            decode_frame(&mut zstd, *id, payload, &mut out);
+            out
+        })
+        .collect();
+    let largest = stored.iter().map(|f| f.1).max().unwrap_or(0);
+    let mut out = vec![0; largest];
+    let mut workspace = ReadWorkspace::new();
+
+    let boundaries = boundary_buckets(&decoded);
+    for (bucket, probes) in buckets.iter().chain(&boundaries) {
+        // The cost of each phase of a seek, on its own over the same probes.
+        let candidates: Vec<(&[u8], usize)> = probes
+            .iter()
+            .filter_map(|prefix| Some((prefix.as_slice(), view.locate(prefix).unwrap()?)))
+            .collect();
+        let locate_ns = timed(probes.len(), &mut || {
+            for prefix in probes {
+                black_box(view.locate(black_box(prefix)).unwrap());
+            }
+        });
+        let decode_ns = if codec == Codec::None {
+            0.0
+        } else {
+            timed(probes.len(), &mut || {
+                for &(_, block) in &candidates {
+                    let (id, len, payload, header) = stored[block];
+                    let mut hasher = Hasher::new();
+                    hasher.update(black_box(header));
+                    hasher.update(black_box(payload));
+                    black_box(hasher.finalize());
+                    decode_frame(&mut zstd, id, payload, &mut out[..len]);
+                    black_box(&out);
+                }
+            })
+        };
+        let mut position = BlockPosition::new();
+        let block_seek_ns = timed(probes.len(), &mut || {
+            for &(prefix, block) in &candidates {
+                let view = BlockView::open(&decoded[block]).unwrap();
+                position.seek(view, black_box(prefix)).unwrap();
+                black_box(&position);
+            }
+        });
+
+        let seek_ns = timed(probes.len(), &mut || {
+            for prefix in probes {
+                let mut cursor = run.cursor(&mut workspace);
+                cursor.seek_prefix(black_box(prefix)).unwrap();
+                black_box(&mut cursor);
+            }
+        });
+
+        // A checked pass: the reader must return what the input records hold.
+        let expected: usize = probes.iter().map(|prefix| matching(records, prefix)).sum();
+        let before = workspace.blocks_loaded();
+        let returned: usize = probes
+            .iter()
+            .map(|prefix| scan_query(&run, &mut workspace, prefix))
+            .sum();
+        assert_eq!(returned, expected, "{dataset} {kib} {label} {bucket}");
+        let loads = workspace.blocks_loaded() - before;
+
+        let scan_ns = timed(probes.len(), &mut || {
+            for prefix in probes {
+                black_box(scan_query(&run, &mut workspace, prefix));
+            }
+        });
+        let mut latencies = Vec::with_capacity(PREFIX_ROUNDS * probes.len());
+        for _ in 0..PREFIX_ROUNDS {
+            for prefix in probes {
+                let start = Instant::now();
+                black_box(scan_query(&run, &mut workspace, prefix));
+                latencies.push(start.elapsed().as_nanos() as u64);
+            }
+        }
+        latencies.sort_unstable();
+        let percentile = |p: f64| latencies[((latencies.len() - 1) as f64 * p) as usize];
+        let warm_allocs = allocations_during(|| {
+            for prefix in probes {
+                black_box(scan_query(&run, &mut workspace, prefix));
+            }
+        });
+
+        let count = expected as f64 / probes.len() as f64;
+        let (ns_per_record, records_per_second) = if expected == 0 {
+            (0.0, 0.0)
+        } else {
+            (scan_ns / count, count / scan_ns * 1e9)
+        };
+        println!(
+            "| {dataset} | {kib} | {label} | {bucket} | {count:.1} | {:.2} | {locate_ns:.0} | {decode_ns:.0} | {block_seek_ns:.0} | {seek_ns:.0} | {scan_ns:.0} | {} | {} | {ns_per_record:.1} | {records_per_second:.0} | {warm_allocs} |",
+            loads as f64 / probes.len() as f64,
+            percentile(0.5),
+            percentile(0.99),
+        );
+    }
+}
+
+fn prefix_summary(dataset: &str, kib: usize, label: &str, codec: Codec, records: &[Owned]) {
+    let run = build_run_with(codec, kib << 10, records);
+    let logical: usize = records
+        .iter()
+        .map(|r| r.key.len() + r.value.as_ref().map_or(0, Vec::len))
+        .sum();
+    let mut workspace = ReadWorkspace::new();
+    let scan_ns = median_ns_of(PREFIX_ROUNDS, records.len(), || {
+        assert_eq!(scan_query(&run, &mut workspace, b""), records.len());
+    });
+    println!(
+        "| {dataset} | {kib} | {label} | {} | {} | {:.1} | {} | {} | {} | {scan_ns:.1} | {:.0} | {} |",
+        records.len(),
+        run.as_bytes().len(),
+        run.as_bytes().len() as f64 / records.len() as f64,
+        run.block_count(),
+        run.view().index_len() + 28,
+        12 * run.block_count(),
+        logical as f64 / records.len() as f64 / scan_ns * 1000.0,
+        workspace.capacity(),
+    );
+}
+
+fn prefix_scans() {
+    println!(
+        "prefix scans; {} MiB of logical data per dataset; {PREFIX_ROUNDS} rounds, {PREFIX_PROBES} seeded prefixes per round",
+        GEOMETRY_BYTES >> 20
+    );
+    println!("every query uses a new cursor, so it decodes its own blocks and reuses none");
+    println!("times are ns per query; records is the mean returned per query");
+    println!();
+    let datasets: [(&str, Fixture); 3] = [
+        ("json-tree", tree_json),
+        ("small-tree", tree_small),
+        ("version-tree", tree_versions),
+    ];
+    println!(
+        "| dataset | kib | codec | records | total | bytes per record | blocks | index | headers | full scan ns per record | full scan MiB/s | workspace bytes |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut cached = Vec::new();
+    for (name, make) in datasets {
+        let records = make(GEOMETRY_BYTES);
+        for kib in PREFIX_KIB {
+            for (codec, label) in CODECS {
+                prefix_summary(name, kib, label, codec, &records);
+            }
+        }
+        cached.push((name, records));
+    }
+    println!();
+    println!(
+        "| dataset | kib | codec | bucket | records | blocks | locate | first decode | block seek | seek | scan | p50 | p99 | ns per record | records/s | warm allocs |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for (name, records) in &cached {
+        let buckets = prefix_buckets(records);
+        for kib in PREFIX_KIB {
+            for (codec, label) in CODECS {
+                measure_prefix_config(name, kib, label, codec, records, &buckets);
+            }
+        }
+    }
+}
+
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("geometry") {
-        geometry();
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("geometry") => return geometry(),
+        Some("prefix") => return prefix_scans(),
+        _ => {}
     }
 
     println!("median of {ROUNDS} rounds; ns per record (build, validate, scan) or per lookup");

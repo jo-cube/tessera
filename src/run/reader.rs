@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::block::{BlockPosition, BlockView, Record, RecordWalk, Version};
+use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Version};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::frame::{self, Frame};
@@ -73,7 +73,8 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 
     /// Returns a cursor positioned before the first record, which holds the
-    /// workspace for as long as it lives.
+    /// workspace for as long as it lives. Use [`RunCursor::seek`] or
+    /// [`RunCursor::seek_prefix`] to start elsewhere.
     pub fn cursor<'r>(&'r self, workspace: &'r mut ReadWorkspace) -> RunCursor<'r> {
         self.view().cursor(workspace)
     }
@@ -94,11 +95,17 @@ impl<B: AsRef<[u8]>> Run<B> {
 /// One workspace serves any number of runs and codecs, and its results are
 /// borrowed from it, so the borrow checker prevents overwriting a value that
 /// is still in use. It retains the capacity of the largest block it has
-/// decoded and a Zstandard context once it has read a Zstandard frame.
+/// decoded, the longest key and prefix a cursor has held, and a Zstandard
+/// context once it has read a Zstandard frame. Keys and prefixes are limited
+/// to [`MAX_KEY_LEN`], so a warm workspace serves a new cursor per query with
+/// no heap allocation.
 #[derive(Default)]
 pub struct ReadWorkspace {
     scratch: Vec<u8>,
     decompressor: Decompressor,
+    position: BlockPosition,
+    prefix: Vec<u8>,
+    blocks_loaded: u64,
 }
 
 impl ReadWorkspace {
@@ -113,8 +120,17 @@ impl ReadWorkspace {
         self.scratch.capacity()
     }
 
+    /// Returns how many blocks reads through this workspace have loaded, each
+    /// of which is a decompression for a compressed run.
+    ///
+    /// A lookup or a seek that needs no block does not count.
+    pub fn blocks_loaded(&self) -> u64 {
+        self.blocks_loaded
+    }
+
     /// Returns a frame's block, decoding and verifying it if it is compressed.
     fn load<'r>(&'r mut self, frame: &Frame<'r>) -> Result<&'r [u8], CorruptRun> {
+        self.blocks_loaded += 1;
         if frame.codec == Codec::None {
             return Ok(frame.stored);
         }
@@ -139,14 +155,14 @@ impl ReadWorkspace {
         }
         Ok(&self.scratch[..len])
     }
+}
 
-    /// Returns a block already decoded by [`load`](Self::load).
-    fn loaded<'r>(&'r self, frame: &Frame<'r>) -> &'r [u8] {
-        if frame.codec == Codec::None {
-            frame.stored
-        } else {
-            &self.scratch[..frame.decoded_len]
-        }
+/// Returns a block already decoded into `scratch` by [`ReadWorkspace::load`].
+fn loaded_bytes<'r>(scratch: &'r [u8], frame: &Frame<'r>) -> &'r [u8] {
+    if frame.codec == Codec::None {
+        frame.stored
+    } else {
+        &scratch[..frame.decoded_len]
     }
 }
 
@@ -166,13 +182,39 @@ impl fmt::Debug for ReadWorkspace {
 /// Because the cursor holds the workspace exclusively, its decoded block
 /// cannot be replaced between steps; a concurrent lookup uses a second
 /// workspace.
+///
+/// [`seek`](Self::seek) and [`seek_prefix`](Self::seek_prefix) reposition a
+/// cursor any number of times, forward or backward. All stored versions and
+/// tombstones are yielded in internal order; a cursor applies no visibility.
+///
+/// ```
+/// use tessera::block::Value;
+/// use tessera::run::{Codec, ReadWorkspace, RunBuilder};
+///
+/// let mut builder = RunBuilder::new(Codec::Zstd);
+/// builder.add(b"user:1", 7, Value::Bytes(b"a"))?;
+/// builder.add(b"user:2", 8, Value::Tombstone)?;
+/// builder.add(b"zone:1", 9, Value::Bytes(b"b"))?;
+/// let run = builder.finish();
+///
+/// let mut workspace = ReadWorkspace::new();
+/// let mut cursor = run.cursor(&mut workspace);
+/// cursor.seek_prefix(b"user:")?;
+/// let mut seen = 0;
+/// while let Some(record) = cursor.next_record()? {
+///     assert!(record.key.starts_with(b"user:"));
+///     seen += 1;
+/// }
+/// assert_eq!(seen, 2);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug)]
 pub struct RunCursor<'a> {
     view: RunView<'a>,
     workspace: &'a mut ReadWorkspace,
     next_block: usize,
     loaded: Option<LoadedBlock<'a>>,
-    position: BlockPosition,
+    failure: Option<CorruptRun>,
 }
 
 /// The block a cursor is walking.
@@ -183,39 +225,129 @@ struct LoadedBlock<'a> {
 }
 
 impl<'a> RunCursor<'a> {
-    /// Advances to the next record, or returns `None` at the end of the run.
+    /// Moves before the first record whose user key is at or above `target`,
+    /// which is the newest version of that key, and iterates without a bound.
+    ///
+    /// Uses the sparse index and decodes at most one block, or none if the
+    /// target is already in the block being walked or above every key. If this
+    /// fails, [`next_record`](Self::next_record) reports the same error until a
+    /// later seek succeeds.
+    pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
+        self.workspace.prefix.clear();
+        self.reposition(target)
+    }
+
+    /// Moves to the first record whose user key starts with `prefix` and
+    /// iterates only while keys do.
+    ///
+    /// An empty prefix selects the whole run. Keys are treated as raw bytes.
+    /// The range ends at the first key without the prefix, so a prefix of
+    /// `0xFF` bytes needs no special handling. That key must be read to be
+    /// seen, so a prefix whose last match ends a block loads the next block.
+    /// A seek clears any bound set earlier.
+    pub fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
+        self.workspace.prefix.clear();
+        if prefix.len() > MAX_KEY_LEN {
+            // No stored key is that long, and the buffer stays bounded.
+            self.failure = None;
+            self.finish();
+            return Ok(());
+        }
+        self.workspace.prefix.extend_from_slice(prefix);
+        self.reposition(prefix)
+    }
+
+    fn reposition(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
+        self.failure = None;
+        let result = self.position_at(target);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+
+    fn position_at(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
+        let Some(index) = self.view.locate(target)? else {
+            self.finish();
+            return Ok(());
+        };
+        let block = match self.loaded {
+            Some(block) if self.next_block == index + 1 => block,
+            _ => self.load_block(index)?,
+        };
+        let workspace = &mut *self.workspace;
+        let bytes = loaded_bytes(&workspace.scratch, &block.frame);
+        let view = BlockView::open(bytes).map_err(|error| block.frame.block_error(error))?;
+        workspace
+            .position
+            .seek(view, target)
+            .map_err(|error| block.frame.block_error(error))
+    }
+
+    /// Moves past the last record of the run.
+    fn finish(&mut self) {
+        self.loaded = None;
+        self.next_block = self.view.table.len();
+    }
+
+    /// Advances to the next record, or returns `None` at the end of the run or
+    /// of the prefix. After `None`, it keeps returning `None` until a seek.
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
         let Some(block) = self.block_with_records()? else {
             return Ok(None);
         };
-        let bytes = self.workspace.loaded(&block.frame);
+        let workspace = &mut *self.workspace;
+        let bytes = loaded_bytes(&workspace.scratch, &block.frame);
         let view = BlockView::open(bytes).map_err(|error| block.frame.block_error(error))?;
-        self.position
+        let record = workspace
+            .position
             .next_record(view)
-            .map_err(|error| block.frame.block_error(error))
+            .map_err(|error| block.frame.block_error(error))?;
+        match record {
+            // Spelled out rather than `finish`, because the record borrows the
+            // workspace in the other arm.
+            Some(record) if !record.key.starts_with(&workspace.prefix) => {
+                self.loaded = None;
+                self.next_block = self.view.table.len();
+                Ok(None)
+            }
+            record => Ok(record),
+        }
     }
 
     /// Returns the block holding the next record, decoding blocks as needed.
     fn block_with_records(&mut self) -> Result<Option<LoadedBlock<'a>>, CorruptRun> {
         loop {
             if let Some(block) = self.loaded {
-                if self.position.offset() < block.entries_len {
+                if self.workspace.position.offset() < block.entries_len {
                     return Ok(Some(block));
                 }
                 self.loaded = None;
-                self.position.reset();
+                self.workspace.position.reset();
             }
             if self.next_block >= self.view.table.len() {
                 return Ok(None);
             }
-            let frame = self.view.frame(self.next_block)?;
-            let bytes = self.workspace.load(&frame)?;
-            let entries_len = BlockView::open(bytes)
-                .map_err(|error| frame.block_error(error))?
-                .entries_len();
-            self.next_block += 1;
-            self.loaded = Some(LoadedBlock { frame, entries_len });
+            self.load_block(self.next_block)?;
         }
+    }
+
+    /// Decodes block `index` and makes it the one being walked. The previous
+    /// block is forgotten first, because decoding overwrites it.
+    fn load_block(&mut self, index: usize) -> Result<LoadedBlock<'a>, CorruptRun> {
+        self.loaded = None;
+        let frame = self.view.frame(index)?;
+        let bytes = self.workspace.load(&frame)?;
+        let entries_len = BlockView::open(bytes)
+            .map_err(|error| frame.block_error(error))?
+            .entries_len();
+        let block = LoadedBlock { frame, entries_len };
+        self.next_block = index + 1;
+        self.loaded = Some(block);
+        Ok(block)
     }
 }
 
@@ -361,12 +493,14 @@ impl<'a> RunView<'a> {
     where
         'a: 'r,
     {
+        workspace.position.reset();
+        workspace.prefix.clear();
         RunCursor {
             view: self,
             workspace,
             next_block: 0,
             loaded: None,
-            position: BlockPosition::new(),
+            failure: None,
         }
     }
 

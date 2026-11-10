@@ -157,6 +157,47 @@ impl BlockPosition {
         self.offset
     }
 
+    /// Moves before the first record of `block` whose user key is at or above
+    /// `target`, or to the end of the block if there is none.
+    ///
+    /// Versions of one key are stored newest first, so this stops at the newest
+    /// version. It searches the restart directory, then walks at most one
+    /// restart interval, reusing the key buffer. On error the position is reset.
+    pub fn seek(&mut self, block: BlockView<'_>, target: &[u8]) -> Result<(), CorruptBlock> {
+        self.reset();
+        let result = self.walk_to(block, target);
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
+    /// Walks from the search start to the first record at or above `target`.
+    /// The buffer holds the previous key, which that record is encoded against.
+    fn walk_to(&mut self, block: BlockView<'_>, target: &[u8]) -> Result<(), CorruptBlock> {
+        let Some(start) = block.search_start(target)? else {
+            return Ok(());
+        };
+        self.offset = start;
+        let mut rest = &block.entries[start..];
+        while !rest.is_empty() {
+            let record = block.decode(&mut rest)?;
+            record
+                .check_key_len(self.key.len())
+                .map_err(|kind| CorruptBlock {
+                    offset: self.offset,
+                    kind,
+                })?;
+            if cmp_joined(&self.key[..record.shared], record.suffix, target).is_ge() {
+                return Ok(());
+            }
+            self.offset = block.entries.len() - rest.len();
+            self.key.truncate(record.shared);
+            self.key.extend_from_slice(record.suffix);
+        }
+        Ok(())
+    }
+
     /// Advances to the next record of `block`, or returns `None` at its end.
     ///
     /// On error the position is unchanged.
@@ -270,31 +311,10 @@ impl<'a> BlockView<'a> {
     ///
     /// Performs no heap allocation.
     pub fn get(self, target: &[u8]) -> Result<Option<Version<'a>>, CorruptBlock> {
-        // Search for the last restart strictly below the target, rather than
-        // at or below it. Versions of one user key can span restarts, and the
-        // newest is the first of them.
-        let mut failure = None;
-        let below = self
-            .restarts
-            .partition_point(|&restart| match self.restart_key(restart) {
-                Ok(key) => key < target,
-                Err(error) => {
-                    failure = Some(error);
-                    false
-                }
-            });
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        let Some(&start) = self.restarts.get(below.saturating_sub(1)) else {
+        let Some(start) = self.search_start(target)? else {
             return Ok(None);
         };
-        let Some(mut rest) = self.entries.get(restart_offset(start)..) else {
-            return Err(CorruptBlock {
-                offset: restart_offset(start),
-                kind: Corruption::InvalidRestarts,
-            });
-        };
+        let mut rest = &self.entries[start..];
 
         // Keys are compared without rebuilding them. Scanning continues only
         // while the current key is below the target, and `matched` is the
@@ -326,6 +346,38 @@ impl<'a> BlockView<'a> {
         Ok(None)
     }
 
+    /// Returns the offset of the record to start a search for `target` from,
+    /// within the record region, or `None` if the block has no records.
+    fn search_start(self, target: &[u8]) -> Result<Option<usize>, CorruptBlock> {
+        // Search for the last restart strictly below the target, rather than
+        // at or below it. Versions of one user key can span restarts, and the
+        // newest is the first of them.
+        let mut failure = None;
+        let below = self
+            .restarts
+            .partition_point(|&restart| match self.restart_key(restart) {
+                Ok(key) => key < target,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let Some(&start) = self.restarts.get(below.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        let offset = restart_offset(start);
+        if offset > self.entries.len() {
+            return Err(CorruptBlock {
+                offset,
+                kind: Corruption::InvalidRestarts,
+            });
+        }
+        Ok(Some(offset))
+    }
+
     /// Returns the key of a restart record, which is stored whole.
     fn restart_key(self, restart: [u8; U32_LEN]) -> Result<&'a [u8], CorruptBlock> {
         let offset = restart_offset(restart);
@@ -348,6 +400,12 @@ impl<'a> BlockView<'a> {
             kind,
         })
     }
+}
+
+/// Orders the key `prefix` + `suffix` against `target` without joining them.
+fn cmp_joined(prefix: &[u8], suffix: &[u8], target: &[u8]) -> Ordering {
+    let (head, tail) = target.split_at(prefix.len().min(target.len()));
+    prefix.cmp(head).then_with(|| suffix.cmp(tail))
 }
 
 fn restart_offset(restart: [u8; U32_LEN]) -> usize {

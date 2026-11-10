@@ -8,6 +8,7 @@
 #   scripts/validate.sh full               check, then limits
 #   scripts/validate.sh bench              the block and run benchmark
 #   scripts/validate.sh geometry           run block size and codec comparison
+#   scripts/validate.sh prefix             prefix scan comparison
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -143,6 +144,10 @@ geometry() {
   bounded geometry 900 cargo run --locked --release --example block_bench -- geometry
 }
 
+prefix() {
+  bounded prefix 900 cargo run --locked --release --example block_bench -- prefix
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -197,7 +202,8 @@ case "$command" in
   full) check; limits ;;
   bench) bench ;;
   geometry) geometry ;;
+  prefix) prefix ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,12p' "$0"; exit 2 ;;
+  *) sed -n '2,13p' "$0"; exit 2 ;;
 esac

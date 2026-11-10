@@ -42,6 +42,13 @@ pub struct RunBuilder {
     record_count: usize,
 }
 
+impl Default for RunBuilder {
+    /// A builder with the default codec and [`TARGET_BLOCK_LEN`].
+    fn default() -> Self {
+        Self::new(Codec::default())
+    }
+}
+
 impl RunBuilder {
     /// Creates a builder aiming for blocks of [`TARGET_BLOCK_LEN`] bytes
     /// before compression.

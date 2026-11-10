@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 3A
+## Status: Milestone 3C
 
 Two physical storage layers exist.
 
@@ -16,11 +16,13 @@ constant time, and `BlockPosition` walks a block without borrowing it.
 
 A **run** is a self-contained sequence of independently compressed blocks in
 contiguous bytes with a sparse index of each block's last user key.
-`RunBuilder` consumes records in internal-key order, cuts blocks near 64 KiB of
-uncompressed data, keeps ordinary version chains whole and stores them
-uncompressed or with LZ4 or Zstandard. Reads take a reusable `ReadWorkspace`:
+`RunBuilder` consumes records in internal-key order, cuts blocks near 16 KiB of
+uncompressed data by default, keeps ordinary version chains whole and stores them
+uncompressed or with LZ4 or Zstandard (level 3 is the provisional default). Reads take a reusable `ReadWorkspace`:
 `Run::get` finds the newest version of a key, including tombstones, by decoding
-at most one block, and `Run::cursor` iterates across blocks. `Run::new`
+at most one block. `Run::cursor` iterates across blocks; `RunCursor::seek` moves
+to the first key at or above a target and `RunCursor::seek_prefix` iterates only
+while keys share a prefix, both yielding every stored version. `Run::new`
 validates untrusted bytes completely. `RunView` offers the same reads on bytes
 already known to be valid.
 
@@ -44,6 +46,7 @@ scripts/validate.sh          # fmt, Clippy, tests and docs
 scripts/validate.sh full     # also the large-allocation boundary tests
 scripts/validate.sh bench    # block and run size, timing and allocations
 scripts/validate.sh geometry # run block size and codec comparison
+scripts/validate.sh prefix   # prefix scan comparison
 colima stop
 ```
 

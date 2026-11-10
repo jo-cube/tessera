@@ -22,6 +22,8 @@ type Model = BTreeMap<(Vec<u8>, Reverse<u64>), Option<Vec<u8>>>;
 const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
 const COMPRESSED: [Codec; 2] = [Codec::Lz4, Codec::Zstd];
 const RECORD_BOUND: usize = 200_000;
+/// Bounds retained bytes too, since values can be megabytes long.
+const RETAINED_BOUND: usize = 512 << 20;
 const HEADER: usize = 12;
 const ENTRY: usize = 12;
 const FOOTER: usize = 28;
@@ -38,6 +40,13 @@ fn owned_value(value: Value<'_>) -> Option<Vec<u8>> {
     match value {
         Value::Bytes(bytes) => Some(bytes.to_vec()),
         Value::Tombstone => None,
+    }
+}
+
+fn value_len(value: Value<'_>) -> usize {
+    match value {
+        Value::Bytes(bytes) => bytes.len(),
+        Value::Tombstone => 0,
     }
 }
 
@@ -58,9 +67,14 @@ fn walk(view: RunView<'_>) -> Result<Vec<Owned>, CorruptRun> {
     let mut workspace = ReadWorkspace::new();
     let mut cursor = view.cursor(&mut workspace);
     let mut records = Vec::new();
+    let mut retained = 0;
     while let Some(record) = cursor.next_record()? {
+        retained += record.key.len() + value_len(record.value);
         records.push(owned(record));
-        assert!(records.len() <= RECORD_BOUND, "cursor did not terminate");
+        assert!(
+            records.len() <= RECORD_BOUND && retained <= RETAINED_BOUND,
+            "cursor did not terminate"
+        );
     }
     Ok(records)
 }
@@ -1576,4 +1590,27 @@ fn errors_format_their_offset_and_reason() {
         error.to_string(),
         "corrupt run at offset 0: invalid magic number"
     );
+}
+
+#[test]
+fn the_default_builder_uses_zstandard_and_16_kib_blocks() {
+    assert_eq!(TARGET_BLOCK_LEN, 16 << 10);
+    let records: Vec<Owned> = (0..4000)
+        .map(|i| rec(format!("key:{i:06}").as_bytes(), 1, Some(&[7; 40])))
+        .collect();
+    let mut builder = RunBuilder::default();
+    for (key, seq, value) in &records {
+        builder.add(key, *seq, as_value(value)).unwrap();
+    }
+    let run = builder.finish();
+    assert_eq!(run.as_bytes()[0], codec_byte(Codec::Zstd));
+    let explicit = build(Codec::Zstd, &records, TARGET_BLOCK_LEN);
+    assert_eq!(run.as_bytes(), explicit.as_bytes());
+    let blocks = decoded_blocks(run.as_bytes());
+    assert!(
+        blocks
+            .iter()
+            .all(|block| block.len() <= (TARGET_BLOCK_LEN * 5) / 4)
+    );
+    assert_eq!(all(&run), records);
 }

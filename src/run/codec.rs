@@ -2,13 +2,15 @@ use lz4_flex::block as lz4;
 use zstd_safe::{CCtx, DCtx};
 
 /// How a run's blocks are stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Codec {
     /// Blocks are stored as they are and read in place.
     None,
     /// LZ4 block compression.
     Lz4,
-    /// Zstandard compression at level 3, the library's own default.
+    /// Zstandard compression at level 3, the library's own default, and the
+    /// provisional default codec for runs.
+    #[default]
     Zstd,
 }
 

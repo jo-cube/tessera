@@ -894,3 +894,143 @@ fn readers_accept_any_restart_spacing_and_prefix_length() {
         assert_matches_model(&raw_block(&entries, &restarts), &records, &mut rng);
     }
 }
+
+// Seeking within one block.
+
+fn from_seek(view: BlockView<'_>, target: &[u8]) -> Result<Vec<Owned>, CorruptBlock> {
+    let mut position = BlockPosition::new();
+    position.seek(view, target)?;
+    let mut records = Vec::new();
+    while let Some(record) = position.next_record(view)? {
+        records.push(owned_record(record));
+        assert!(records.len() < RECORD_BOUND, "seek did not terminate");
+    }
+    Ok(records)
+}
+
+fn expected_from(records: &[Owned], target: &[u8]) -> Vec<Owned> {
+    records
+        .iter()
+        .filter(|(key, ..)| key.as_slice() >= target)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn seek_stops_at_the_first_record_at_or_above_every_target() {
+    // Several restart intervals, with keys that share long prefixes.
+    let records: Vec<Owned> = (0..RESTART_INTERVAL * 5)
+        .flat_map(|i| {
+            let key = format!("key:{i:05}").into_bytes();
+            [owned(&key, 2, Some(b"new")), owned(&key, 1, None)]
+        })
+        .collect();
+    let bytes = build(&records);
+    let view = BlockView::open(&bytes).unwrap();
+
+    let mut targets: Vec<Vec<u8>> = vec![Vec::new(), b"a".to_vec(), b"z".to_vec()];
+    for (key, ..) in &records {
+        targets.push(key.clone());
+        // A gap directly after this key and a shorter key directly before it.
+        targets.push([key.as_slice(), &[0]].concat());
+        targets.push(key[..key.len() - 1].to_vec());
+    }
+    for target in &targets {
+        assert_eq!(
+            from_seek(view, target).as_ref(),
+            Ok(&expected_from(&records, target)),
+            "target {target:02x?}"
+        );
+    }
+}
+
+#[test]
+fn seek_finds_the_newest_version_of_a_chain_spanning_restarts() {
+    let mut records = vec![owned(b"a", 1, Some(b"before"))];
+    let chain = (RESTART_INTERVAL * 3 + 5) as u64;
+    records.extend((1..=chain).rev().map(|seq| owned(b"m", seq, Some(b"v"))));
+    records.push(owned(b"z", 1, Some(b"after")));
+    let bytes = build(&records);
+    let view = BlockView::open(&bytes).unwrap();
+
+    let found = from_seek(view, b"m").unwrap();
+    assert_eq!(found.first().map(|(_, seq, _)| *seq), Some(chain));
+    assert_eq!(found, expected_from(&records, b"m"));
+}
+
+#[test]
+fn seek_on_an_empty_block_and_past_the_end_yields_nothing() {
+    let empty = build(&[]);
+    let view = BlockView::open(&empty).unwrap();
+    assert_eq!(from_seek(view, b"anything"), Ok(Vec::new()));
+
+    let bytes = build(&[owned(b"a", 1, None)]);
+    let view = BlockView::open(&bytes).unwrap();
+    let mut position = BlockPosition::new();
+    position.seek(view, b"b").unwrap();
+    assert!(position.is_finished(view));
+    assert_eq!(position.next_record(view), Ok(None));
+
+    // A position that has walked elsewhere finds an empty block empty too.
+    let view = BlockView::open(&empty).unwrap();
+    position.seek(view, b"a").unwrap();
+    assert_eq!(position.next_record(view), Ok(None));
+}
+
+#[test]
+fn seek_repositions_in_any_direction_and_reuses_the_position() {
+    let records: Vec<Owned> = (0..50)
+        .map(|i| owned(format!("{i:03}").as_bytes(), 1, Some(b"v")))
+        .collect();
+    let bytes = build(&records);
+    let view = BlockView::open(&bytes).unwrap();
+    let mut position = BlockPosition::new();
+    for target in [&b"030"[..], b"040", b"010", b"010", b"", b"049"] {
+        position.seek(view, target).unwrap();
+        let record = position.next_record(view).unwrap().map(owned_record);
+        assert_eq!(record.as_ref(), expected_from(&records, target).first());
+    }
+}
+
+#[test]
+fn seek_reports_malformed_bytes_it_touches_and_resets() {
+    // A restart past the record region.
+    let entries = raw_record(0, b"a", 1, 1, b"");
+    let bytes = raw_block(&entries, &[0, 4096]);
+    let view = BlockView::open(&bytes).unwrap();
+    let mut position = BlockPosition::new();
+    let error = position.seek(view, b"zzz").unwrap_err();
+    assert_eq!(error.kind, Corruption::InvalidRestarts);
+    let first = position.next_record(view).unwrap().unwrap();
+    assert_eq!(first.key, b"a");
+
+    // A record in the walked interval that shares more than its predecessor.
+    let mut entries = raw_record(0, b"a", 1, 2, b"");
+    entries.extend(raw_record(9, b"b", 1, 1, b""));
+    let bytes = raw_block(&entries, &[0]);
+    let view = BlockView::open(&bytes).unwrap();
+    let error = position.seek(view, b"zzz").unwrap_err();
+    assert_eq!(error.kind, Corruption::InvalidPrefix);
+    assert_eq!(position.next_record(view).unwrap().unwrap().key, b"a");
+}
+
+#[test]
+fn seek_matches_a_reference_model() {
+    for seed in 0..64 {
+        let mut rng = Rng(2000 + seed);
+        let target = 1 + rng.below(600);
+        let records = flatten(&random_model(&mut rng, target));
+        let bytes = build(&records);
+        let view = BlockView::open(&bytes).unwrap();
+        for _ in 0..100 {
+            let probe: Vec<u8> = (0..rng.below(8))
+                .map(|_| [0x00, 0x01, b'a', b'b', 0xff][rng.below(5)])
+                .collect();
+            assert_eq!(
+                from_seek(view, &probe).as_ref(),
+                Ok(&expected_from(&records, &probe)),
+                "seed {seed} probe {probe:02x?}"
+            );
+        }
+    }
+}

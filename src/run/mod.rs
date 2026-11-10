@@ -137,8 +137,9 @@ pub use builder::RunBuilder;
 pub use codec::Codec;
 pub use reader::{ReadWorkspace, Run, RunCursor, RunView};
 
-/// Encoded block length that [`RunBuilder::new`] aims for.
-pub const TARGET_BLOCK_LEN: usize = 64 << 10;
+/// Encoded block length that [`RunBuilder::new`] aims for. Provisional: see
+/// `docs/benchmarks.md` for the measurements behind it.
+pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 
 /// Largest target accepted by [`RunBuilder::with_target_block_len`]. Staying
 /// at a quarter of the block limit means a soft cut always happens before a
