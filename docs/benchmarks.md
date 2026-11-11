@@ -781,3 +781,81 @@ prefix scans 1.14–1.52 times, writes under kept snapshots 1.14–1.17 times,
 and 1.10–1.19 times the heap. It offers no view of which nodes a write
 copies, so pinned history could not be charged. `bbtree` was not measured:
 its documentation states that a scan is not a snapshot.
+
+## Compaction selection
+
+`scripts/validate.sh policy` (about 40 s) records every compaction the
+worker's loop runs: input sizes, the largest input's share and age, input
+and output bytes, CPU and wall time, and per-run rewrite counts. A bench
+thread runs that loop through the public API so each selection is visible.
+The base state is 173,536 json keys put in random order, flushed and
+compacted; then 350,000 puts with 1 MiB memtables, unpaced and paced at 400k
+and 100k puts per second, for three workloads: uniform overwrites, an
+8,000-key window sliding across the key space, and new keys in random order.
+Total time runs until nothing is eligible. Two rounds agreed within a few
+percent, and paced rows almost exactly.
+
+### Where the work went
+
+The earlier policy took the smallest runs at the deepest key up to
+`max_inputs` (8). A flush of random keys covers the whole key space, so
+every flush deepened the same stack. Unpaced, more than eight runs piled up
+before the worker ran and the large run was left out. Paced, the worker kept
+up, and each time the fifth run arrived it merged all five: the large run
+plus one flush's worth. At 100k puts per second, 90–100% of compaction input
+went to compactions whose largest input was at least four times the rest,
+and the largest input was 89–91% of all input bytes. Rewrite (compaction
+input per flushed byte) rose with pacing: uniform 3.6, 8.8 and 9.8; window
+8.4, 10.5 and 10.5; new keys 3.6, 6.3 and 9.3.
+
+### Alternatives (same session, `max_overlap` 4 unless noted)
+
+| alternative | effect |
+|---|---|
+| size-tiered: the fewest smallest runs that restore the allowance, then each next run no larger than all taken | rewrite 2.4–4.2 at every rate; compactor CPU down 55–80% when paced; settles at up to the allowed overlap |
+| minimal: only the fewest that restore the allowance | rewrite up to 15.7: the large run soon becomes one of the fewest |
+| earlier policy with `max_overlap` 8 | rewrite 0.8–4.3, but the window workload settles at 47 runs and reads load 4.8 blocks |
+| size-tiered with `max_overlap` 3 or 2 | the lopsided merges return (60–95% of input) and rewrite reaches 7–18 |
+
+Size-tiered selection is now the policy. It keeps every invariant of the
+merge (inputs share the deepest key, so the overlap there falls and nowhere
+rises), and needs no new state.
+
+### Before and after
+
+The earlier policy from a copy of the previous commit and the current one,
+run in the same session, medians of two rounds:
+
+| workload | rate | rewrite before → after | compactor CPU s | total s | runs at end | get after ns | tenant scan after µs |
+|---|---|---|---|---|---|---|---|
+| uniform | natural | 3.59 → 2.89 | 0.33 → 0.28 | 0.35 → 0.29 | 1 → 3 | 10,200 → 30,100 | 374 → 745 |
+| uniform | 400k/s | 8.84 → 4.14 | 0.86 → 0.38 | 0.90 → 0.88 | 4 → 4 | 36,900 → 40,100 | 474 → 909 |
+| uniform | 100k/s | 9.80 → 4.19 | 0.94 → 0.38 | 3.55 → 3.51 | 2 → 4 | 18,500 → 38,700 | 401 → 839 |
+| window | natural | 8.45 → 2.44 | 0.53 → 0.14 | 0.54 → 0.22 | 6 → 6 | 10,200 → 33,800 | 416 → 843 |
+| window | 400k/s | 10.49 → 3.47 | 0.65 → 0.19 | 0.92 → 0.94 | 2 → 3 | 16,700 → 10,300 | 388 → 450 |
+| window | 100k/s | 10.49 → 3.71 | 0.66 → 0.20 | 3.53 → 3.55 | 2 → 3 | 16,500 → 16,900 | 386 → 504 |
+| new keys | natural | 3.13 → 2.41 | 0.35 → 0.27 | 0.37 → 0.30 | 2–5 → 4 | 10,200 → 19,900 | 383 → 420 |
+| new keys | 400k/s | 6.26 → 3.03 | 0.66 → 0.31 | 0.89 → 0.89 | 4 → 6 | 10,100 → 19,800 | 391 → 420 |
+| new keys | 100k/s | 9.31 → 3.03 | 0.97 → 0.31 | 3.59 → 3.51 | 3 → 6 | 10,200 → 19,900 | 383 → 425 |
+
+Writer time, writer CPU and put p99 were unchanged: the writer never waited
+on compaction at these rates. Gets sampled during ingestion loaded fewer
+blocks under uniform overwrites unpaced and at 400k/s (14.5 → 11.4, 7.2 →
+4.6) and about as many at 100k/s (3.5 → 3.7), but more under the window
+(1.2–2.5 → 2.8) and new keys (1.0 → 2.0). Their p99 moved within 13% under
+uniform overwrites, from 41–64 to 50–55 µs for the window, and from 14–16 to
+26–31 µs for new keys.
+
+Settled reads are the cost. The earlier policy's frequent merge of the large
+run often left one or two runs at the end; the size-tiered policy stops once
+the overlap is within the allowance, so it settles at up to four overlapping
+runs, as the earlier one also did in some rows. Settled point lookups load
+one block per overlapping run and long prefix scans merge them: up to about
+three times the get latency and twice the tenant scan time where the earlier
+policy happened to finish with one run, and about 10% slower scans for new
+keys, whose runs mostly do not overlap. The heap after settling held 2–2.7
+MiB more under uniform overwrites, 0.7–2.2 MiB more for the window (superseded
+versions in the extra runs) and 0.1–0.2 MiB more for new keys. Peak heap fell
+for new keys (21.6–22.4 → 12.2–20.3 MiB), rose up to 3 MiB for uniform
+overwrites, and for the window fell unpaced (12.4 → 7.3) and rose 1.9–2.2
+MiB paced.

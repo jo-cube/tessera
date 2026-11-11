@@ -342,6 +342,39 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert_eq!(engine.stats().runs, 1);
 }
 
+/// The waste the size rule removes: a large run covering the same keys as a
+/// few small ones is left in place rather than rewritten to absorb them.
+#[test]
+fn small_runs_are_merged_without_rewriting_a_large_run_over_them() {
+    let engine = Engine::new(EngineOptions::default());
+    for i in 0..2_000 {
+        engine.put(format!("k{i:04}").as_bytes(), b"base").unwrap();
+    }
+    engine.flush().unwrap();
+    let base = engine.stats().run_bytes;
+    for round in 0..4 {
+        engine.put(b"k0000", format!("{round}").as_bytes()).unwrap();
+        engine.put(b"k1999", format!("{round}").as_bytes()).unwrap();
+        engine.flush().unwrap();
+    }
+    assert_eq!(engine.stats().max_overlap, 5);
+
+    let mut workspace = MergeWorkspace::new();
+    let options = CompactionOptions::default();
+    let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+    assert_eq!(report.inputs, 4);
+    assert!(report.input_bytes < base / 10);
+    assert!(!report.complete);
+    // Nothing more is eligible, so compacting again rewrites nothing.
+    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
+    let stats = engine.stats();
+    assert_eq!((stats.runs, stats.max_overlap), (2, 2));
+    assert_eq!(get(&engine, b"k0000").unwrap(), b"3");
+    assert_eq!(get(&engine, b"k1999").unwrap(), b"3");
+    assert_eq!(get(&engine, b"k1000").unwrap(), b"base");
+    assert_eq!(everything(&engine).len(), 2_000);
+}
+
 /// Runs flushed between selection and publication, and the memtables, are
 /// newer than every input. They stay published and keep winning.
 #[test]

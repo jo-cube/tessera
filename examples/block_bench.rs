@@ -10,7 +10,9 @@
 //! With `retention`, `persistent` and `pacing`, instead measures what snapshots
 //! retain under sustained writes, their cost to the memtable tree, and their
 //! effect on background compaction; see `block_bench/retention.rs`. With
-//! `profile`, instead splits memtable and engine write cost by component.
+//! `profile`, instead splits memtable and engine write cost by component. With
+//! `policy`, instead records each compaction's selection and cost across
+//! arrival rates; see `block_bench/policy.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -35,6 +37,8 @@ use tessera::run::{
     RunBuilder, RunCursor, RunSet, RunView,
 };
 
+#[path = "block_bench/policy.rs"]
+mod policy;
 #[path = "block_bench/profile.rs"]
 mod profile;
 #[path = "block_bench/retention.rs"]
@@ -4416,6 +4420,7 @@ fn main() {
         Some("persistent") => return retention::persistent_bench(),
         Some("pacing") => return retention::pacing_bench(),
         Some("profile") => return profile::profile_bench(),
+        Some("policy") => return policy::policy_bench(),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}

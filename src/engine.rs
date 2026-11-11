@@ -613,10 +613,13 @@ impl Engine {
     ///
     /// If some key lies in the ranges of more than
     /// [`CompactionOptions::max_overlap`] runs, the runs covering the most
-    /// deeply covered key are the candidates, and the smallest of them are
-    /// taken within the input limits. They all share that key, so the merge
-    /// lowers the overlap there and, since its output is disjoint and stays
-    /// within their combined range, raises it nowhere.
+    /// deeply covered key are the candidates. The fewest smallest of them
+    /// that bring the overlap there within the allowance are taken, then each
+    /// next smallest no larger than all taken so far, within the input limits.
+    /// A large run is so rewritten only once comparable data has accumulated
+    /// over it, not each time a small run arrives. The runs taken all share
+    /// that key, so the merge lowers the overlap there and, since its output
+    /// is disjoint and stays within their combined range, raises it nowhere.
     ///
     /// If no two runs overlap and there are more than
     /// [`CompactionOptions::disjoint_runs_above`], neighbouring tails are
@@ -1290,14 +1293,26 @@ fn select(
         .max()
         .unwrap_or(0);
 
-    if deepest > options.max_overlap.max(1) {
-        stacks.retain(|(_, stack)| stack.len() > options.max_overlap.max(1));
+    let limit = options.max_overlap.max(1);
+    if deepest > limit {
+        stacks.retain(|(_, stack)| stack.len() > limit);
         stacks.sort_by(|(a, x), (b, y)| (y.len(), bytes(x), *a).cmp(&(x.len(), bytes(y), *b)));
         let mut smallest_pair = usize::MAX;
         for (_, mut stack) in stacks {
             stack.sort_by_key(|&index| (runs[index].bytes, index));
-            let picked = fill(&stack, runs, options);
+            let mut picked = fill(&stack, runs, options);
             if picked.len() >= 2 {
+                // Merging k runs lowers this stack by k - 1. Take the fewest
+                // that bring it within the allowance, then each next run no
+                // larger than all taken so far.
+                let need = (stack.len() - limit + 1).clamp(2, picked.len());
+                let mut total = bytes(&picked[..need]);
+                let mut keep = need;
+                while keep < picked.len() && runs[picked[keep]].bytes <= total {
+                    total += runs[picked[keep]].bytes;
+                    keep += 1;
+                }
+                picked.truncate(keep);
                 return Ok(Some(picked));
             }
             smallest_pair = smallest_pair.min(bytes(&stack[..2]));
@@ -1914,6 +1929,39 @@ mod tests {
                 max_input_bytes: 2
             })
         );
+    }
+
+    #[test]
+    fn selection_rewrites_a_large_run_only_once_comparable_data_covers_it() {
+        let allow = |max_overlap| CompactionOptions {
+            max_overlap,
+            ..options(8, 1_000)
+        };
+        // Five runs over one key: a large one and four small. Two inputs bring
+        // the stack within 4; the other small runs are no larger than those
+        // taken, but the large one is.
+        let mut runs = vec![
+            candidate("a", "z", 100),
+            candidate("a", "z", 1),
+            candidate("b", "y", 1),
+            candidate("c", "x", 1),
+            candidate("d", "w", 1),
+        ];
+        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4])));
+        // Deeper, more inputs are needed, but the large run still waits until
+        // those taken add up to it.
+        runs.extend((0..3).map(|_| candidate("e", "v", 3)));
+        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4, 5, 6, 7])));
+        runs.truncate(5);
+        runs[0].bytes = 4;
+        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4, 0])));
+        // The fewest needed are always taken, even when larger than the rest.
+        runs[0].bytes = 100;
+        assert_eq!(select(&runs, allow(1)), Ok(Some(vec![1, 2, 3, 4, 0])));
+        assert_eq!(select(&runs, allow(2)), Ok(Some(vec![1, 2, 3, 4])));
+        runs[4].bytes = 50;
+        assert_eq!(select(&runs, allow(3)), Ok(Some(vec![1, 2, 3])));
+        assert_eq!(select(&runs, allow(5)), Ok(None));
     }
 
     #[test]

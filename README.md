@@ -95,7 +95,8 @@ output are limited and checked, the workspace before anything is decoded.
 and replaces exactly its inputs in one step, after checking they are still
 published; runs flushed meanwhile and the memtables are newer and stay. The
 policy merges the smallest runs covering the most deeply overlapped key once
-more than `max_overlap` runs share a key, and merges neighbouring short runs
+more than `max_overlap` runs share a key, taking a larger run only once the
+smaller ones taken add up to it, and merges neighbouring short runs
 once there are many disjoint runs. It is not leveled.
 
 With `EngineOptions::background_compaction` set, the engine owns one worker
@@ -137,6 +138,7 @@ scripts/validate.sh retention # sustained snapshot retention and backpressure
 scripts/validate.sh persistent # memtable tree costs under held snapshots
 scripts/validate.sh pacing   # background compaction under frequent snapshots
 scripts/validate.sh profile  # memtable and engine write cost by component
+scripts/validate.sh policy   # compaction selection cost across arrival rates
 colima stop
 ```
 

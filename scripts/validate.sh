@@ -21,6 +21,7 @@
 #   scripts/validate.sh persistent         memtable tree costs under held snapshots
 #   scripts/validate.sh pacing             background compaction under frequent snapshots
 #   scripts/validate.sh profile            memtable and engine write cost by component
+#   scripts/validate.sh policy             compaction selection policies and pacing (5G)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -204,6 +205,10 @@ pacing() {
   bounded pacing 900 cargo run --locked --release --example block_bench -- pacing
 }
 
+policy() {
+  bounded policy 1800 cargo run --locked --release --example block_bench -- policy
+}
+
 profile() {
   bounded profile 900 cargo run --locked --release --example block_bench -- profile
 }
@@ -275,7 +280,8 @@ case "$command" in
   persistent) persistent ;;
   pacing) pacing ;;
   profile) profile ;;
+  policy) policy ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  *) sed -n '2,26p' "$0"; exit 2 ;;
 esac
