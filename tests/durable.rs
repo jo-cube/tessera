@@ -12,7 +12,7 @@ use std::thread;
 use tessera::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions,
-    EngineWorkspace, LogDamage, RecoveryError, UpdateError,
+    EngineWorkspace, LogDamage, RecoveryError, UpdateError, Verdict,
 };
 use tessera::memtable::WriteError;
 
@@ -373,6 +373,124 @@ fn damage_to_acknowledged_history_is_rejected_but_a_torn_tail_is_truncated() {
         let (_, report) = open().unwrap();
         assert_eq!(report.torn_tail, None);
     }
+}
+
+/// Every file under `dir` with its bytes, to show that nothing changed.
+fn listing(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(listing(&path));
+        } else {
+            out.insert(path.clone(), fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// `inspect` reports what open would do, where the valid log ends and where
+/// it is damaged, and changes nothing: a clean log, a torn tail open would
+/// truncate, a hole of zeros before the end of the last segment, which open
+/// refuses, an interrupted creation and a directory that lost `CURRENT`.
+#[test]
+fn inspection_reports_what_open_would_do_and_changes_nothing() {
+    let scratch = Scratch::new("inspect");
+    let dir = &scratch.0;
+    let files = damaged_fixture(dir);
+    let (last, last_bytes) = files.last().unwrap();
+    let len = last_bytes.len() as u64;
+    let inspect = |dir: &Path| {
+        let before = listing(dir);
+        let inspection = Engine::inspect(dir, &EngineOptions::default()).unwrap();
+        assert_eq!(listing(dir), before, "inspect changed {}", dir.display());
+        inspection
+    };
+
+    let clean = inspect(dir);
+    let full = clean.last_valid.clone().unwrap();
+    assert_eq!((&full.path, full.end, full.seq), (last, len, 600));
+    assert_eq!(clean.checkpoint.unwrap().1, 300);
+    assert_eq!(clean.segments, files.len());
+    assert!(matches!(
+        clean.verdict,
+        Verdict::Opens {
+            torn_tail: None,
+            interrupted_segment: None
+        }
+    ));
+
+    // Part of the last record: open would truncate it, and nothing else.
+    fs::write(last, &last_bytes[..last_bytes.len() - 3]).unwrap();
+    let torn = inspect(dir);
+    let valid = torn.last_valid.unwrap();
+    assert_eq!(valid.seq, 599);
+    match torn.verdict {
+        Verdict::Opens {
+            torn_tail: Some(tail),
+            interrupted_segment: None,
+        } => assert_eq!((tail.offset, tail.bytes), (valid.end, len - 3 - valid.end)),
+        verdict => panic!("{verdict:?}"),
+    }
+    restore(dir, &files);
+
+    // Zeros where records were, with records after them: not a clean
+    // prefix, so open refuses, and inspect says where the valid log ends.
+    let mut holed = last_bytes.clone();
+    holed[last_bytes.len() - 200..last_bytes.len() - 100].fill(0);
+    fs::write(last, &holed).unwrap();
+    assert!(matches!(
+        log_damage(Engine::open(dir, EngineOptions::default(), small())),
+        LogDamage::Checksum | LogDamage::Frame | LogDamage::Length(_)
+    ));
+    let damaged = inspect(dir);
+    let valid = damaged.last_valid.unwrap();
+    assert!(valid.seq < 600 && valid.end <= len - 200, "{valid:?}");
+    match damaged.verdict {
+        Verdict::Damaged {
+            path,
+            offset,
+            bytes_after,
+            ..
+        } => assert_eq!(
+            (&path, offset, bytes_after),
+            (last, valid.end, len - valid.end)
+        ),
+        verdict => panic!("{verdict:?}"),
+    }
+    restore(dir, &files);
+
+    // A durable engine holds the directory against inspection.
+    let engine = open(dir);
+    assert!(matches!(
+        Engine::inspect(dir, &EngineOptions::default()),
+        Err(RecoveryError::Locked(_))
+    ));
+    drop(engine);
+
+    // Interrupted creation: everything but CURRENT. Inspect creates no LOCK.
+    let created = dir.join("created");
+    drop(Engine::create(&created, EngineOptions::default(), small()).unwrap());
+    fs::remove_file(created.join("CURRENT")).unwrap();
+    fs::remove_file(created.join("LOCK")).unwrap();
+    assert!(matches!(
+        Engine::open(&created, EngineOptions::default(), small()),
+        Err(RecoveryError::NoCheckpoint(_))
+    ));
+    assert!(matches!(inspect(&created).verdict, Verdict::Uncommitted));
+    // The same with a write logged has lost its CURRENT.
+    let lost = dir.join("lost");
+    let engine = Engine::create(&lost, EngineOptions::default(), small()).unwrap();
+    engine.put(b"k", b"v").unwrap();
+    drop(engine);
+    fs::remove_file(lost.join("CURRENT")).unwrap();
+    let inspection = inspect(&lost);
+    assert!(matches!(inspection.verdict, Verdict::NoCheckpoint));
+    assert_eq!(inspection.last_valid.unwrap().seq, 1);
+    assert!(matches!(
+        Engine::inspect(&dir.join("absent"), &EngineOptions::default()),
+        Err(RecoveryError::NoCheckpoint(_))
+    ));
 }
 
 #[test]

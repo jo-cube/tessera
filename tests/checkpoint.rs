@@ -434,3 +434,46 @@ fn recovery_refuses_more_runs_than_the_options_allow() {
     );
     assert!(matches!(error, Err(RecoveryError::RunLimit(_))));
 }
+
+/// A file longer than its manifest entry or format allows is refused before
+/// it is read into memory: here sparse files far larger than the memory the
+/// tests run in.
+#[test]
+fn oversized_files_are_refused_before_they_are_read() {
+    let scratch = Scratch::new("oversized");
+    let (engine, _) = varied_engine();
+    engine
+        .checkpoint(&scratch.0, CheckpointOptions::default())
+        .unwrap();
+    let generation = scratch.0.join(format!("ckpt-{:020}", 1));
+    for path in [
+        scratch.0.join("CURRENT"),
+        generation.join("MANIFEST"),
+        generation.join("run-000000"),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 << 30)
+            .unwrap();
+        let error = Engine::recover(&scratch.0, EngineOptions::default());
+        assert!(
+            matches!(
+                error,
+                Err(RecoveryError::Corrupt {
+                    damage: Damage::Length {
+                        found: 68_719_476_736,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "{}: {error:?}",
+            path.display()
+        );
+        fs::write(&path, original).unwrap();
+    }
+    Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+}

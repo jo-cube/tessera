@@ -107,11 +107,15 @@
 //!
 //! Recovery reads one run file at a time into memory, which is the engine's
 //! storage afterwards, checks it fully and rebuilds its key filter. Nothing
-//! is exposed until every file has passed.
+//! is exposed until every file has passed. A file is read only if it is no
+//! longer than it may be: `CURRENT` its fixed size, the manifest a list of
+//! the allowed runs, a run the length its manifest entry gives (and those
+//! lengths within the run limits), so a damaged file cannot make recovery
+//! allocate more than the checkpoint it should hold.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 
@@ -766,9 +770,12 @@ impl Engine {
         options: CheckpointOptions,
     ) -> Result<CheckpointReport, CheckpointError> {
         // None if there is no CURRENT, Some(None) if it cannot be read.
-        let committed = match fs::read(dir.join(CURRENT)) {
+        let committed = match read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64) {
             Ok(bytes) => Some(decode_current(&bytes).ok()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(RecoveryError::Corrupt {
+                damage: Damage::Missing,
+                ..
+            }) => None,
             Err(_) => Some(None),
         };
         let found = generations(dir)?;
@@ -947,30 +954,135 @@ impl Loaded {
     }
 }
 
+fn corrupt(path: &Path, damage: Damage) -> RecoveryError {
+    RecoveryError::Corrupt {
+        path: path.to_owned(),
+        damage,
+    }
+}
+
+/// Reads `path` if it holds at most `max` bytes. A longer file is damage,
+/// found before anything is allocated for it.
+fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, RecoveryError> {
+    let file = File::open(path).map_err(read_error(path))?;
+    let len = file.metadata().map_err(read_error(path))?.len();
+    let too_long = |found| {
+        corrupt(
+            path,
+            Damage::Length {
+                expected: max,
+                found,
+            },
+        )
+    };
+    if len > max {
+        return Err(too_long(len));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error(path))?;
+    if bytes.len() as u64 > max {
+        return Err(too_long(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+/// The committed checkpoint's directory, manifest path and manifest, from
+/// `CURRENT` and the manifest alone. The manifest is read only if it is no
+/// longer than a list of `max_runs` runs, or of 2^20 if that is more
+/// (`48 + 12 × max(max_runs, 2^20)` bytes); a longer one is
+/// [`Damage::Length`], not [`RecoveryError::RunLimit`].
+fn committed_manifest(
+    dir: &Path,
+    max_runs: usize,
+) -> Result<(PathBuf, PathBuf, Manifest), RecoveryError> {
+    let current = dir.join(CURRENT);
+    let bytes = read_bounded(&current, CURRENT_LEN as u64)?;
+    let generation = decode_current(&bytes).map_err(|damage| corrupt(&current, damage))?;
+    let path = checkpoint_dir(dir, generation);
+    let manifest_path = path.join(MANIFEST);
+    // Generous beside the run limit, which is checked once it is decoded and
+    // reported as such; capped by the format's u32 count. At most 12 bytes a
+    // run the options allow, and 12 MiB at least.
+    let most = max_runs
+        .max(1 << 20)
+        .min(u32::MAX as usize)
+        .saturating_mul(MANIFEST_ENTRY_LEN)
+        .saturating_add(MANIFEST_HEADER_LEN + 4);
+    let bytes = read_bounded(&manifest_path, most as u64)?;
+    let manifest = Manifest::decode(&bytes).map_err(|damage| corrupt(&manifest_path, damage))?;
+    if manifest.generation != generation {
+        return Err(corrupt(
+            &manifest_path,
+            Damage::Generation {
+                expected: generation,
+                found: manifest.generation,
+            },
+        ));
+    }
+    Ok((path, manifest_path, manifest))
+}
+
+/// The generation and ceiling `CURRENT` and its manifest name, without
+/// reading the runs, or `None` if there is no `CURRENT`.
+pub(super) fn committed(
+    dir: &Path,
+    options: &EngineOptions,
+) -> Result<Option<(u64, u64)>, RecoveryError> {
+    if !dir.join(CURRENT).try_exists().map_err(read_error(dir))? {
+        return Ok(None);
+    }
+    let (_, _, manifest) = committed_manifest(dir, options.max_runs)?;
+    Ok(Some((manifest.generation, manifest.last_seq)))
+}
+
+/// Whether the checkpoint directories in `dir` are at most what an
+/// interrupted [`Engine::create`] leaves: generation 1, with no manifest yet
+/// or one of no runs.
+pub(super) fn at_most_an_empty_first_checkpoint(dir: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
+            continue;
+        };
+        if rest != format!("{:020}", 1) {
+            return Ok(false);
+        }
+        match fs::read(checkpoint_dir(dir, 1).join(MANIFEST)) {
+            Ok(bytes) => {
+                if !Manifest::decode(&bytes).is_ok_and(|manifest| manifest.runs.is_empty()) {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// A shared lock on `dir`'s `LOCK` for a read-only inspection, without
+/// creating it: `None` if there is no `LOCK`, which no live engine lacks.
+pub(super) fn lock_shared(dir: &Path) -> Result<Option<File>, RecoveryError> {
+    let path = dir.join(LOCK);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RecoveryError::Io { path, error }),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(RecoveryError::Locked(dir.to_owned())),
+        Err(TryLockError::Error(error)) => Err(RecoveryError::Io { path, error }),
+    }
+}
+
 /// Reads and checks the checkpoint `dir`'s `CURRENT` names, under its lock.
 pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, RecoveryError> {
     {
-        let current = dir.join(CURRENT);
-        let bytes = fs::read(&current).map_err(read_error(&current))?;
-        let corrupt = |path: &Path, damage| RecoveryError::Corrupt {
-            path: path.to_owned(),
-            damage,
-        };
-        let generation = decode_current(&bytes).map_err(|damage| corrupt(&current, damage))?;
-        let path = checkpoint_dir(dir, generation);
-        let manifest_path = path.join(MANIFEST);
-        let bytes = fs::read(&manifest_path).map_err(read_error(&manifest_path))?;
-        let manifest =
-            Manifest::decode(&bytes).map_err(|damage| corrupt(&manifest_path, damage))?;
-        if manifest.generation != generation {
-            return Err(corrupt(
-                &manifest_path,
-                Damage::Generation {
-                    expected: generation,
-                    found: manifest.generation,
-                },
-            ));
-        }
+        let (path, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
+        let generation = manifest.generation;
 
         // The manifest's lengths bound what reading the runs allocates; refuse
         // before reading any. Filters are added to the bytes once rebuilt.
@@ -987,7 +1099,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
         let mut records = 0u64;
         for (index, &(len, sum)) in manifest.runs.iter().enumerate() {
             let file = path.join(run_name(index));
-            let data = fs::read(&file).map_err(read_error(&file))?;
+            let data = read_bounded(&file, len)?;
             if data.len() as u64 != len {
                 return Err(corrupt(
                     &file,

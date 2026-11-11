@@ -82,22 +82,28 @@
 //! **Torn tails.** Every batch is synced before the next is written, and a
 //! segment before the next is created, so only records of the last batch,
 //! at the end of the last segment, can be incomplete. In the last segment,
-//! and nowhere else, recovery accepts after the last valid record: fewer bytes than a frame; a
-//! frame whose own checksum holds but whose body runs past the end of the
-//! file; or bytes that are all zero. These are an interrupted append, which
-//! was never acknowledged; they are truncated (and reported in
+//! and nowhere else, recovery accepts after the last valid record: fewer
+//! bytes than a frame; a frame whose own checksum holds but whose body runs
+//! past the end of the file; or bytes that are all zero. None of these can
+//! hold a complete record, so they are an interrupted append, which was
+//! never acknowledged; they are truncated (and reported in
 //! [`OpenReport::torn_tail`]) before writing resumes. A last segment whose
 //! header is incomplete or zero is an interrupted rotation and is removed.
 //! Anything else is [`RecoveryError::Log`]: a bad frame or body checksum, a
 //! complete record with a bad checksum even at the very end, an invalid
 //! operation or length, a gap, or a log behind the checkpoint. Acknowledged
 //! history is never discarded as a torn tail, provided an interrupted write
-//! leaves a prefix of its bytes, possibly followed by zeros. A batch of
-//! several records is one such write: if a crash left a later page of it
-//! without an earlier one (non-zero bytes after a hole), recovery reports
-//! damage instead of truncating. No acknowledged write is at stake there,
-//! since none of the batch was acknowledged, but opening needs the damaged
-//! tail removed by hand.
+//! leaves a prefix of its bytes, possibly followed by zeros.
+//!
+//! A batch of several records is one such write. If a crash left a later
+//! page of it without an earlier one (non-zero bytes after a hole), the
+//! first incomplete record fails a checksum like corrupted history would,
+//! and nothing in the log tells the two apart: there is no record of where
+//! the last batch began or what was acknowledged. Recovery therefore
+//! refuses it rather than truncate. [`Engine::inspect`] reports where the
+//! valid log ends and how many bytes follow; truncating them is a decision
+//! only someone who knows what was acknowledged can make, and Tessera
+//! offers no repair.
 //!
 //! # Checkpoints and pruning
 //!
@@ -110,12 +116,87 @@
 //! the log still form the full history. A segment that cannot be removed
 //! stops pruning and is retried by the next checkpoint.
 //!
+//! # Crash and sync boundaries
+//!
+//! A durable write ends in one of these classes:
+//!
+//! 1. **Acknowledged**: its sequence number was returned. Its record and
+//!    every earlier one were synced before it became visible, so recovery
+//!    returns it, under the filesystem assumptions.
+//! 2. **Uncertain**: its caller got [`UpdateError::LogFailed`], or the
+//!    process died before the call returned. The record may or may not
+//!    survive; recovery settles it: if the complete record survives with
+//!    every earlier one it is replayed and is history from then on,
+//!    otherwise it is gone and its number is reused. Read the key back
+//!    after reopening to learn which. It is never applied in part.
+//! 3. **Incomplete**: the bytes of a torn tail or an interrupted segment, as
+//!    above. They hold no complete record; open removes them.
+//! 4. **Damaged**: anything else that fails a check. The history cannot be
+//!    established safely, and open refuses the directory.
+//!
+//! Refused writes (`Rejected`, `LogFull`, `LogClosed`, `SequencesExhausted`)
+//! are in no class: nothing was logged and no number used.
+//!
+//! The boundaries, in order:
+//!
+//! - **Segment creation**: the file is created, its header written, the file
+//!   and then the directory synced, before any record goes in, and the
+//!   previous segment is synced before it. A crash in between leaves a last
+//!   segment without a complete header, which holds no record.
+//! - **Append**: one vector write per segment a batch touches. A crash or
+//!   error during it leaves the batch uncertain, with incomplete bytes after
+//!   its last complete record.
+//! - **Sync**: success of `fdatasync` makes the batch durable, by
+//!   assumption. If it fails, the batch is uncertain and the log closes. On
+//!   Linux a failed writeback may drop the pages while the page cache still
+//!   shows them, and a later sync on another descriptor can succeed: a
+//!   reopen in the same boot may then replay records that are not on the
+//!   device. A later power loss would leave the next segment based past the
+//!   end of the one before, which open reports as damage (such as
+//!   [`LogDamage::Base`]), never silently; but the writes acknowledged after
+//!   that reopen lie beyond the damage. After a failed sync, check the device
+//!   before reopening.
+//! - **Acknowledgment**: after the sync and the publication, never before.
+//! - **Open**: only after every check passes, the torn tail is truncated and
+//!   synced, an interrupted segment removed, the last segment synced (a
+//!   process that died before its sync left records only in the page cache,
+//!   which must be durable before anything is based on them), and a new
+//!   segment created.
+//! - **Checkpoint**: the runs, the manifest and their directories are
+//!   synced, then `CURRENT.tmp`, which the rename makes `CURRENT`, then the
+//!   parent directory (see `src/engine/checkpoint.rs`). A crash before the
+//!   rename leaves the previous checkpoint and the full log; after it, the
+//!   new checkpoint and the full log.
+//! - **Pruning**: after the commit is durable, and only segments the new
+//!   ceiling covers. Removals are not synced: a segment that reappears after
+//!   a crash is covered and ignored.
+//! - **Process termination**: the kernel releases `LOCK`. Written but
+//!   unsynced bytes stay in the page cache, where the next open reads and
+//!   syncs them; only an operating system crash or power loss can lose them.
+//!
+//! What the tests show is the behaviour at each boundary when a process is
+//! killed or an operation fails. That `fdatasync` reaches stable media, and
+//! that an interrupted write leaves a prefix of its bytes, are assumptions;
+//! only power-loss testing on a given device and filesystem can support
+//! them.
+//!
+//! # Inspection
+//!
+//! [`Engine::inspect`] reads `CURRENT`, the manifest and the whole log as
+//! open would, under a shared lock and without creating or changing any
+//! file, and reports the last valid record, the damage if any and what open
+//! would do. It tells an interrupted [`Engine::create`] (nothing committed,
+//! safe to remove) from a directory that has lost `CURRENT` (not safe), and
+//! reports a truncation as safe only where open itself would make it.
+//!
 //! # Resources
 //!
 //! A write encodes its record into a buffer of its own, which its batch
 //! holds until it is logged; group commit bounds the queued and batched
 //! bytes. Recovery reads through a 64 KiB buffer and one record buffer, at
-//! most one record of the largest size. The log on disk is bounded by
+//! most one record of the largest size, and holds one segment file open at
+//! a time; it allocates a record's buffer only after the frame's checksum
+//! and length bound pass. The log on disk is bounded by
 //! [`DurableOptions::max_log_bytes`]; segments are pruned only by
 //! checkpoints, so the log can stay near that limit until one is taken, and
 //! the previous checkpoint stays on disk beside the new one until the new one
@@ -127,7 +208,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -283,6 +364,74 @@ pub struct TornTail {
     pub offset: u64,
     /// Bytes removed.
     pub bytes: u64,
+}
+
+/// What [`Engine::inspect`] found in a directory, changing nothing.
+#[derive(Debug)]
+pub struct Inspection {
+    /// The generation and ceiling `CURRENT` and its manifest name (the runs
+    /// are not read), or `None` without `CURRENT`.
+    pub checkpoint: Option<(u64, u64)>,
+    /// Log segments present.
+    pub segments: usize,
+    /// The last record, in log order from where recovery starts, that passed
+    /// every check.
+    pub last_valid: Option<LogPosition>,
+    /// What [`Engine::open`] would do.
+    pub verdict: Verdict,
+}
+
+/// A record in the log: its segment, the offset where it ends, and its
+/// sequence number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogPosition {
+    /// The segment.
+    pub path: PathBuf,
+    /// Where the record ends.
+    pub end: u64,
+    /// Its sequence number.
+    pub seq: u64,
+}
+
+/// What [`Engine::open`] would make of a directory.
+#[derive(Debug)]
+pub enum Verdict {
+    /// The log passes every check, and open would recover it, provided the
+    /// checkpoint's runs (not read here) pass theirs and fit the options.
+    /// Open first removes a torn tail and an interrupted segment, if listed
+    /// here: neither holds a complete record.
+    Opens {
+        /// The bytes after the last valid record of the last segment.
+        torn_tail: Option<TornTail>,
+        /// A last segment without a complete header.
+        interrupted_segment: Option<PathBuf>,
+    },
+    /// There is no `CURRENT`, and nothing more than an interrupted
+    /// [`Engine::create`] leaves: at most the first segment without a record
+    /// and the first checkpoint without a run. Nothing was committed here;
+    /// removing the directory loses no write.
+    Uncommitted,
+    /// There is no `CURRENT`, but the directory holds more than an
+    /// interrupted creation: records or checkpoints whose committed state is
+    /// unknown. Nothing here is safe to remove or recover automatically.
+    NoCheckpoint,
+    /// Open refuses it, at this damage. No truncation is known to be safe:
+    /// a complete record that fails its checks may be acknowledged history,
+    /// and the records after it cannot be verified. Truncating at `offset`
+    /// would discard `bytes_after` bytes of log; only the final batch's
+    /// records can have been unacknowledged, so whatever else it discards
+    /// may be acknowledged writes.
+    Damaged {
+        /// The segment, or the directory for a missing one.
+        path: PathBuf,
+        /// Where in it.
+        offset: u64,
+        /// How.
+        damage: LogDamage,
+        /// Log bytes from `offset` to the end of the last segment, or 0 when
+        /// `path` is not a segment.
+        bytes_after: u64,
+    },
 }
 
 /// The state of a durable engine's log.
@@ -827,6 +976,11 @@ type Apply<'a> = dyn FnMut(u64, &[u8], Value<'_>) -> Result<(), RecoveryError> +
 struct Replay<'a> {
     /// The last sequence number read, or the chain's base.
     prev: u64,
+    /// The segment being read.
+    number: u64,
+    /// The last record that passed its checks: its segment, where it ends,
+    /// and its sequence number.
+    last_valid: Option<(u64, u64, u64)>,
     ceiling: u64,
     replayed: u64,
     skipped: u64,
@@ -847,6 +1001,8 @@ fn read_segment(
 ) -> Result<(u64, bool), RecoveryError> {
     let Replay {
         prev,
+        number,
+        last_valid,
         ceiling,
         replayed,
         skipped,
@@ -932,6 +1088,7 @@ fn read_segment(
         }
         *prev = record.seq;
         offset += (FRAME_LEN + len) as u64;
+        *last_valid = Some((*number, offset, record.seq));
     }
 }
 
@@ -960,8 +1117,16 @@ fn io_error(path: &Path, error: io::Error) -> RecoveryError {
 }
 
 /// Reads and checks the log against a checkpoint at `ceiling`, passing each
-/// record above it to `apply`. Changes nothing on disk.
-fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanned, RecoveryError> {
+/// record above it to `apply`, or without a checkpoint from the oldest
+/// segment. Changes nothing on disk. `last_valid` is left at the last record
+/// that passed, also when an error is returned. Segment files are opened one
+/// at a time, so the number of segments is not bounded by open files.
+fn scan<'a>(
+    dir: &Path,
+    ceiling: Option<u64>,
+    apply: &'a mut Apply<'a>,
+    last_valid: &mut Option<(u64, u64, u64)>,
+) -> Result<Scanned, RecoveryError> {
     let damaged = |path: PathBuf, offset: u64, damage| RecoveryError::Log {
         path,
         offset,
@@ -978,8 +1143,7 @@ fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanne
         torn: None,
         interrupted: None,
     };
-    // Headers first, with the open files' lengths.
-    let mut files = Vec::with_capacity(numbers.len());
+    // Headers first, with the files' lengths.
     for (index, &number) in numbers.iter().enumerate() {
         let path = dir.join(segment_name(number));
         let mut file = File::open(&path).map_err(|error| io_error(&path, error))?;
@@ -1011,12 +1175,12 @@ fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanne
             Err(damage) => return Err(damaged(path, 0, damage)),
         };
         scanned.segments.push(Segment { number, base, len });
-        files.push((path, file));
     }
     if scanned.segments.is_empty() {
         return Err(damaged(dir.to_owned(), 0, LogDamage::NoSegments));
     }
     // The newest segment whose base the checkpoint covers starts the chain.
+    let ceiling = ceiling.unwrap_or(scanned.segments[0].base);
     let Some(start) = scanned
         .segments
         .iter()
@@ -1036,14 +1200,17 @@ fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanne
     let count = scanned.segments.len();
     let mut replay = Replay {
         prev: scanned.segments[start].base,
+        number: 0,
+        last_valid: None,
         ceiling,
         replayed: 0,
         skipped: 0,
         body: Vec::new(),
         apply,
     };
-    for (index, (path, file)) in files.into_iter().enumerate().skip(start) {
+    for index in start..count {
         let segment = scanned.segments[index];
+        let path = dir.join(segment_name(segment.number));
         if index > start {
             let before = scanned.segments[index - 1].number;
             if segment.number != before + 1 {
@@ -1065,7 +1232,13 @@ fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanne
             }
         }
         let last = index + 1 == count;
-        let (valid, torn) = read_segment(&path, file, segment.len, last, &mut replay)?;
+        let mut file = File::open(&path).map_err(|error| io_error(&path, error))?;
+        file.seek(SeekFrom::Start(SEGMENT_HEADER_LEN as u64))
+            .map_err(|error| io_error(&path, error))?;
+        replay.number = segment.number;
+        let read = read_segment(&path, file, segment.len, last, &mut replay);
+        *last_valid = replay.last_valid;
+        let (valid, torn) = read?;
         scanned.log_bytes += segment.len;
         if torn {
             scanned.torn = Some(TornTail {
@@ -1098,7 +1271,9 @@ impl Engine {
     /// [`EngineOptions::last_seq`]) and then commits an empty checkpoint,
     /// which marks the directory as a database; until that commit `open`
     /// refuses it as [`RecoveryError::NoCheckpoint`]. If creation fails or is
-    /// interrupted, remove the directory before creating it again.
+    /// interrupted, remove the directory before creating it again;
+    /// [`Engine::inspect`] tells such a directory ([`Verdict::Uncommitted`])
+    /// from one that lost its `CURRENT`.
     pub fn create(
         dir: &Path,
         options: EngineOptions,
@@ -1164,9 +1339,12 @@ impl Engine {
             ..options
         };
         let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options);
-        let scanned = scan(dir, ceiling, &mut |seq, key, value| {
-            engine.replay(seq, key, value)
-        })?;
+        let scanned = scan(
+            dir,
+            Some(ceiling),
+            &mut |seq, key, value| engine.replay(seq, key, value),
+            &mut None,
+        )?;
         debug_assert_eq!(engine.core.read_state().last_seq, scanned.last_seq);
 
         if let Some(torn) = &scanned.torn {
@@ -1181,6 +1359,17 @@ impl Engine {
         }
         if let Some(path) = &scanned.interrupted {
             fs::remove_file(path).map_err(|error| io_error(path, error))?;
+        }
+        // What was replayed must be durable before a segment based on it is
+        // created: a process that died before its sync left records only in
+        // the page cache, and a power loss could otherwise drop them but keep
+        // the next segment, whose base would then point past the end.
+        if scanned.torn.is_none() {
+            let last = scanned.segments.last().expect("scan found a segment");
+            let path = dir.join(segment_name(last.number));
+            File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| io_error(&path, error))?;
         }
         let wal = Wal::new(dir, durable, scanned.segments.clone(), scanned.last_seq)
             .map_err(|error| io_error(dir, error))?;
@@ -1223,6 +1412,101 @@ impl Engine {
         }
         report.pruned_segments = prune(durable, report.last_seq);
         Ok(report)
+    }
+
+    /// Reads and checks `dir`'s checkpoint pointer and log as [`Engine::open`]
+    /// with `options` would, changing nothing and creating nothing, and reports what open
+    /// would do, how far the log is valid and where it is damaged. The
+    /// checkpoint's runs are not read: open and [`Engine::recover`] check
+    /// them. It takes a shared lock if `LOCK` exists, so it fails with
+    /// [`RecoveryError::Locked`] while an engine has the directory open.
+    ///
+    /// Damage to `CURRENT` or the manifest is returned as the error open
+    /// would return. Nothing is repaired: see [`Verdict::Damaged`].
+    pub fn inspect(dir: &Path, options: &EngineOptions) -> Result<Inspection, RecoveryError> {
+        match fs::metadata(dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(RecoveryError::NoCheckpoint(dir.to_owned()));
+            }
+            Err(error) => return Err(io_error(dir, error)),
+        }
+        let _lock = checkpoint::lock_shared(dir)?;
+        let checkpoint = checkpoint::committed(dir, options)?;
+        let numbers = segment_numbers(dir).map_err(|error| io_error(dir, error))?;
+        let mut last_valid = None;
+        let scanned = scan(
+            dir,
+            checkpoint.map(|(_, ceiling)| ceiling),
+            &mut |_, _, _| Ok(()),
+            &mut last_valid,
+        );
+        let verdict = match (checkpoint, scanned) {
+            (Some(_), Ok(scanned)) => Verdict::Opens {
+                torn_tail: scanned.torn,
+                interrupted_segment: scanned.interrupted,
+            },
+            (None, _) => {
+                // `create` writes segment 1 and then checkpoint 1.
+                let empty_log = match numbers.as_slice() {
+                    [] => true,
+                    [1] => {
+                        let path = dir.join(segment_name(1));
+                        let len = fs::metadata(&path)
+                            .map_err(|error| io_error(&path, error))?
+                            .len();
+                        len <= SEGMENT_HEADER_LEN as u64
+                    }
+                    _ => false,
+                };
+                let empty_checkpoints = checkpoint::at_most_an_empty_first_checkpoint(dir)
+                    .map_err(|error| io_error(dir, error))?;
+                if empty_log && empty_checkpoints {
+                    Verdict::Uncommitted
+                } else {
+                    Verdict::NoCheckpoint
+                }
+            }
+            (
+                Some(_),
+                Err(RecoveryError::Log {
+                    path,
+                    offset,
+                    damage,
+                }),
+            ) => {
+                let mut bytes_after = 0;
+                if let Some(at) = numbers
+                    .iter()
+                    .position(|&number| dir.join(segment_name(number)) == path)
+                {
+                    for &number in &numbers[at..] {
+                        let segment = dir.join(segment_name(number));
+                        bytes_after += fs::metadata(&segment)
+                            .map_err(|error| io_error(&segment, error))?
+                            .len();
+                    }
+                    bytes_after = bytes_after.saturating_sub(offset);
+                }
+                Verdict::Damaged {
+                    path,
+                    offset,
+                    damage,
+                    bytes_after,
+                }
+            }
+            (Some(_), Err(error)) => return Err(error),
+        };
+        Ok(Inspection {
+            checkpoint,
+            segments: numbers.len(),
+            last_valid: last_valid.map(|(number, end, seq)| LogPosition {
+                path: dir.join(segment_name(number)),
+                end,
+                seq,
+            }),
+            verdict,
+        })
     }
 
     /// The log of a durable engine, or `None` for a RAM-only one.
@@ -1563,6 +1847,30 @@ mod tests {
         let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
         assert_eq!((report.last_seq, report.interrupted_segment), (3, None));
         assert_eq!(get(&engine, b"c"), Some(value.to_vec()));
+        drop(engine);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Recovery opens one segment at a time, so a log of more segments than
+    /// a process may have files open (1,024 here) is recovered, and pruned.
+    #[test]
+    fn a_log_of_more_segments_than_open_files_is_recovered() {
+        let dir = scratch("many");
+        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        engine.put(b"a", b"1").unwrap();
+        drop(engine);
+        // What 1,200 opens without a checkpoint would leave: empty segments.
+        for number in 2..=1_201 {
+            fs::write(dir.join(segment_name(number)), encode_header(number, 1)).unwrap();
+        }
+        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        assert_eq!((report.last_seq, report.segments), (1, 1_201));
+        assert_eq!(get(&engine, b"a"), Some(b"1".to_vec()));
+        let checkpoint = engine
+            .durable_checkpoint(CheckpointOptions::default())
+            .unwrap();
+        assert_eq!(checkpoint.pruned_segments, 1_201);
+        assert_eq!(engine.log_status().unwrap().segments, 1);
         drop(engine);
         fs::remove_dir_all(&dir).unwrap();
     }

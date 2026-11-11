@@ -143,7 +143,11 @@ database is reopened. `durable_checkpoint`
 commits a checkpoint while writes continue and then removes the log segments
 it covers. `open` loads the committed checkpoint and replays the log after
 it, checking every record; only an interrupted final append is tolerated
-(and truncated), and any other damage is an error. Engines from
+(and truncated), and any other damage is an error.
+`Engine::inspect` reads a directory as `open` would without changing it, and
+reports what `open` would do, how far the log is valid and where it is
+damaged; it tells an interrupted `create` from a database that lost its
+`CURRENT`, and repairs nothing. Engines from
 `Engine::new` and `recover` stay RAM-only and write no file. The record
 format, write protocol and recovery rules are in
 [`src/engine/wal.rs`](src/engine/wal.rs).

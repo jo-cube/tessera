@@ -1416,8 +1416,32 @@ tmpfs (the sync does nothing; this is the software cost):
   condition variable on every write and cost twice that; it now signals only
   when someone sleeps.
 - Admission in arrival order (added in review, so that a large write is not
-  starved): a first version encoded each record only after admission, which
-  took the queue's mutex twice a write and cost 13% at W=8 on the disk (two
-  runs of 30.3–31.0 k writes a second, mean batch 4.5). Encoding first and
-  re-encoding only after a wait restored 34.7 k (mean batch 5.0) in one run;
-  W=1–4 were unchanged throughout.
+  starved): a first version encoded each record only after admission,
+  taking the queue's mutex twice a write, and measured 30.3–31.0 k writes a
+  second at W=8 on the disk (two runs). The version kept encodes first and
+  re-encodes only after a wait; it measured 29.6–34.7 k in three runs (one
+  in 5N, two after 5O, whose write path is the same). The
+  difference is within the W=8 spread on this disk, so the cost of the
+  second lock is not established; the single-lock path was kept since it
+  does no more work. W=1–4 were unchanged throughout.
+
+### Recovery hardening (5O)
+
+One regression run of the same benchmark after Milestone 5O (open syncs
+the last segment, recovery opens one segment at a time and bounds its file
+reads; the write path is unchanged), plus one more disk run:
+
+| | 5O | 5N ranges above |
+|---|---|---|
+| RAM-only, tmpfs, W=1 / 4, k writes/s | 1,319 / 1,648 | 1,201–1,320 / 1,553–1,714 |
+| group commit, tmpfs, W=1, k writes/s | 620 | 500–617 |
+| group commit, VM disk, W=1, k writes/s (p50 µs) | 6.1–7.9 (125–129) | 7.8 (121–126) |
+| group commit, VM disk, W=4 / 8, k writes/s | 18.5 / 29.6–32.2 | 18.7–19.0 / 35.4–36.2 before the review, 34.7 after |
+| reader beside 8 disk writers, k gets/s | 1,168–1,203 | 1,377 |
+| recovery from the log, tmpfs, s (MiB/s) | 0.14 (276) | 0.13–0.14 (274–287) |
+| recovery from the checkpoint, s | 0.01–0.04 | 0.01–0.04 |
+
+The disk rows vary by about 20% between runs of the same code (W=1 fell
+to 6.1 k in one run with p95 351 µs, a disk hiccup, not a code change).
+Nothing here is outside that spread, and the one extra sync at open is not
+visible in recovery time.

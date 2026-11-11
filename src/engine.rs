@@ -218,7 +218,9 @@ mod wal;
 mod worker;
 
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, RecoveryError};
-pub use wal::{DurableOptions, LogDamage, LogStatus, OpenReport, TornTail};
+pub use wal::{
+    DurableOptions, Inspection, LogDamage, LogPosition, LogStatus, OpenReport, TornTail, Verdict,
+};
 pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
