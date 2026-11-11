@@ -26,8 +26,10 @@
 #   scripts/validate.sh bloom              filtered against unfiltered point lookups
 #   scripts/validate.sh filtercost         key filter construction cost by component (5J)
 #   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
-#   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs then VM disk (5L)
-#   scripts/validate.sh durable            durable writes and log recovery, tmpfs then VM disk (5M, 5N)
+#   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs (5L)
+#   scripts/validate.sh checkpoint-disk    the same on the VM disk, which writes to the host SSD
+#   scripts/validate.sh durable            durable writes and log recovery, tmpfs (5M, 5N)
+#   scripts/validate.sh durable-disk       the same on the VM disk, which writes to the host SSD
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -107,6 +109,12 @@ build_image() {
 
 # The timeout runs inside the container, so it holds even if this script dies.
 # Peak memory is the cgroup's and includes page cache, which is reclaimable.
+# disk_written is what the container's cgroup had written to block devices
+# when the step ended (the build cache on the VM's disk, whose image lives on
+# the host's SSD): a lower bound, since dirty pages written back after the
+# step are not counted, and logical, since the host's own writes are not
+# visible here. Writes to the /tmp tmpfs are not among them. tmp_left is what
+# /tmp still holds.
 readonly INNER='
 limit=$1; shift
 start=$(date +%s)
@@ -114,7 +122,10 @@ status=0
 timeout --kill-after=5 "$limit" "$@" || status=$?
 oom=$(awk "\$1 == \"oom_kill\" { print \$2 }" /sys/fs/cgroup/memory.events)
 peak=$(( $(cat /sys/fs/cgroup/memory.peak) / 1048576 ))
-echo "[$STEP] exit=$status peak=${peak}MiB oom_kills=$oom wall=$(( $(date +%s) - start ))s"
+wrote=$(awk "{ for (i = 2; i <= NF; i++) if (\$i ~ /^wbytes=/) { sub(/wbytes=/, \"\", \$i); n += \$i } } END { printf \"%d\", n / 1048576 }" /sys/fs/cgroup/io.stat 2>/dev/null || echo "?")
+tmp=$(df -Pm /tmp 2>/dev/null | awk "NR == 2 { print \$3 }")
+[ -n "$tmp" ] || tmp="?"
+echo "[$STEP] exit=$status peak=${peak}MiB oom_kills=$oom wall=$(( $(date +%s) - start ))s disk_written=${wrote}MiB tmp_left=${tmp}MiB"
 exit $status
 '
 
@@ -233,15 +244,32 @@ filtercost() {
   bounded filtercost 900 cargo run --locked --release --example block_bench -- filtercost
 }
 
-# The second run writes into the cache volume, on the VM's disk, so that
-# fsync costs something; the benchmark removes its directory.
+# Write budgets for durability work: tests and fixtures stay on the 512 MiB
+# /tmp tmpfs (charged to the container's 3 GiB), a few MiB per database and
+# never more than a few hundred MiB at once; each test removes its
+# directory. Builds write the cache volume (measured: 20–40 MiB for an
+# incremental test build, about 300 MiB when every test binary relinks);
+# prefer one final `full` to repeated ones.
+#
+# Routine runs use the tmpfs only. The -disk variants write into the cache
+# volume, on the VM's disk and so the host's SSD, so that fsync costs
+# something. By estimate they can write well over a GiB each, mostly the
+# rows that take checkpoints back to back, each a full copy of the database
+# (disk_written reports at least what was written). Run them only when a disk number is needed; each
+# benchmark removes its directory.
 checkpoint() {
   bounded checkpoint-tmpfs 900 cargo run --locked --release --example block_bench -- checkpoint /tmp
+}
+
+checkpoint_disk() {
   bounded checkpoint-disk 900 cargo run --locked --release --example block_bench -- checkpoint /cache
 }
 
 durable() {
   bounded durable-tmpfs 900 cargo run --locked --release --example block_bench -- durable /tmp
+}
+
+durable_disk() {
   bounded durable-disk 900 cargo run --locked --release --example block_bench -- durable /cache
 }
 
@@ -326,8 +354,10 @@ case "$command" in
   filtercost) filtercost ;;
   operate) operate ;;
   checkpoint) checkpoint ;;
+  checkpoint-disk) checkpoint_disk ;;
   durable) durable ;;
+  durable-disk) durable_disk ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,32p' "$0"; exit 2 ;;
+  *) sed -n '2,34p' "$0"; exit 2 ;;
 esac

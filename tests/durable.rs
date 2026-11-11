@@ -439,10 +439,13 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     let mut holed = last_bytes.clone();
     holed[last_bytes.len() - 200..last_bytes.len() - 100].fill(0);
     fs::write(last, &holed).unwrap();
+    // A refused open changes nothing either: no truncation, no new segment.
+    let before = listing(dir);
     assert!(matches!(
         log_damage(Engine::open(dir, EngineOptions::default(), small())),
         LogDamage::Checksum | LogDamage::Frame | LogDamage::Length(_)
     ));
+    assert_eq!(listing(dir), before);
     let damaged = inspect(dir);
     let valid = damaged.last_valid.unwrap();
     assert!(valid.seq < 600 && valid.end <= len - 200, "{valid:?}");
@@ -473,10 +476,13 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     drop(Engine::create(&created, EngineOptions::default(), small()).unwrap());
     fs::remove_file(created.join("CURRENT")).unwrap();
     fs::remove_file(created.join("LOCK")).unwrap();
+    let before = listing(&created);
     assert!(matches!(
         Engine::open(&created, EngineOptions::default(), small()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
+    // Refused before it would create LOCK, and never initialized.
+    assert_eq!(listing(&created), before);
     assert!(matches!(inspect(&created).verdict, Verdict::Uncommitted));
     // The same with a write logged has lost its CURRENT.
     let lost = dir.join("lost");

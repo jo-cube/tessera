@@ -105,6 +105,16 @@
 //! only someone who knows what was acknowledged can make, and Tessera
 //! offers no repair.
 //!
+//! Marking where each batch begins would not make that truncation safe. A
+//! damaged final batch may have been synced and acknowledged before the
+//! damage, and nothing durable records whether its sync completed: the sync
+//! leaves no trace in the file. Recording it would take a second write and
+//! sync per batch, before acknowledgment (or a marker carried by the next
+//! batch, which the final batch never gets). Only then could a damaged,
+//! unmarked final batch be known unacknowledged. The case arises only from
+//! an operating system crash or power loss during a batch that spans pages
+//! written out of order; it fails safe, so the format stays as it is.
+//!
 //! # Checkpoints and pruning
 //!
 //! [`Engine::durable_checkpoint`] commits a checkpoint into the engine's own
@@ -684,6 +694,23 @@ thread_local! {
     pub(super) static BEFORE_PUBLISH: std::cell::Cell<Option<Hook>> = const { std::cell::Cell::new(None) };
 }
 
+/// Each segment's length at its last successful sync, for tests that model
+/// a power loss: what a sync made durable stays, and the rest may not.
+#[cfg(test)]
+pub(super) static SYNCED: Mutex<std::collections::BTreeMap<PathBuf, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Records that `file`, at `path`, was just synced.
+#[cfg(test)]
+fn synced(path: &Path, file: &File) {
+    if let Ok(metadata) = file.metadata() {
+        SYNCED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_owned(), metadata.len());
+    }
+}
+
 fn injected() -> io::Error {
     io::Error::other("fault injected by a test")
 }
@@ -769,6 +796,8 @@ fn create_segment(dir: &Path, number: u64, base: u64, torn: bool) -> io::Result<
     };
     file.write_all(&header[..len])?;
     file.sync_all()?;
+    #[cfg(test)]
+    synced(&path, &file);
     sync_dir(dir)?;
     if torn {
         return Err(io::Error::other("torn rotation injected by a test"));
@@ -877,6 +906,8 @@ impl Wal {
             self.file
                 .write_all(&records[0].0[..records[0].0.len() / 2])?;
             self.file.sync_data()?;
+            #[cfg(test)]
+            synced(&self.active_path(), &self.file);
             return Err(injected());
         }
         let mut slices: Vec<io::IoSlice<'_>> = records
@@ -900,8 +931,16 @@ impl Wal {
             return Err(injected());
         }
         self.file.sync_data()?;
+        #[cfg(test)]
+        synced(&self.active_path(), &self.file);
         self.stats.syncs += 1;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn active_path(&self) -> PathBuf {
+        self.dir
+            .join(segment_name(self.segments.last().unwrap().number))
     }
 
     fn status(&self) -> LogStatus {
@@ -1353,7 +1392,10 @@ impl Engine {
                 .open(&torn.path)
                 .and_then(|file| {
                     file.set_len(torn.offset)?;
-                    file.sync_all()
+                    file.sync_all()?;
+                    #[cfg(test)]
+                    synced(&torn.path, &file);
+                    Ok(())
                 })
                 .map_err(|error| io_error(&torn.path, error))?;
         }
@@ -1368,7 +1410,12 @@ impl Engine {
             let last = scanned.segments.last().expect("scan found a segment");
             let path = dir.join(segment_name(last.number));
             File::open(&path)
-                .and_then(|file| file.sync_all())
+                .and_then(|file| {
+                    file.sync_all()?;
+                    #[cfg(test)]
+                    synced(&path, &file);
+                    Ok(())
+                })
                 .map_err(|error| io_error(&path, error))?;
         }
         let wal = Wal::new(dir, durable, scanned.segments.clone(), scanned.last_seq)
@@ -1851,6 +1898,73 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Models a power loss: every segment is cut back to its length at its
+    /// last sync, or with `zeros` keeps its length but loses the rest to
+    /// zeros; one never synced is gone. It models only the loss of unsynced
+    /// segment bytes, as a prefix: not pages of one write persisting out of
+    /// order, not lost directory entries or renames, and not checkpoint
+    /// files, which it takes as durable once synced.
+    fn power_loss(dir: &Path, zeros: bool) {
+        let synced = SYNCED.lock().unwrap().clone();
+        for number in segment_numbers(dir).unwrap() {
+            let path = dir.join(segment_name(number));
+            let Some(&durable) = synced.get(&path) else {
+                fs::remove_file(&path).unwrap();
+                continue;
+            };
+            let mut bytes = fs::read(&path).unwrap();
+            if zeros {
+                bytes[durable as usize..].fill(0);
+            } else {
+                bytes.truncate(durable as usize);
+            }
+            fs::write(&path, bytes).unwrap();
+        }
+    }
+
+    /// A process that dies after writing a batch but before syncing it
+    /// leaves the batch in the page cache, where the next open replays it.
+    /// That open syncs it before basing a new segment on it, so a power loss
+    /// after further acknowledged writes loses none of them. A batch whose
+    /// sync then fails is lost to the power loss, or left as zeros, and the
+    /// acknowledged history before it is recovered intact.
+    #[test]
+    fn a_power_loss_after_a_crash_and_reopen_keeps_every_acknowledged_write() {
+        for zeros in [false, true] {
+            let dir = scratch(&format!("power-{zeros}"));
+            let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+            let mut model = Vec::new();
+            for at in 0..3u8 {
+                engine.put(&[at], &[at; 100]).unwrap();
+                model.push((vec![at], vec![at; 100]));
+            }
+            // Written, never synced: as if the process died before its sync.
+            inject(&engine, Fault::SyncFails);
+            assert!(engine.put(&[3], &[3; 100]).is_err());
+            drop(engine);
+            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            assert_eq!(report.last_seq, 4, "recovered from the page cache");
+            model.push((vec![3], vec![3; 100]));
+            // Acknowledged after the reopen, across several new segments.
+            for at in 4..80u8 {
+                engine.put(&[at], &[at; 100]).unwrap();
+                model.push((vec![at], vec![at; 100]));
+            }
+            assert!(engine.log_status().unwrap().segments > 3);
+            inject(&engine, Fault::SyncFails);
+            assert!(engine.put(b"lost", b"").is_err());
+            drop(engine);
+
+            power_loss(&dir, zeros);
+            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small())
+                .unwrap_or_else(|error| panic!("zeros {zeros}: {error}"));
+            assert_eq!(report.last_seq, 80);
+            assert_eq!(state(&engine), model);
+            drop(engine);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// Recovery opens one segment at a time, so a log of more segments than
     /// a process may have files open (1,024 here) is recovered, and pruned.
     #[test]
@@ -1882,8 +1996,10 @@ mod tests {
     fn an_interrupted_durable_checkpoint_keeps_the_full_history() {
         for crash in [
             Crash::AfterFirstRun,
+            Crash::BeforeManifestSync,
             Crash::BeforeRename,
             Crash::AfterRename,
+            Crash::BeforeReclaim,
             Crash::BeforePrune,
         ] {
             let dir = scratch(&format!("durable-{crash:?}"));
