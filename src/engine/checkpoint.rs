@@ -77,6 +77,11 @@
 //! `LOCK` is an advisory `flock` on an open file. The kernel releases it when
 //! the file is closed, including when the process is killed, so a crash never
 //! leaves the directory locked; the file itself is left and is harmless.
+//! The lock belongs to the open file description, so a process that forks
+//! while it holds `LOCK` shares the lock with the child until the child
+//! executes another program or exits (the descriptor is close-on-exec);
+//! meanwhile a second open of the same directory, even in this process,
+//! finds it locked.
 //!
 //! # Filesystem assumptions
 //!

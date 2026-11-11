@@ -11,42 +11,31 @@
 //!
 //! # Durable writes
 //!
-//! Durable writers take the log's mutex, one at a time, and then:
-//!
-//! 1. **validate and reserve**: under the state lock, take the next sequence
-//!    number and ask the active memtable whether it admits the update
-//!    ([`UpdateError::Rejected`] logs nothing and uses no number);
-//! 2. **log**: without the state lock, append one record to the active
-//!    segment and sync it (`fdatasync`);
-//! 3. **publish**: under the state lock again, apply the update to the
-//!    active memtable and publish its sequence number.
-//!
-//! No other write can take a number between 1 and 3, since writers hold the
-//! log's mutex throughout. A flush may freeze the table checked, or a
-//! snapshot pin more of it, between 1 and 3; the logged update is then
-//! applied regardless of the budget, which the active table may exceed by
-//! this one update until the next flush. Only lengths and sequence order are
-//! checked again, and those cannot change. So a write becomes **visible**
-//! only after its record is durable, it is **acknowledged** (its sequence
-//! number returned) only after that, no record is logged for a write the
-//! engine refused, and none logged is left unapplied. Reads proceed while a
-//! record syncs, and see the state before it.
+//! Durable writes are committed in batches by group commit (see
+//! `src/engine/group.rs`): concurrent writers queue, and one of them, the
+//! leader, validates the batch and reserves its sequence numbers under the
+//! state lock, appends it and syncs it (`fdatasync`) without that lock, then
+//! publishes it under the lock and acknowledges each write. A lone writer
+//! forms a batch of one at once. So a write becomes **visible** only after
+//! its record is durable, it is **acknowledged** (its sequence number
+//! returned) only after that, no record is logged for a write the engine
+//! refused, and none logged is left unapplied. Reads proceed while a batch
+//! syncs, and see the state before it.
 //!
 //! **Recovered history.** Every acknowledged write is recovered, under the
-//! filesystem assumptions below. Recovery may also include the one write
-//! after them that was not acknowledged (its sync failed, the process died
-//! before returning, or it panicked), if its complete record survived; it
-//! never includes a write the engine refused, and never a later write
-//! without an earlier one.
+//! filesystem assumptions below. Recovery may also include writes after them
+//! that were not acknowledged: a prefix of the final batch (its sync failed,
+//! the process died before it returned, or its leader panicked), as far as
+//! its complete records survived. It never includes a write the engine
+//! refused, and never a later write without an earlier one.
 //!
-//! **Failures.** If the append or the sync fails, the write returns
-//! [`UpdateError::LogFailed`] and is not applied, but its record may or may
-//! not survive (a failed `fsync` may also have dropped earlier pages). The log
-//! is then **closed**: every later write returns [`UpdateError::LogClosed`]
-//! and logs nothing, so a record of uncertain fate is always the last one, and
-//! recovery returns the acknowledged history with or without it, never a
-//! later write without it. Reads, flushes, compaction and checkpoints
-//! continue; reopening the directory resumes writing. A write that would make
+//! **Failures.** If the append, a rotation or the sync fails, every write of
+//! the batch returns [`UpdateError::LogFailed`] and is not applied, but their
+//! records may or may not survive (a failed `fsync` may also have dropped
+//! earlier pages). The log is then **closed**: queued and later writes
+//! return [`UpdateError::LogClosed`] and log nothing, so records of
+//! uncertain fate are always the last ones. Reads, flushes, compaction and
+//! checkpoints continue; reopening the directory resumes writing. A write that would make
 //! the log exceed [`DurableOptions::max_log_bytes`] returns
 //! [`UpdateError::LogFull`] and logs nothing, without closing the log; a
 //! [`Engine::durable_checkpoint`] frees space. Applying a logged update cannot
@@ -90,9 +79,10 @@
 //! order, flushing as needed; the log must reach `S`. The engine is exposed
 //! only once every record has passed.
 //!
-//! **Torn tails.** Every record is synced before the next is written, so only
-//! the last one can be incomplete. In the last segment, and nowhere else,
-//! recovery accepts after the last valid record: fewer bytes than a frame; a
+//! **Torn tails.** Every batch is synced before the next is written, and a
+//! segment before the next is created, so only records of the last batch,
+//! at the end of the last segment, can be incomplete. In the last segment,
+//! and nowhere else, recovery accepts after the last valid record: fewer bytes than a frame; a
 //! frame whose own checksum holds but whose body runs past the end of the
 //! file; or bytes that are all zero. These are an interrupted append, which
 //! was never acknowledged; they are truncated (and reported in
@@ -102,7 +92,12 @@
 //! complete record with a bad checksum even at the very end, an invalid
 //! operation or length, a gap, or a log behind the checkpoint. Acknowledged
 //! history is never discarded as a torn tail, provided an interrupted write
-//! leaves a prefix of its bytes, possibly followed by zeros.
+//! leaves a prefix of its bytes, possibly followed by zeros. A batch of
+//! several records is one such write: if a crash left a later page of it
+//! without an earlier one (non-zero bytes after a hole), recovery reports
+//! damage instead of truncating. No acknowledged write is at stake there,
+//! since none of the batch was acknowledged, but opening needs the damaged
+//! tail removed by hand.
 //!
 //! # Checkpoints and pruning
 //!
@@ -117,8 +112,9 @@
 //!
 //! # Resources
 //!
-//! A write encodes its record into one buffer, released after a large
-//! record. Recovery reads through a 64 KiB buffer and one record buffer, at
+//! A write encodes its record into a buffer of its own, which its batch
+//! holds until it is logged; group commit bounds the queued and batched
+//! bytes. Recovery reads through a 64 KiB buffer and one record buffer, at
 //! most one record of the largest size. The log on disk is bounded by
 //! [`DurableOptions::max_log_bytes`]; segments are pruned only by
 //! checkpoints, so the log can stay near that limit until one is taken, and
@@ -156,8 +152,6 @@ const DELETE: u8 = 2;
 /// Operation, sequence number and key length.
 const MIN_BODY: usize = 1 + 8 + 4;
 const MAX_BODY: usize = MIN_BODY + MAX_KEY_LEN + 4 + MAX_VALUE_LEN;
-/// A write buffer grown past this by a large record is released after it.
-const KEEP_BUFFER: usize = 1 << 20;
 const READ_BUFFER: usize = 64 << 10;
 
 /// The log of a durable engine.
@@ -169,14 +163,29 @@ pub struct DurableOptions {
     /// The most bytes all segments may hold. A write beyond it is refused
     /// with [`UpdateError::LogFull`] until a checkpoint prunes segments.
     pub max_log_bytes: u64,
+    /// The most writes one batch logs with one sync, at most 256. 1 syncs
+    /// every write on its own.
+    pub max_batch_records: usize,
+    /// The most encoded bytes one batch logs, though a single larger write
+    /// forms a batch alone.
+    pub max_batch_bytes: usize,
+    /// The most encoded bytes of writes waiting for a batch, each counted
+    /// with a fixed overhead. Writers are admitted in arrival order; one that
+    /// would exceed it waits, and a single larger write is admitted alone
+    /// once the queue is empty.
+    pub max_queue_bytes: usize,
 }
 
 impl Default for DurableOptions {
-    /// 64 MiB segments, 1 GiB of log.
+    /// 64 MiB segments, 1 GiB of log, batches of up to 64 writes and 1 MiB,
+    /// and 16 MiB of writes queued.
     fn default() -> Self {
         Self {
             segment_bytes: 64 << 20,
             max_log_bytes: 1 << 30,
+            max_batch_records: 64,
+            max_batch_bytes: 1 << 20,
+            max_queue_bytes: 16 << 20,
         }
     }
 }
@@ -287,6 +296,20 @@ pub struct LogStatus {
     pub active_bytes: u64,
     /// Why the log closed, if it did.
     pub closed: Option<io::ErrorKind>,
+    /// Syncs of record data since the engine opened: one per batch, or two if
+    /// it started a segment. Segment headers and directories are synced too,
+    /// and not counted.
+    pub syncs: u64,
+    /// Batches logged since the engine opened.
+    pub batches: u64,
+    /// Records logged since the engine opened.
+    pub records: u64,
+    /// Batches by size: 1, 2, 3–4, 5–8, 9–16, 17–32, 33–64 and more records.
+    pub batch_sizes: [u64; 8],
+    /// Writes waiting in the queue for a batch, now.
+    pub queued_writes: usize,
+    /// Their cost against [`DurableOptions::max_queue_bytes`].
+    pub queued_bytes: usize,
 }
 
 fn segment_name(number: u64) -> String {
@@ -359,32 +382,92 @@ fn decode_header(bytes: &[u8; SEGMENT_HEADER_LEN], number: u64) -> Result<u64, L
     Ok(u64_at(24))
 }
 
-/// Encodes one record, frame and body, into `out`.
-fn encode_record(out: &mut Vec<u8>, seq: u64, key: &[u8], value: Value<'_>) {
-    out.clear();
-    out.extend_from_slice(&[0; FRAME_LEN]);
-    match value {
+/// One record encoded without its sequence number and checksums, which
+/// [`seal`] adds once the number is known, and the CRC state of the body
+/// after the sequence number, computed by the writer's own thread.
+pub(super) struct Unsealed {
+    pub(super) record: Vec<u8>,
+    tail: Hasher,
+    pub(super) key: std::ops::Range<usize>,
+    /// The value's bytes, or `None` for a delete.
+    pub(super) value: Option<std::ops::Range<usize>>,
+}
+
+/// Where a body's sequence number starts in a record.
+const SEQ_AT: usize = FRAME_LEN + 1;
+
+/// The length of the record [`encode`] makes.
+pub(super) fn encoded_len(key: &[u8], value: Value<'_>) -> usize {
+    let value_len = match value {
+        Value::Bytes(bytes) => 4 + bytes.len(),
+        Value::Tombstone => 0,
+    };
+    FRAME_LEN + MIN_BODY + key.len() + value_len
+}
+
+pub(super) fn encode(key: &[u8], value: Value<'_>) -> Unsealed {
+    let mut record = Vec::with_capacity(encoded_len(key, value));
+    record.extend_from_slice(&[0; FRAME_LEN]);
+    record.push(match value {
+        Value::Bytes(_) => PUT,
+        Value::Tombstone => DELETE,
+    });
+    record.extend_from_slice(&[0; 8]);
+    record.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    let key_at = record.len();
+    record.extend_from_slice(key);
+    let value_range = match value {
         Value::Bytes(bytes) => {
-            out.push(PUT);
-            out.extend_from_slice(&seq.to_le_bytes());
-            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            out.extend_from_slice(key);
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(bytes);
+            record.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            let at = record.len();
+            record.extend_from_slice(bytes);
+            Some(at..record.len())
         }
-        Value::Tombstone => {
-            out.push(DELETE);
-            out.extend_from_slice(&seq.to_le_bytes());
-            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            out.extend_from_slice(key);
+        Value::Tombstone => None,
+    };
+    let mut tail = Hasher::new();
+    tail.update(&record[SEQ_AT + 8..]);
+    Unsealed {
+        key: key_at..key_at + key.len(),
+        value: value_range,
+        record,
+        tail,
+    }
+}
+
+impl Unsealed {
+    pub(super) fn key(&self) -> &[u8] {
+        &self.record[self.key.clone()]
+    }
+
+    pub(super) fn value(&self) -> Value<'_> {
+        match &self.value {
+            Some(range) => Value::Bytes(&self.record[range.clone()]),
+            None => Value::Tombstone,
         }
     }
-    let body_len = (out.len() - FRAME_LEN) as u32;
-    let body_sum = crc(&[&out[FRAME_LEN..]]);
-    out[..4].copy_from_slice(&body_len.to_le_bytes());
-    out[4..8].copy_from_slice(&body_sum.to_le_bytes());
-    let frame_sum = crc(&[&out[..8]]);
-    out[8..12].copy_from_slice(&frame_sum.to_le_bytes());
+
+    /// Writes `seq` and the checksums.
+    pub(super) fn seal(&mut self, seq: u64) {
+        let record = &mut self.record;
+        record[SEQ_AT..SEQ_AT + 8].copy_from_slice(&seq.to_le_bytes());
+        let mut body = Hasher::new();
+        body.update(&record[FRAME_LEN..SEQ_AT + 8]);
+        body.combine(&self.tail);
+        let body_len = (record.len() - FRAME_LEN) as u32;
+        record[..4].copy_from_slice(&body_len.to_le_bytes());
+        record[4..8].copy_from_slice(&body.finalize().to_le_bytes());
+        let frame_sum = crc(&[&record[..8]]);
+        record[8..12].copy_from_slice(&frame_sum.to_le_bytes());
+    }
+}
+
+/// Encodes one record, frame and body, into `out`.
+#[cfg(test)]
+fn encode_record(out: &mut Vec<u8>, seq: u64, key: &[u8], value: Value<'_>) {
+    let mut unsealed = encode(key, value);
+    unsealed.seal(seq);
+    *out = unsealed.record;
 }
 
 /// A record body, checked.
@@ -430,51 +513,38 @@ struct Segment {
     len: u64,
 }
 
-/// Faults a test can inject into the next log operation on this thread.
-#[cfg(test)]
+/// Faults a test can inject into the next batch a durable engine logs;
+/// always `None` outside tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Fault {
-    /// Write the first half of the record, then fail.
+    /// Write the first half of the batch's first record, then fail.
     TornAppend,
-    /// Write the record, then fail instead of syncing.
+    /// Write the batch, then fail instead of syncing.
     SyncFails,
     /// Create the next segment with half a header, then fail.
     TornRotation,
 }
 
+/// Runs after the next batch this thread leads is logged, before it is
+/// published, without the state lock but holding the log.
 #[cfg(test)]
-thread_local! {
-    pub(super) static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
-}
-
-/// Runs after the next durable write on this thread is logged, before it is
-/// published, without the state lock.
-#[cfg(test)]
-type Hook = Box<dyn FnOnce(&Core)>;
+pub(super) type Hook = Box<dyn FnOnce(&Core)>;
 
 #[cfg(test)]
 thread_local! {
     pub(super) static BEFORE_PUBLISH: std::cell::Cell<Option<Hook>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-fn fault(at: Fault) -> bool {
-    FAULT.with(|fault| {
-        let hit = fault.get() == Some(at);
-        if hit {
-            fault.set(None);
-        }
-        hit
-    })
-}
-
-#[cfg(test)]
 fn injected() -> io::Error {
     io::Error::other("fault injected by a test")
 }
 
-/// The live log, behind a mutex that durable writers hold from reservation
-/// to publication; the state lock is taken inside it, never around it.
+/// Bounds on [`Wal::write_batch`]'s vector writes, below every platform's
+/// `IOV_MAX`.
+pub(super) const MAX_BATCH_RECORDS: usize = 256;
+
+/// The live log. Only a batch's leader holds it, from reservation to
+/// publication; the state lock is taken inside it, never around it.
 pub(super) struct Wal {
     dir: PathBuf,
     options: DurableOptions,
@@ -485,36 +555,75 @@ pub(super) struct Wal {
     bytes: u64,
     /// Records in the active segment.
     records: u64,
-    buffer: Vec<u8>,
-    closed: Option<io::ErrorKind>,
+    pub(super) closed: Option<io::ErrorKind>,
+    stats: Stats,
+}
+
+/// What the log has done since it was opened.
+#[derive(Clone, Copy, Debug, Default)]
+struct Stats {
+    syncs: u64,
+    batches: u64,
+    records: u64,
+    batch_sizes: [u64; 8],
+}
+
+/// Where the next records of a batch would go: projected while it is
+/// validated, so that every record given a sequence number fits the log.
+pub(super) struct Plan {
+    active_len: u64,
+    active_records: u64,
+    bytes: u64,
 }
 
 /// What a durable engine owns beside its core.
 pub(super) struct Durable {
     pub(super) dir: PathBuf,
+    pub(super) options: DurableOptions,
     /// Held for the engine's life; the kernel releases it if the process dies.
     _lock: File,
     pub(super) wal: Mutex<Wal>,
+    pub(super) group: Mutex<super::group::Group>,
+    /// Signalled whenever the group changes: a batch taken or finished.
+    pub(super) turn: std::sync::Condvar,
+    /// The fault for the next batch; tests only.
+    pub(super) fault: Mutex<Option<Fault>>,
+}
+
+impl Durable {
+    fn new(dir: &Path, options: DurableOptions, lock: File, wal: Wal) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            options,
+            _lock: lock,
+            wal: Mutex::new(wal),
+            group: Mutex::new(super::group::Group::default()),
+            turn: std::sync::Condvar::new(),
+            fault: Mutex::new(None),
+        }
+    }
 }
 
 /// Creates segment `number` with `base`, synced with its directory entry.
-fn create_segment(dir: &Path, number: u64, base: u64) -> io::Result<File> {
+/// With `torn`, a test's fault, it writes half the header and fails.
+fn create_segment(dir: &Path, number: u64, base: u64, torn: bool) -> io::Result<File> {
     let path = dir.join(segment_name(number));
     let mut file = OpenOptions::new()
         .append(true)
         .create_new(true)
         .open(&path)?;
     let header = encode_header(number, base);
-    #[cfg(test)]
-    if fault(Fault::TornRotation) {
-        file.write_all(&header[..SEGMENT_HEADER_LEN / 2])?;
-        file.sync_all()?;
-        sync_dir(dir)?;
-        return Err(injected());
-    }
-    file.write_all(&header)?;
+    let len = if torn {
+        SEGMENT_HEADER_LEN / 2
+    } else {
+        SEGMENT_HEADER_LEN
+    };
+    file.write_all(&header[..len])?;
     file.sync_all()?;
     sync_dir(dir)?;
+    if torn {
+        return Err(io::Error::other("torn rotation injected by a test"));
+    }
     Ok(file)
 }
 
@@ -526,7 +635,7 @@ impl Wal {
         base: u64,
     ) -> io::Result<Self> {
         let number = segments.last().map_or(1, |last| last.number + 1);
-        let file = create_segment(dir, number, base)?;
+        let file = create_segment(dir, number, base, false)?;
         segments.push(Segment {
             number,
             base,
@@ -539,70 +648,110 @@ impl Wal {
             segments,
             file,
             records: 0,
-            buffer: Vec::new(),
             closed: None,
+            stats: Stats::default(),
         })
     }
 
-    /// Logs one update with `seq`, the next sequence number, and syncs it.
-    pub(super) fn append(
-        &mut self,
-        seq: u64,
-        key: &[u8],
-        value: Value<'_>,
-    ) -> Result<(), UpdateError> {
-        if self.closed.is_some() {
-            return Err(UpdateError::LogClosed);
+    /// The log as it stands, for a batch to be planned against.
+    pub(super) fn plan(&self) -> Plan {
+        Plan {
+            active_len: self.segments.last().map_or(0, |segment| segment.len),
+            active_records: self.records,
+            bytes: self.bytes,
         }
-        encode_record(&mut self.buffer, seq, key, value);
-        let len = self.buffer.len() as u64;
-        let active = self.segments.last().expect("a log has an active segment");
-        let rotate = self.records > 0 && active.len + len > self.options.segment_bytes;
+    }
+
+    /// Adds a record of `len` bytes to `plan` if the log has room for it,
+    /// returning whether a new segment must start before it.
+    pub(super) fn admit(&self, plan: &mut Plan, len: u64) -> Result<bool, UpdateError> {
+        let rotate = plan.active_records > 0 && plan.active_len + len > self.options.segment_bytes;
         let needed = len + if rotate { SEGMENT_HEADER_LEN as u64 } else { 0 };
-        if self.bytes + needed > self.options.max_log_bytes {
+        if plan.bytes + needed > self.options.max_log_bytes {
             return Err(UpdateError::LogFull {
-                bytes: self.bytes + needed,
+                bytes: plan.bytes + needed,
                 max_bytes: self.options.max_log_bytes,
             });
         }
-        let result = self.write(rotate, seq - 1);
-        if self.buffer.capacity() > KEEP_BUFFER {
-            self.buffer = Vec::new();
+        if rotate {
+            plan.active_len = SEGMENT_HEADER_LEN as u64;
+            plan.active_records = 0;
         }
-        result.map_err(|error| {
-            self.closed = Some(error.kind());
-            UpdateError::LogFailed(error.kind())
-        })
+        plan.active_len += len;
+        plan.active_records += 1;
+        plan.bytes += needed;
+        Ok(rotate)
     }
 
-    fn write(&mut self, rotate: bool, base: u64) -> io::Result<()> {
-        if rotate {
-            let number = self.segments.last().unwrap().number + 1;
-            self.file = create_segment(&self.dir, number, base)?;
-            self.segments.push(Segment {
-                number,
-                base,
-                len: SEGMENT_HEADER_LEN as u64,
-            });
-            self.bytes += SEGMENT_HEADER_LEN as u64;
-            self.records = 0;
+    /// Appends a batch planned by [`Self::admit`]: each record, with the base
+    /// of a new segment to start before it if one must. The records of each
+    /// segment are written together and synced once, and a segment is synced
+    /// before the next is created, so a crash leaves at most the batch's
+    /// last records incomplete, at the end of the last segment.
+    pub(super) fn write_batch(
+        &mut self,
+        records: &[(&[u8], Option<u64>)],
+        fault: Option<Fault>,
+    ) -> io::Result<()> {
+        let mut start = 0;
+        for (at, &(_, rotate)) in records.iter().enumerate() {
+            if let Some(base) = rotate {
+                self.append(&records[start..at], fault)?;
+                start = at;
+                let torn = fault == Some(Fault::TornRotation);
+                let number = self.segments.last().unwrap().number + 1;
+                self.file = create_segment(&self.dir, number, base, torn)?;
+                self.segments.push(Segment {
+                    number,
+                    base,
+                    len: SEGMENT_HEADER_LEN as u64,
+                });
+                self.bytes += SEGMENT_HEADER_LEN as u64;
+                self.records = 0;
+            }
         }
-        #[cfg(test)]
-        if fault(Fault::TornAppend) {
-            self.file.write_all(&self.buffer[..self.buffer.len() / 2])?;
+        self.append(&records[start..], fault)?;
+        let count = records.len() as u64;
+        self.stats.batches += 1;
+        self.stats.records += count;
+        let bucket = (64 - (count - 1).leading_zeros() as usize).min(7);
+        self.stats.batch_sizes[bucket] += 1;
+        Ok(())
+    }
+
+    /// Writes records to the active segment with vector writes, then syncs.
+    fn append(&mut self, records: &[(&[u8], Option<u64>)], fault: Option<Fault>) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if fault == Some(Fault::TornAppend) {
+            self.file
+                .write_all(&records[0].0[..records[0].0.len() / 2])?;
             self.file.sync_data()?;
             return Err(injected());
         }
-        self.file.write_all(&self.buffer)?;
-        #[cfg(test)]
-        if fault(Fault::SyncFails) {
+        let mut slices: Vec<io::IoSlice<'_>> = records
+            .iter()
+            .map(|&(record, _)| io::IoSlice::new(record))
+            .collect();
+        let mut remaining = &mut slices[..];
+        while !remaining.is_empty() {
+            match self.file.write_vectored(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => io::IoSlice::advance_slices(&mut remaining, written),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let len: u64 = records.iter().map(|&(record, _)| record.len() as u64).sum();
+        self.segments.last_mut().unwrap().len += len;
+        self.bytes += len;
+        self.records += records.len() as u64;
+        if fault == Some(Fault::SyncFails) {
             return Err(injected());
         }
         self.file.sync_data()?;
-        let len = self.buffer.len() as u64;
-        self.segments.last_mut().unwrap().len += len;
-        self.bytes += len;
-        self.records += 1;
+        self.stats.syncs += 1;
         Ok(())
     }
 
@@ -612,6 +761,12 @@ impl Wal {
             bytes: self.bytes,
             active_bytes: self.segments.last().map_or(0, |segment| segment.len),
             closed: self.closed,
+            syncs: self.stats.syncs,
+            batches: self.stats.batches,
+            records: self.stats.records,
+            batch_sizes: self.stats.batch_sizes,
+            queued_writes: 0,
+            queued_bytes: 0,
         }
     }
 }
@@ -966,11 +1121,7 @@ impl Engine {
         let wal = Wal::new(dir, durable, Vec::new(), options.last_seq).map_err(io(dir))?;
         let engine = Engine::new(options);
         let published = engine.publish(dir, CheckpointOptions::default());
-        let installed = Durable {
-            dir: dir.to_owned(),
-            _lock: lock,
-            wal: Mutex::new(wal),
-        };
+        let installed = Durable::new(dir, durable, lock, wal);
         match published {
             Ok(_) => {}
             Err(CheckpointError::Io {
@@ -1044,11 +1195,10 @@ impl Engine {
             torn_tail: scanned.torn,
             interrupted_segment: scanned.interrupted,
         };
-        let _ = engine.core.durable.set(Durable {
-            dir: dir.to_owned(),
-            _lock: lock,
-            wal: Mutex::new(wal),
-        });
+        let _ = engine
+            .core
+            .durable
+            .set(Durable::new(dir, durable, lock, wal));
         Ok((engine, report))
     }
 
@@ -1078,11 +1228,14 @@ impl Engine {
     /// The log of a durable engine, or `None` for a RAM-only one.
     pub fn log_status(&self) -> Option<LogStatus> {
         self.core.durable.get().map(|durable| {
-            durable
+            // One lock at a time: the log waits for a batch in progress.
+            let mut status = durable
                 .wal
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .status()
+                .status();
+            (status.queued_writes, status.queued_bytes) = durable.queue_load();
+            status
         })
     }
 
@@ -1119,51 +1272,6 @@ impl Engine {
 }
 
 impl Core {
-    /// The durable write path: reserve, log, publish. Durable writers take
-    /// the log first, one at a time, so the sequence number reserved under
-    /// the first hold of the state lock is still the next one when the
-    /// second publishes it. The state lock is not held while the record is
-    /// synced, so reads, flushes and snapshots proceed meanwhile.
-    // Kept out of the RAM-only write path, which only tests for it.
-    #[inline(never)]
-    pub(super) fn update_durable(
-        &self,
-        durable: &Durable,
-        key: &[u8],
-        value: Value<'_>,
-    ) -> Result<u64, UpdateError> {
-        let mut wal = durable.wal.lock().map_err(|_| UpdateError::LogClosed)?;
-        let seq = {
-            let mut state = self.write_state();
-            let seq = state
-                .last_seq
-                .checked_add(1)
-                .ok_or(UpdateError::SequencesExhausted)?;
-            state
-                .active
-                .check(key, seq, value)
-                .map_err(|error| UpdateError::Rejected(self.reason(&state, error)))?;
-            seq
-        };
-        wal.append(seq, key, value)?;
-        #[cfg(test)]
-        if let Some(hook) = BEFORE_PUBLISH.with(|hook| hook.take()) {
-            hook(self);
-        }
-        let mut state = self.write_state();
-        // A flush may have frozen the table checked, and its successor
-        // continues after `seq - 1`; snapshots may have pinned more. The
-        // record is logged, so it goes in regardless of the budget.
-        state
-            .active
-            .write_admitted(key, seq, value)
-            .expect("lengths and the reserved sequence number were checked");
-        state.last_seq = seq;
-        drop(state);
-        drop(wal);
-        Ok(seq)
-    }
-
     /// Applies a recovered record with its own sequence number.
     fn apply_logged(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), WriteError> {
         let mut state = self.write_state();
@@ -1195,6 +1303,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tessera-wal-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    /// Makes the next batch `engine` logs fail with `fault`.
+    fn inject(engine: &Engine, fault: Fault) {
+        *engine.core.durable.get().unwrap().fault.lock().unwrap() = Some(fault);
     }
 
     fn small() -> DurableOptions {
@@ -1271,7 +1384,7 @@ mod tests {
             let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
             assert_eq!(engine.put(b"a", b"1").unwrap(), 1);
             assert_eq!(engine.delete(b"a").unwrap(), 2);
-            FAULT.with(|cell| cell.set(Some(fault)));
+            inject(&engine, fault);
             assert!(matches!(
                 engine.put(b"b", b"2"),
                 Err(UpdateError::LogFailed(_))
@@ -1435,7 +1548,7 @@ mod tests {
         engine.put(b"a", &value).unwrap();
         engine.put(b"b", &value).unwrap();
         // The third does not fit the first segment.
-        FAULT.with(|cell| cell.set(Some(Fault::TornRotation)));
+        inject(&engine, Fault::TornRotation);
         assert!(matches!(
             engine.put(b"c", &value),
             Err(UpdateError::LogFailed(_))

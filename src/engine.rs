@@ -213,6 +213,7 @@
 //! file. See [`DurableOptions`] and the contract in the source of `wal.rs`.
 
 mod checkpoint;
+mod group;
 mod wal;
 mod worker;
 
@@ -361,9 +362,10 @@ pub enum UpdateError {
     Rejected(WriteError),
     /// Every sequence number has been used.
     SequencesExhausted,
-    /// Logging this write failed (its append or sync), so it was not
-    /// applied, but its record may survive and be recovered. The log is now
-    /// closed. See "Durable writes" in `src/engine/wal.rs`.
+    /// Logging this write failed (its append or sync, or the thread logging
+    /// its batch panicked: [`std::io::ErrorKind::Other`]), so it was not
+    /// applied, but its record may survive and be recovered: its outcome is
+    /// uncertain until the database is reopened. The log is now closed. See "Durable writes" in `src/engine/wal.rs`.
     LogFailed(std::io::ErrorKind),
     /// An earlier log failure closed the log: nothing was logged. Reopen the
     /// database to write again.

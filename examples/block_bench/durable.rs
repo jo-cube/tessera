@@ -1,7 +1,8 @@
-//! Milestone 5M: the cost of durable writes against RAM-only ones, recovery
-//! from the log and from a checkpoint, and checkpoints beside a durable
-//! writer. The directory is the argument after `durable`; databases are
-//! created under it and removed here.
+//! Milestones 5M and 5N: durable writes against RAM-only ones by writer
+//! concurrency, syncing each write alone and with group commit, beside a
+//! reader; then recovery from the log and from a checkpoint. The directory
+//! is the argument after `durable`; databases are created under it and
+//! removed here.
 
 use std::fs;
 use std::hint::black_box;
@@ -17,9 +18,9 @@ use tessera::engine::{
 use super::{FlushTally, LIVE, PEAK, Rng, mib, percentile, put_flushing, tree_json, tree_key};
 
 const KEYS: u64 = 1_000_000;
-/// Each write row stops at this many puts or after this long.
-const PUTS: usize = 300_000;
-const ROW_TIME: Duration = Duration::from_secs(20);
+/// Each row stops after this many writes in all, or after this long.
+const WRITES: usize = 200_000;
+const ROW_TIME: Duration = Duration::from_secs(10);
 
 fn key(index: u64) -> Vec<u8> {
     tree_key(index, (1_000, 100, 1_000))
@@ -33,10 +34,12 @@ fn options() -> EngineOptions {
     }
 }
 
-fn durable(segment_bytes: u64) -> DurableOptions {
+fn durable(segment_bytes: u64, batch: usize) -> DurableOptions {
     DurableOptions {
         segment_bytes,
         max_log_bytes: u64::MAX,
+        max_batch_records: batch,
+        ..DurableOptions::default()
     }
 }
 
@@ -55,118 +58,61 @@ fn us(ns: u64) -> f64 {
     ns as f64 / 1e3
 }
 
-/// One writer of uniform overwrites, timing every put.
-fn writes(name: &str, engine: &Engine, values: &[Vec<u8>]) -> usize {
-    let mut rng = Rng(11);
-    let mut tally = FlushTally::default();
-    let mut latency = Vec::with_capacity(PUTS);
-    let start = Instant::now();
-    for at in 0..PUTS {
-        let key = key(rng.next() % KEYS);
-        let t = Instant::now();
-        put_flushing(engine, &key, &values[at % values.len()], &mut tally);
-        latency.push(t.elapsed().as_nanos() as u64);
-        if at % 1024 == 0 && start.elapsed() > ROW_TIME {
-            break;
-        }
-    }
-    let wall = start.elapsed().as_secs_f64();
-    let puts = latency.len();
-    latency.sort_unstable();
-    let (log, segments) = engine.log_status().map_or((0.0, 0), |status| {
-        (mib(status.bytes as usize), status.segments)
-    });
-    println!(
-        "| {name} | {puts} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.1} | {segments} |",
-        puts as f64 / wall / 1e3,
-        us(percentile(&latency, 0.5)),
-        us(percentile(&latency, 0.99)),
-        us(percentile(&latency, 0.999)),
-        us(*latency.last().unwrap()),
-        log,
-    );
-    puts
-}
-
-fn recovery(dir: &Path, values: &[Vec<u8>]) {
-    let _ = fs::remove_dir_all(dir);
-    let engine = Engine::create(dir, options(), durable(64 << 20)).unwrap();
-    let puts = writes("(load)", &engine, values);
-    drop(engine);
-    println!();
-    println!(
-        "| recovery of {puts} puts | s | log MiB | log MiB/s | replayed | heap peak MiB | log MiB after |"
-    );
-    println!("|{}", "---|".repeat(7));
-    let start = Instant::now();
-    let ((engine, report), heap) =
-        peak(|| Engine::open(dir, options(), durable(64 << 20)).unwrap());
-    let s = start.elapsed().as_secs_f64();
-    let log = mib(report.log_bytes as usize);
-    println!(
-        "| from the log alone | {s:.2} | {log:.1} | {:.0} | {} | {:.1} | |",
-        log / s,
-        report.replayed,
-        mib(heap),
-    );
-    let start = Instant::now();
-    let checkpoint = engine
-        .durable_checkpoint(CheckpointOptions::default())
-        .unwrap();
-    let checkpoint_s = start.elapsed().as_secs_f64();
-    let after = mib(engine.log_status().unwrap().bytes as usize);
-    println!(
-        "| (durable checkpoint: {checkpoint_s:.2} s, {:.1} MiB, {} segments pruned) | | | | | | {after:.1} |",
-        mib(checkpoint.bytes as usize),
-        checkpoint.pruned_segments,
-    );
-    drop(engine);
-    let start = Instant::now();
-    let ((engine, report), heap) =
-        peak(|| Engine::open(dir, options(), durable(64 << 20)).unwrap());
-    let s = start.elapsed().as_secs_f64();
-    println!(
-        "| from the checkpoint | {s:.2} | {:.1} | | {} | {:.1} | |",
-        mib(report.log_bytes as usize),
-        report.replayed,
-        mib(heap),
-    );
-    drop(engine);
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// A durable writer and a reader with the worker, with or without durable
-/// checkpoints back to back.
-fn beside(dir: &Path, values: &[Vec<u8>], checkpoints: bool) {
-    let _ = fs::remove_dir_all(dir);
-    // Small memtables, so that flushes and compactions happen beside the log.
-    let options = EngineOptions {
-        memtable_budget: 2 << 20,
-        ..options()
+/// CPU this thread has used, in microseconds, at the kernel's 10 ms tick,
+/// or 0 where `/proc` is missing.
+fn thread_cpu_us() -> u64 {
+    let Ok(stat) = fs::read_to_string("/proc/thread-self/stat") else {
+        return 0;
     };
-    let engine = Engine::create(dir, options, durable(16 << 20)).unwrap();
-    let status0 = engine.background_status().unwrap();
+    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    ticks * 10_000
+}
+
+enum Mode {
+    Ram,
+    /// Durable, with these segments and at most this many writes a batch.
+    Durable(u64, usize),
+}
+
+/// `writers` threads of uniform json overwrites and one reader, optionally
+/// with durable checkpoints back to back.
+fn row(name: &str, dir: &Path, mode: Mode, writers: usize, values: &[Vec<u8>], checkpoints: bool) {
+    let _ = fs::remove_dir_all(dir);
+    let engine = match mode {
+        Mode::Ram => Engine::new(options()),
+        Mode::Durable(segment, batch) => {
+            Engine::create(dir, options(), durable(segment, batch)).unwrap()
+        }
+    };
+    let per_writer = WRITES / writers;
     let done = AtomicBool::new(false);
     let start = Instant::now();
-    let (mut taken, mut pruned, mut most_log) = (0, 0, 0u64);
-    let ((mut puts, wall), mut gets) = thread::scope(|scope| {
-        let writer = scope.spawn(|| {
-            let (mut rng, mut tally, mut latency) = (Rng(7), FlushTally::default(), Vec::new());
-            for at in 0..PUTS {
-                let key = key(rng.next() % KEYS);
-                let t = Instant::now();
-                put_flushing(&engine, &key, &values[at % values.len()], &mut tally);
-                latency.push(t.elapsed().as_nanos() as u64);
-                if at % 1024 == 0 && start.elapsed() > ROW_TIME {
-                    break;
-                }
-            }
-            done.store(true, Ordering::Relaxed);
-            (latency, start.elapsed().as_secs_f64())
-        });
+    let (mut taken, mut most_queued) = (0, 0);
+    let (results, mut gets, wall) = thread::scope(|scope| {
+        let handles: Vec<_> = (0..writers)
+            .map(|writer| {
+                let engine = &engine;
+                scope.spawn(move || {
+                    let cpu = thread_cpu_us();
+                    let (mut rng, mut tally) = (Rng(7 + writer as u64), FlushTally::default());
+                    let mut latency = Vec::with_capacity(per_writer);
+                    for at in 0..per_writer {
+                        let key = key(rng.next() % KEYS);
+                        let t = Instant::now();
+                        put_flushing(engine, &key, &values[at % values.len()], &mut tally);
+                        latency.push(t.elapsed().as_nanos() as u64);
+                        if at % 256 == 0 && start.elapsed() > ROW_TIME {
+                            break;
+                        }
+                    }
+                    (latency, thread_cpu_us() - cpu)
+                })
+            })
+            .collect();
         let reader = scope.spawn(|| {
             let (mut rng, mut workspace, mut latency) =
-                (Rng(8), EngineWorkspace::new(), Vec::new());
+                (Rng(99), EngineWorkspace::new(), Vec::new());
             while !done.load(Ordering::Relaxed) {
                 let key = key(rng.next() % KEYS);
                 let t = Instant::now();
@@ -175,35 +121,112 @@ fn beside(dir: &Path, values: &[Vec<u8>], checkpoints: bool) {
             }
             latency
         });
-        while !writer.is_finished() {
-            most_log = most_log.max(engine.log_status().unwrap().bytes);
+        while handles.iter().any(|handle| !handle.is_finished()) {
+            if let Some(status) = engine.log_status() {
+                most_queued = most_queued.max(status.queued_bytes);
+            }
             if checkpoints {
-                let report = engine
+                engine
                     .durable_checkpoint(CheckpointOptions::default())
                     .unwrap();
                 taken += 1;
-                pruned += report.pruned_segments;
             } else {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(1));
             }
         }
-        (writer.join().unwrap(), reader.join().unwrap())
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wall = start.elapsed().as_secs_f64();
+        done.store(true, Ordering::Relaxed);
+        (results, reader.join().unwrap(), wall)
     });
-    let status = engine.background_status().unwrap();
-    puts.sort_unstable();
+    let mut latency: Vec<u64> = results
+        .iter()
+        .flat_map(|(l, _)| l.iter().copied())
+        .collect();
+    let cpu: u64 = results.iter().map(|(_, cpu)| cpu).sum();
+    latency.sort_unstable();
     gets.sort_unstable();
+    let writes = latency.len() as f64;
+    let log = engine.log_status();
+    let (syncs, batch, large, bytes) = log.map_or(Default::default(), |s| {
+        let large: u64 = s.batch_sizes[3..].iter().sum();
+        (
+            format!("{:.3}", s.syncs as f64 / writes),
+            format!("{:.1}", s.records as f64 / s.batches as f64),
+            format!("{:.0}", large as f64 * 100.0 / s.batches as f64),
+            format!("{:.1}", mib(s.bytes as usize)),
+        )
+    });
     println!(
-        "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} | {taken} | {pruned} | {} ({}) | {:.1} |",
-        if checkpoints { "back to back" } else { "none" },
-        puts.len() as f64 / wall / 1e3,
-        us(percentile(&puts, 0.99)),
+        "| {name} | {writers} | {:.1} | {:.1} | {:.1} | {:.1} | {syncs} | {batch} | {large} | {bytes} | {:.1} | {:.0} | {:.1} | {} | {:.0} |",
+        writes / wall / 1e3,
+        us(percentile(&latency, 0.5)),
+        us(percentile(&latency, 0.95)),
+        us(percentile(&latency, 0.99)),
+        cpu as f64 / writes,
         gets.len() as f64 / wall / 1e3,
         us(percentile(&gets, 0.99)),
-        us(percentile(&gets, 0.999)),
-        us(*gets.last().unwrap_or(&0)),
-        status.compactions - status0.compactions,
-        status.failures - status0.failures,
-        mib(most_log as usize),
+        if checkpoints {
+            taken.to_string()
+        } else {
+            String::new()
+        },
+        most_queued as f64 / 1024.0,
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn recovery(dir: &Path, values: &[Vec<u8>]) {
+    let _ = fs::remove_dir_all(dir);
+    let durable = durable(64 << 20, 64);
+    let engine = Engine::create(dir, options(), durable).unwrap();
+    let mut tally = FlushTally::default();
+    let mut rng = Rng(11);
+    let start = Instant::now();
+    let mut puts = 0;
+    while puts < 300_000 && start.elapsed() < ROW_TIME {
+        put_flushing(
+            &engine,
+            &key(rng.next() % KEYS),
+            &values[puts % values.len()],
+            &mut tally,
+        );
+        puts += 1;
+    }
+    drop(engine);
+    println!("| recovery of {puts} puts | s | log MiB | log MiB/s | replayed | heap peak MiB |");
+    println!("|{}", "---|".repeat(6));
+    let start = Instant::now();
+    let ((engine, report), heap) = peak(|| Engine::open(dir, options(), durable).unwrap());
+    let s = start.elapsed().as_secs_f64();
+    let log = mib(report.log_bytes as usize);
+    println!(
+        "| from the log alone | {s:.2} | {log:.1} | {:.0} | {} | {:.1} |",
+        log / s,
+        report.replayed,
+        mib(heap),
+    );
+    let start = Instant::now();
+    let checkpoint = engine
+        .durable_checkpoint(CheckpointOptions::default())
+        .unwrap();
+    println!(
+        "| (durable checkpoint: {:.2} s, {:.1} MiB, {} segments pruned, log after {:.1} MiB) | | | | | |",
+        start.elapsed().as_secs_f64(),
+        mib(checkpoint.bytes as usize),
+        checkpoint.pruned_segments,
+        mib(engine.log_status().unwrap().bytes as usize),
+    );
+    drop(engine);
+    let start = Instant::now();
+    let ((engine, report), heap) = peak(|| Engine::open(dir, options(), durable).unwrap());
+    println!(
+        "| from the checkpoint | {:.2} | {:.1} | | {} | {:.1} |",
+        start.elapsed().as_secs_f64(),
+        mib(report.log_bytes as usize),
+        report.replayed,
+        mib(heap),
     );
     drop(engine);
     let _ = fs::remove_dir_all(dir);
@@ -220,34 +243,53 @@ pub(super) fn durable_bench() {
     println!("databases in {}", dir.display());
     println!();
     println!(
-        "One writer, uniform json overwrites over {KEYS} keys, at most {PUTS} puts or {} s:",
+        "Uniform json overwrites over {KEYS} keys from W writers, at most {WRITES} writes or {} s, beside one reader:",
         ROW_TIME.as_secs()
     );
     println!();
     println!(
-        "| mode | puts | k puts/s | p50 µs | p99 µs | p99.9 µs | max µs | log MiB | segments |"
+        "| mode | W | k writes/s | p50 µs | p95 µs | p99 µs | syncs/write | mean batch | batches ≥5 % | log MiB | writer CPU µs/write | k gets/s | get p99 µs | checkpoints | most queued KiB |"
     );
-    println!("|{}", "---|".repeat(9));
-    writes("RAM-only", &Engine::new(options()), &values);
-    for (name, segment) in [
-        ("durable, 64 MiB segments", 64 << 20),
-        ("durable, 1 MiB segments", 1 << 20),
-    ] {
-        let _ = fs::remove_dir_all(&dir);
-        let engine = Engine::create(&dir, options(), durable(segment)).unwrap();
-        writes(name, &engine, &values);
-        drop(engine);
+    println!("|{}", "---|".repeat(15));
+    for writers in [1, 2, 4] {
+        row("RAM-only", &dir, Mode::Ram, writers, &values, false);
     }
-    let _ = fs::remove_dir_all(&dir);
+    for writers in [1, 2, 4] {
+        row(
+            "sync per write",
+            &dir,
+            Mode::Durable(64 << 20, 1),
+            writers,
+            &values,
+            false,
+        );
+    }
+    for writers in [1, 2, 4, 8] {
+        row(
+            "group commit",
+            &dir,
+            Mode::Durable(64 << 20, 64),
+            writers,
+            &values,
+            false,
+        );
+    }
+    row(
+        "group, 1 MiB segments",
+        &dir,
+        Mode::Durable(1 << 20, 64),
+        4,
+        &values,
+        false,
+    );
+    row(
+        "group, checkpoints",
+        &dir,
+        Mode::Durable(64 << 20, 64),
+        4,
+        &values,
+        true,
+    );
     println!();
     recovery(&dir, &values);
-    println!();
-    println!("A durable writer (2 MiB memtables, 16 MiB segments), a reader and the worker:");
-    println!();
-    println!(
-        "| checkpoints | k puts/s | put p99 µs | k gets/s | get p99 µs | get p99.9 µs | get max µs | checkpoints | segments pruned | compactions (failures) | most log MiB |"
-    );
-    println!("|{}", "---|".repeat(11));
-    beside(&dir, &values, false);
-    beside(&dir, &values, true);
 }

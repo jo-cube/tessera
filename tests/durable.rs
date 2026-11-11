@@ -1,14 +1,12 @@
 //! Durable engines through the public API: what `open` recovers from a
-//! checkpoint and the log, what it rejects, and what a killed process leaves.
+//! checkpoint and the log, and what it rejects (a killed process is in `tests/process.rs`).
 //! Injected append and checkpoint failures are tested beside the code.
 //! Files go to fresh directories under the system temporary directory, which
 //! the bounded runner makes a small tmpfs.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 
 use tessera::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
@@ -131,6 +129,8 @@ fn reopening_recovers_puts_overwrites_deletes_and_reinsertions_and_continues_the
         }
     }
     assert!(segments(&scratch.0).len() > 2);
+    let status = engine.log_status().unwrap();
+    assert_eq!((status.batches, status.syncs), (seq, seq));
     drop(engine);
 
     for reopen in 0..2 {
@@ -479,6 +479,7 @@ fn a_full_log_refuses_writes_until_a_checkpoint_prunes_it() {
     let durable = DurableOptions {
         segment_bytes: 2048,
         max_log_bytes: 8192,
+        ..DurableOptions::default()
     };
     let engine = Engine::create(&scratch.0, EngineOptions::default(), durable).unwrap();
     let mut acked = 0u64;
@@ -501,110 +502,4 @@ fn a_full_log_refuses_writes_until_a_checkpoint_prunes_it() {
     let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), durable).unwrap();
     assert_eq!(report.last_seq, acked + 1);
     assert_eq!(contents(&engine).len() as u64, acked + 1);
-}
-
-fn child_key(at: u64) -> Vec<u8> {
-    format!("key-{at:08}").into_bytes()
-}
-
-fn child_value(at: u64) -> Vec<u8> {
-    at.to_le_bytes().repeat(1 + at as usize % 13)
-}
-
-/// Run as a child by the test below: opens the database and writes until
-/// killed, printing each acknowledged sequence number, with a checkpoint
-/// every few hundred writes.
-fn write_as_child(dir: &str) {
-    let dir = Path::new(dir);
-    let (engine, report) = Engine::open(dir, EngineOptions::default(), small()).unwrap();
-    let mut out = std::io::stdout().lock();
-    writeln!(out, "tessera-child-open {}", report.last_seq).unwrap();
-    let mut at = report.last_seq;
-    loop {
-        at += 1;
-        let seq = engine.put(&child_key(at), &child_value(at)).unwrap();
-        assert_eq!(seq, at);
-        writeln!(out, "tessera-acked {seq}").unwrap();
-        out.flush().unwrap();
-        if at.is_multiple_of(300) {
-            engine
-                .durable_checkpoint(CheckpointOptions::default())
-                .unwrap();
-        }
-        assert!(at < 10_000_000, "the parent never killed the child");
-    }
-}
-
-/// A process killed (SIGKILL) at an arbitrary write loses no write it
-/// acknowledged, at most the one it had not, and holds the directory against
-/// this process until it dies.
-#[test]
-fn a_killed_process_loses_no_acknowledged_write() {
-    if let Ok(dir) = std::env::var("TESSERA_DURABLE_CHILD") {
-        return write_as_child(&dir);
-    }
-    let scratch = Scratch::new("killed");
-    drop(Engine::create(&scratch.0, EngineOptions::default(), small()).unwrap());
-    let mut acked = 0;
-    for (round, writes) in [2_000u64, 3_500, 1_200].into_iter().enumerate() {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "a_killed_process_loses_no_acknowledged_write",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("TESSERA_DURABLE_CHILD", &scratch.0)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut opened = None;
-        let mut last = None;
-        for line in lines.by_ref() {
-            let line = line.unwrap();
-            if let Some(seq) = line.split("tessera-child-open ").nth(1) {
-                opened = Some(seq.parse::<u64>().unwrap());
-            } else if let Some(seq) = line.strip_prefix("tessera-acked ") {
-                let seq: u64 = seq.parse().unwrap();
-                last = Some(seq);
-                if seq == opened.unwrap() + writes / 2 {
-                    assert!(matches!(
-                        Engine::open(&scratch.0, EngineOptions::default(), small()),
-                        Err(RecoveryError::Locked(_))
-                    ));
-                }
-                if seq >= opened.unwrap() + writes {
-                    break;
-                }
-            }
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        // The child went on writing; what it printed before dying is still in
-        // the pipe. A write it made durable without printing is the one
-        // recovery may add.
-        for line in lines {
-            let Ok(line) = line else { break };
-            if let Some(seq) = line.strip_prefix("tessera-acked ") {
-                last = Some(seq.parse().unwrap());
-            }
-        }
-        // Every write acknowledged in an earlier round was recovered by the
-        // child, and every one acknowledged in this round is recovered now.
-        assert_eq!(opened, Some(acked), "round {round}");
-        acked = last.unwrap();
-        let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), small()).unwrap();
-        assert!(
-            (acked..=acked + 1).contains(&report.last_seq),
-            "acknowledged {acked}, recovered {}",
-            report.last_seq
-        );
-        let mut workspace = EngineWorkspace::new();
-        for at in 1..=report.last_seq {
-            let found = engine.get(&child_key(at), &mut workspace).unwrap().unwrap();
-            assert_eq!(found.value, &child_value(at)[..], "write {at}");
-        }
-        acked = report.last_seq;
-    }
 }

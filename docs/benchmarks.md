@@ -1269,7 +1269,10 @@ holds. Two sessions agree within 15% except where noted.
 
 ## Durable writes
 
-`scripts/validate.sh durable` (Milestone 5M) runs one writer of uniform json
+These are the Milestone 5M results; 5N replaced the benchmark with the one
+under [Group commit](#group-commit), so they are not rerun as written.
+
+`scripts/validate.sh durable` (Milestone 5M) ran one writer of uniform json
 overwrites over a million keys (16 MiB memtables, the worker) for at most
 300,000 puts or 20 s, RAM-only and durable, then recovers the database from
 its log and from a checkpoint, then puts a durable writer beside a reader
@@ -1334,3 +1337,87 @@ databases. Ranges are two sessions.
   half its size; on the VM disk it never filled a 16 MiB segment, so nothing
   was pruned.
 - Compaction ran beside the log with no failures.
+
+## Group commit
+
+`scripts/validate.sh durable` (Milestone 5N) runs W writer threads of
+uniform json overwrites over a million keys (16 MiB memtables, the
+worker), 200,000 writes in all or 10 s, beside one reader of uniform gets:
+RAM-only; durable with batches of one write (`max_batch_records: 1`, a sync
+per write, as in 5M); and durable with group commit (64 writes or 1 MiB a
+batch, 16 MiB of queue). Then group commit with 1 MiB segments, with durable
+checkpoints back to back, and recovery. Into the container's tmpfs, then the
+cache volume on the VM's disk. Ranges are two sessions. The VM disk is a
+virtual disk behind Colima's hypervisor, not a characterised device: its
+sync times say nothing about NVMe or any real drive, and whether its
+`fdatasync` reaches stable media is not known.
+
+VM disk:
+
+| mode | W | k writes/s | p50 µs | p99 µs | syncs/write | mean batch | writer CPU µs/write | k gets/s |
+|---|---|---|---|---|---|---|---|---|
+| RAM-only | 1 / 2 / 4 | 1,325–1,361 / 1,511–1,519 / 1,522–1,783 | 0.2–0.3 | 1.3–1.7 | | | 0.6–0.7 | 393–987 |
+| sync per write | 1 | 7.7–7.9 | 123–126 | 166–182 | 1.000 | 1.0 | 9.5–10.3 | 2,755 |
+| sync per write | 2 | 7.9–8.1 | 242–247 | 299 | 1.000 | 1.0 | 10.9 | 2,955 |
+| sync per write | 4 | 7.2–7.9 | 493–530 | 611–1,300 | 1.000 | 1.0 | 12.8–14 | 2,922 |
+| group commit | 1 | 7.8 | 121–126 | 166–255 | 1.000 | 1.0 | 9.7–9.9 | 2,858 |
+| group commit | 2 | 11.3–11.8 | 135–139 | 293–393 | 0.667 | 1.5 | 8.3 | 2,150 |
+| group commit | 4 | 18.9–19.0 | 239–242 | 318–384 | 0.399 | 2.5 | 6.5 | 1,543 |
+| group commit | 8 | 35.4–36.2 | 246–248 | 336–434 | 0.196 | 5.1 | 5.2 | 1,377 |
+| group, 1 MiB segments | 4 | 18.0–18.7 | 242 | 345 | 0.399 | 2.5 | 6.5 | 1,599 |
+| group, checkpoints back to back | 4 | 12.5–12.7 | 254 | 2,400–2,461 | 0.377 | 2.7 | 8.0 | 1,808 |
+
+tmpfs (the sync does nothing; this is the software cost):
+
+| mode | W=1 | W=2 | W=4 | W=8 | p99 µs at W=4 | syncs/write at W=4 / 8 |
+|---|---|---|---|---|---|---|
+| RAM-only, k writes/s | 1,201–1,320 | 1,287–1,432 | 1,553–1,714 | | 1.2 | |
+| sync per write | 490–572 | 464–563 | 328–338 | | 26 | 1.000 |
+| group commit | 500–617 | 500–545 | 444–448 | 288–297 | 30 | 0.94–0.95 / 0.62 |
+| group, 1 MiB segments | | | 411–443 | | 33 | 0.95 |
+| group, checkpoints back to back | | | 228–268 | | 35 | 0.94 |
+
+- On the VM disk a sync costs about 120 µs, and with a sync per write extra
+  writers only queue: 7–8 k writes a second at any W, p50 rising with W.
+  Group commit turns the waiting into batching: the mean batch is about
+  two thirds of W, syncs a write fall to 0.2 at W=8, and throughput grows 4.6× to
+  35–36 k writes a second at the same p50 as one writer's two syncs. A
+  writer that arrives while a sync is in progress waits for it and then the
+  next, so p50 settles near two syncs.
+- One writer pays nothing for batching: 7.8 k writes a second, one sync and
+  batch a write, the same latency as a sync per write. It never waits for
+  company; there is no delay setting.
+- Writer CPU a write (at the kernel's 10 ms tick) falls from 10–14 µs with a
+  sync per write to 5.2 µs at W=8: the sync's own CPU is shared.
+- On tmpfs batching rarely happens (syncs are free, so the leader seldom
+  finds anyone queued): group commit and a sync per write are within noise,
+  and both lose to RAM-only by the encoding, checksum and system calls.
+- Rotation: 1 MiB segments (about 24 in a row) cost 1–5% at W=4 on the
+  disk and 1–8% on tmpfs; a batch crossing a segment syncs the old segment
+  before creating the next.
+- Checkpoints back to back (500–580 in a row on the disk) cost a third of
+  the disk throughput and raise p99 to 2.4 ms: the checkpoint's own syncs
+  and its pruning, which waits for the batch being published.
+- The reader keeps its throughput beside the syncs (1.4–3.0 M gets a second
+  on the disk; it slows as writers take more CPU, as RAM-only does). Its p99
+  stays at 10 µs.
+- Queue memory peaked at 1–2 KiB (logical encoded bytes plus 128 a request,
+  not RSS); the 16 MiB bound was never approached by these 4 KiB values.
+- Recovery is unchanged: 37.8 MiB of log in 0.13–0.14 s on tmpfs (274–287
+  MiB/s, 20 MiB heap) and 8.3 MiB in 0.02 s on the disk; from a checkpoint
+  0.01–0.04 s.
+- RAM-only writes, A/B against the 5M commit (the same microbenchmark as
+  5M, one thread, 1M puts): unchanged, within run-to-run spread; the RAM path
+  does not touch the group code.
+- One durable writer on tmpfs, A/B against 5M (paired runs): 743 against
+  905 and 871 against 1,062 k puts a second, about 0.2 µs a write more,
+  from the queue's mutex, the per-request allocation and the outcome table.
+  On a disk that is lost in the sync. The first version also signalled the
+  condition variable on every write and cost twice that; it now signals only
+  when someone sleeps.
+- Admission in arrival order (added in review, so that a large write is not
+  starved): a first version encoded each record only after admission, which
+  took the queue's mutex twice a write and cost 13% at W=8 on the disk (two
+  runs of 30.3–31.0 k writes a second, mean batch 4.5). Encoding first and
+  re-encoding only after a wait restored 34.7 k (mean batch 5.0) in one run;
+  W=1–4 were unchanged throughout.

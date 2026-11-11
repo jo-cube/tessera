@@ -131,9 +131,15 @@ assumptions (local Linux filesystems) are in
 **Durable mode** is opt-in too. `Engine::create(dir, ..)` starts a database
 and `Engine::open(dir, ..)` reopens one; such an engine holds the directory's
 lock and appends every write to a write-ahead log, synced before the write is
-applied, visible or acknowledged. The sync happens outside the state lock, so
-reads continue meanwhile. A failed append or sync is reported, not applied,
-and closes the log until the database is reopened. `durable_checkpoint`
+applied, visible or acknowledged. Concurrent writers share syncs through
+bounded group commit: the first writer in the queue leads a batch of those
+behind it (at most `max_batch_records` and `max_batch_bytes`), appends it,
+syncs once, publishes it in sequence order and wakes its members; a lone
+writer never waits for company. Queued writes are bounded by
+`max_queue_bytes`. The sync happens outside the state lock, so reads
+continue meanwhile. A failed append or sync is reported to every write
+of its batch, none of which is applied, and closes the log until the
+database is reopened. `durable_checkpoint`
 commits a checkpoint while writes continue and then removes the log segments
 it covers. `open` loads the committed checkpoint and replays the log after
 it, checking every record; only an interrupted final append is tolerated
@@ -143,8 +149,8 @@ format, write protocol and recovery rules are in
 [`src/engine/wal.rs`](src/engine/wal.rs).
 
 There is no transaction, sequence-filtered read of the runs, persisted filter,
-snapshot of a state older than the call, group commit or weaker durability
-mode, and flushing never happens in the background.
+snapshot of a state older than the call, weaker durability mode or
+parallel log writer, and flushing never happens in the background.
 
 ## Validate
 

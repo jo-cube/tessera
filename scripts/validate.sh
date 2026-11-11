@@ -27,7 +27,7 @@
 #   scripts/validate.sh filtercost         key filter construction cost by component (5J)
 #   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
 #   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs then VM disk (5L)
-#   scripts/validate.sh durable            durable writes and log recovery, tmpfs then VM disk (5M)
+#   scripts/validate.sh durable            durable writes and log recovery, tmpfs then VM disk (5M, 5N)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #

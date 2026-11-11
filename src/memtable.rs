@@ -471,13 +471,20 @@ impl Table {
         }
     }
 
-    /// Whether [`Self::write`] would accept the update now.
-    fn check(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
-        self.admit(key, seq, value, true).map(|_| ())
+    /// Whether [`Self::write`] would accept the update now with `reserved`
+    /// more bytes of the budget already promised to other updates.
+    fn check(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+        reserved: usize,
+    ) -> Result<(), WriteError> {
+        self.admit(key, seq, value, Some(reserved)).map(|_| ())
     }
 
     fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
-        let admitted = self.admit(key, seq, value, true)?;
+        let admitted = self.admit(key, seq, value, Some(0))?;
         self.insert(key, seq, admitted);
         Ok(())
     }
@@ -486,7 +493,7 @@ impl Table {
     /// have shrunk or snapshots pinned more since; the other checks still
     /// apply.
     fn write_admitted(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
-        let admitted = self.admit(key, seq, value, false)?;
+        let admitted = self.admit(key, seq, value, None)?;
         self.insert(key, seq, admitted);
         Ok(())
     }
@@ -521,14 +528,15 @@ impl Table {
         self.last_seq = Some(seq);
     }
 
-    /// Every check of [`Self::write`], the budget's only if `budget`,
-    /// changing nothing but forgetting dead snapshots.
+    /// Every check of [`Self::write`], the budget's only if `budget` gives
+    /// the bytes already reserved beside this update, changing nothing but
+    /// forgetting dead snapshots.
     fn admit<'v>(
         &mut self,
         key: &[u8],
         seq: u64,
         value: Value<'v>,
-        budget: bool,
+        budget: Option<usize>,
     ) -> Result<Admitted<'v>, WriteError> {
         let bytes = match value {
             Value::Bytes(bytes) => Some(bytes),
@@ -546,7 +554,7 @@ impl Table {
         }
         // Both lengths are within the limits above, so this cannot overflow.
         let charge = key.len() + value_len + ENTRY_OVERHEAD;
-        if budget && charge > self.budget {
+        if budget.is_some() && charge > self.budget {
             return Err(WriteError::RecordExceedsBudget {
                 charge,
                 budget: self.budget,
@@ -571,7 +579,9 @@ impl Table {
             .budget
             .saturating_add(released)
             .saturating_sub(self.live + self.pinned());
-        if budget && needed > available {
+        if let Some(reserved) = budget
+            && needed.saturating_add(reserved) > available
+        {
             return Err(WriteError::BudgetExceeded { needed, available });
         }
         Ok(Admitted {
@@ -667,8 +677,8 @@ pub struct MemoryUsage {
     /// Key and value bytes of the table's entries.
     pub payload: usize,
     /// Bytes charged against the budget, pinned bytes included, which exceed
-    /// it only by one update a durable engine logged before the budget
-    /// shrank (see `src/engine/wal.rs`).
+    /// it only by one batch of updates a durable engine logged before the
+    /// budget shrank (see `src/engine/group.rs`).
     pub charged: usize,
     /// The part of `charged` that only snapshots of the table still need:
     /// nodes and values its writes copied or replaced since the oldest live
@@ -777,21 +787,23 @@ impl Memtable {
     }
 
     /// Whether [`put`](Self::put) or [`delete`](Self::delete) would accept
-    /// this update now, changing nothing.
+    /// this update now, changing nothing, with `reserved` bytes of the budget
+    /// already promised to updates admitted but not yet written.
     pub(crate) fn check(
         &mut self,
         key: &[u8],
         seq: u64,
         value: Value<'_>,
+        reserved: usize,
     ) -> Result<(), WriteError> {
-        self.0.check(key, seq, value)
+        self.0.check(key, seq, value, reserved)
     }
 
     /// Writes an update that [`check`](Self::check) admitted, on this table
     /// or the one it was frozen from, even if the budget no longer admits
     /// it: a durable engine has already logged it. The table may then exceed
-    /// its budget by this one update. Lengths and sequence order are still
-    /// checked.
+    /// its budget by the updates of one logged batch. Lengths and sequence
+    /// order are still checked.
     pub(crate) fn write_admitted(
         &mut self,
         key: &[u8],
