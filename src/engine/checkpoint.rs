@@ -231,7 +231,11 @@ impl fmt::Display for CheckpointError {
         match self {
             Self::Snapshot(error) => write!(f, "checkpoint snapshot refused: {error}"),
             Self::Read(error) => write!(f, "checkpoint read failed: {error}"),
-            Self::Locked(path) => write!(f, "{} is locked by another process", path.display()),
+            Self::Locked(path) => write!(
+                f,
+                "{} is locked by another engine or process",
+                path.display()
+            ),
             Self::HasLog(path) => {
                 write!(f, "{} holds a write-ahead log", path.display())
             }
@@ -358,7 +362,11 @@ impl fmt::Display for RecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoCheckpoint(path) => write!(f, "no checkpoint in {}", path.display()),
-            Self::Locked(path) => write!(f, "{} is locked by another process", path.display()),
+            Self::Locked(path) => write!(
+                f,
+                "{} is locked by another engine or process",
+                path.display()
+            ),
             Self::HasLog(path) => write!(
                 f,
                 "{} holds a write-ahead log; open it as a durable database",

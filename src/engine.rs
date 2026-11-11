@@ -1,4 +1,5 @@
-//! A minimal in-memory key-value engine over memtables and runs.
+//! A RAM-first key-value engine over memtables and runs, RAM-only unless
+//! opened with a checkpoint or a write-ahead log.
 //!
 //! An [`Engine`] owns one active memtable, frozen memtables awaiting flush,
 //! the published immutable runs, and the sequence counter:
@@ -24,10 +25,14 @@
 //!
 //! # Consistency
 //!
-//! All state sits behind one reader-writer lock. A write holds it exclusively
-//! while taking its sequence number and installing the update, so sequence
-//! order is visibility order and each successful write has one position in it.
-//! A read holds the lock shared, so reads and writes of a key are linearizable.
+//! All state sits behind one reader-writer lock. A RAM-only write holds it
+//! exclusively while taking its sequence number and installing the update. A
+//! durable write reserves its number under the lock, logs and syncs without
+//! it, and installs it under the lock again; batches are installed whole and
+//! in order. In both modes sequence order is visibility order and each
+//! successful write has one position in it, and a write is visible before it
+//! returns. A read holds the lock shared, so reads and writes of a key are
+//! linearizable.
 //!
 //! There are two ways to make several reads agree:
 //!
@@ -611,8 +616,8 @@ struct Core {
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-/// A minimal key-value engine. See the [module documentation](self) for its
-/// consistency, flushing and compaction rules.
+/// A key-value engine. See the [module documentation](self) for its
+/// consistency, flushing, compaction and persistence rules.
 pub struct Engine {
     core: Arc<Core>,
     /// Joined when the engine is dropped.
