@@ -14,7 +14,9 @@
 //! `policy`, instead records each compaction's selection and cost across
 //! arrival rates; see `block_bench/policy.rs`. With `reads`, instead measures
 //! read amplification under sustained ingestion (with the `diagnostics`
-//! feature); see `block_bench/reads.rs`.
+//! feature); see `block_bench/reads.rs`. With `filtercost`, instead splits
+//! key filter construction cost by component and reports filter memory on
+//! large runs; see `block_bench/filtercost.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -42,6 +44,8 @@ use tessera::run::{
 #[cfg(feature = "diagnostics")]
 #[path = "block_bench/bloom.rs"]
 mod bloom;
+#[path = "block_bench/filtercost.rs"]
+mod filtercost;
 #[path = "block_bench/policy.rs"]
 mod policy;
 #[path = "block_bench/profile.rs"]
@@ -4428,6 +4432,7 @@ fn main() {
         Some("persistent") => return retention::persistent_bench(),
         Some("pacing") => return retention::pacing_bench(),
         Some("profile") => return profile::profile_bench(),
+        Some("filtercost") => return filtercost::filter_cost_bench(),
         Some("policy") => return policy::policy_bench(),
         #[cfg(feature = "diagnostics")]
         Some("reads") => return reads::reads_bench(),

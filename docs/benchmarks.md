@@ -1007,4 +1007,65 @@ estimate leaves of `max_workspace_bytes`) and one hash per record. Flushing
 json records cost the same per record with and without filters in two
 alternating sessions (291–321 against 291–306 ns); 8-byte records cost 20–30%
 more (267–282 against 338–350 ns). The same sessions varied by up to 60% on
-rows that filters do not touch.
+rows that filters do not touch. Those flush rows are single timed passes; the
+repeated measurements under "Filter construction cost" put the cost at
+5–17%.
+
+## Filter construction cost
+
+`scripts/validate.sh filtercost` (Milestone 5J) times the filter steps alone,
+copied from `src/run/filter.rs`, on the sorted records that `RunBuilder`
+encodes, and times a memtable flush and a `RunBuilder` build of the same
+records as medians of 15 rounds (1 MiB) or 5 (16 MiB). Builds without a
+filter come from the same benchmark on a copy whose builder skips the filter
+(`RunBuilder::add` without `key_hashes.add`, `finish` with no filter, run with
+`TESSERA_SOURCE=<copy>`), alternated with the real one in two sessions. ns per record:
+
+| records | flush without | flush with | build without | build with | hash | hash, tracking and growth | finalize | finalize, one line per key |
+|---|---|---|---|---|---|---|---|---|
+| 8-byte, tree keys, 54k | 111–113 | 117–123 | 99–100 | 105–112 | 5.4 | 5.5 | 2.1 | 2.9 |
+| 8-byte, tree keys, 858k | 129–136 | 142–162 | 99–102 | 108–113 | 5.4 | 5.5 | 5.0 | 3.2 |
+| 32-byte, 49-byte shared-prefix keys, 369k | 188–193 | 201–205 | 248–252 | 262–267 | 9.8 | 9.9 | 4.2 | 3.0 |
+| json, tree keys, 174k | 192–200 | 209–211 | 174–177 | 182–185 | 6.8 | 7.0 | 3.4 | 3.0 |
+| 4 KiB values, 4k | 2914–3022 | 3071–3157 | 2498–2580 | 2521–2579 | 5.6 | 5.8 | 2.2 | 2.8 |
+| 8-byte, random 16-byte keys, 699k | 147–154 | 159–165 | 118–122 | 92–134 | 20–37 | 19–37 | 4.9 | 3.1 |
+
+- The filter adds 8–15 ns per record: 5–12% of a build and 5–17% of a flush
+  for records up to json size, and nothing measurable for 4 KiB values. The
+  steps timed alone sum to 8–14 ns, which accounts for the difference. The
+  20–30% reported for 5I came from single timed passes.
+- SipHash-1-3 is half to two thirds of it, 5.4 ns for an 18-byte key and
+  9.8 ns for a 49-byte one. Even a hash that cost nothing would save at most
+  5% of a small-record build, so no alternative was evaluated and no
+  dependency added. (The 20–37 ns for random keys is the cost of reaching keys
+  scattered in memory, which a build pays once whichever step reads them.)
+- Distinct-key tracking and buffer growth together cost about 0.1–0.5 ns.
+- Finalizing costs 2 ns per key while the filter fits in cache and 4–5 ns at
+  0.5–1 MiB. Placing a key's seven probes in one 64-byte line would save about
+  2 ns per key at that size, about 2% of a build, so the layout is unchanged.
+- False positives, probing each stored key with a zero byte appended: 0.74–
+  0.83% for tree, shared-prefix and random binary keys, against 0.82% in
+  theory for 10 bits and 7 probes.
+
+Larger runs, from the engine's reports (one flush of a 256 MiB memtable with a
+1 GiB target run, a snapshot, an overwriting flush, and one compaction of both
+into one run), in MiB; peaks are the live Rust heap above the start, counting
+a reallocation as a copy:
+
+| values | records flushed | stored | filter | hash buffer | flush peak | records compacted | stored | filter | hash buffer | compaction peak | snapshot retains |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8 bytes | 1,743,087 | 22.1 | 2.08 | 16.0 | 70.4 | 2,614,631 | 32.2 | 3.1 | 32.0 | 96.6 | 22.1 + 2.1 |
+| 100 bytes | 1,091,201 | 29.1 | 1.30 | 16.0 | 77.6 | 1,636,802 | 43.6 | 2.0 | 16.0 | 124.6 | 29.1 + 1.3 |
+| 4 KiB | 63,280 | 63.9 | 0.08 | 0.5 | 129.7 | 94,920 | 95.9 | 0.1 | 1.0 | 227.5 | 63.9 + 0.1 |
+
+- The hash buffer is the largest transient filter cost: 8 bytes per distinct
+  key, under 16 after doubling, here 6–12 times the filter it builds and
+  13–33% of the flush and compaction peaks for records up to 100 bytes. It
+  is freed when each run is finished, reported as `filter_build_bytes`, and in
+  a compaction held within what the workspace estimate leaves of
+  `max_workspace_bytes` (61 MiB under the defaults here).
+- Flushes built 5.8–7.8 million records a second and compactions read 5.3–6.9
+  million; a snapshot retained exactly the stored and filter bytes of the run
+  it held, and nothing after it was dropped.
+- Runs of more than 2^24 distinct keys are not built here (they would need a
+  memtable of several GiB); unit tests cover the filterless fallback.
