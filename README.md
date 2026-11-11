@@ -124,14 +124,27 @@ directory, and removes the previous checkpoint. Writes, flushes and
 compaction continue meanwhile. `Engine::recover(dir, options)` validates the
 committed checkpoint completely, rebuilds the key filters and continues the
 sequence after its ceiling; a missing or damaged checkpoint is an error,
-never an empty engine. Writes after a checkpoint are lost on restart until a
-write-ahead log exists. The format, publication protocol and filesystem
+never an empty engine. The format, publication protocol and filesystem
 assumptions (local Linux filesystems) are in
 [`src/engine/checkpoint.rs`](src/engine/checkpoint.rs).
 
+**Durable mode** is opt-in too. `Engine::create(dir, ..)` starts a database
+and `Engine::open(dir, ..)` reopens one; such an engine holds the directory's
+lock and appends every write to a write-ahead log, synced before the write is
+applied, visible or acknowledged. The sync happens outside the state lock, so
+reads continue meanwhile. A failed append or sync is reported, not applied,
+and closes the log until the database is reopened. `durable_checkpoint`
+commits a checkpoint while writes continue and then removes the log segments
+it covers. `open` loads the committed checkpoint and replays the log after
+it, checking every record; only an interrupted final append is tolerated
+(and truncated), and any other damage is an error. Engines from
+`Engine::new` and `recover` stay RAM-only and write no file. The record
+format, write protocol and recovery rules are in
+[`src/engine/wal.rs`](src/engine/wal.rs).
+
 There is no transaction, sequence-filtered read of the runs, persisted filter,
-snapshot of a state older than the call, write-ahead log, and flushing never
-happens in the background.
+snapshot of a state older than the call, group commit or weaker durability
+mode, and flushing never happens in the background.
 
 ## Validate
 
@@ -166,6 +179,7 @@ scripts/validate.sh bloom    # filtered against unfiltered point lookups
 scripts/validate.sh filtercost # key filter construction cost
 scripts/validate.sh operate  # sustained, concurrent and limited operation
 scripts/validate.sh checkpoint # checkpoint and recovery cost
+scripts/validate.sh durable  # durable writes and log recovery
 colima stop
 ```
 

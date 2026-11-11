@@ -202,14 +202,22 @@
 //! # Checkpoints
 //!
 //! [`Engine::checkpoint`] writes one snapshot's state to a directory and
-//! [`Engine::recover`] restores it; nothing else touches the filesystem. See
-//! [`CheckpointOptions`] and the format, publication and recovery contract in
-//! the source of `checkpoint.rs`.
+//! [`Engine::recover`] restores it. See [`CheckpointOptions`] and the format,
+//! publication and recovery contract in the source of `checkpoint.rs`.
+//!
+//! # Durability
+//!
+//! An engine from [`Engine::create`] or [`Engine::open`] logs every write to
+//! a write-ahead log in its directory, synced before the write is applied,
+//! and [`Engine::durable_checkpoint`] bounds the log. Other engines touch no
+//! file. See [`DurableOptions`] and the contract in the source of `wal.rs`.
 
 mod checkpoint;
+mod wal;
 mod worker;
 
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, RecoveryError};
+pub use wal::{DurableOptions, LogDamage, LogStatus, OpenReport, TornTail};
 pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
@@ -344,7 +352,8 @@ impl fmt::Display for SnapshotError {
 impl std::error::Error for SnapshotError {}
 
 /// Why a write was rejected. The engine is unchanged, and no sequence number
-/// was used.
+/// was used, though after [`Self::LogFailed`] the record may survive in the
+/// log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateError {
     /// The memtable refused the update. If it is
@@ -352,6 +361,21 @@ pub enum UpdateError {
     Rejected(WriteError),
     /// Every sequence number has been used.
     SequencesExhausted,
+    /// Logging this write failed (its append or sync), so it was not
+    /// applied, but its record may survive and be recovered. The log is now
+    /// closed. See "Durable writes" in `src/engine/wal.rs`.
+    LogFailed(std::io::ErrorKind),
+    /// An earlier log failure closed the log: nothing was logged. Reopen the
+    /// database to write again.
+    LogClosed,
+    /// The log would exceed [`DurableOptions::max_log_bytes`]: nothing was
+    /// logged. [`Engine::durable_checkpoint`] frees segments.
+    LogFull {
+        /// Bytes the log would reach.
+        bytes: u64,
+        /// The limit.
+        max_bytes: u64,
+    },
 }
 
 impl fmt::Display for UpdateError {
@@ -359,6 +383,14 @@ impl fmt::Display for UpdateError {
         match self {
             Self::Rejected(error) => error.fmt(f),
             Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
+            Self::LogFailed(kind) => {
+                write!(f, "logging the write failed ({kind}); the log is closed")
+            }
+            Self::LogClosed => f.write_str("the log closed after an earlier failure"),
+            Self::LogFull { bytes, max_bytes } => write!(
+                f,
+                "the log would reach {bytes} bytes, over the limit of {max_bytes}"
+            ),
         }
     }
 }
@@ -557,6 +589,9 @@ struct Core {
     compacting: Mutex<()>,
     /// Held by a checkpoint, so that checkpoints run one at a time.
     checkpointing: Mutex<()>,
+    /// The log and directory lock of a durable engine, set once it is open.
+    /// Unset, writes touch no file.
+    durable: std::sync::OnceLock<wal::Durable>,
     memtable_budget: usize,
     target_run_len: usize,
     snapshot_limits: SnapshotLimits,
@@ -754,6 +789,7 @@ impl Core {
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             checkpointing: Mutex::new(()),
+            durable: std::sync::OnceLock::new(),
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             snapshot_limits: options.snapshots,
@@ -775,6 +811,9 @@ impl Core {
     }
 
     fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
+        if let Some(durable) = self.durable.get() {
+            return self.update_durable(durable, key, value);
+        }
         let mut state = self.write_state();
         let seq = state
             .last_seq
@@ -801,7 +840,7 @@ impl Core {
             {
                 WriteError::BudgetExceeded {
                     needed: charge,
-                    available: budget - state.active.memory().charged,
+                    available: budget.saturating_sub(state.active.memory().charged),
                 }
             }
             error => error,

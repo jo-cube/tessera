@@ -20,7 +20,9 @@
 //! `diagnostics` feature), instead measures the engine under sustained and
 //! concurrent load and small limits; see `block_bench/operate.rs`. With
 //! `checkpoint DIR`, instead measures checkpoints and recovery in `DIR`; see
-//! `block_bench/checkpoint.rs`.
+//! `block_bench/checkpoint.rs`. With `durable DIR`, instead measures durable
+//! writes, log recovery and checkpoints beside them in `DIR`; see
+//! `block_bench/durable.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -50,6 +52,8 @@ use tessera::run::{
 mod bloom;
 #[path = "block_bench/checkpoint.rs"]
 mod checkpoint;
+#[path = "block_bench/durable.rs"]
+mod durable;
 #[path = "block_bench/filtercost.rs"]
 mod filtercost;
 #[cfg(feature = "diagnostics")]
@@ -4443,6 +4447,7 @@ fn main() {
         Some("profile") => return profile::profile_bench(),
         Some("filtercost") => return filtercost::filter_cost_bench(),
         Some("checkpoint") => return checkpoint::checkpoint_bench(),
+        Some("durable") => return durable::durable_bench(),
         Some("policy") => return policy::policy_bench(),
         #[cfg(feature = "diagnostics")]
         Some("reads") => return reads::reads_bench(),

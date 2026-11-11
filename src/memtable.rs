@@ -391,6 +391,15 @@ struct Table {
     family: Arc<()>,
 }
 
+/// An update [`Table::admit`] accepted, and where it goes.
+struct Admitted<'v> {
+    path: Path,
+    new: bool,
+    grows: usize,
+    released: usize,
+    bytes: Option<&'v [u8]>,
+}
+
 impl Table {
     fn new(budget: usize, last_seq: Option<u64>) -> Self {
         Self {
@@ -462,46 +471,34 @@ impl Table {
         }
     }
 
+    /// Whether [`Self::write`] would accept the update now.
+    fn check(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
+        self.admit(key, seq, value, true).map(|_| ())
+    }
+
     fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
-        let bytes = match value {
-            Value::Bytes(bytes) => Some(bytes),
-            Value::Tombstone => None,
-        };
-        let value_len = bytes.map_or(0, <[u8]>::len);
-        if key.len() > MAX_KEY_LEN {
-            return Err(WriteError::KeyTooLong { len: key.len() });
-        }
-        if value_len > MAX_VALUE_LEN {
-            return Err(WriteError::ValueTooLong { len: value_len });
-        }
-        if let Some(last) = self.last_seq.filter(|&last| seq <= last) {
-            return Err(WriteError::SequenceNotIncreasing { seq, last });
-        }
-        // Both lengths are within the limits above, so this cannot overflow.
-        let charge = key.len() + value_len + ENTRY_OVERHEAD;
-        if charge > self.budget {
-            return Err(WriteError::RecordExceedsBudget {
-                charge,
-                budget: self.budget,
-            });
-        }
+        let admitted = self.admit(key, seq, value, true)?;
+        self.insert(key, seq, admitted);
+        Ok(())
+    }
 
-        while self.views.front().is_some_and(|view| !view.is_alive()) {
-            self.views.pop_front();
-        }
-        let (path, slot, detach) = self.plan(key);
-        let (grows, released) = match slot {
-            Some(slot) => (value_len, slot.value_len()),
-            None => (charge, 0),
-        };
-        let needed = grows + detach;
-        let available = self.budget.saturating_sub(self.live + self.pinned()) + released;
-        if needed > available {
-            return Err(WriteError::BudgetExceeded { needed, available });
-        }
+    /// Writes an update [`Self::check`] once admitted, though the budget may
+    /// have shrunk or snapshots pinned more since; the other checks still
+    /// apply.
+    fn write_admitted(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
+        let admitted = self.admit(key, seq, value, false)?;
+        self.insert(key, seq, admitted);
+        Ok(())
+    }
 
-        // Nothing can be rejected from here on.
-        let new = slot.is_none();
+    fn insert(&mut self, key: &[u8], seq: u64, admitted: Admitted<'_>) {
+        let Admitted {
+            path,
+            new,
+            grows,
+            released,
+            bytes,
+        } = admitted;
         let replacement = Slot::new(key, seq, bytes);
         if let Some((separator, right)) = insert(
             &mut self.root,
@@ -522,7 +519,68 @@ impl Table {
         self.len += usize::from(new);
         self.live = self.live - released + grows;
         self.last_seq = Some(seq);
-        Ok(())
+    }
+
+    /// Every check of [`Self::write`], the budget's only if `budget`,
+    /// changing nothing but forgetting dead snapshots.
+    fn admit<'v>(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'v>,
+        budget: bool,
+    ) -> Result<Admitted<'v>, WriteError> {
+        let bytes = match value {
+            Value::Bytes(bytes) => Some(bytes),
+            Value::Tombstone => None,
+        };
+        let value_len = bytes.map_or(0, <[u8]>::len);
+        if key.len() > MAX_KEY_LEN {
+            return Err(WriteError::KeyTooLong { len: key.len() });
+        }
+        if value_len > MAX_VALUE_LEN {
+            return Err(WriteError::ValueTooLong { len: value_len });
+        }
+        if let Some(last) = self.last_seq.filter(|&last| seq <= last) {
+            return Err(WriteError::SequenceNotIncreasing { seq, last });
+        }
+        // Both lengths are within the limits above, so this cannot overflow.
+        let charge = key.len() + value_len + ENTRY_OVERHEAD;
+        if budget && charge > self.budget {
+            return Err(WriteError::RecordExceedsBudget {
+                charge,
+                budget: self.budget,
+            });
+        }
+
+        while self.views.front().is_some_and(|view| !view.is_alive()) {
+            self.views.pop_front();
+        }
+        let (path, slot, detach) = self.plan(key);
+        let (grows, released) = match slot {
+            Some(slot) => (value_len, slot.value_len()),
+            None => (charge, 0),
+        };
+        let needed = grows + detach;
+        // Equal to the budget's headroom plus what the update releases, but
+        // a table over its budget (by an update a durable engine logged, see
+        // `write_admitted`) must release the excess first, so every update
+        // checked leaves the table within its budget and the excess never
+        // accumulates.
+        let available = self
+            .budget
+            .saturating_add(released)
+            .saturating_sub(self.live + self.pinned());
+        if budget && needed > available {
+            return Err(WriteError::BudgetExceeded { needed, available });
+        }
+        Ok(Admitted {
+            path,
+            new: slot.is_none(),
+            grows,
+            released,
+            bytes,
+        })
     }
 
     fn get(&self, key: &[u8]) -> Option<Version<'_>> {
@@ -608,8 +666,9 @@ impl fmt::Debug for Table {
 pub struct MemoryUsage {
     /// Key and value bytes of the table's entries.
     pub payload: usize,
-    /// Bytes charged against the budget, pinned bytes included, which never
-    /// exceed it.
+    /// Bytes charged against the budget, pinned bytes included, which exceed
+    /// it only by one update a durable engine logged before the budget
+    /// shrank (see `src/engine/wal.rs`).
     pub charged: usize,
     /// The part of `charged` that only snapshots of the table still need:
     /// nodes and values its writes copied or replaced since the oldest live
@@ -715,6 +774,31 @@ impl Memtable {
     /// rules as [`put`](Self::put).
     pub fn delete(&mut self, key: &[u8], seq: u64) -> Result<(), WriteError> {
         self.0.write(key, seq, Value::Tombstone)
+    }
+
+    /// Whether [`put`](Self::put) or [`delete`](Self::delete) would accept
+    /// this update now, changing nothing.
+    pub(crate) fn check(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+    ) -> Result<(), WriteError> {
+        self.0.check(key, seq, value)
+    }
+
+    /// Writes an update that [`check`](Self::check) admitted, on this table
+    /// or the one it was frozen from, even if the budget no longer admits
+    /// it: a durable engine has already logged it. The table may then exceed
+    /// its budget by this one update. Lengths and sequence order are still
+    /// checked.
+    pub(crate) fn write_admitted(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+    ) -> Result<(), WriteError> {
+        self.0.write_admitted(key, seq, value)
     }
 
     /// Returns the latest update of `key`, which may be a tombstone, or `None`

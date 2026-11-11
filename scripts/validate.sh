@@ -27,6 +27,7 @@
 #   scripts/validate.sh filtercost         key filter construction cost by component (5J)
 #   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
 #   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs then VM disk (5L)
+#   scripts/validate.sh durable            durable writes and log recovery, tmpfs then VM disk (5M)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -239,6 +240,11 @@ checkpoint() {
   bounded checkpoint-disk 900 cargo run --locked --release --example block_bench -- checkpoint /cache
 }
 
+durable() {
+  bounded durable-tmpfs 900 cargo run --locked --release --example block_bench -- durable /tmp
+  bounded durable-disk 900 cargo run --locked --release --example block_bench -- durable /cache
+}
+
 operate() {
   bounded operate 1800 cargo run --locked --release --features diagnostics --example block_bench -- operate
 }
@@ -320,7 +326,8 @@ case "$command" in
   filtercost) filtercost ;;
   operate) operate ;;
   checkpoint) checkpoint ;;
+  durable) durable ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,31p' "$0"; exit 2 ;;
+  *) sed -n '2,32p' "$0"; exit 2 ;;
 esac

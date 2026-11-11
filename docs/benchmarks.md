@@ -1266,3 +1266,71 @@ holds. Two sessions agree within 15% except where noted.
   Compaction keeps running; what it replaces stays allocated for the
   checkpoint's snapshot, up to 45 MiB retained here, with 16 MiB memtables and
   18 MiB of runs.
+
+## Durable writes
+
+`scripts/validate.sh durable` (Milestone 5M) runs one writer of uniform json
+overwrites over a million keys (16 MiB memtables, the worker) for at most
+300,000 puts or 20 s, RAM-only and durable, then recovers the database from
+its log and from a checkpoint, then puts a durable writer beside a reader
+with and without durable checkpoints back to back (2 MiB memtables so that
+flushes and compactions happen). It runs once into the container's tmpfs and
+once into the cache volume on the VM's disk; the benchmark removes its
+databases. Ranges are two sessions.
+
+| mode | k puts/s | put p50 µs | p99 µs | p99.9 µs | log MiB | segments |
+|---|---|---|---|---|---|---|
+| RAM-only (either) | 1,768–1,854 | 0.2 | 0.7–0.8 | 1.3–1.4 | | |
+| durable, tmpfs, 64 MiB segments | 880–911 | 0.8 | 1.4–1.5 | 4.9–5.2 | 37.8 | 1 |
+| durable, tmpfs, 1 MiB segments | 883–897 | 0.8 | 1.4 | 5.1–5.4 | 37.8 | 38 |
+| durable, VM disk, 64 MiB segments | 6.7 | 146–147 | 185–193 | 365–424 | 16.9 | 1 |
+| durable, VM disk, 1 MiB segments | 6.7 | 147 | 185–188 | 381–390 | 16.9 | 17 |
+
+- One durable write is one `write` and one `fdatasync` on the caller's
+  thread. On tmpfs, where the sync does nothing, encoding, checksums and the
+  two system calls add 0.6 µs a write and halve throughput. On the VM disk the
+  sync is the cost: about 150 µs, so about 6,700 writes a second from one
+  writer, since there is no group commit. Real devices will differ either way.
+- Rotation costs nothing visible: 38 segments instead of one change nothing.
+- Every row's maximum (17–19 ms, RAM-only too) is a 16 MiB flush the
+  benchmark runs inline when the memtables are full.
+- RAM-only writes, A/B against the 5L commit with a separate microbenchmark
+  (one thread, 1M puts of 100-byte values, seven runs each, twice): 2,837–2,909
+  k puts/s against 2,937–2,972 k, 1.5–4% slower, near the run-to-run spread of
+  about 2%. The same tree without the test for a log matched 5L (2,929–2,933
+  against 2,942), so the cost is that one branch on `OnceLock::get` and the
+  code layout it changes, not the memtable's split admission check.
+
+| recovery | s | log MiB | log MiB/s | records | heap peak MiB |
+|---|---|---|---|---|---|
+| tmpfs, from the log alone | 0.13–0.14 | 37.8 | 277–281 | 300,000 replayed | 20.0 |
+| tmpfs, from the checkpoint | 0.04 | 0.0 | | 0 replayed | 8.2 |
+| VM disk, from the log alone | 0.06 | 16.6–16.8 | 291–298 | 132–133 k replayed | 16.8 |
+| VM disk, from the checkpoint | 0.02 | 0.0 | | 0 replayed | 4.0 |
+
+- Replay runs at about 2.2 million records a second, reading files the page
+  cache holds; its heap is the memtables and runs it rebuilds, plus one 64 KiB
+  read buffer and one record buffer.
+- The durable checkpoint between the two opens took 0.04–0.08 s, wrote 2.5–5.2
+  MiB and pruned the one full segment, leaving only the header of the active
+  segment: the log shrinks to nothing a checkpoint covers.
+
+| disk | checkpoints | k puts/s | put p99 µs | k gets/s | get p99 µs | get max ms | taken | pruned | compactions (failures) | most log MiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| tmpfs | none | 663–711 | 1.5–1.8 | 458–512 | 10.8–13.6 | 4.0 | | | 11 (0) | 37.3–37.5 |
+| tmpfs | back to back | 373–458 | 1.5–1.8 | 266–319 | 11.6–15.0 | 7.0–8.0 | 32–37 | 2 | 13–14 (0) | 17.9–19.5 |
+| VM disk | none | 5.1–6.4 | 373–538 | 991–1,091 | 11.5–13.6 | 1.0–4.2 | | | 2–4 (0) | 12.9–16.1 |
+| VM disk | back to back | 5.7–5.9 | 470–488 | 895–1,110 | 12.7–16.9 | 2.4–5.3 | 87–207 | 0 | 3 (0) | 14.4–14.8 |
+
+- Reads do not wait for syncs. A durable write reserves its sequence number
+  under the state lock, syncs without it, and publishes under it again.
+  The first version held the lock through the sync: on the VM disk (16 MiB
+  memtables) the reader then managed 1.9–3.3 k gets a second with a 2.0 s
+  worst get, because the writer, given priority, retook the lock after every
+  sync. After the change the same run read 1,877 k gets a second with a worst
+  get of 0.8–6 ms.
+- Checkpoints back to back cost the tmpfs writer 30–45% (CPU on two cores) and
+  the disk writer little (it is waiting on syncs). They keep the log at about
+  half its size; on the VM disk it never filled a 16 MiB segment, so nothing
+  was pruned.
+- Compaction ran beside the log with no failures.

@@ -117,9 +117,11 @@ use crate::run::{
     CorruptRun, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD, ReadError, Run, RunBuilder,
 };
 
-use super::{Core, Engine, EngineOptions, EngineWorkspace, FlushError, SnapshotError, published};
+use super::{
+    Core, Engine, EngineOptions, EngineWorkspace, FlushError, SnapshotError, UpdateError, published,
+};
 
-const LOCK: &str = "LOCK";
+pub(super) const LOCK: &str = "LOCK";
 const CURRENT: &str = "CURRENT";
 const CURRENT_TMP: &str = "CURRENT.tmp";
 const MANIFEST: &str = "MANIFEST";
@@ -174,6 +176,9 @@ pub struct CheckpointReport {
     /// Older checkpoint directories that could not be removed; the next
     /// checkpoint tries again.
     pub unreclaimed: usize,
+    /// Write-ahead log segments removed because the checkpoint covers them.
+    /// Always 0 but for [`Engine::durable_checkpoint`].
+    pub pruned_segments: usize,
 }
 
 /// Why a checkpoint was not committed, or (for [`Self::Io`] after the commit
@@ -185,8 +190,13 @@ pub enum CheckpointError {
     Snapshot(SnapshotError),
     /// Reading the snapshot failed.
     Read(ReadError),
-    /// Another process holds the directory's `LOCK`.
+    /// Another process, or a durable engine, holds the directory's `LOCK`.
     Locked(PathBuf),
+    /// The directory holds a write-ahead log, so it belongs to a durable
+    /// database, which only its own engine checkpoints.
+    HasLog(PathBuf),
+    /// [`Engine::durable_checkpoint`] on an engine without a log.
+    NotDurable,
     /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
     DiskLimit {
         /// Bytes the checkpoint would have reached.
@@ -213,6 +223,10 @@ impl fmt::Display for CheckpointError {
             Self::Snapshot(error) => write!(f, "checkpoint snapshot refused: {error}"),
             Self::Read(error) => write!(f, "checkpoint read failed: {error}"),
             Self::Locked(path) => write!(f, "{} is locked by another process", path.display()),
+            Self::HasLog(path) => {
+                write!(f, "{} holds a write-ahead log", path.display())
+            }
+            Self::NotDurable => f.write_str("the engine has no write-ahead log"),
             Self::DiskLimit { bytes, max_bytes } => write!(
                 f,
                 "checkpoint reached {bytes} bytes, over the limit of {max_bytes}"
@@ -294,8 +308,25 @@ pub enum Damage {
 pub enum RecoveryError {
     /// The directory or its `CURRENT` file does not exist.
     NoCheckpoint(PathBuf),
-    /// Another process holds the directory's `LOCK`.
+    /// Another process, or a durable engine, holds the directory's `LOCK`.
     Locked(PathBuf),
+    /// [`Engine::recover`] found a write-ahead log, whose records a recovery
+    /// of the checkpoint alone would drop. Open it with [`Engine::open`].
+    HasLog(PathBuf),
+    /// [`Engine::create`] found files in the directory.
+    NotEmpty(PathBuf),
+    /// A write-ahead log segment failed its checks.
+    Log {
+        /// The segment, or the directory for a missing one.
+        path: PathBuf,
+        /// Offset of the damaged record or header in the segment.
+        offset: u64,
+        /// How.
+        damage: super::LogDamage,
+    },
+    /// A logged record was refused by the memtable on replay, which happens
+    /// only if the options are smaller than when it was written.
+    Replay(UpdateError),
     /// A file could not be read.
     Io {
         /// The file.
@@ -319,6 +350,22 @@ impl fmt::Display for RecoveryError {
         match self {
             Self::NoCheckpoint(path) => write!(f, "no checkpoint in {}", path.display()),
             Self::Locked(path) => write!(f, "{} is locked by another process", path.display()),
+            Self::HasLog(path) => write!(
+                f,
+                "{} holds a write-ahead log; open it as a durable database",
+                path.display()
+            ),
+            Self::NotEmpty(path) => write!(f, "{} is not empty", path.display()),
+            Self::Log {
+                path,
+                offset,
+                damage,
+            } => write!(
+                f,
+                "log segment {} is damaged at offset {offset}: {damage:?}",
+                path.display()
+            ),
+            Self::Replay(error) => write!(f, "a logged record was refused on replay: {error}"),
             Self::Io { path, error } => write!(f, "cannot read {}: {error}", path.display()),
             Self::Corrupt { path, damage } => {
                 write!(
@@ -355,7 +402,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Opens and locks `LOCK`, which is released when the file is dropped.
-fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
+pub(super) fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -477,6 +524,8 @@ pub(super) enum Crash {
     BeforeRename,
     AfterRename,
     BeforeReclaim,
+    /// After a durable checkpoint commits, before it prunes the log.
+    BeforePrune,
 }
 
 #[cfg(test)]
@@ -487,13 +536,13 @@ thread_local! {
 /// Whether a test asked to crash here, which also makes the caller skip all
 /// cleanup.
 #[cfg(test)]
-fn crash(at: Crash) -> bool {
+pub(super) fn crash(at: Crash) -> bool {
     CRASH_AT.with(|crash| crash.get() == Some(at))
 }
 
 /// Stands for the crash a test asked for.
 #[cfg(test)]
-fn crashed(path: &Path) -> CheckpointError {
+pub(super) fn crashed(path: &Path) -> CheckpointError {
     CheckpointError::Io {
         path: path.to_owned(),
         error: io::Error::other("crash injected by a test"),
@@ -696,6 +745,21 @@ impl Engine {
             Ok(file) => file,
             Err(()) => return Err(CheckpointError::Locked(dir.to_owned())),
         };
+        // A checkpoint beside another engine's log would pair a foreign state
+        // with its records.
+        if super::wal::has_log(dir).map_err(io_error(dir))? {
+            return Err(CheckpointError::HasLog(dir.to_owned()));
+        }
+        self.publish(dir, options)
+    }
+
+    /// The checkpoint itself, once the caller serializes checkpoints of this
+    /// engine and holds `dir`'s lock.
+    pub(super) fn publish(
+        &self,
+        dir: &Path,
+        options: CheckpointOptions,
+    ) -> Result<CheckpointReport, CheckpointError> {
         // None if there is no CURRENT, Some(None) if it cannot be read.
         let committed = match fs::read(dir.join(CURRENT)) {
             Ok(bytes) => Some(decode_current(&bytes).ok()),
@@ -785,6 +849,7 @@ impl Engine {
             largest_run_bytes,
             reclaimed,
             unreclaimed,
+            pruned_segments: 0,
         })
     }
 
@@ -799,34 +864,88 @@ impl Engine {
     /// returns an empty engine for a missing or damaged checkpoint, nor falls
     /// back to an older one.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, RecoveryError> {
-        let read_error = |path: &Path| {
-            let path = path.to_owned();
-            move |error: io::Error| match error.kind() {
-                io::ErrorKind::NotFound => RecoveryError::Corrupt {
-                    path,
-                    damage: Damage::Missing,
-                },
-                _ => RecoveryError::Io { path, error },
-            }
-        };
-        let current = dir.join(CURRENT);
-        // Checked before locking, which would create LOCK.
-        match fs::metadata(&current) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(RecoveryError::NoCheckpoint(dir.to_owned()));
-            }
-            Err(error) => {
-                return Err(RecoveryError::Io {
-                    path: current,
-                    error,
-                });
-            }
+        let _lock = lock_existing(dir)?;
+        if super::wal::has_log(dir).map_err(|error| RecoveryError::Io {
+            path: dir.to_owned(),
+            error,
+        })? {
+            return Err(RecoveryError::HasLog(dir.to_owned()));
         }
-        let _lock = match lock(dir).map_err(read_error(dir))? {
-            Ok(file) => file,
-            Err(()) => return Err(RecoveryError::Locked(dir.to_owned())),
+        let loaded = load(dir, &options)?;
+        let options = EngineOptions {
+            last_seq: options.last_seq.max(loaded.ceiling),
+            ..options
         };
+        Ok(Engine::start(
+            Arc::new(loaded.into_core(&options)),
+            &options,
+        ))
+    }
+}
+
+fn read_error(path: &Path) -> impl FnOnce(io::Error) -> RecoveryError + '_ {
+    move |error: io::Error| match error.kind() {
+        io::ErrorKind::NotFound => RecoveryError::Corrupt {
+            path: path.to_owned(),
+            damage: Damage::Missing,
+        },
+        _ => RecoveryError::Io {
+            path: path.to_owned(),
+            error,
+        },
+    }
+}
+
+/// Locks `dir` for a recovery, which needs `CURRENT`: checked first, since
+/// locking would create `LOCK`.
+pub(super) fn lock_existing(dir: &Path) -> Result<File, RecoveryError> {
+    let current = dir.join(CURRENT);
+    match fs::metadata(&current) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RecoveryError::NoCheckpoint(dir.to_owned()));
+        }
+        Err(error) => {
+            return Err(RecoveryError::Io {
+                path: current,
+                error,
+            });
+        }
+    }
+    match lock(dir).map_err(read_error(dir))? {
+        Ok(file) => Ok(file),
+        Err(()) => Err(RecoveryError::Locked(dir.to_owned())),
+    }
+}
+
+/// A committed checkpoint, read and checked in full.
+pub(super) struct Loaded {
+    pub(super) generation: u64,
+    pub(super) ceiling: u64,
+    runs: Vec<Run<Vec<u8>>>,
+    run_bytes: usize,
+    filter_bytes: usize,
+}
+
+impl Loaded {
+    /// A core holding the checkpoint's runs, whose sequence continues after
+    /// `options.last_seq`.
+    pub(super) fn into_core(self, options: &EngineOptions) -> Core {
+        let core = Core::new(options);
+        {
+            let mut state = core.write_state();
+            state.runs.extend(published(self.runs));
+            state.run_bytes = self.run_bytes;
+            state.filter_bytes = self.filter_bytes;
+        }
+        core
+    }
+}
+
+/// Reads and checks the checkpoint `dir`'s `CURRENT` names, under its lock.
+pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, RecoveryError> {
+    {
+        let current = dir.join(CURRENT);
         let bytes = fs::read(&current).map_err(read_error(&current))?;
         let corrupt = |path: &Path, damage| RecoveryError::Corrupt {
             path: path.to_owned(),
@@ -925,18 +1044,13 @@ impl Engine {
             }));
         }
 
-        let options = EngineOptions {
-            last_seq: options.last_seq.max(manifest.last_seq),
-            ..options
-        };
-        let core = Arc::new(Core::new(&options));
-        {
-            let mut state = core.write_state();
-            state.runs.extend(published(runs));
-            state.run_bytes = run_bytes;
-            state.filter_bytes = filter_bytes;
-        }
-        Ok(Engine::start(core, &options))
+        Ok(Loaded {
+            generation,
+            ceiling: manifest.last_seq,
+            runs,
+            run_bytes,
+            filter_bytes,
+        })
     }
 }
 

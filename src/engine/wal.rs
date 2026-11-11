@@ -1,0 +1,1512 @@
+//! The write-ahead log of a durable engine: every acknowledged write since
+//! the latest committed checkpoint, so that [`Engine::open`] recovers the
+//! acknowledged history.
+//!
+//! # Modes
+//!
+//! An engine from [`Engine::new`] or [`Engine::recover`] is **RAM-only**: it
+//! has no log and its writes touch no file. One from [`Engine::create`] or
+//! [`Engine::open`] is **durable**: it holds its directory's `LOCK` for its
+//! whole life, and every write is logged and synced before it is applied.
+//!
+//! # Durable writes
+//!
+//! Durable writers take the log's mutex, one at a time, and then:
+//!
+//! 1. **validate and reserve**: under the state lock, take the next sequence
+//!    number and ask the active memtable whether it admits the update
+//!    ([`UpdateError::Rejected`] logs nothing and uses no number);
+//! 2. **log**: without the state lock, append one record to the active
+//!    segment and sync it (`fdatasync`);
+//! 3. **publish**: under the state lock again, apply the update to the
+//!    active memtable and publish its sequence number.
+//!
+//! No other write can take a number between 1 and 3, since writers hold the
+//! log's mutex throughout. A flush may freeze the table checked, or a
+//! snapshot pin more of it, between 1 and 3; the logged update is then
+//! applied regardless of the budget, which the active table may exceed by
+//! this one update until the next flush. Only lengths and sequence order are
+//! checked again, and those cannot change. So a write becomes **visible**
+//! only after its record is durable, it is **acknowledged** (its sequence
+//! number returned) only after that, no record is logged for a write the
+//! engine refused, and none logged is left unapplied. Reads proceed while a
+//! record syncs, and see the state before it.
+//!
+//! **Recovered history.** Every acknowledged write is recovered, under the
+//! filesystem assumptions below. Recovery may also include the one write
+//! after them that was not acknowledged (its sync failed, the process died
+//! before returning, or it panicked), if its complete record survived; it
+//! never includes a write the engine refused, and never a later write
+//! without an earlier one.
+//!
+//! **Failures.** If the append or the sync fails, the write returns
+//! [`UpdateError::LogFailed`] and is not applied, but its record may or may
+//! not survive (a failed `fsync` may also have dropped earlier pages). The log
+//! is then **closed**: every later write returns [`UpdateError::LogClosed`]
+//! and logs nothing, so a record of uncertain fate is always the last one, and
+//! recovery returns the acknowledged history with or without it, never a
+//! later write without it. Reads, flushes, compaction and checkpoints
+//! continue; reopening the directory resumes writing. A write that would make
+//! the log exceed [`DurableOptions::max_log_bytes`] returns
+//! [`UpdateError::LogFull`] and logs nothing, without closing the log; a
+//! [`Engine::durable_checkpoint`] frees space. Applying a logged update cannot
+//! fail; if it panicked, the state lock is poisoned and the engine unusable,
+//! and the logged record is recovered on the next open.
+//!
+//! **Sequence numbers.** Every number a durable engine uses is logged, in
+//! order, without gaps: the log is the sequence authority. Recovery resumes
+//! after the last record recovered. A number is reused only if its record was
+//! never acknowledged and did not survive.
+//!
+//! # Segments
+//!
+//! The log is a series of files `wal-<number>` (20 decimal digits, numbers
+//! consecutive), each starting with a header: the magic `TSRWAL\0\x01`,
+//! version (u32, 1), flags (u32, 0), its number (u64), its **base** (u64: the
+//! sequence number before its first record, which is the last record of the
+//! segment before it), and a CRC-32 of the header. Records follow:
+//!
+//! - frame: body length (u32), CRC-32 of the body (u32), CRC-32 of those
+//!   eight bytes (u32);
+//! - body: operation (u8: 1 put, 2 delete), sequence number (u64), key length
+//!   (u32), key, and for a put the value length (u32) and value.
+//!
+//! All integers are little-endian. Lengths are bounded by the memtable's key
+//! and value limits, which recovery checks before allocating. A new segment
+//! is started when a record would take the active one past
+//! [`DurableOptions::segment_bytes`] (a record larger than that gets a
+//! segment of its own), and at every open: no process appends to a segment
+//! another wrote. Creating one writes and syncs the file, then syncs the
+//! directory, before any record goes in.
+//!
+//! # Recovery
+//!
+//! [`Engine::open`] loads the committed checkpoint (ceiling `S`), then reads
+//! the segments from the newest one whose base is at most `S` (older ones
+//! hold only records the checkpoint covers and are ignored until pruned).
+//! From there the numbers must be consecutive, each base must equal the last
+//! sequence number before it, and the records must be numbered `base + 1`,
+//! `base + 2` and so on. Records above `S` are applied to the memtables in
+//! order, flushing as needed; the log must reach `S`. The engine is exposed
+//! only once every record has passed.
+//!
+//! **Torn tails.** Every record is synced before the next is written, so only
+//! the last one can be incomplete. In the last segment, and nowhere else,
+//! recovery accepts after the last valid record: fewer bytes than a frame; a
+//! frame whose own checksum holds but whose body runs past the end of the
+//! file; or bytes that are all zero. These are an interrupted append, which
+//! was never acknowledged; they are truncated (and reported in
+//! [`OpenReport::torn_tail`]) before writing resumes. A last segment whose
+//! header is incomplete or zero is an interrupted rotation and is removed.
+//! Anything else is [`RecoveryError::Log`]: a bad frame or body checksum, a
+//! complete record with a bad checksum even at the very end, an invalid
+//! operation or length, a gap, or a log behind the checkpoint. Acknowledged
+//! history is never discarded as a torn tail, provided an interrupted write
+//! leaves a prefix of its bytes, possibly followed by zeros.
+//!
+//! # Checkpoints and pruning
+//!
+//! [`Engine::durable_checkpoint`] commits a checkpoint into the engine's own
+//! directory while writes continue; its ceiling `S` is the snapshot it took.
+//! Only after `CURRENT` names it durably are segments removed: oldest first,
+//! each one whose successor's base is at most `S`, so that every record
+//! above `S` stays. The active segment is never removed. A failed or
+//! interrupted checkpoint removes no segment, so the previous checkpoint and
+//! the log still form the full history. A segment that cannot be removed
+//! stops pruning and is retried by the next checkpoint.
+//!
+//! # Resources
+//!
+//! A write encodes its record into one buffer, released after a large
+//! record. Recovery reads through a 64 KiB buffer and one record buffer, at
+//! most one record of the largest size. The log on disk is bounded by
+//! [`DurableOptions::max_log_bytes`]; segments are pruned only by
+//! checkpoints, so the log can stay near that limit until one is taken, and
+//! the previous checkpoint stays on disk beside the new one until the new one
+//! commits. A checkpoint can always free every segment but the active one,
+//! so keep `max_log_bytes` well above two segments and the largest record.
+//!
+//! The filesystem assumptions of checkpoints apply: see
+//! `src/engine/checkpoint.rs`.
+
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use crc32fast::Hasher;
+
+use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
+use crate::memtable::WriteError;
+
+use super::checkpoint::{
+    self, CheckpointError, CheckpointOptions, CheckpointReport, RecoveryError,
+};
+use super::{Core, Engine, EngineOptions, UpdateError};
+
+const PREFIX: &str = "wal-";
+const SEGMENT_MAGIC: [u8; 8] = *b"TSRWAL\0\x01";
+const SEGMENT_VERSION: u32 = 1;
+/// Magic, version, flags, number, base and CRC.
+const SEGMENT_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + 4;
+const FRAME_LEN: usize = 12;
+const PUT: u8 = 1;
+const DELETE: u8 = 2;
+/// Operation, sequence number and key length.
+const MIN_BODY: usize = 1 + 8 + 4;
+const MAX_BODY: usize = MIN_BODY + MAX_KEY_LEN + 4 + MAX_VALUE_LEN;
+/// A write buffer grown past this by a large record is released after it.
+const KEEP_BUFFER: usize = 1 << 20;
+const READ_BUFFER: usize = 64 << 10;
+
+/// The log of a durable engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableOptions {
+    /// A new segment is started when a record would take the active one past
+    /// this many bytes.
+    pub segment_bytes: u64,
+    /// The most bytes all segments may hold. A write beyond it is refused
+    /// with [`UpdateError::LogFull`] until a checkpoint prunes segments.
+    pub max_log_bytes: u64,
+}
+
+impl Default for DurableOptions {
+    /// 64 MiB segments, 1 GiB of log.
+    fn default() -> Self {
+        Self {
+            segment_bytes: 64 << 20,
+            max_log_bytes: 1 << 30,
+        }
+    }
+}
+
+/// How a log segment failed its checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogDamage {
+    /// The directory holds a checkpoint but no segment.
+    NoSegments,
+    /// A segment header is truncated, has the wrong magic or checksum, or
+    /// names another segment.
+    Header,
+    /// A version or flags this build does not read.
+    Unsupported {
+        /// The version.
+        version: u32,
+        /// The flags.
+        flags: u32,
+    },
+    /// The segment after `after` is missing.
+    Missing {
+        /// The last segment present before the gap.
+        after: u64,
+    },
+    /// A segment's base is not the last sequence number before it.
+    Base {
+        /// The last sequence number before it.
+        expected: u64,
+        /// Its base.
+        found: u64,
+    },
+    /// Every segment's base is above the checkpoint's ceiling, so records
+    /// between them are missing.
+    Gap {
+        /// The oldest base.
+        base: u64,
+        /// The ceiling.
+        ceiling: u64,
+    },
+    /// The log ends before the checkpoint's ceiling.
+    Behind {
+        /// Its last sequence number.
+        last: u64,
+        /// The ceiling.
+        ceiling: u64,
+    },
+    /// A record frame's own checksum fails.
+    Frame,
+    /// A record's length is out of bounds or disagrees with its body.
+    Length(u64),
+    /// A record body's checksum fails.
+    Checksum,
+    /// A record is incomplete before the end of the last segment.
+    Truncated,
+    /// An unknown operation.
+    Operation(u8),
+    /// A record's sequence number is not the next one.
+    Sequence {
+        /// The next one.
+        expected: u64,
+        /// The record's.
+        found: u64,
+    },
+}
+
+/// What [`Engine::open`] recovered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenReport {
+    /// The checkpoint's generation.
+    pub generation: u64,
+    /// Its ceiling.
+    pub checkpoint_seq: u64,
+    /// The last sequence number recovered, after which writes continue.
+    pub last_seq: u64,
+    /// Segments read.
+    pub segments: usize,
+    /// Records above the ceiling, applied.
+    pub replayed: u64,
+    /// Records at or below the ceiling, already in the checkpoint.
+    pub skipped: u64,
+    /// Log bytes read.
+    pub log_bytes: u64,
+    /// An interrupted append removed from the end of the last segment.
+    pub torn_tail: Option<TornTail>,
+    /// A segment left by an interrupted rotation, removed.
+    pub interrupted_segment: Option<PathBuf>,
+}
+
+/// Bytes after the last valid record of the last segment, truncated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TornTail {
+    /// The segment.
+    pub path: PathBuf,
+    /// Where the valid records end.
+    pub offset: u64,
+    /// Bytes removed.
+    pub bytes: u64,
+}
+
+/// The state of a durable engine's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogStatus {
+    /// Segments on disk, the active one included.
+    pub segments: usize,
+    /// Their bytes.
+    pub bytes: u64,
+    /// Bytes of the active segment.
+    pub active_bytes: u64,
+    /// Why the log closed, if it did.
+    pub closed: Option<io::ErrorKind>,
+}
+
+fn segment_name(number: u64) -> String {
+    format!("{PREFIX}{number:020}")
+}
+
+fn crc(parts: &[&[u8]]) -> u32 {
+    let mut hasher = Hasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize()
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// Numbers of the segments in `dir`, ascending.
+fn segment_numbers(dir: &Path) -> io::Result<Vec<u64>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if let Some(digits) = name.to_str().and_then(|name| name.strip_prefix(PREFIX))
+            && digits.len() == 20
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(number) = digits.parse()
+        {
+            found.push(number);
+        }
+    }
+    found.sort_unstable();
+    Ok(found)
+}
+
+/// Whether `dir` holds a log segment.
+pub(super) fn has_log(dir: &Path) -> io::Result<bool> {
+    match segment_numbers(dir) {
+        Ok(found) => Ok(!found.is_empty()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn encode_header(number: u64, base: u64) -> [u8; SEGMENT_HEADER_LEN] {
+    let mut bytes = [0; SEGMENT_HEADER_LEN];
+    bytes[..8].copy_from_slice(&SEGMENT_MAGIC);
+    bytes[8..12].copy_from_slice(&SEGMENT_VERSION.to_le_bytes());
+    bytes[16..24].copy_from_slice(&number.to_le_bytes());
+    bytes[24..32].copy_from_slice(&base.to_le_bytes());
+    let sum = crc(&[&bytes[..32]]);
+    bytes[32..].copy_from_slice(&sum.to_le_bytes());
+    bytes
+}
+
+/// The base of a segment from its header.
+fn decode_header(bytes: &[u8; SEGMENT_HEADER_LEN], number: u64) -> Result<u64, LogDamage> {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    if bytes[..8] != SEGMENT_MAGIC || crc(&[&bytes[..32]]) != u32_at(32) {
+        return Err(LogDamage::Header);
+    }
+    let (version, flags) = (u32_at(8), u32_at(12));
+    if version != SEGMENT_VERSION || flags != 0 {
+        return Err(LogDamage::Unsupported { version, flags });
+    }
+    if u64_at(16) != number {
+        return Err(LogDamage::Header);
+    }
+    Ok(u64_at(24))
+}
+
+/// Encodes one record, frame and body, into `out`.
+fn encode_record(out: &mut Vec<u8>, seq: u64, key: &[u8], value: Value<'_>) {
+    out.clear();
+    out.extend_from_slice(&[0; FRAME_LEN]);
+    match value {
+        Value::Bytes(bytes) => {
+            out.push(PUT);
+            out.extend_from_slice(&seq.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        Value::Tombstone => {
+            out.push(DELETE);
+            out.extend_from_slice(&seq.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+        }
+    }
+    let body_len = (out.len() - FRAME_LEN) as u32;
+    let body_sum = crc(&[&out[FRAME_LEN..]]);
+    out[..4].copy_from_slice(&body_len.to_le_bytes());
+    out[4..8].copy_from_slice(&body_sum.to_le_bytes());
+    let frame_sum = crc(&[&out[..8]]);
+    out[8..12].copy_from_slice(&frame_sum.to_le_bytes());
+}
+
+/// A record body, checked.
+struct Record<'b> {
+    seq: u64,
+    key: &'b [u8],
+    value: Value<'b>,
+}
+
+fn decode_body(body: &[u8]) -> Result<Record<'_>, LogDamage> {
+    let length = LogDamage::Length(body.len() as u64);
+    let op = body[0];
+    let seq = u64::from_le_bytes(body[1..9].try_into().unwrap());
+    let key_len = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
+    if key_len > MAX_KEY_LEN || MIN_BODY + key_len > body.len() {
+        return Err(length);
+    }
+    let key = &body[MIN_BODY..MIN_BODY + key_len];
+    let rest = &body[MIN_BODY + key_len..];
+    let value = match op {
+        PUT => {
+            if rest.len() < 4 {
+                return Err(length);
+            }
+            let value_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            if value_len > MAX_VALUE_LEN || rest.len() != 4 + value_len {
+                return Err(length);
+            }
+            Value::Bytes(&rest[4..])
+        }
+        DELETE if rest.is_empty() => Value::Tombstone,
+        DELETE => return Err(length),
+        op => return Err(LogDamage::Operation(op)),
+    };
+    Ok(Record { seq, key, value })
+}
+
+/// One segment on disk.
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    number: u64,
+    base: u64,
+    len: u64,
+}
+
+/// Faults a test can inject into the next log operation on this thread.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fault {
+    /// Write the first half of the record, then fail.
+    TornAppend,
+    /// Write the record, then fail instead of syncing.
+    SyncFails,
+    /// Create the next segment with half a header, then fail.
+    TornRotation,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs after the next durable write on this thread is logged, before it is
+/// published, without the state lock.
+#[cfg(test)]
+type Hook = Box<dyn FnOnce(&Core)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_PUBLISH: std::cell::Cell<Option<Hook>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fault(at: Fault) -> bool {
+    FAULT.with(|fault| {
+        let hit = fault.get() == Some(at);
+        if hit {
+            fault.set(None);
+        }
+        hit
+    })
+}
+
+#[cfg(test)]
+fn injected() -> io::Error {
+    io::Error::other("fault injected by a test")
+}
+
+/// The live log, behind a mutex that durable writers hold from reservation
+/// to publication; the state lock is taken inside it, never around it.
+pub(super) struct Wal {
+    dir: PathBuf,
+    options: DurableOptions,
+    /// Oldest first; the last is the active segment.
+    segments: Vec<Segment>,
+    file: File,
+    /// Total bytes of `segments`.
+    bytes: u64,
+    /// Records in the active segment.
+    records: u64,
+    buffer: Vec<u8>,
+    closed: Option<io::ErrorKind>,
+}
+
+/// What a durable engine owns beside its core.
+pub(super) struct Durable {
+    pub(super) dir: PathBuf,
+    /// Held for the engine's life; the kernel releases it if the process dies.
+    _lock: File,
+    pub(super) wal: Mutex<Wal>,
+}
+
+/// Creates segment `number` with `base`, synced with its directory entry.
+fn create_segment(dir: &Path, number: u64, base: u64) -> io::Result<File> {
+    let path = dir.join(segment_name(number));
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .open(&path)?;
+    let header = encode_header(number, base);
+    #[cfg(test)]
+    if fault(Fault::TornRotation) {
+        file.write_all(&header[..SEGMENT_HEADER_LEN / 2])?;
+        file.sync_all()?;
+        sync_dir(dir)?;
+        return Err(injected());
+    }
+    file.write_all(&header)?;
+    file.sync_all()?;
+    sync_dir(dir)?;
+    Ok(file)
+}
+
+impl Wal {
+    fn new(
+        dir: &Path,
+        options: DurableOptions,
+        mut segments: Vec<Segment>,
+        base: u64,
+    ) -> io::Result<Self> {
+        let number = segments.last().map_or(1, |last| last.number + 1);
+        let file = create_segment(dir, number, base)?;
+        segments.push(Segment {
+            number,
+            base,
+            len: SEGMENT_HEADER_LEN as u64,
+        });
+        Ok(Self {
+            dir: dir.to_owned(),
+            options,
+            bytes: segments.iter().map(|segment| segment.len).sum(),
+            segments,
+            file,
+            records: 0,
+            buffer: Vec::new(),
+            closed: None,
+        })
+    }
+
+    /// Logs one update with `seq`, the next sequence number, and syncs it.
+    pub(super) fn append(
+        &mut self,
+        seq: u64,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> Result<(), UpdateError> {
+        if self.closed.is_some() {
+            return Err(UpdateError::LogClosed);
+        }
+        encode_record(&mut self.buffer, seq, key, value);
+        let len = self.buffer.len() as u64;
+        let active = self.segments.last().expect("a log has an active segment");
+        let rotate = self.records > 0 && active.len + len > self.options.segment_bytes;
+        let needed = len + if rotate { SEGMENT_HEADER_LEN as u64 } else { 0 };
+        if self.bytes + needed > self.options.max_log_bytes {
+            return Err(UpdateError::LogFull {
+                bytes: self.bytes + needed,
+                max_bytes: self.options.max_log_bytes,
+            });
+        }
+        let result = self.write(rotate, seq - 1);
+        if self.buffer.capacity() > KEEP_BUFFER {
+            self.buffer = Vec::new();
+        }
+        result.map_err(|error| {
+            self.closed = Some(error.kind());
+            UpdateError::LogFailed(error.kind())
+        })
+    }
+
+    fn write(&mut self, rotate: bool, base: u64) -> io::Result<()> {
+        if rotate {
+            let number = self.segments.last().unwrap().number + 1;
+            self.file = create_segment(&self.dir, number, base)?;
+            self.segments.push(Segment {
+                number,
+                base,
+                len: SEGMENT_HEADER_LEN as u64,
+            });
+            self.bytes += SEGMENT_HEADER_LEN as u64;
+            self.records = 0;
+        }
+        #[cfg(test)]
+        if fault(Fault::TornAppend) {
+            self.file.write_all(&self.buffer[..self.buffer.len() / 2])?;
+            self.file.sync_data()?;
+            return Err(injected());
+        }
+        self.file.write_all(&self.buffer)?;
+        #[cfg(test)]
+        if fault(Fault::SyncFails) {
+            return Err(injected());
+        }
+        self.file.sync_data()?;
+        let len = self.buffer.len() as u64;
+        self.segments.last_mut().unwrap().len += len;
+        self.bytes += len;
+        self.records += 1;
+        Ok(())
+    }
+
+    fn status(&self) -> LogStatus {
+        LogStatus {
+            segments: self.segments.len(),
+            bytes: self.bytes,
+            active_bytes: self.segments.last().map_or(0, |segment| segment.len),
+            closed: self.closed,
+        }
+    }
+}
+
+/// Removes, oldest first, the segments a checkpoint at `ceiling` covers:
+/// those whose successor's base is at most `ceiling`, never the active one.
+/// Files are removed without holding the log, which only appends meanwhile.
+fn prune(durable: &Durable, ceiling: u64) -> usize {
+    let lock = || durable.wal.lock().unwrap_or_else(PoisonError::into_inner);
+    let covered: Vec<u64> = {
+        let wal = lock();
+        wal.segments
+            .windows(2)
+            .take_while(|pair| pair[1].base <= ceiling)
+            .map(|pair| pair[0].number)
+            .collect()
+    };
+    let mut removed = 0;
+    for &number in &covered {
+        if fs::remove_file(durable.dir.join(segment_name(number))).is_err() {
+            break;
+        }
+        removed += 1;
+    }
+    if removed > 0 {
+        let mut wal = lock();
+        let freed: u64 = wal.segments[..removed]
+            .iter()
+            .map(|segment| segment.len)
+            .sum();
+        wal.segments.drain(..removed);
+        wal.bytes -= freed;
+        drop(wal);
+        // Removal need not be durable: a segment that reappears is covered by
+        // the checkpoint and ignored, and removed again by the next one.
+        let _ = sync_dir(&durable.dir);
+    }
+    removed
+}
+
+/// What reading the log found.
+struct Scanned {
+    /// Segments to keep, the obsolete ones first, then the chain read.
+    segments: Vec<Segment>,
+    first_read: usize,
+    last_seq: u64,
+    replayed: u64,
+    skipped: u64,
+    log_bytes: u64,
+    torn: Option<TornTail>,
+    interrupted: Option<PathBuf>,
+}
+
+/// Applies a recovered record.
+type Apply<'a> = dyn FnMut(u64, &[u8], Value<'_>) -> Result<(), RecoveryError> + 'a;
+
+/// Where reading the log has got to.
+struct Replay<'a> {
+    /// The last sequence number read, or the chain's base.
+    prev: u64,
+    ceiling: u64,
+    replayed: u64,
+    skipped: u64,
+    /// One record body, reused.
+    body: Vec<u8>,
+    apply: &'a mut Apply<'a>,
+}
+
+/// Reads one segment's records after its header, checking each, and passes
+/// those above `ceiling` to `apply`. Returns the valid length and whether a
+/// torn tail follows it.
+fn read_segment(
+    path: &Path,
+    file: File,
+    file_len: u64,
+    last: bool,
+    replay: &mut Replay<'_>,
+) -> Result<(u64, bool), RecoveryError> {
+    let Replay {
+        prev,
+        ceiling,
+        replayed,
+        skipped,
+        body,
+        apply,
+    } = replay;
+    let ceiling = *ceiling;
+    let damaged = |offset: u64, damage| RecoveryError::Log {
+        path: path.to_owned(),
+        offset,
+        damage,
+    };
+    let mut reader = BufReader::with_capacity(READ_BUFFER, file);
+    let mut offset = SEGMENT_HEADER_LEN as u64;
+    loop {
+        let remaining = file_len - offset;
+        if remaining == 0 {
+            return Ok((offset, false));
+        }
+        if remaining < FRAME_LEN as u64 {
+            return if last {
+                Ok((offset, true))
+            } else {
+                Err(damaged(offset, LogDamage::Truncated))
+            };
+        }
+        let mut frame = [0; FRAME_LEN];
+        reader
+            .read_exact(&mut frame)
+            .map_err(|error| io_error(path, error))?;
+        if frame == [0; FRAME_LEN]
+            && last
+            && zeros(&mut reader, remaining - FRAME_LEN as u64, path)?
+        {
+            return Ok((offset, true));
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+        if crc(&[&frame[..8]]) != u32_at(8) {
+            return Err(damaged(offset, LogDamage::Frame));
+        }
+        let len = u32_at(0) as usize;
+        if !(MIN_BODY..=MAX_BODY).contains(&len) {
+            return Err(damaged(offset, LogDamage::Length(len as u64)));
+        }
+        if (len as u64) > remaining - FRAME_LEN as u64 {
+            return if last {
+                Ok((offset, true))
+            } else {
+                Err(damaged(offset, LogDamage::Truncated))
+            };
+        }
+        body.resize(len, 0);
+        reader
+            .read_exact(body.as_mut_slice())
+            .map_err(|error| io_error(path, error))?;
+        if crc(&[body.as_slice()]) != u32_at(4) {
+            return Err(damaged(offset, LogDamage::Checksum));
+        }
+        let record = decode_body(body).map_err(|damage| damaged(offset, damage))?;
+        let expected = prev.checked_add(1).ok_or_else(|| {
+            damaged(
+                offset,
+                LogDamage::Sequence {
+                    expected: u64::MAX,
+                    found: record.seq,
+                },
+            )
+        })?;
+        if record.seq != expected {
+            return Err(damaged(
+                offset,
+                LogDamage::Sequence {
+                    expected,
+                    found: record.seq,
+                },
+            ));
+        }
+        if record.seq > ceiling {
+            apply(record.seq, record.key, record.value)?;
+            *replayed += 1;
+        } else {
+            *skipped += 1;
+        }
+        *prev = record.seq;
+        offset += (FRAME_LEN + len) as u64;
+    }
+}
+
+/// Whether the next `len` bytes are all zero.
+fn zeros(reader: &mut impl Read, len: u64, path: &Path) -> Result<bool, RecoveryError> {
+    let mut chunk = [0u8; 4096];
+    let mut left = len;
+    while left > 0 {
+        let take = left.min(chunk.len() as u64) as usize;
+        reader
+            .read_exact(&mut chunk[..take])
+            .map_err(|error| io_error(path, error))?;
+        if chunk[..take].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        left -= take as u64;
+    }
+    Ok(true)
+}
+
+fn io_error(path: &Path, error: io::Error) -> RecoveryError {
+    RecoveryError::Io {
+        path: path.to_owned(),
+        error,
+    }
+}
+
+/// Reads and checks the log against a checkpoint at `ceiling`, passing each
+/// record above it to `apply`. Changes nothing on disk.
+fn scan<'a>(dir: &Path, ceiling: u64, apply: &'a mut Apply<'a>) -> Result<Scanned, RecoveryError> {
+    let damaged = |path: PathBuf, offset: u64, damage| RecoveryError::Log {
+        path,
+        offset,
+        damage,
+    };
+    let numbers = segment_numbers(dir).map_err(|error| io_error(dir, error))?;
+    let mut scanned = Scanned {
+        segments: Vec::with_capacity(numbers.len()),
+        first_read: 0,
+        last_seq: 0,
+        replayed: 0,
+        skipped: 0,
+        log_bytes: 0,
+        torn: None,
+        interrupted: None,
+    };
+    // Headers first, with the open files' lengths.
+    let mut files = Vec::with_capacity(numbers.len());
+    for (index, &number) in numbers.iter().enumerate() {
+        let path = dir.join(segment_name(number));
+        let mut file = File::open(&path).map_err(|error| io_error(&path, error))?;
+        let len = file
+            .metadata()
+            .map_err(|error| io_error(&path, error))?
+            .len();
+        let mut header = [0; SEGMENT_HEADER_LEN];
+        let last = index + 1 == numbers.len();
+        if len < SEGMENT_HEADER_LEN as u64 {
+            if last {
+                scanned.interrupted = Some(path);
+                break;
+            }
+            return Err(damaged(path, 0, LogDamage::Header));
+        }
+        file.read_exact(&mut header)
+            .map_err(|error| io_error(&path, error))?;
+        let base = match decode_header(&header, number) {
+            Ok(base) => base,
+            Err(_)
+                if last
+                    && header == [0; SEGMENT_HEADER_LEN]
+                    && len == SEGMENT_HEADER_LEN as u64 =>
+            {
+                scanned.interrupted = Some(path);
+                break;
+            }
+            Err(damage) => return Err(damaged(path, 0, damage)),
+        };
+        scanned.segments.push(Segment { number, base, len });
+        files.push((path, file));
+    }
+    if scanned.segments.is_empty() {
+        return Err(damaged(dir.to_owned(), 0, LogDamage::NoSegments));
+    }
+    // The newest segment whose base the checkpoint covers starts the chain.
+    let Some(start) = scanned
+        .segments
+        .iter()
+        .rposition(|segment| segment.base <= ceiling)
+    else {
+        let first = scanned.segments[0];
+        return Err(damaged(
+            dir.join(segment_name(first.number)),
+            0,
+            LogDamage::Gap {
+                base: first.base,
+                ceiling,
+            },
+        ));
+    };
+    scanned.first_read = start;
+    let count = scanned.segments.len();
+    let mut replay = Replay {
+        prev: scanned.segments[start].base,
+        ceiling,
+        replayed: 0,
+        skipped: 0,
+        body: Vec::new(),
+        apply,
+    };
+    for (index, (path, file)) in files.into_iter().enumerate().skip(start) {
+        let segment = scanned.segments[index];
+        if index > start {
+            let before = scanned.segments[index - 1].number;
+            if segment.number != before + 1 {
+                return Err(damaged(
+                    dir.to_owned(),
+                    0,
+                    LogDamage::Missing { after: before },
+                ));
+            }
+            if segment.base != replay.prev {
+                return Err(damaged(
+                    path,
+                    0,
+                    LogDamage::Base {
+                        expected: replay.prev,
+                        found: segment.base,
+                    },
+                ));
+            }
+        }
+        let last = index + 1 == count;
+        let (valid, torn) = read_segment(&path, file, segment.len, last, &mut replay)?;
+        scanned.log_bytes += segment.len;
+        if torn {
+            scanned.torn = Some(TornTail {
+                path,
+                offset: valid,
+                bytes: segment.len - valid,
+            });
+            scanned.segments[index].len = valid;
+        }
+    }
+    if replay.prev < ceiling {
+        return Err(damaged(
+            dir.join(segment_name(scanned.segments[count - 1].number)),
+            0,
+            LogDamage::Behind {
+                last: replay.prev,
+                ceiling,
+            },
+        ));
+    }
+    scanned.last_seq = replay.prev;
+    scanned.replayed = replay.replayed;
+    scanned.skipped = replay.skipped;
+    Ok(scanned)
+}
+
+impl Engine {
+    /// Creates a durable database in `dir`, which must not exist or be empty,
+    /// and returns its engine. It writes the first log segment (based at
+    /// [`EngineOptions::last_seq`]) and then commits an empty checkpoint,
+    /// which marks the directory as a database; until that commit `open`
+    /// refuses it as [`RecoveryError::NoCheckpoint`]. If creation fails or is
+    /// interrupted, remove the directory before creating it again.
+    pub fn create(
+        dir: &Path,
+        options: EngineOptions,
+        durable: DurableOptions,
+    ) -> Result<Engine, RecoveryError> {
+        let io = |path: &Path| {
+            let path = path.to_owned();
+            move |error| RecoveryError::Io { path, error }
+        };
+        fs::create_dir_all(dir).map_err(io(dir))?;
+        let lock = match checkpoint::lock(dir).map_err(io(dir))? {
+            Ok(file) => file,
+            Err(()) => return Err(RecoveryError::Locked(dir.to_owned())),
+        };
+        for entry in fs::read_dir(dir).map_err(io(dir))? {
+            if entry.map_err(io(dir))?.file_name() != checkpoint::LOCK {
+                return Err(RecoveryError::NotEmpty(dir.to_owned()));
+            }
+        }
+        let wal = Wal::new(dir, durable, Vec::new(), options.last_seq).map_err(io(dir))?;
+        let engine = Engine::new(options);
+        let published = engine.publish(dir, CheckpointOptions::default());
+        let installed = Durable {
+            dir: dir.to_owned(),
+            _lock: lock,
+            wal: Mutex::new(wal),
+        };
+        match published {
+            Ok(_) => {}
+            Err(CheckpointError::Io {
+                path,
+                error,
+                after_commit_point: true,
+            }) => return Err(RecoveryError::Io { path, error }),
+            Err(error) => {
+                let _ = fs::remove_file(dir.join(segment_name(1)));
+                return Err(RecoveryError::Io {
+                    path: dir.to_owned(),
+                    error: io::Error::other(error.to_string()),
+                });
+            }
+        }
+        let _ = engine.core.durable.set(installed);
+        Ok(engine)
+    }
+
+    /// Opens the durable database in `dir`: loads its committed checkpoint,
+    /// replays the log after it, and returns an engine that logs every write,
+    /// holding `dir`'s lock until it is dropped. The sequence continues after
+    /// the last record recovered; [`EngineOptions::last_seq`] is ignored.
+    ///
+    /// Everything is checked before the engine is returned; see the module
+    /// source `src/engine/wal.rs` for the rules. Only then are a torn tail
+    /// truncated and an interrupted segment removed, and a new segment
+    /// started. A directory without `CURRENT` is
+    /// [`RecoveryError::NoCheckpoint`], never a new empty database.
+    pub fn open(
+        dir: &Path,
+        options: EngineOptions,
+        durable: DurableOptions,
+    ) -> Result<(Engine, OpenReport), RecoveryError> {
+        let lock = checkpoint::lock_existing(dir)?;
+        let loaded = checkpoint::load(dir, &options)?;
+        let (generation, ceiling) = (loaded.generation, loaded.ceiling);
+        let options = EngineOptions {
+            last_seq: ceiling,
+            ..options
+        };
+        let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options);
+        let scanned = scan(dir, ceiling, &mut |seq, key, value| {
+            engine.replay(seq, key, value)
+        })?;
+        debug_assert_eq!(engine.core.read_state().last_seq, scanned.last_seq);
+
+        if let Some(torn) = &scanned.torn {
+            OpenOptions::new()
+                .write(true)
+                .open(&torn.path)
+                .and_then(|file| {
+                    file.set_len(torn.offset)?;
+                    file.sync_all()
+                })
+                .map_err(|error| io_error(&torn.path, error))?;
+        }
+        if let Some(path) = &scanned.interrupted {
+            fs::remove_file(path).map_err(|error| io_error(path, error))?;
+        }
+        let wal = Wal::new(dir, durable, scanned.segments.clone(), scanned.last_seq)
+            .map_err(|error| io_error(dir, error))?;
+        let report = OpenReport {
+            generation,
+            checkpoint_seq: ceiling,
+            last_seq: scanned.last_seq,
+            segments: scanned.segments.len() - scanned.first_read,
+            replayed: scanned.replayed,
+            skipped: scanned.skipped,
+            log_bytes: scanned.log_bytes,
+            torn_tail: scanned.torn,
+            interrupted_segment: scanned.interrupted,
+        };
+        let _ = engine.core.durable.set(Durable {
+            dir: dir.to_owned(),
+            _lock: lock,
+            wal: Mutex::new(wal),
+        });
+        Ok((engine, report))
+    }
+
+    /// Commits a checkpoint into this durable engine's directory while writes
+    /// continue, then prunes the log segments it covers. See
+    /// [`Engine::checkpoint`] for the checkpoint and `src/engine/wal.rs` for
+    /// pruning; a checkpoint that fails or is not committed prunes nothing.
+    pub fn durable_checkpoint(
+        &self,
+        options: CheckpointOptions,
+    ) -> Result<CheckpointReport, CheckpointError> {
+        let durable = self.core.durable.get().ok_or(CheckpointError::NotDurable)?;
+        let _serial = self
+            .core
+            .checkpointing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut report = self.publish(&durable.dir, options)?;
+        #[cfg(test)]
+        if checkpoint::crash(checkpoint::Crash::BeforePrune) {
+            return Err(checkpoint::crashed(&durable.dir));
+        }
+        report.pruned_segments = prune(durable, report.last_seq);
+        Ok(report)
+    }
+
+    /// The log of a durable engine, or `None` for a RAM-only one.
+    pub fn log_status(&self) -> Option<LogStatus> {
+        self.core.durable.get().map(|durable| {
+            durable
+                .wal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .status()
+        })
+    }
+
+    /// Applies one logged record on recovery, flushing (and waiting for
+    /// compaction) when the memtables are full.
+    fn replay(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), RecoveryError> {
+        let mut made_room = false;
+        loop {
+            match self.core.apply_logged(seq, key, value) {
+                Ok(()) => return Ok(()),
+                Err(WriteError::BudgetExceeded { .. }) if !made_room => {
+                    self.make_room()?;
+                    made_room = true;
+                }
+                Err(error) => return Err(RecoveryError::Replay(UpdateError::Rejected(error))),
+            }
+        }
+    }
+
+    fn make_room(&self) -> Result<(), RecoveryError> {
+        match self.core.flush() {
+            Ok(_) => Ok(()),
+            Err(refused) => {
+                if self.core.background.is_none() || self.wait_for_compaction().is_err() {
+                    return Err(RecoveryError::RunLimit(refused));
+                }
+                self.core
+                    .flush()
+                    .map(|_| ())
+                    .map_err(RecoveryError::RunLimit)
+            }
+        }
+    }
+}
+
+impl Core {
+    /// The durable write path: reserve, log, publish. Durable writers take
+    /// the log first, one at a time, so the sequence number reserved under
+    /// the first hold of the state lock is still the next one when the
+    /// second publishes it. The state lock is not held while the record is
+    /// synced, so reads, flushes and snapshots proceed meanwhile.
+    // Kept out of the RAM-only write path, which only tests for it.
+    #[inline(never)]
+    pub(super) fn update_durable(
+        &self,
+        durable: &Durable,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> Result<u64, UpdateError> {
+        let mut wal = durable.wal.lock().map_err(|_| UpdateError::LogClosed)?;
+        let seq = {
+            let mut state = self.write_state();
+            let seq = state
+                .last_seq
+                .checked_add(1)
+                .ok_or(UpdateError::SequencesExhausted)?;
+            state
+                .active
+                .check(key, seq, value)
+                .map_err(|error| UpdateError::Rejected(self.reason(&state, error)))?;
+            seq
+        };
+        wal.append(seq, key, value)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PUBLISH.with(|hook| hook.take()) {
+            hook(self);
+        }
+        let mut state = self.write_state();
+        // A flush may have frozen the table checked, and its successor
+        // continues after `seq - 1`; snapshots may have pinned more. The
+        // record is logged, so it goes in regardless of the budget.
+        state
+            .active
+            .write_admitted(key, seq, value)
+            .expect("lengths and the reserved sequence number were checked");
+        state.last_seq = seq;
+        drop(state);
+        drop(wal);
+        Ok(seq)
+    }
+
+    /// Applies a recovered record with its own sequence number.
+    fn apply_logged(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), WriteError> {
+        let mut state = self.write_state();
+        let applied = match value {
+            Value::Bytes(bytes) => state.active.put(key, seq, bytes),
+            Value::Tombstone => state.active.delete(key, seq),
+        };
+        applied.map_err(|error| self.reason(&state, error))?;
+        state.last_seq = seq;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Durable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Durable")
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineWorkspace;
+    use crate::engine::checkpoint::{CRASH_AT, Crash};
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("tessera-wal-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    fn small() -> DurableOptions {
+        DurableOptions {
+            segment_bytes: 1024,
+            ..DurableOptions::default()
+        }
+    }
+
+    fn get(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
+        let mut workspace = EngineWorkspace::new();
+        engine
+            .get(key, &mut workspace)
+            .unwrap()
+            .map(|found| found.value.to_vec())
+    }
+
+    fn state(engine: &Engine) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut workspace = EngineWorkspace::new();
+        let guard = engine.read();
+        let mut scan = guard.scan(&mut workspace);
+        let mut out = Vec::new();
+        while let Some(record) = scan.next_record().unwrap() {
+            out.push((record.key.to_vec(), record.value.to_vec()));
+        }
+        out
+    }
+
+    #[test]
+    fn records_round_trip_and_reject_damage() {
+        let mut out = Vec::new();
+        for (seq, key, value) in [
+            (1, &b""[..], Value::Bytes(b"")),
+            (u64::MAX, &[0xff; 3][..], Value::Tombstone),
+            (7, &b"key"[..], Value::Bytes(&[0; 300])),
+        ] {
+            encode_record(&mut out, seq, key, value);
+            let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
+            assert_eq!(len, out.len() - FRAME_LEN);
+            assert_eq!(crc(&[&out[..8]]).to_le_bytes(), out[8..12]);
+            let record = decode_body(&out[FRAME_LEN..]).unwrap();
+            assert_eq!((record.seq, record.key, record.value), (seq, key, value));
+        }
+        // Lengths inside the body that disagree with it, and an unknown
+        // operation, are damage.
+        encode_record(&mut out, 3, b"ab", Value::Bytes(b"cd"));
+        let body = &mut out[FRAME_LEN..];
+        let mut long_key = body.to_vec();
+        long_key[9] = 200;
+        assert!(matches!(decode_body(&long_key), Err(LogDamage::Length(_))));
+        let mut short_value = body.to_vec();
+        short_value.pop();
+        assert!(matches!(
+            decode_body(&short_value),
+            Err(LogDamage::Length(_))
+        ));
+        body[0] = 9;
+        assert_eq!(decode_body(body).err(), Some(LogDamage::Operation(9)));
+        let header = encode_header(4, 99);
+        assert_eq!(decode_header(&header, 4), Ok(99));
+        assert_eq!(decode_header(&header, 5), Err(LogDamage::Header));
+        let mut damaged = header;
+        damaged[25] ^= 1;
+        assert_eq!(decode_header(&damaged, 4), Err(LogDamage::Header));
+    }
+
+    /// An append that fails part way, or whose sync fails, is not applied
+    /// and closes the log; recovery has the acknowledged writes, with the
+    /// failed one only if all of it reached the file.
+    #[test]
+    fn a_failed_append_closes_the_log_and_recovery_keeps_what_was_acknowledged() {
+        for (fault, survives) in [(Fault::TornAppend, false), (Fault::SyncFails, true)] {
+            let dir = scratch(&format!("{fault:?}"));
+            let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+            assert_eq!(engine.put(b"a", b"1").unwrap(), 1);
+            assert_eq!(engine.delete(b"a").unwrap(), 2);
+            FAULT.with(|cell| cell.set(Some(fault)));
+            assert!(matches!(
+                engine.put(b"b", b"2"),
+                Err(UpdateError::LogFailed(_))
+            ));
+            assert_eq!(engine.put(b"c", b"3"), Err(UpdateError::LogClosed));
+            assert_eq!(get(&engine, b"b"), None);
+            assert_eq!(engine.stats().last_seq, 2);
+            assert!(engine.log_status().unwrap().closed.is_some());
+            drop(engine);
+
+            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            assert_eq!(report.torn_tail.is_some(), !survives, "{fault:?}");
+            assert_eq!(get(&engine, b"a"), None);
+            assert_eq!(get(&engine, b"b").is_some(), survives);
+            let next = if survives { 4 } else { 3 };
+            assert_eq!(engine.put(b"d", b"4").unwrap(), next);
+            drop(engine);
+            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            assert_eq!(report.torn_tail, None);
+            assert_eq!(report.last_seq, next);
+            assert_eq!(get(&engine, b"d"), Some(b"4".to_vec()));
+            drop(engine);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A snapshot taken while a record syncs can leave its update no longer
+    /// fitting the budget; it is logged, so it is applied, over the budget by
+    /// that update, and the next write is refused as usual.
+    #[test]
+    fn a_logged_update_is_applied_even_if_the_budget_shrank_while_it_synced() {
+        let dir = scratch("over-budget");
+        let options = EngineOptions {
+            memtable_budget: 16 << 10,
+            ..EngineOptions::default()
+        };
+        let engine = Engine::create(&dir, options, small()).unwrap();
+        let mut keys = 0u32;
+        while engine.put(&keys.to_be_bytes(), &[1; 100]).is_ok() {
+            keys += 1;
+        }
+        // Fits now, replacing a value of the same length...
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held = std::rc::Rc::clone(&snapshot);
+        BEFORE_PUBLISH.with(|hook| {
+            hook.set(Some(Box::new(move |core: &Core| {
+                *held.borrow_mut() = Some(core.snapshot().unwrap());
+            })))
+        });
+        // ...but not once a snapshot shares the path it copies.
+        let seq = engine.put(&0u32.to_be_bytes(), &[2; 100]).unwrap();
+        assert!(snapshot.borrow().is_some());
+        let active = engine.stats().active;
+        assert!(active.charged > active.budget, "{active:?}");
+        assert_eq!(get(&engine, &0u32.to_be_bytes()), Some(vec![2; 100]));
+        assert!(matches!(
+            engine.put(&1u32.to_be_bytes(), &[3; 100]),
+            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. }))
+        ));
+        drop(snapshot);
+        drop(engine);
+        let (engine, report) = Engine::open(&dir, options, small()).unwrap();
+        assert_eq!(report.last_seq, seq);
+        assert_eq!(get(&engine, &0u32.to_be_bytes()), Some(vec![2; 100]));
+        drop(engine);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A table over its budget admits only an update that brings it back
+    /// within it, so the excess a logged update leaves cannot grow through
+    /// later updates.
+    #[test]
+    fn a_table_over_its_budget_admits_only_updates_that_restore_it() {
+        use crate::memtable::Memtable;
+        let mut table = Memtable::new(4096, None);
+        let mut seq = 0u64;
+        while table.put(&seq.to_be_bytes(), seq + 1, &[1; 100]).is_ok() {
+            seq += 1;
+        }
+        // A logged update past the budget by 50 bytes, as a durable engine
+        // applies one: a larger value for the first key.
+        let full = table.memory();
+        let len = 100 + (full.budget - full.charged) + 50;
+        let key = 0u64.to_be_bytes();
+        table
+            .write_admitted(&key, seq + 1, Value::Bytes(&vec![2; len]))
+            .unwrap();
+        let over = table.memory();
+        assert_eq!(over.charged, over.budget + 50);
+        // Shrinking the value by less than the excess is refused...
+        assert!(matches!(
+            table.put(&key, seq + 2, &vec![3; len - 49]),
+            Err(WriteError::BudgetExceeded { .. })
+        ));
+        // ...and shrinking it by the excess is admitted, within the budget.
+        table.put(&key, seq + 2, &vec![3; len - 50]).unwrap();
+        let after = table.memory();
+        assert!(after.charged <= after.budget, "{after:?}");
+    }
+
+    /// A checkpoint committed while a write is logged but not yet published
+    /// excludes it from its ceiling, and its pruning, which waits for the
+    /// write, keeps the segment holding it.
+    #[test]
+    fn a_checkpoint_during_an_in_flight_write_keeps_its_record() {
+        use std::sync::mpsc;
+        let dir = scratch("in-flight");
+        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        for at in 0..20u32 {
+            engine.put(&at.to_be_bytes(), &[1; 100]).unwrap();
+        }
+        let current = || fs::read(dir.join("CURRENT")).unwrap();
+        let before = current();
+        let (logged, wait_logged) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                BEFORE_PUBLISH.with(|hook| {
+                    hook.set(Some(Box::new(move |_: &Core| {
+                        logged.send(()).unwrap();
+                        wait_go.recv().unwrap();
+                    })))
+                });
+                // Does not fit the active segment, so it starts a new one.
+                engine.put(b"in-flight", &[2; 900]).unwrap()
+            });
+            wait_logged.recv().unwrap();
+            let checkpoint = scope.spawn(|| {
+                engine
+                    .durable_checkpoint(CheckpointOptions::default())
+                    .unwrap()
+            });
+            // Let the writer publish once the checkpoint has committed; its
+            // pruning waits for the log until then.
+            for _ in 0..10_000 {
+                if current() != before {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_ne!(current(), before, "the checkpoint did not commit");
+            go.send(()).unwrap();
+            let seq = writer.join().unwrap();
+            let report = checkpoint.join().unwrap();
+            assert_eq!(report.last_seq, seq - 1);
+            assert!(report.pruned_segments > 0, "{report:?}");
+        });
+        drop(engine);
+        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        assert_eq!((report.replayed, report.last_seq), (1, 21));
+        assert_eq!(get(&engine, b"in-flight"), Some(vec![2; 900]));
+        drop(engine);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_rotation_is_removed_on_open() {
+        let dir = scratch("rotation");
+        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        let value = [7; 400];
+        engine.put(b"a", &value).unwrap();
+        engine.put(b"b", &value).unwrap();
+        // The third does not fit the first segment.
+        FAULT.with(|cell| cell.set(Some(Fault::TornRotation)));
+        assert!(matches!(
+            engine.put(b"c", &value),
+            Err(UpdateError::LogFailed(_))
+        ));
+        drop(engine);
+        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        assert_eq!(report.interrupted_segment, Some(dir.join(segment_name(2))));
+        assert_eq!(report.last_seq, 2);
+        assert_eq!(get(&engine, b"b"), Some(value.to_vec()));
+        engine.put(b"c", &value).unwrap();
+        drop(engine);
+        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        assert_eq!((report.last_seq, report.interrupted_segment), (3, None));
+        assert_eq!(get(&engine, b"c"), Some(value.to_vec()));
+        drop(engine);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A durable checkpoint stopped at any point, before or after its commit,
+    /// leaves the full history: no segment is pruned before the commit is
+    /// durable, and pruning only removes what the commit covers.
+    #[test]
+    fn an_interrupted_durable_checkpoint_keeps_the_full_history() {
+        for crash in [
+            Crash::AfterFirstRun,
+            Crash::BeforeRename,
+            Crash::AfterRename,
+            Crash::BeforePrune,
+        ] {
+            let dir = scratch(&format!("durable-{crash:?}"));
+            let options = EngineOptions {
+                target_run_len: 1024,
+                ..EngineOptions::default()
+            };
+            let engine = Engine::create(&dir, options, small()).unwrap();
+            for round in 0..3u8 {
+                for at in 0..200u32 {
+                    engine.put(&at.to_be_bytes(), &[round; 20]).unwrap();
+                }
+                engine.flush().unwrap();
+                engine
+                    .durable_checkpoint(CheckpointOptions::default())
+                    .unwrap();
+            }
+            for at in 0..100u32 {
+                engine.delete(&(at * 2).to_be_bytes()).unwrap();
+            }
+            CRASH_AT.with(|cell| cell.set(Some(crash)));
+            assert!(
+                engine
+                    .durable_checkpoint(CheckpointOptions::default())
+                    .is_err()
+            );
+            CRASH_AT.with(|cell| cell.set(None));
+            for at in 0..50u32 {
+                engine.put(&(at * 4).to_be_bytes(), b"later").unwrap();
+            }
+            let expected = (state(&engine), engine.stats().last_seq);
+            drop(engine);
+            let (engine, report) = Engine::open(&dir, options, small()).unwrap();
+            assert_eq!((state(&engine), report.last_seq), expected, "{crash:?}");
+            // The next checkpoint prunes what is left behind.
+            let report = engine
+                .durable_checkpoint(CheckpointOptions::default())
+                .unwrap();
+            assert_eq!(engine.log_status().unwrap().segments, 1, "{report:?}");
+            drop(engine);
+            let (engine, _) = Engine::open(&dir, options, small()).unwrap();
+            assert_eq!((state(&engine), engine.stats().last_seq), expected);
+            drop(engine);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+}
