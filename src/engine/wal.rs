@@ -1470,7 +1470,7 @@ impl Engine {
     ///
     /// Damage to `CURRENT` or the manifest is returned as the error open
     /// would return. Nothing is repaired: see [`Verdict::Damaged`].
-    pub fn inspect(dir: &Path, options: &EngineOptions) -> Result<Inspection, RecoveryError> {
+    pub fn inspect(dir: &Path, options: EngineOptions) -> Result<Inspection, RecoveryError> {
         match fs::metadata(dir) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1479,7 +1479,7 @@ impl Engine {
             Err(error) => return Err(io_error(dir, error)),
         }
         let _lock = checkpoint::lock_shared(dir)?;
-        let checkpoint = checkpoint::committed(dir, options)?;
+        let checkpoint = checkpoint::committed(dir, &options)?;
         let numbers = segment_numbers(dir).map_err(|error| io_error(dir, error))?;
         let mut last_valid = None;
         let scanned = scan(

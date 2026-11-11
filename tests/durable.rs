@@ -402,7 +402,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     let len = last_bytes.len() as u64;
     let inspect = |dir: &Path| {
         let before = listing(dir);
-        let inspection = Engine::inspect(dir, &EngineOptions::default()).unwrap();
+        let inspection = Engine::inspect(dir, EngineOptions::default()).unwrap();
         assert_eq!(listing(dir), before, "inspect changed {}", dir.display());
         inspection
     };
@@ -466,7 +466,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     // A durable engine holds the directory against inspection.
     let engine = open(dir);
     assert!(matches!(
-        Engine::inspect(dir, &EngineOptions::default()),
+        Engine::inspect(dir, EngineOptions::default()),
         Err(RecoveryError::Locked(_))
     ));
     drop(engine);
@@ -494,7 +494,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     assert!(matches!(inspection.verdict, Verdict::NoCheckpoint));
     assert_eq!(inspection.last_valid.unwrap().seq, 1);
     assert!(matches!(
-        Engine::inspect(&dir.join("absent"), &EngineOptions::default()),
+        Engine::inspect(&dir.join("absent"), EngineOptions::default()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
 }
