@@ -116,9 +116,22 @@ retried until the next flush, or the next flush refused by the run limits.
 for its outcome; dropping the engine finishes the compaction in progress and
 joins the thread.
 
+**Checkpoints** are explicit and opt-in; the engine never touches a file
+otherwise. `Engine::checkpoint(dir, options)` takes a snapshot, streams its
+live keys into runs of the ordinary format one at a time, syncs every file,
+then commits by atomically replacing a small `CURRENT` file and syncing the
+directory, and removes the previous checkpoint. Writes, flushes and
+compaction continue meanwhile. `Engine::recover(dir, options)` validates the
+committed checkpoint completely, rebuilds the key filters and continues the
+sequence after its ceiling; a missing or damaged checkpoint is an error,
+never an empty engine. Writes after a checkpoint are lost on restart until a
+write-ahead log exists. The format, publication protocol and filesystem
+assumptions (local Linux filesystems) are in
+[`src/engine/checkpoint.rs`](src/engine/checkpoint.rs).
+
 There is no transaction, sequence-filtered read of the runs, persisted filter,
-snapshot of a state older than the call, write-ahead log or persistence, and
-flushing never happens in the background.
+snapshot of a state older than the call, write-ahead log, and flushing never
+happens in the background.
 
 ## Validate
 
@@ -152,6 +165,7 @@ scripts/validate.sh reads    # read amplification under sustained writes
 scripts/validate.sh bloom    # filtered against unfiltered point lookups
 scripts/validate.sh filtercost # key filter construction cost
 scripts/validate.sh operate  # sustained, concurrent and limited operation
+scripts/validate.sh checkpoint # checkpoint and recovery cost
 colima stop
 ```
 
@@ -159,7 +173,8 @@ Benchmark method, reproduction steps and findings are in
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
 Each step gets a 3 GiB cgroup with no swap, 2 CPUs, 256 processes, 2 build jobs,
-2 test threads and a timeout. Use `scripts/validate.sh exec SECONDS CMD...` for
+2 test threads, a 512 MiB tmpfs at `/tmp` for checkpoint tests, and a
+timeout. Use `scripts/validate.sh exec SECONDS CMD...` for
 anything else that could loop or allocate without bound, including tests of
 deliberately broken code. A bare `cargo test` on macOS has no memory limit.
 

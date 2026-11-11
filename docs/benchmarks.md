@@ -1224,3 +1224,45 @@ consolidation roughly doubles point-read throughput and halves long-scan time.
 The existing `Engine::compact` with `max_overlap` 1 already does it, so no new
 API or scheduler is needed. In one session the worker happened to leave one
 run, and consolidation had nothing to do.
+
+## Checkpoints
+
+`scripts/validate.sh checkpoint` (Milestone 5L) loads an engine (16 MiB
+memtables, default limits, the worker), checkpoints it, reads the files and
+recovers them, then measures a writer of 1.5 million json overwrites and a
+reader beside checkpoints taken back to back. It runs once into the
+container's tmpfs and once into the cache volume on the VM's disk; the
+benchmark removes its directory. Recovery reads files the page cache already
+holds. Two sessions agree within 15% except where noted.
+
+| values | keys | payload MiB | runs MiB | checkpoint MiB | checkpoint s | k records/s | heap peak MiB | recover s | recover MiB/s | recover heap MiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| json | 1,000,000 | 98.4 | 18.3 (14 runs) | 18.3 | 0.27–0.29 | 3,470–3,680 | 34.8 | 0.14 | 127–128 | 25.0 |
+| 8-byte | 2,000,000 | 49.6 | 24.6 (12 runs) | 24.6 | 0.34–0.36 | 5,600–5,840 | 68.2 | 0.15 | 163–166 | 43.6 |
+| 4 KiB | 50,000 | 196.2 | 50.5 (13 runs) | 50.5 | 0.17–0.20 | 255–297 | 49.3 | 0.08 | 628–637 | 50.6 |
+
+- A checkpoint is as large as the compacted runs: it rewrites the live keys
+  into runs of the same format. Its time is decoding and re-encoding, not I/O:
+  tmpfs and the VM disk differ by 0–15%. The VM disk's `fsync` is fast because
+  the hypervisor acknowledges it from the host's cache, so these times say
+  nothing about a real device's sync latency.
+- The heap peak beside the engine is one run under construction (up to the
+  64 MiB input target), its key-hash buffer and the scan's decoded blocks: 35–68 MiB,
+  bounded by `target_run_len`, not by the size of the database.
+- Recovery spends 3–6 ms reading (cached) files; the rest is the full run
+  check and rebuilding the filters, 128–166 MiB/s of stored runs for small
+  and json values. Its heap is the runs and filters it returns.
+
+| checkpoints | k puts/s | put p99 µs | k gets/s | get p99 µs | checkpoints | compactions (failures) | most retained MiB |
+|---|---|---|---|---|---|---|---|
+| none | 1,154–1,376 | 0.6–0.7 | 40–42 | 42–43 | | 5–8 (0) | 0 |
+| back to back | 614–874 | 0.7–0.8 | 29–31 | 43–52 | 3–4 of 555–707 ms | 6–10 (0) | 37.8–45.0 |
+
+- Writes never wait for a checkpoint: the put p99 is unchanged. Throughput
+  falls 30–52% because the checkpoint's re-encoding takes a core on a 2-CPU
+  machine already running a writer, a reader and the worker. Checkpoints back
+  to back are the worst case.
+- Under load a checkpoint takes about twice as long as idle (0.56–0.71 s).
+  Compaction keeps running; what it replaces stays allocated for the
+  checkpoint's snapshot, up to 45 MiB retained here, with 16 MiB memtables and
+  18 MiB of runs.

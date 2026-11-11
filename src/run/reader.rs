@@ -3,7 +3,7 @@ use std::fmt;
 use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
-use super::filter::{self as key_filter, KeyFilter};
+use super::filter::{self as key_filter, KeyFilter, KeyHashes};
 use super::frame::{self, Frame};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, TABLE_ENTRY_LEN, read_u32,
@@ -124,6 +124,27 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the run's serialized bytes.
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_ref()
+    }
+}
+
+impl Run<Vec<u8>> {
+    /// Checks `data` as [`new`](Self::new) does, then walks its records once
+    /// more to rebuild the key filter a builder would have made, returning
+    /// the run and its largest sequence number (0 if empty). For runs read
+    /// back from storage.
+    pub(crate) fn recover(data: Vec<u8>) -> Result<(Self, u64), CorruptRun> {
+        validate(&data)?;
+        let mut hashes = KeyHashes::new();
+        let mut max_seq = 0;
+        {
+            let mut workspace = ReadWorkspace::new();
+            let mut cursor = RunView::open(&data)?.cursor(&mut workspace);
+            while let Some(record) = cursor.next_record()? {
+                hashes.add(record.key);
+                max_seq = max_seq.max(record.seq);
+            }
+        }
+        Ok((Self::from_builder(data, hashes.finish()), max_seq))
     }
 }
 

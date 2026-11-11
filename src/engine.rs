@@ -198,9 +198,18 @@
 //!
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
+//!
+//! # Checkpoints
+//!
+//! [`Engine::checkpoint`] writes one snapshot's state to a directory and
+//! [`Engine::recover`] restores it; nothing else touches the filesystem. See
+//! [`CheckpointOptions`] and the format, publication and recovery contract in
+//! the source of `checkpoint.rs`.
 
+mod checkpoint;
 mod worker;
 
+pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, RecoveryError};
 pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
@@ -546,6 +555,8 @@ struct Core {
     /// Held by a compaction from selection to publication, so that runs are
     /// removed by one compaction at a time.
     compacting: Mutex<()>,
+    /// Held by a checkpoint, so that checkpoints run one at a time.
+    checkpointing: Mutex<()>,
     memtable_budget: usize,
     target_run_len: usize,
     snapshot_limits: SnapshotLimits,
@@ -573,7 +584,11 @@ impl Engine {
     /// Creates an empty engine, starting a background compaction worker if
     /// [`EngineOptions::background_compaction`] is set.
     pub fn new(options: EngineOptions) -> Self {
-        let core = Arc::new(Core::new(&options));
+        Self::start(Arc::new(Core::new(&options)), &options)
+    }
+
+    /// Wraps `core`, starting its worker if `options` ask for one.
+    fn start(core: Arc<Core>, options: &EngineOptions) -> Self {
         let worker = options
             .background_compaction
             .map(|compaction| worker::start(Arc::clone(&core), compaction));
@@ -738,6 +753,7 @@ impl Core {
             gate: Mutex::new(()),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
+            checkpointing: Mutex::new(()),
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             snapshot_limits: options.snapshots,

@@ -26,6 +26,7 @@
 #   scripts/validate.sh bloom              filtered against unfiltered point lookups
 #   scripts/validate.sh filtercost         key filter construction cost by component (5J)
 #   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
+#   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs then VM disk (5L)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -124,12 +125,18 @@ bounded() {
     --label "$run_label" \
     --memory "$memory" --memory-swap "$memory" --cpus "$cpus" --pids-limit "$pids" \
     --ulimit core=0 --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,exec,size=512m,mode=1777 \
     --volume "$source_dir:/work:ro" --volume "$cache_mount" --volume "$crates_mount" \
     ${extra_mounts[@]+"${extra_mounts[@]}"} --workdir /work \
     --env STEP="$label" --env CARGO_HOME=/crates --env CARGO_TARGET_DIR=/cache/target \
     --env CARGO_BUILD_JOBS=2 --env RUST_TEST_THREADS=2 --env CARGO_NET_OFFLINE="$offline" \
     "$image" sh -c "$INNER" sh "$seconds" "$@"
 }
+
+# /tmp is a 512 MiB tmpfs, charged to the container's memory, so checkpoint
+# tests write only to bounded scratch space that disappears with the
+# container. fsync is free there; durability is not what those tests check.
+# It must allow exec: rustdoc runs merged doctest binaries from /tmp.
 
 # The one writable path in the repository is Cargo.lock, mounted over the
 # read-only source. `cargo fetch` honours existing pins and never compiles.
@@ -225,6 +232,13 @@ filtercost() {
   bounded filtercost 900 cargo run --locked --release --example block_bench -- filtercost
 }
 
+# The second run writes into the cache volume, on the VM's disk, so that
+# fsync costs something; the benchmark removes its directory.
+checkpoint() {
+  bounded checkpoint-tmpfs 900 cargo run --locked --release --example block_bench -- checkpoint /tmp
+  bounded checkpoint-disk 900 cargo run --locked --release --example block_bench -- checkpoint /cache
+}
+
 operate() {
   bounded operate 1800 cargo run --locked --release --features diagnostics --example block_bench -- operate
 }
@@ -305,7 +319,8 @@ case "$command" in
   bloom) bloom ;;
   filtercost) filtercost ;;
   operate) operate ;;
+  checkpoint) checkpoint ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,30p' "$0"; exit 2 ;;
+  *) sed -n '2,31p' "$0"; exit 2 ;;
 esac
