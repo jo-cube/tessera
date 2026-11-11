@@ -252,48 +252,58 @@ a baseline, not a target. Times include the counting allocator.
 
 ### Findings
 
-Same reference environment, three passes. Times differ between passes by a
-median of 5.5% and by up to 41%, the largest being `json` traversal. Freezing is
-at or below the timer's resolution, about 40 ns, and allocates nothing.
+Reference environment, one pass of the copy-on-write B+ tree (32 entries per
+node) and one of the `BTreeMap` memtable it replaced (5E), in the same session.
+Earlier passes of this benchmark differed between runs by a median of 5.5% and
+by up to 41%, the largest being `json` traversal, so differences under about
+10% are noise. Freezing is at or below the timer's resolution, about 40 ns, and
+allocates nothing.
 
-| dataset, random order | payload MiB | charged MiB | requested MiB | RSS MiB | RSS after overwrite | RSS/charged |
+| dataset, random order | payload MiB | charged MiB | requested MiB (5E) | RSS MiB (5E) | RSS after overwrite | RSS/charged |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| json | 17.1 | 38.2 | 27.4 | 32.0 | 33.3 | 0.84 |
-| tiny | 10.6 | 63.0 | 36.1 | 52.1 | 55.4 | 0.83 |
-| large | 16.0 | 16.5 | 16.3 | 16.4 | 16.4 | 0.99 |
+| json | 17.1 | 38.2 | 29.2 (27.4) | 31.3 (32.0) | 32.7 | 0.82 |
+| tiny | 10.6 | 63.0 | 41.6 (36.1) | 48.9 (52.1) | 52.2 | 0.78 |
+| large | 16.0 | 16.5 | 16.3 (16.3) | 16.4 (16.4) | 16.4 | 0.99 |
 
-| ns per operation | sequential insert | random insert | random overwrite | random delete | get hit | get miss | traversal per record |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| json | 216 | 744 | 556 | 542 | 475 | 469 | 8.6 |
-| tiny | 216 | 882 | 669 | 658 | 606 | 618 | 13.4 |
-| large | 286 | 512 | 451 | 149 | 109 | 104 | 2.1 |
+In sorted order the tree requests less than the map did: 26.5 against 30.0 MiB
+for `json` and 34.8 against 42.7 MiB for `tiny`, because appending splits leave
+the left node full.
+
+| ns per operation (5E) | sequential insert | random insert | random overwrite | random delete | get hit | traversal per record |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| json | 93 (226) | 637 (770) | 768 (589) | 700 (551) | 456 (483) | 4.7 (9.6) |
+| tiny | 86 (215) | 740 (931) | 871 (723) | 940 (685) | 574 (599) | 8.0 (14.1) |
+| large | 228 (295) | 544 (509) | 573 (428) | 237 (141) | 145 (104) | 2.6 (2.1) |
 
 | flush | target MiB | runs | stored/payload | ms | payload MiB/s | peak collected MiB | peak streamed MiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| json | 64 | 1 | 0.202 | 34 | 498 | 7.6 | 7.6 |
-| json | 4 | 5 | 0.202 | 34 | 502 | 4.5 | 1.8 |
-| tiny | 64 | 1 | 0.547 | 58 | 183 | 14.0 | 14.0 |
-| tiny | 4 | 5 | 0.547 | 58 | 185 | 7.5 | 3.4 |
-| large | 64 | 1 | 0.507 | 12 | 1329 | 24.4 | 24.4 |
-| large | 4 | 5 | 0.507 | 12 | 1364 | 10.1 | 4.1 |
+| json | 64 | 1 | 0.202 | 34 | 506 | 7.6 | 7.6 |
+| json | 4 | 5 | 0.202 | 33 | 519 | 4.5 | 1.8 |
+| tiny | 64 | 1 | 0.547 | 56 | 189 | 14.0 | 14.0 |
+| tiny | 4 | 5 | 0.547 | 56 | 191 | 7.5 | 3.4 |
+| large | 64 | 1 | 0.507 | 12 | 1330 | 24.4 | 24.4 |
+| large | 4 | 5 | 0.507 | 12 | 1373 | 10.1 | 4.1 |
 
 - Measured RSS growth stayed at or below the charge in all six insert cases,
-  including after overwriting. The margins are small: `large` reached 16.5 MiB
-  against 16.5 charged and `tiny` in sorted order 62.0 against 63.0. That is an
-  observation on these datasets and this allocator, not a limit. The 128-byte
-  entry charge is calculated for a worst-case `BTreeMap` occupancy that no
-  dataset here reaches.
+  including after overwriting, and the 128-byte entry charge still covers the
+  tree's per-entry overhead with the same margin. That is an observation on
+  these datasets and this allocator, not a limit.
 - Amplification is a small-record problem. Requested memory is 1.02 times the
-  payload at 4 KiB values, 1.6 to 1.8 at 100 bytes and 3.4 to 4.0 at 26 bytes.
-- An insert makes 2.13 to 2.17 allocations: its key, its value and a share of
-  a `BTreeMap` node. An overwrite makes one, a delete, a lookup and a traversal
-  none, and a freeze none.
-- Splitting costs nothing measurable in flush time. It does bound what is held: for `large`, the 24.4 MiB peak
-  of one run falls to 10.1 MiB when all five runs are kept and 4.1 MiB when each
-  is released as it is produced. These peaks are on top of the frozen table and
-  leave out Zstandard's own context.
-- Dropping a frozen table takes 11 ms for `json` and 28 ms for `tiny`, because
-  each entry is freed individually.
+  payload at 4 KiB values, 1.6 to 1.7 at 100 bytes and 3.3 to 3.9 at 26 bytes.
+- An entry is one allocation holding its key and value together, so an insert
+  makes 1.10 to 1.14 allocations (5E: 2.13 to 2.17) and an overwrite or delete
+  one. Lookups, traversal and freezing allocate nothing.
+- Sequential inserts are 1.3 to 2.5 times faster and traversal about twice as
+  fast for small records. Overwrites and deletes are 20 to 40% slower and
+  lookups on `large` about 40% slower: the tree compares through a shared
+  pointer at every level and replaces the entry's allocation rather than its
+  value in place. This is the price of sharing nodes with snapshots.
+- Splitting costs nothing measurable in flush time. It does bound what is held:
+  for `large`, the 24.4 MiB peak of one run falls to 10.1 MiB when all five runs
+  are kept and 4.1 MiB when each is released as it is produced. These peaks are
+  on top of the frozen table and leave out Zstandard's own context.
+- Dropping a frozen table takes 12 ms for `json` and 16 ms for `tiny` (5E: 11
+  and 28 ms), because each entry is freed individually.
 
 ## Integrated engine
 
@@ -409,3 +419,169 @@ key range covering everything between the two windows, so the overlap
 measured from key ranges was as high as for random writes (56 runs without
 compaction), and compaction cost as much. Key ranges cannot describe a run
 that is dense in two separate places.
+
+## Snapshots
+
+A snapshot takes a copy-on-write view of the active memtable, so acquisition
+neither copies nor freezes it; later writes copy the tree nodes the view still
+shares and charge them to the memtable's budget as pinned history. Two modes
+measure this on the 173,536-key `json` dataset (values of about 90 bytes) and
+on 4,096 keys with 4 KiB random values (`large`). Each row starts from every
+key put in random order, flushed and compacted with default options.
+
+`scripts/validate.sh snapshot` (about 100 s) measures acquisition against
+table size, the cost moved to writes, reads, a writer under concurrent scans,
+and reclamation. `scripts/validate.sh frequency` (about 30 s, two rounds)
+runs one overwrite pass with a snapshot every N puts. Its configurations are:
+
+- 1, 4 or 16 MiB memtables, and the two value kinds.
+- **catch-up**: no compaction during the pass, with `max_runs` raised to
+  4096, then compaction until nothing is eligible.
+- **background**: the worker with default options and the default `max_runs`
+  of 64. A flush refused at that limit waits for compaction.
+- **lifetime** rows (json, background, every 1,000 puts): each snapshot is
+  held for the next 4,000 or 15,000 puts, or the first is held for the whole
+  pass.
+
+Every snapshot scans one 200-key group. Every tenth also scans a 4,000-key
+tenant, then gets one key and is dropped. Total time runs from the first put
+until flushing and compaction leave nothing eligible, so every configuration
+is compared at the same completion point.
+
+### Findings
+
+Reference environment (2 CPUs), with the uncommitted 5E implementation, which
+froze or copied the active table, measured in the same session as the
+baseline: **freeze** always froze it, **hybrid** copied a table charged at most
+1 MiB and froze a larger one, **copy** always copied. Counts were identical
+across rounds, and times varied by at most about 10% unless a range is given.
+
+**Acquisition** (one thread, so the time is the time the exclusive lock is
+held; each acquisition follows a put, so it takes a new view):
+
+| values | charged | acquire p50 | acquire max | allocations | 5E copy p50 | 5E freeze |
+|---|---|---|---|---|---|---|
+| json | 16 KiB | 42 ns | 250 ns | 3 | 1.3 µs | 126 ns |
+| json | 1 MiB | 42 ns | 333 ns | 3 | 96 µs | 168 ns |
+| json | 4 MiB | 42 ns | 375 ns | 3 | 404 µs | 378 ns |
+| json | 16 MiB | 42 ns | 667 ns | 3 | — | — |
+| large | 4 MiB | 42 ns | 125 ns | 3 | 113 µs | 209 ns |
+| large | 16 MiB | 42 ns | 750 ns | 3 | — | — |
+
+Acquisition is constant in table size. With the base state of 3 runs it is
+42 ns p50 and 84 ns p99 after a put, with 4 allocations; sharing an unchanged
+view is 22–23 ns, 1 allocation and 88 bytes held, as before. No snapshot in
+any mode froze or flushed a table.
+
+**The cost moves to writes** (1,000 overwrites of random keys; pinned and
+freed per overwrite under one held snapshot):
+
+| values | charged | put, no snapshot | put after a fresh snapshot | put under a held snapshot | pinned B/overwrite | heap freed B/overwrite | held drop |
+|---|---|---|---|---|---|---|---|
+| json | 16 KiB | 82 ns | 208 ns | 79 ns | 13 | 13 | 1 µs |
+| json | 1 MiB | 180 ns | 374 ns | 251 ns | 338 | 341 | 25 µs |
+| json | 4 MiB | 250 ns | 517 ns | 532 ns | 779 | 783 | 51 µs |
+| json | 16 MiB | 540 ns | 804 ns | 1,085 ns | 1,225 | 1,229 | 145 µs |
+| large | 4 MiB | 326 ns | 525 ns | 883 ns | 2,618 | 2,622 | 17 µs |
+| large | 16 MiB | 491 ns | 717 ns | 1,406 ns | 3,844 | 3,849 | 40 µs |
+
+The first put after a snapshot copies its path, 120–270 ns more. Under a
+held snapshot, each overwrite of a key the snapshot has not yet diverged on
+copies one leaf and its branches; that is the pinned history, and the
+estimate charged to the budget matched the heap freed on release within 1%.
+
+**Frequency** (flushes are the same for catch-up and background):
+
+| values | budget | every | flushes (5E freeze / hybrid) | acquire p50 / p99 | catch-up total s (5E hybrid) | background rewrite / flushed (never) |
+|---|---|---|---|---|---|---|
+| json | 1 MiB | 100 | 39 (695 / 39) | 84–125 / 250–292 ns | 0.96 (1.15–1.18) | 8.31–8.34 (3.97–4.14) |
+| json | 1 MiB | 1,000 | 39 (70 / 39) | 125 / 417–625 ns | 0.32 (0.35) | 3.24–3.59 |
+| json | 4 MiB | 100 | 10 (695 / 16) | 84 / 250–333 ns | 0.60–0.61 (0.83) | 2.63 (2.63–2.74) |
+| json | 4 MiB | 1,000 | 10 (70 / 14) | 125–166 / 0.4–2.5 µs | 0.26–0.27 (0.23) | 2.63 |
+| json | 16 MiB | 100 | 3 | 84 / 167–416 ns | 0.47–0.48 | 1.83 (1.83) |
+| large | 4 MiB | 100 | 17 (66 / 22) | 84–125 / 375–541 ns | 0.15 | 1.98 (1.98) |
+| large | 16 MiB | 100 | 5 | 84 / 625–750 ns | 0.12 | 1.00 (1.00) |
+
+Without snapshots the same passes flushed 39, 10 and 3 times for json and 67,
+17 and 5 for large values, and catch-up took 0.22–0.25 s for json.
+
+**Lifetimes** (json, background, a snapshot every 1,000 puts):
+
+| held for | budget | flushes (none held) | rewrite / flushed | peak pinned | peak retained | acquire p99 |
+|---|---|---|---|---|---|---|
+| 4,000 puts | 4 MiB | 16 (10) | 3.66 | 1.2 MiB | 8.6 MiB | 0.8–2.8 µs |
+| 4,000 puts | 16 MiB | 4 (3) | 1.63 | 2.9 MiB | 16.1 MiB | 0.8–12.7 µs |
+| 15,000 puts | 4 MiB | 19 (10) | 4.74 | 1.9 MiB | 13.1 MiB | 2.4–2.5 µs |
+| 15,000 puts | 16 MiB | 7 (3) | 2.92 | 9.2 MiB | 24.2 MiB | 6.7–6.8 µs |
+| the first, whole pass | 4 MiB | 10 (10) | 2.63 | 50 KiB | 7.5 MiB | 0.5–0.6 µs |
+| the first, whole pass | 16 MiB | 3 (3) | 1.83 | 50 KiB | 16.0 MiB | 0.5–0.7 µs |
+
+**Concurrent writer** (1 MiB memtables, 21,692 puts with synchronous
+compaction after each flush; readers repeat full scans):
+
+| readers | puts M/s | put p99 | put max | flushes | compaction rewrite | reader acquire p50 / max |
+|---|---|---|---|---|---|---|
+| none | 0.33–0.34 | 0.58–0.75 µs | 7–9 µs | 4 | 3.6 MiB | — |
+| 1 guard | 0.00 | 22 ms | 23–36 ms | 4 | 3.6 MiB | — |
+| 1 snapshot | 0.33 | 0.67–0.75 µs | 2 µs | 4 | 3.6 MiB | 0.5–0.6 / 1.2–2.2 µs |
+| 2 snapshots | 0.33 | 0.63–0.75 µs | 6–8 µs | 4 | 3.6 MiB | 0.3–0.7 / 1.6–2.3 µs |
+
+In 5E, freezing readers reduced throughput to 0.12–0.28 M/s and doubled
+compaction rewrite to 7.4 MiB, and the hybrid's reader acquisition reached
+8–190 µs at its maximum.
+
+**Other measurements** (three rounds):
+
+- **Reads** (2,000 keys overwritten): group scans 52.0–52.2 µs through a
+  snapshot against 52.2–52.5 µs through a guard, and full scans 113–116 ns per
+  record either way. Gets were 110–118 ns through a snapshot and 110–123 ns
+  through `Engine::get`, against 85–91 and 89–99 ns in 5E, about 25% slower
+  on the small active tree; see the memtable findings.
+- **Reclamation**: a snapshot of 3 runs and a 1.5 MiB table, held while every
+  key was overwritten, flushed and compacted away, pinned 0.6 MiB in the
+  memtable and was reported as retaining 7.5 MiB (5E: 5.0 MiB); dropping it
+  freed 4.5 MiB of Rust heap in 312–333 µs (5E: 472–504 µs for a frozen
+  table, 255–263 µs for a copy).
+
+Measured:
+
+- **Snapshots no longer fragment flushes.** In every frequency row, flushes,
+  runs flushed and flushed bytes equal the row without snapshots, at every
+  100, 1,000 and 10,000 puts and every budget, where 5E freezing flushed up to
+  695 times and the hybrid up to 16 and 22 times above its copy limit.
+- **Acquisition is constant.** Median acquisition is 42–125 ns at every table
+  size and frequency, against 52–68 µs for the 5E hybrid and up to 404 µs for
+  copying a 4 MiB table. The lock is held for that time only.
+- **The writer's own time is unchanged.** Catch-up write time minus the
+  snapshots' scans equals the row without snapshots (about 0.11 s for json).
+  The remaining total, 0.96 s against 0.25 s at every 100 puts with 1 MiB
+  tables, is the 1,735 snapshots' own scans and gets.
+- **The cost of a held snapshot is retention, not freezing.** Pinned history
+  grows with what later writes replace, up to 1.2 KiB per json overwrite and
+  3.8 KiB per large one in 16 MiB tables, and counts against the memtable
+  budget, so long-lived snapshots bring flushes forward: 16 and 19 against 10
+  with 4 MiB tables. A snapshot held over a whole pass pins little in the
+  memtable (50 KiB) because the table it saw was flushed early, but keeps the
+  runs it saw: 7.5 and 16 MiB retained at completion.
+- **Background rewrite still depends on pacing.** At every 100 puts with
+  1 MiB tables the worker rewrote 8.31–8.34 times what was flushed against
+  3.97–4.14 without snapshots (5E hybrid 9.23), though flushes were equal and
+  catch-up rewrite was identical (3.08) at every frequency. With 4 and 16 MiB
+  tables it equalled no snapshots.
+
+Hypotheses, not measured:
+
+- The extra background rewrite at 1 MiB comes from compaction pacing: the
+  snapshots' scans slow the pass, so the worker compacts smaller increments
+  more often. Catch-up rewrite being unchanged supports this; no run of the
+  worker with snapshots that do no reads was made.
+- The p99 acquisition outliers of 2.4–12.7 µs, seen mostly while snapshots
+  are held and once without (2.5 µs), are allocator work after a large free
+  or a wait for a worker's publication. The cause was not measured, and the
+  same configuration varied from 0.8 to 12.7 µs between rounds.
+- The retained figure overestimated after release because a released memtable
+  was then charged in full while any snapshot shared it: the heap freed was
+  4.5 of 7.5 MiB. A released table that only views share is now charged the
+  newest view's charge plus the pinned history; these rows predate that.
+- With the default 64 MiB budget, the pinned history a snapshot causes would
+  be bounded by the same budget; only 1, 4 and 16 MiB tables were measured.

@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::block::Value;
-use tessera::engine::{CompactionOptions, Engine, EngineOptions, EngineWorkspace, UpdateError};
+use tessera::engine::{
+    CompactionOptions, Engine, EngineOptions, EngineWorkspace, Snapshot, UpdateError,
+};
+use tessera::memtable::WriteError;
 use tessera::run::{
     CONTEXT_ALLOWANCE, CompactError, CompactLimits, Compacted, ConflictingCopies, MergeWorkspace,
     ReadError, ReadWorkspace, Run, RunBuilder, compact,
@@ -256,6 +259,32 @@ fn everything(engine: &Engine) -> Vec<(Vec<u8>, Vec<u8>)> {
         out.push((record.key.to_vec(), record.value.to_vec()));
     }
     out
+}
+
+type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
+fn snapshot_contents(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut workspace = EngineWorkspace::new();
+    let mut scan = snapshot.scan(&mut workspace);
+    let mut out = Vec::new();
+    while let Some(record) = scan.next_record().unwrap() {
+        out.push((record.key.to_vec(), record.value.to_vec()));
+    }
+    out
+}
+
+/// A snapshot equals the model as it was when the snapshot was taken.
+fn check_snapshot(snapshot: &Snapshot, then: &Model, pool: &[Vec<u8>]) {
+    let expected: Vec<_> = then.clone().into_iter().collect();
+    assert_eq!(snapshot_contents(snapshot), expected);
+    let mut workspace = EngineWorkspace::new();
+    for key in pool {
+        let found = snapshot.get(key, &mut workspace).unwrap();
+        assert_eq!(
+            found.map(|found| found.value.to_vec()),
+            then.get(key).cloned()
+        );
+    }
 }
 
 fn compact_fully(engine: &Engine) {
@@ -542,9 +571,10 @@ enum Stage<'e> {
     Built(tessera::engine::BuiltCompaction<'e>),
 }
 
-/// Writes, flushes and partial compactions, staged so that writes and flushes
-/// land between selection, build and publication. After every step reads
-/// equal the latest-update map, and every report adds up.
+/// Writes, flushes, snapshots and partial compactions, staged so that writes
+/// and flushes land between selection, build and publication. After every
+/// step reads equal the latest-update map, every report adds up, and a
+/// retained snapshot still equals the map as it was when it was taken.
 #[test]
 fn randomized_compactions_match_an_independent_model() {
     const SEEDS: u64 = 30;
@@ -556,6 +586,7 @@ fn randomized_compactions_match_an_independent_model() {
         .chain([Vec::new(), vec![0xFF; 3]])
         .collect();
     let (mut compactions, mut incomplete, mut dropped_tombstones) = (0, 0, 0);
+    let (mut snapshots, mut outlived, mut refused) = (0, 0, 0);
 
     // Then a few seeds again with a background worker compacting beside the
     // staged manual compactions. Counts come from the manual seeds only.
@@ -570,26 +601,62 @@ fn randomized_compactions_match_an_independent_model() {
                 max_overlap: 1 + seed as usize % 3,
                 ..CompactionOptions::default()
             }),
+            // Odd seeds use small memtables, which the history pinned by
+            // snapshots fills, so writes are refused and retried after a flush.
+            memtable_budget: if seed % 2 == 0 { 64 << 20 } else { 4 << 10 },
             ..EngineOptions::default()
         });
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         let mut stage = Stage::Idle;
         let mut workspace = MergeWorkspace::new();
+        let mut held: Vec<(Snapshot, Model)> = Vec::new();
 
         for _ in 0..OPERATIONS {
             match rng.below(100) {
-                0..=59 => {
-                    let key = pool[rng.below(pool.len())].clone();
-                    if rng.below(4) == 0 {
-                        engine.delete(&key).unwrap();
-                        model.remove(&key);
-                    } else {
-                        let len = if rng.below(10) == 0 { 3_000 } else { 12 };
-                        let value: Vec<u8> =
-                            (0..rng.below(len)).map(|_| rng.next() as u8).collect();
-                        engine.put(&key, &value).unwrap();
-                        model.insert(key, value);
+                55..=59 if held.len() >= 6 || (!held.is_empty() && rng.below(3) == 0) => {
+                    held.swap_remove(rng.below(held.len()));
+                }
+                55..=59 => match engine.snapshot() {
+                    Ok(snapshot) => {
+                        assert_eq!(snapshot.last_seq(), engine.stats().last_seq);
+                        held.push((snapshot, model.clone()));
+                        snapshots += 1;
                     }
+                    Err(error) => panic!("seed {seed}: {error}"),
+                },
+                0..=54 => {
+                    let key = pool[rng.below(pool.len())].clone();
+                    let value = (rng.below(4) != 0).then(|| {
+                        let len = if rng.below(10) == 0 { 3_000 } else { 12 };
+                        (0..rng.below(len))
+                            .map(|_| rng.next() as u8)
+                            .collect::<Vec<u8>>()
+                    });
+                    let write = |engine: &Engine| match &value {
+                        Some(value) => engine.put(&key, value),
+                        None => engine.delete(&key),
+                    };
+                    if let Err(error) = write(&engine) {
+                        assert!(
+                            matches!(
+                                error,
+                                UpdateError::Rejected(WriteError::BudgetExceeded { .. })
+                            ),
+                            "seed {seed}: {error}"
+                        );
+                        // A refused write changed nothing that reads can see.
+                        assert_eq!(
+                            everything(&engine),
+                            model.clone().into_iter().collect::<Vec<_>>()
+                        );
+                        refused += 1;
+                        engine.flush().unwrap();
+                        write(&engine).unwrap();
+                    }
+                    match value {
+                        Some(value) => model.insert(key, value),
+                        None => model.remove(&key),
+                    };
                 }
                 60..=74 => {
                     engine.flush().unwrap();
@@ -655,6 +722,10 @@ fn randomized_compactions_match_an_independent_model() {
                     "seed {seed}, background {background}"
                 );
             }
+            if !held.is_empty() {
+                let (snapshot, then) = &held[rng.below(held.len())];
+                check_snapshot(snapshot, then, &pool);
+            }
         }
         drop(stage);
         engine.flush().unwrap();
@@ -672,7 +743,22 @@ fn randomized_compactions_match_an_independent_model() {
             expected,
             "seed {seed}, background {background}"
         );
+        // Everything a snapshot saw has since been flushed and compacted
+        // away, and the snapshot still reads it.
+        for (snapshot, then) in &held {
+            check_snapshot(snapshot, then, &pool);
+        }
+        outlived += held.len();
+        let stats = engine.stats();
+        assert_eq!(stats.snapshots, held.len());
+        assert!(held.is_empty() <= (stats.retained_bytes == 0));
+        drop(held);
+        let stats = engine.stats();
+        assert_eq!((stats.snapshots, stats.retained_bytes), (0, 0));
     }
+    assert!(snapshots > 300, "{snapshots}");
+    assert!(refused > 0, "{refused}");
+    assert!(outlived > 20, "{outlived}");
     assert!(compactions > 300, "{compactions}");
     assert!(incomplete > 50, "{incomplete}");
     assert!(dropped_tombstones > 50, "{dropped_tombstones}");

@@ -3,7 +3,7 @@
 Tessera aims to become a RAM-first, compressed LSM key-value database written
 in Rust.
 
-## Status: Milestone 5D
+## Status: Milestone 5E
 
 Two physical storage layers exist, with mutable storage above them.
 
@@ -42,28 +42,49 @@ An input is not decoded until the merge reaches its smallest key.
 order. The newest sequence number decides a key, and a tombstone hides it.
 Identical copies of a record count once. Copies that differ fail the read
 with `ReadError::ConflictingCopies`, because run order must not choose a winner.
-There are no snapshots: a reader sees the newest version only.
+A run set has no snapshots of its own: it reads the newest version only.
 Key ranges exclude runs that cannot hold a key or prefix, without decoding them.
 
 The byte formats and their invariants are documented in
 [`src/block/mod.rs`](src/block/mod.rs) and [`src/run/mod.rs`](src/run/mod.rs).
 
 A **memtable** holds the latest update of each key in memory, in key order,
-under a memory budget. The caller supplies strictly increasing sequence numbers
-and a rejected update changes nothing. Freezing consumes the table, and a
-`FrozenMemtable` builds compressed runs on demand, one at a time, keeping every
-tombstone. A frozen table is only borrowed by a flush, so a flush can be
-repeated.
+under a memory budget. It is a copy-on-write B+ tree whose nodes and updates
+are shared by reference count, so `Memtable::snapshot` returns the current
+tree as a `FrozenMemtable` in constant time and later writes copy only the
+nodes on their path that a snapshot still shares. What they copy or replace is
+charged to the table's budget as `pinned` until the snapshot is dropped. The
+caller supplies strictly increasing sequence numbers and a rejected update
+changes nothing. Freezing consumes the table, and a `FrozenMemtable` builds
+compressed runs on demand, one at a time, keeping every tombstone. A frozen
+table is only borrowed by a flush, so a flush can be repeated.
 
 An **`Engine`** combines them: `put`, `delete`, `get`, ordered and prefix scans,
 and an explicit synchronous `flush`. It assigns sequence numbers and holds one
-active memtable, at most one frozen memtable and the published runs behind a
-single reader-writer lock, with a gate that keeps readers from starving writers.
-Single-key reads and writes are linearizable. A `ReadGuard` gives a stable view
-for scans and **blocks writers while held**. A flush freezes the active table,
-compresses outside the lock, and publishes its runs while removing the frozen
-table in one step; an abandoned or rejected flush leaves the table readable for
-a retry. Memtable budgets and limits on run count and bytes bound what is kept.
+active memtable, frozen memtables awaiting flush and the published runs behind
+a single reader-writer lock, with a gate that keeps readers from starving
+writers. Single-key reads and writes are linearizable. A `ReadGuard` gives a
+stable view for a few reads and **blocks writers while held**. A flush freezes
+the active table, compresses outside the lock, and publishes its runs while
+removing the frozen tables in one step; an abandoned or rejected flush leaves
+the tables readable for a retry. Memtable budgets and limits on run count and
+bytes bound what is kept.
+
+**Snapshots** give long scans a stable view without the lock.
+`Engine::snapshot` takes, under the exclusive lock and in constant time per
+source, a memtable snapshot of the active table and shared references to the
+frozen tables and published runs. Nothing is copied, frozen or flushed for it.
+It sees exactly the writes up to its `last_seq` while writes, flushes and
+compactions continue, can be sent between threads and may outlive the engine.
+Flushes and compactions still keep only the latest version of each key: a
+snapshot keeps the sources it saw instead of asking the engine for older
+versions, and sources the engine releases stay alive until the last snapshot
+holding them is dropped. The history a snapshot pins in a memtable counts
+against that memtable's budget, so a long-lived snapshot brings flushes
+forward instead of growing memory. `SnapshotLimits` bound live snapshots and
+retained bytes; over the retained limit, new snapshots and compactions are
+refused, which is the backpressure. `EngineStats` reports what snapshots
+retain.
 
 **Compaction** is explicit and synchronous. `compact` merges runs into new
 disjoint runs that keep only the newest version of each key, collapse identical
@@ -85,8 +106,9 @@ retried until the next flush. `wait_for_compaction` asks for a pass and waits
 for its outcome; dropping the engine finishes the compaction in progress and
 joins the thread.
 
-There is no Bloom filter, MVCC, snapshot older than the present, write-ahead
-log or persistence, and flushing never happens in the background.
+There is no Bloom filter, transaction, sequence-filtered read of the runs,
+snapshot of a state older than the call, write-ahead log or persistence, and
+flushing never happens in the background.
 
 ## Validate
 
@@ -109,6 +131,8 @@ scripts/validate.sh ranges   # key-range pruning measurements
 scripts/validate.sh memtable # memtable and flush measurements
 scripts/validate.sh engine   # integrated engine measurements
 scripts/validate.sh compaction # sustained writes: none, sync and background compaction
+scripts/validate.sh snapshot # snapshots compared with read guards
+scripts/validate.sh frequency # frequent and long-lived snapshots
 colima stop
 ```
 

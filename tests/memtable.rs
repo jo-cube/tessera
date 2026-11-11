@@ -328,6 +328,7 @@ fn an_entry_is_charged_its_key_value_and_overhead() {
         MemoryUsage {
             payload: 3 + 5 + 4,
             charged: 3 + 5 + 4 + 2 * ENTRY_OVERHEAD,
+            pinned: 0,
             budget: ROOMY
         }
     );
@@ -1024,4 +1025,141 @@ fn randomized_updates_match_an_independent_model_across_flushes() {
     for reason in ["key", "value", "sequence", "record", "budget"] {
         assert!(rejected.get(reason).copied().unwrap_or(0) > 0, "{reason}");
     }
+}
+
+fn entries_from(table: &FrozenMemtable, start: &[u8]) -> Vec<Entry> {
+    table.iter_from(start).map(owned).collect()
+}
+
+/// Snapshots of a table under random writes, across enough keys for the tree
+/// to split several levels deep. Each snapshot must keep exactly the model it
+/// was taken with, whatever is written, rejected or dropped after it, and the
+/// pinned charge must stay within the budget and vanish with the snapshots.
+#[test]
+fn snapshots_keep_their_state_through_random_writes() {
+    const SEEDS: u64 = 12;
+    const OPERATIONS: usize = 6_000;
+
+    let pool: Vec<Vec<u8>> = (0..3_000u32)
+        .map(|i| {
+            (i.wrapping_mul(2_654_435_761) % 100_000)
+                .to_be_bytes()
+                .to_vec()
+        })
+        .chain([Vec::new(), vec![0xFF; 5]])
+        .collect();
+    let (mut taken, mut refused) = (0, 0);
+    for seed in 0..SEEDS {
+        let mut rng = Rng(seed);
+        let budget = [1 << 24, 400_000][seed as usize % 2];
+        let mut table = Memtable::new(budget, None);
+        let mut model = Model::new();
+        let mut held: Vec<(FrozenMemtable, Vec<Entry>)> = Vec::new();
+        let mut seq = 0;
+
+        for op in 0..OPERATIONS {
+            match rng.below(100) {
+                0..=1 if held.len() < 8 => {
+                    held.push((table.snapshot(), sorted_entries(&model)));
+                    taken += 1;
+                }
+                2..=3 if !held.is_empty() => {
+                    let (snapshot, then) = held.swap_remove(rng.below(held.len()));
+                    assert_eq!(frozen_contents(&snapshot), then, "seed {seed}");
+                }
+                _ => {
+                    let key = &pool[rng.below(pool.len())];
+                    let value: Option<Vec<u8>> = (rng.below(5) != 0)
+                        .then(|| (0..rng.below(60)).map(|_| rng.next() as u8).collect());
+                    seq += 1;
+                    // Contents are compared with the model at checkpoints.
+                    let before = (table.memory(), table.len(), table.last_seq());
+                    let result = match &value {
+                        Some(value) => table.put(key, seq, value),
+                        None => table.delete(key, seq),
+                    };
+                    match result {
+                        Ok(()) => {
+                            model.insert(key.clone(), (seq, value));
+                        }
+                        Err(WriteError::BudgetExceeded { .. }) => {
+                            let after = (table.memory(), table.len(), table.last_seq());
+                            assert_eq!(after, before, "seed {seed}");
+                            refused += 1;
+                        }
+                        Err(error) => panic!("seed {seed}: {error}"),
+                    }
+                }
+            }
+            let memory = table.memory();
+            assert!(memory.charged <= memory.budget, "seed {seed}");
+            assert_eq!(memory.charged, total_charge(&model) + memory.pinned);
+            if held.is_empty() {
+                assert_eq!(memory.pinned, 0, "seed {seed}");
+            }
+            if op % 250 == 0 {
+                assert_eq!(contents(&table), sorted_entries(&model), "seed {seed}");
+                for (snapshot, then) in &held {
+                    assert_eq!(&frozen_contents(snapshot), then, "seed {seed}");
+                    let start = &pool[rng.below(pool.len())];
+                    let from: Vec<Entry> = then.iter().filter(|e| e.0 >= *start).cloned().collect();
+                    assert_eq!(entries_from(snapshot, start), from, "seed {seed}");
+                    let probe = &pool[rng.below(pool.len())];
+                    let found = snapshot.get(probe).map(|version| version.seq);
+                    let wanted = then.iter().find(|e| &e.0 == probe).map(|e| e.1);
+                    assert_eq!(found, wanted, "seed {seed}");
+                }
+            }
+        }
+        let final_entries = sorted_entries(&model);
+        for (snapshot, then) in &held {
+            assert_eq!(&frozen_contents(snapshot), then, "seed {seed}");
+        }
+        drop(held);
+        assert_eq!(table.memory().pinned, 0);
+        assert_eq!(table.memory().charged, total_charge(&model));
+        let frozen = table.freeze();
+        assert_eq!(frozen_contents(&frozen), final_entries);
+    }
+    assert!(taken > 200, "{taken}");
+    assert!(refused > 0, "{refused}");
+}
+
+/// A snapshot of an untouched table pins nothing, an overwrite pins its
+/// leaf and old value once, and a write the budget refuses pins nothing.
+#[test]
+fn a_snapshot_pins_only_what_later_writes_replace() {
+    let mut table = Memtable::new(4_000, None);
+    table.put(b"a", 1, &[1; 100]).unwrap();
+    table.put(b"b", 2, &[1; 100]).unwrap();
+    let charged = table.memory().charged;
+    let snapshot = table.snapshot();
+    assert_eq!(table.memory().pinned, 0);
+    assert_eq!(snapshot.memory().charged, charged);
+
+    table.put(b"a", 3, &[2; 100]).unwrap();
+    let once = table.memory().pinned;
+    assert!(once > 100);
+    // The leaf is now the table's own, so only the old value is pinned.
+    table.put(b"b", 4, &[2; 100]).unwrap();
+    let twice = table.memory().pinned;
+    assert!(twice > once && twice - once < once);
+    // Overwriting a value no snapshot shares pins nothing more.
+    table.put(b"b", 5, &[3; 100]).unwrap();
+    assert_eq!(table.memory().pinned, twice);
+
+    let before = state(&table);
+    let large = vec![0; 4_000 - table.memory().charged];
+    assert!(matches!(
+        table.put(b"c", 6, &large),
+        Err(WriteError::BudgetExceeded { .. })
+    ));
+    assert_eq!(state(&table), before);
+    assert_eq!(
+        frozen_contents(&snapshot),
+        vec![put(b"a", 1, &[1; 100]), put(b"b", 2, &[1; 100])]
+    );
+    drop(snapshot);
+    assert_eq!(table.memory().pinned, 0);
+    assert_eq!(table.memory().charged, charged);
 }

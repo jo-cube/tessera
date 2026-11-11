@@ -12,7 +12,7 @@ use std::thread;
 use tessera::block::MAX_KEY_LEN;
 use tessera::engine::{
     BuiltFlush, Engine, EngineOptions, EngineStats, EngineWorkspace, FlushError, FlushJob,
-    ReadGuard, UpdateError,
+    ReadGuard, SnapshotLimits, UpdateError,
 };
 use tessera::memtable::{ENTRY_OVERHEAD, WriteError};
 
@@ -359,7 +359,7 @@ fn a_frozen_table_receives_no_later_writes() {
     engine.put(b"a", b"frozen").unwrap();
     let job = engine.begin_flush().unwrap();
     engine.put(b"a", b"during").unwrap();
-    assert_eq!(job.table().len(), 1);
+    assert_eq!(job.tables().map(|table| table.len()).sum::<usize>(), 1);
     let built = job.build();
     assert_eq!(built.runs()[0].len(), 1);
     built.publish().unwrap();
@@ -393,21 +393,21 @@ fn a_retry_does_not_freeze_the_newer_active_table() {
     let before = engine.stats().active;
 
     let job = engine.begin_flush().unwrap();
-    assert_eq!(job.table().len(), 1);
+    assert_eq!(job.tables().map(|table| table.len()).sum::<usize>(), 1);
     assert_eq!(engine.stats().active, before);
     job.build().publish().unwrap();
     assert_eq!(engine.stats().active, before);
 }
 
 #[test]
-fn a_full_flush_finishes_a_retry_and_then_the_active_table() {
+fn a_full_flush_writes_a_retried_table_and_the_active_one_as_one_set_of_runs() {
     let engine = engine();
     engine.put(b"a", b"v").unwrap();
     drop(engine.begin_flush().unwrap());
     engine.put(b"b", b"v").unwrap();
 
     let report = engine.flush().unwrap();
-    assert_eq!((report.tables, report.records, report.runs), (2, 2, 2));
+    assert_eq!((report.tables, report.records, report.runs), (2, 2, 1));
     let stats = engine.stats();
     assert!(no_frozen(stats));
     assert_eq!(stats.active.payload, 0);
@@ -1035,6 +1035,7 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
             max_run_bytes: usize::MAX,
             last_seq: 0,
             background_compaction: None,
+            snapshots: SnapshotLimits::default(),
         });
         let mut model = Model::new();
         // Charged per key in the active table, and whether one table is frozen.

@@ -15,6 +15,8 @@
 #   scripts/validate.sh memtable           memtable and flush measurements
 #   scripts/validate.sh engine             integrated engine measurements
 #   scripts/validate.sh compaction         sustained writes, three compaction modes
+#   scripts/validate.sh snapshot           snapshots compared with read guards
+#   scripts/validate.sh frequency          frequent and long-lived snapshots
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -178,6 +180,14 @@ compaction() {
   bounded compaction 900 cargo run --locked --release --example block_bench -- compaction
 }
 
+snapshot() {
+  bounded snapshot 900 cargo run --locked --release --example block_bench -- snapshot
+}
+
+frequency() {
+  bounded frequency 900 cargo run --locked --release --example block_bench -- snapshot-frequency
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -239,7 +249,9 @@ case "$command" in
   memtable) memtable ;;
   engine) engine ;;
   compaction) compaction ;;
+  snapshot) snapshot ;;
+  frequency) frequency ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,19p' "$0"; exit 2 ;;
+  *) sed -n '2,21p' "$0"; exit 2 ;;
 esac

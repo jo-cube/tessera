@@ -1,7 +1,7 @@
 //! A minimal in-memory key-value engine over memtables and runs.
 //!
-//! An [`Engine`] owns one active memtable, at most one frozen memtable awaiting
-//! flush, the published immutable runs, and the sequence counter:
+//! An [`Engine`] owns one active memtable, frozen memtables awaiting flush,
+//! the published immutable runs, and the sequence counter:
 //!
 //! ```
 //! use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
@@ -29,14 +29,18 @@
 //! order is visibility order and each successful write has one position in it.
 //! A read holds the lock shared, so reads and writes of a key are linearizable.
 //!
-//! A [`ReadGuard`] holds the lock for as long as it lives, so everything read
-//! through it, including a whole scan, sees one state. **Writers and flush
-//! publication wait while a guard is held**, so a long scan blocks them. A
-//! waiting writer holds back new readers, so readers cannot starve it, and
-//! each write waits for at most the guards already held.
-//! Memtables keep only the latest update per key, so a sequence number could
-//! not recreate an earlier state; holding the lock is what makes a scan
-//! consistent.
+//! There are two ways to make several reads agree:
+//!
+//! - A [`ReadGuard`] holds the lock for as long as it lives, so everything
+//!   read through it sees one state. **Writers and publication wait while a
+//!   guard is held**, so use one only for a few reads. A waiting writer holds
+//!   back new readers, so readers cannot starve it, and each write waits for
+//!   at most the guards already held.
+//! - A [`Snapshot`] holds no lock. See [Snapshots](self#snapshots).
+//!
+//! [`Engine::get`] holds the lock only for its own read, and sees every write
+//! that returned before it began. A snapshot's reads see the state when it
+//! was taken, which grows older as writes continue.
 //!
 //! Do not call a method of the [`Engine`] on a thread that holds a guard: a
 //! write would deadlock, and so can a read once a writer is waiting. Use the
@@ -56,19 +60,47 @@
 //! engine usable, and so does a panic in the background worker, which stops
 //! it. [`Engine::new`] panics if the worker's thread cannot be created.
 //!
+//! # Snapshots
+//!
+//! [`Engine::snapshot`] takes, under the exclusive lock and in constant time
+//! per source, a [`Memtable::snapshot`] of the active table and shared
+//! references to the frozen tables and the published runs. The memtable is a
+//! copy-on-write tree, so its snapshot shares every node, and later writes
+//! copy only the nodes they change that a snapshot still shares. Nothing is
+//! frozen or flushed for a snapshot, and taking one costs the same whatever
+//! the size of the table.
+//!
+//! Every source a snapshot holds is immutable, so it reads without the lock,
+//! in the same newest-first order as the engine, and sees exactly the writes
+//! up to its [`last_seq`](Snapshot::last_seq), tombstones included, while
+//! writes, flushes and compactions continue. The acquisition point is the
+//! moment it holds the lock, between two writes.
+//!
+//! A snapshot keeps the sources it saw rather than asking the engine for
+//! versions later, so flushes and compactions keep only the latest version of
+//! each key: no reader of an older state ever reads their output. A flush or
+//! compaction that removes a source from the engine leaves it to the
+//! snapshots holding it, and it is freed with the last of them. A snapshot
+//! taken with nothing written since the previous one shares that one's view.
+//!
+//! [`SnapshotLimits`] bound the live snapshots and the bytes kept only for
+//! them; see [Memory](self#memory). A refused snapshot changes nothing.
+//!
 //! # Flushing
 //!
 //! Flushing is explicit. [`Engine::flush`] does the whole job, and
 //! [`Engine::begin_flush`] exposes its stages:
 //!
-//! 1. The active memtable is frozen and replaced, under the lock.
-//! 2. Runs are built without the lock, so reads and writes continue.
-//! 3. The runs are published and the frozen table is removed in one step under
-//!    the lock.
+//! 1. The active memtable is frozen and replaced, under the lock, unless
+//!    frozen tables are waiting from an abandoned or refused flush.
+//! 2. Runs are built from every frozen table without the lock, so reads and
+//!    writes continue.
+//! 3. The runs are published and the tables they came from are removed in one
+//!    step under the lock.
 //!
-//! The frozen table stays readable throughout, and no reader sees its runs
-//! until they replace it. A flush abandoned or rejected at any stage leaves the
-//! frozen table in place, and the next flush retries it.
+//! Frozen tables stay readable throughout, and no reader sees their runs
+//! until they replace them. A flush abandoned or rejected at any stage leaves
+//! the tables frozen, and the next flush retries them.
 //!
 //! # Compaction
 //!
@@ -111,9 +143,15 @@
 //!
 //! # Memory
 //!
-//! Mutable memory is limited by two memtable budgets, the active and at most
-//! one frozen table. When the active table is full a write is rejected with
-//! [`WriteError::BudgetExceeded`] and the caller should flush.
+//! Memtables are limited to two budgets in all: the active table and at most
+//! one frozen table, or several left by abandoned flushes, whose charge
+//! lowers the active table's budget until a flush removes them. When the
+//! active table is full a write is rejected with [`WriteError::BudgetExceeded`]
+//! and the caller should flush. A table's charge includes the nodes and values
+//! its writes copied or replaced while a snapshot still shares them
+//! ([`MemoryUsage::pinned`]), so the two budgets bound the memtables together
+//! with the history their snapshots pin, and a long-lived snapshot makes
+//! flushes come sooner rather than letting memory grow.
 //!
 //! Published runs are limited by a count and a byte total. Once a flush would
 //! exceed either limit it is rejected, and writes stop when the memtables are
@@ -127,12 +165,28 @@
 //! delays publication rather than keeping old runs. Run bytes can therefore
 //! briefly be the published total plus one output, beside two memtable
 //! budgets and one workspace. A compaction is refused only if it would leave
-//! more runs or bytes than both the limits and what it replaces.
+//! more runs or bytes than both the limits, or what it replaces.
 //!
 //! When flushes outpace compaction, the run limits reject flushes, the
 //! memtables fill and writes are rejected with
 //! [`WriteError::BudgetExceeded`]. Nothing waits on its own. A caller can
 //! [`Engine::wait_for_compaction`] and retry.
+//!
+//! Snapshots keep memory in two ways, both reported as
+//! [`EngineStats::retained_bytes`]: the history pinned in the engine's
+//! memtables, within their budgets, and the memtables and runs the engine
+//! has released but snapshots still hold. A released memtable is charged in
+//! full while a snapshot holds it; one that only snapshots of the earlier,
+//! still writable table share is charged the newest such snapshot's charge
+//! plus the history pinned since the oldest, fixed when it is released and
+//! dropped once none lives. Each live snapshot holds at most the
+//! state it saw, so the total depends on what is flushed and compacted while
+//! it lives. While it exceeds [`SnapshotLimits::max_retained_bytes`], new
+//! snapshots are refused and so are compactions, whose output would be held
+//! beside inputs that snapshots keep. That is the backpressure: runs then
+//! accumulate until flushes and finally writes are refused, until snapshots
+//! are dropped. Each reader's [`EngineWorkspace`] adds one decoded block per
+//! run it reads.
 //!
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
@@ -142,10 +196,14 @@ mod worker;
 pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 
 use crate::block::{Record, Value, Version};
-use crate::memtable::{FrozenMemtable, MemoryUsage, Memtable, Records, TARGET_RUN_LEN, WriteError};
+use crate::memtable::{
+    FrozenMemtable, MemoryUsage, Memtable, Records, TARGET_RUN_LEN, WriteError, flush_merged,
+};
 use crate::run::{
     CompactError, CompactLimits, CompactStats, LiveRecord, LiveValue, LogicalCursor,
     LogicalWorkspace, MergeWorkspace, ReadError, Run, RunView, compact, latest_in,
@@ -188,11 +246,13 @@ pub struct EngineOptions {
     /// Starts a background worker that compacts with these options whenever
     /// a flush publishes runs. See [Background compaction](self#background-compaction).
     pub background_compaction: Option<CompactionOptions>,
+    /// Limits on [`Engine::snapshot`].
+    pub snapshots: SnapshotLimits,
 }
 
 impl Default for EngineOptions {
-    /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs, and no
-    /// background compaction.
+    /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs, no
+    /// background compaction, and the default snapshot limits.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -201,9 +261,68 @@ impl Default for EngineOptions {
             max_run_bytes: 4 << 30,
             last_seq: 0,
             background_compaction: None,
+            snapshots: SnapshotLimits::default(),
         }
     }
 }
+
+/// Admission limits for [`Engine::snapshot`]. A snapshot that would exceed
+/// one is refused with a [`SnapshotError`]; none is ever weakened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotLimits {
+    /// The most snapshots alive at once, including any that outlived the
+    /// engine.
+    pub max_live: usize,
+    /// No snapshot is taken, and no compaction, while snapshots keep more
+    /// than this many bytes: memtable history they pin, and memtables and
+    /// runs the engine has released. See [Memory](self#memory).
+    pub max_retained_bytes: usize,
+}
+
+impl Default for SnapshotLimits {
+    /// 16 live snapshots and 1 GiB retained.
+    fn default() -> Self {
+        Self {
+            max_live: 16,
+            max_retained_bytes: 1 << 30,
+        }
+    }
+}
+
+/// Why [`Engine::snapshot`] refused. Nothing was changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// [`SnapshotLimits::max_live`] snapshots are alive. Drop one.
+    Readers {
+        /// Snapshots alive.
+        live: usize,
+        /// The limit.
+        max: usize,
+    },
+    /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`].
+    /// Dropping old snapshots frees it.
+    Retained {
+        /// Bytes retained.
+        bytes: usize,
+        /// The limit.
+        max: usize,
+    },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Readers { live, max } => {
+                write!(f, "{live} snapshots are alive, the limit is {max}")
+            }
+            Self::Retained { bytes, max } => {
+                write!(f, "snapshots retain {bytes} bytes, over the limit of {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 /// Why a write was rejected. The engine is unchanged, and no sequence number
 /// was used.
@@ -273,8 +392,10 @@ pub struct EngineStats {
     pub last_seq: u64,
     /// The active memtable's accounting.
     pub active: MemoryUsage,
-    /// The frozen memtable's accounting, if one is awaiting flush.
+    /// The frozen memtables' accounting, summed, if any await flush.
     pub frozen: Option<MemoryUsage>,
+    /// Frozen memtables awaiting flush.
+    pub frozen_tables: usize,
     /// Published runs.
     pub runs: usize,
     /// Stored bytes of the published runs.
@@ -282,19 +403,88 @@ pub struct EngineStats {
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes.
     pub max_overlap: usize,
+    /// Live snapshots.
+    pub snapshots: usize,
+    /// Memtables and runs the engine has released that snapshots still hold.
+    pub retained_sources: usize,
+    /// Bytes kept only for snapshots: the charged or stored bytes of those
+    /// sources, and the history pinned in the engine's memtables, which
+    /// `active` and `frozen` also report as [`MemoryUsage::pinned`].
+    pub retained_bytes: usize,
 }
 
 struct State {
     last_seq: u64,
     active: Memtable,
-    /// Its sequence numbers are all above the runs' and below `active`'s.
-    frozen: Option<Arc<FrozenMemtable>>,
+    /// Oldest first. Each table's sequence numbers are above the runs' and
+    /// those of the tables before it, and below `active`'s. Only flushes
+    /// freeze tables, so there is more than one only after a flush was
+    /// abandoned or refused.
+    frozen: Vec<Arc<FrozenMemtable>>,
     /// Shared so that a compaction can read its inputs without the lock while
     /// flushes publish beside them.
     runs: Vec<SharedRun>,
     run_bytes: usize,
     max_runs: usize,
     max_run_bytes: usize,
+    /// Sources removed from the state, kept track of until no snapshot holds
+    /// them. Pruned whenever a source is added.
+    retired: Vec<Retired>,
+    /// The latest snapshot of the active table and the `last_seq` it was
+    /// taken at. Every write raises `last_seq`, so while it is unchanged the
+    /// snapshot still equals the active table and can be shared.
+    last_view: Option<(u64, Weak<FrozenMemtable>)>,
+}
+
+/// A source the engine released, with the bytes it accounts for.
+struct Retired {
+    source: Weak<dyn Send + Sync>,
+    bytes: usize,
+}
+
+/// What snapshots alone keep.
+#[derive(Clone, Copy, Default)]
+struct Retained {
+    sources: usize,
+    bytes: usize,
+}
+
+impl State {
+    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize) {
+        self.retired
+            .retain(|retired| retired.source.strong_count() > 0);
+        if source.strong_count() > 0 {
+            self.retired.push(Retired { source, bytes });
+        }
+    }
+
+    /// Released sources still held, each counted once however many snapshots
+    /// hold it, and the history pinned in the engine's memtables.
+    fn retained(&self) -> Retained {
+        let pinned = self.active.memory().pinned
+            + self
+                .frozen
+                .iter()
+                .map(|table| table.memory().pinned)
+                .sum::<usize>();
+        self.retired
+            .iter()
+            .filter(|retired| retired.source.strong_count() > 0)
+            .fold(
+                Retained {
+                    sources: 0,
+                    bytes: pinned,
+                },
+                |sum, retired| Retained {
+                    sources: sum.sources + 1,
+                    bytes: sum.bytes + retired.bytes,
+                },
+            )
+    }
+
+    fn frozen_charged(&self) -> usize {
+        self.frozen.iter().map(|table| table.memory().charged).sum()
+    }
 }
 
 /// Everything an engine shares with its background worker.
@@ -311,6 +501,9 @@ struct Core {
     compacting: Mutex<()>,
     memtable_budget: usize,
     target_run_len: usize,
+    snapshot_limits: SnapshotLimits,
+    /// Cloned by every snapshot, so that its count is the live snapshots.
+    snapshots: Arc<()>,
     /// Present when a background worker compacts this engine.
     background: Option<worker::Signal>,
     /// Makes the worker panic at the start of its next pass.
@@ -360,24 +553,38 @@ impl Engine {
         self.core.get(key, workspace)
     }
 
-    /// Takes the shared lock and returns a stable view of the engine.
+    /// Takes the shared lock and returns a stable view of the engine, for a
+    /// few reads that must agree.
     ///
-    /// Writers and flush publication wait until it is dropped. See the
-    /// [module documentation](self) for what must not be done while holding it.
+    /// Writers and flush publication wait until it is dropped, so use a
+    /// [`Snapshot`] for a long scan. See the [module documentation](self) for
+    /// what must not be done while holding it.
     pub fn read(&self) -> ReadGuard<'_> {
         self.core.read()
     }
 
-    /// Flushes until everything written before this call is in runs.
+    /// Returns a view of the current state that holds no lock.
     ///
-    /// A frozen table left by an earlier flush is flushed first, then the
-    /// active table. An empty engine does nothing.
+    /// Takes the exclusive lock to snapshot the active memtable, in constant
+    /// time, and to copy one pointer per run and frozen table; see
+    /// [Snapshots](self#snapshots). Snapshots taken with nothing written
+    /// between them share the same view of the active table.
+    ///
+    /// Refused, changing nothing, when a [`SnapshotLimits`] would be exceeded.
+    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+        self.core.snapshot()
+    }
+
+    /// Flushes everything written before this call: the active table and any
+    /// frozen tables, left by an abandoned or refused flush, are merged into
+    /// one set of runs. An empty engine does nothing.
     pub fn flush(&self) -> Result<FlushReport, FlushError> {
         self.core.flush()
     }
 
-    /// Starts a flush, freezing the active table unless a frozen table is
-    /// waiting to be retried. Returns `None` if there is nothing to flush.
+    /// Starts a flush of every frozen table, freezing the active table first
+    /// only if none is waiting, so that a retry leaves newer writes in place.
+    /// Returns `None` if there is nothing to flush.
     ///
     /// Waits for any flush already in progress, including one this thread
     /// holds, so drop or publish a job before starting another.
@@ -462,17 +669,21 @@ impl Core {
             state: RwLock::new(State {
                 last_seq: options.last_seq,
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
-                frozen: None,
+                frozen: Vec::new(),
                 runs: Vec::new(),
                 run_bytes: 0,
                 max_runs: options.max_runs,
                 max_run_bytes: options.max_run_bytes,
+                retired: Vec::new(),
+                last_view: None,
             }),
             gate: Mutex::new(()),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
+            snapshot_limits: options.snapshots,
+            snapshots: Arc::new(()),
             background: options.background_compaction.map(|_| worker::Signal::new()),
             #[cfg(test)]
             panic_worker: std::sync::atomic::AtomicBool::new(false),
@@ -499,10 +710,42 @@ impl Core {
             Value::Bytes(bytes) => state.active.put(key, seq, bytes),
             Value::Tombstone => state.active.delete(key, seq),
         };
-        written.map_err(UpdateError::Rejected)?;
+        written.map_err(|error| UpdateError::Rejected(self.reason(&state, error)))?;
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         Ok(seq)
+    }
+
+    /// While frozen tables hold memory, the active table's budget is lowered
+    /// so that all of them stay within two budgets. A record refused only by
+    /// the lowered budget fits once a flush frees it, so it is reported as
+    /// not fitting now rather than never.
+    fn reason(&self, state: &State, error: WriteError) -> WriteError {
+        match error {
+            WriteError::RecordExceedsBudget { charge, budget }
+                if charge <= self.memtable_budget =>
+            {
+                WriteError::BudgetExceeded {
+                    needed: charge,
+                    available: budget - state.active.memory().charged,
+                }
+            }
+            error => error,
+        }
+    }
+
+    /// The active table's budget beside frozen tables charged `frozen` bytes.
+    fn active_budget(&self, frozen: usize) -> usize {
+        let total = self.memtable_budget.saturating_mul(2);
+        self.memtable_budget.min(total.saturating_sub(frozen))
+    }
+
+    /// Freezes the active table and replaces it, in constant time.
+    fn freeze_active(&self, state: &mut State) {
+        let frozen = state.frozen_charged() + state.active.memory().charged;
+        let successor = Memtable::new(self.active_budget(frozen), Some(state.last_seq));
+        let table = std::mem::replace(&mut state.active, successor).freeze();
+        state.frozen.push(Arc::new(table));
     }
 
     fn get<'w>(
@@ -512,7 +755,7 @@ impl Core {
     ) -> Result<Option<LiveValue<'w>>, ReadError> {
         let EngineWorkspace { logical, value, .. } = workspace;
         let state = self.read_state();
-        let Some(found) = lookup(&state, key, logical)? else {
+        let Some(found) = lookup_state(&state, key, logical)? else {
             return Ok(None);
         };
         let seq = found.seq;
@@ -525,43 +768,79 @@ impl Core {
         ReadGuard(self.read_state())
     }
 
-    fn flush(&self) -> Result<FlushReport, FlushError> {
-        let mut total = FlushReport::default();
-        while let Some(job) = self.begin_flush() {
-            let includes_active = !job.retried;
-            let report = job.build().publish()?;
-            total.tables += report.tables;
-            total.records += report.records;
-            total.runs += report.runs;
-            total.run_bytes += report.run_bytes;
-            if includes_active {
-                break;
-            }
+    fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+        let limits = self.snapshot_limits;
+        let mut state = self.write_state();
+        // Clones are made only under the exclusive lock, so this count is
+        // exact; drops can only lower it.
+        let live = Arc::strong_count(&self.snapshots) - 1;
+        if live >= limits.max_live {
+            return Err(SnapshotError::Readers {
+                live,
+                max: limits.max_live,
+            });
         }
-        Ok(total)
+        let bytes = state.retained().bytes;
+        if bytes > limits.max_retained_bytes {
+            return Err(SnapshotError::Retained {
+                bytes,
+                max: limits.max_retained_bytes,
+            });
+        }
+        let mut tables =
+            Vec::with_capacity(state.frozen.len() + usize::from(!state.active.is_empty()));
+        if !state.active.is_empty() {
+            let reusable = state
+                .last_view
+                .as_ref()
+                .filter(|(seq, _)| *seq == state.last_seq)
+                .and_then(|(_, view)| view.upgrade());
+            let view = reusable.unwrap_or_else(|| {
+                let view = Arc::new(state.active.snapshot());
+                state.last_view = Some((state.last_seq, Arc::downgrade(&view)));
+                view
+            });
+            tables.push(view);
+        }
+        tables.extend(state.frozen.iter().rev().cloned());
+        Ok(Snapshot {
+            tables,
+            runs: state.runs.clone(),
+            last_seq: state.last_seq,
+            _live: Arc::clone(&self.snapshots),
+        })
+    }
+
+    fn flush(&self) -> Result<FlushReport, FlushError> {
+        match self.begin(true) {
+            Some(job) => job.build().publish(),
+            None => Ok(FlushReport::default()),
+        }
     }
 
     fn begin_flush(&self) -> Option<FlushJob<'_>> {
+        self.begin(false)
+    }
+
+    /// Starts a flush of every frozen table, freezing the active one first if
+    /// `with_active` or if no table is frozen.
+    fn begin(&self, with_active: bool) -> Option<FlushJob<'_>> {
         // This mutex guards no data, so a panic elsewhere leaves nothing to
         // distrust, and the flush must stay retryable.
         let serial = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut state = self.write_state();
-        let (frozen, retried) = match &state.frozen {
-            Some(frozen) => (Arc::clone(frozen), true),
-            None if state.active.is_empty() => return None,
-            None => {
-                let successor = Memtable::new(self.memtable_budget, Some(state.last_seq));
-                let frozen = Arc::new(std::mem::replace(&mut state.active, successor).freeze());
-                state.frozen = Some(Arc::clone(&frozen));
-                (frozen, false)
-            }
-        };
+        if !state.active.is_empty() && (with_active || state.frozen.is_empty()) {
+            self.freeze_active(&mut state);
+        }
+        if state.frozen.is_empty() {
+            return None;
+        }
+        let tables = state.frozen.clone();
         drop(state);
         Some(FlushJob {
             engine: self,
             _serial: serial,
-            frozen,
-            retried,
+            tables,
         })
     }
 
@@ -586,6 +865,11 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let state = self.read_state();
+        let bytes = state.retained().bytes;
+        let max = self.snapshot_limits.max_retained_bytes;
+        if bytes > max {
+            return Err(CompactionError::Retained { bytes, max });
+        }
         let candidates: Vec<Candidate<'_>> = state
             .runs
             .iter()
@@ -647,13 +931,27 @@ impl Core {
 
     fn stats(&self) -> EngineStats {
         let state = self.read_state();
+        let retained = state.retained();
         EngineStats {
             last_seq: state.last_seq,
             active: state.active.memory(),
-            frozen: state.frozen.as_ref().map(|frozen| frozen.memory()),
+            frozen: state
+                .frozen
+                .iter()
+                .map(|table| table.memory())
+                .reduce(|sum, table| MemoryUsage {
+                    payload: sum.payload + table.payload,
+                    charged: sum.charged + table.charged,
+                    pinned: sum.pinned + table.pinned,
+                    budget: sum.budget + table.budget,
+                }),
+            frozen_tables: state.frozen.len(),
             runs: state.runs.len(),
             run_bytes: state.run_bytes,
             max_overlap: deepest_overlap(&state.runs),
+            snapshots: Arc::strong_count(&self.snapshots) - 1,
+            retained_sources: retained.sources,
+            retained_bytes: retained.bytes,
         }
     }
 
@@ -725,35 +1023,43 @@ impl fmt::Debug for Engine {
     }
 }
 
-/// A flush whose table is frozen and whose runs are not built yet.
+/// A flush whose tables are frozen and whose runs are not built yet.
 ///
-/// Dropping it abandons the flush and keeps the table frozen. Holding it
-/// blocks other flushes, but not reads or writes.
+/// Dropping it abandons the flush and keeps the tables frozen. Holding it
+/// blocks other flushes, but not reads, writes or snapshots.
 pub struct FlushJob<'e> {
     engine: &'e Core,
     _serial: MutexGuard<'e, ()>,
-    frozen: Arc<FrozenMemtable>,
-    retried: bool,
+    /// Oldest first: a prefix of the state's frozen tables, since only
+    /// flushes, one at a time, add or remove them.
+    tables: Vec<Arc<FrozenMemtable>>,
 }
 
 impl<'e> FlushJob<'e> {
-    /// Builds the runs, compressing without the state lock.
+    /// Builds the runs, compressing without the state lock. Several tables
+    /// are merged as one, keeping each key's newest update.
     pub fn build(self) -> BuiltFlush<'e> {
-        let runs = self.frozen.flush(self.engine.target_run_len).collect();
+        let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
+        let runs = flush_merged(&tables, self.engine.target_run_len);
         BuiltFlush { job: self, runs }
     }
 
-    /// Returns the frozen table being flushed.
-    pub fn table(&self) -> &FrozenMemtable {
-        &self.frozen
+    /// Returns the frozen tables being flushed, oldest first.
+    pub fn tables(&self) -> impl ExactSizeIterator<Item = &FrozenMemtable> {
+        self.tables.iter().map(Arc::as_ref)
+    }
+
+    /// The records in the tables, counting a key once per table.
+    fn records(&self) -> usize {
+        self.tables.iter().map(|table| table.len()).sum()
     }
 }
 
 impl fmt::Debug for FlushJob<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlushJob")
-            .field("records", &self.frozen.len())
-            .field("retried", &self.retried)
+            .field("tables", &self.tables.len())
+            .field("records", &self.records())
             .finish_non_exhaustive()
     }
 }
@@ -770,15 +1076,15 @@ impl BuiltFlush<'_> {
         &self.runs
     }
 
-    /// Publishes the runs and removes the frozen table in one step.
+    /// Publishes the runs and removes the frozen tables in one step.
     ///
-    /// On a [`FlushError`] the built runs are dropped and the table stays
+    /// On a [`FlushError`] the built runs are dropped and the tables stay
     /// frozen and readable.
     pub fn publish(self) -> Result<FlushReport, FlushError> {
         let Self { job, runs } = self;
         let report = FlushReport {
-            tables: 1,
-            records: job.frozen.len(),
+            tables: job.tables.len(),
+            records: job.records(),
             runs: runs.len(),
             run_bytes: runs.iter().map(|run| run.as_bytes().len()).sum(),
         };
@@ -793,11 +1099,32 @@ impl BuiltFlush<'_> {
                 max_run_bytes: state.max_run_bytes,
             });
         }
+        let flushed = job.tables.len();
+        assert!(
+            state.frozen[..flushed]
+                .iter()
+                .zip(&job.tables)
+                .all(|(held, flushed)| Arc::ptr_eq(held, flushed)),
+            "a flush's tables are the oldest frozen ones"
+        );
         state.runs.extend(published(runs));
         state.run_bytes = total_bytes;
-        state.frozen = None;
-        // `job` holds the last reference, so the table is freed after this
-        // releases the lock.
+        for table in state.frozen.drain(..flushed).collect::<Vec<_>>() {
+            // This and the job's are the engine's references, and snapshots
+            // are taken only under the lock, so any other is a snapshot's,
+            // which keeps the whole table. Otherwise only views of it can
+            // remain, which share its family, so this follows all of them.
+            let bytes = if Arc::strong_count(&table) > 2 {
+                table.memory().charged
+            } else {
+                table.held_by_snapshots()
+            };
+            state.retire(table.family() as Weak<dyn Send + Sync>, bytes);
+        }
+        let budget = job.engine.active_budget(state.frozen_charged());
+        state.active.raise_budget(budget);
+        // Unless a snapshot holds them, `job` has the last references, so the
+        // tables are freed after this releases the lock.
         drop(state);
         job.engine.notify_worker();
         Ok(report)
@@ -865,6 +1192,14 @@ pub enum CompactionError {
     /// Publishing would leave more runs or run bytes than both the engine's
     /// limit and what is published now.
     RunLimit(FlushError),
+    /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`], so
+    /// the output could only add to it. Dropping snapshots lifts this.
+    Retained {
+        /// Bytes retained.
+        bytes: usize,
+        /// The limit.
+        max: usize,
+    },
 }
 
 impl From<CompactError> for CompactionError {
@@ -886,6 +1221,10 @@ impl fmt::Display for CompactionError {
             Self::Compact(error) => error.fmt(f),
             Self::InputsChanged => f.write_str("compaction inputs changed before publication"),
             Self::RunLimit(error) => error.fmt(f),
+            Self::Retained { bytes, max } => write!(
+                f,
+                "snapshots retain {bytes} bytes, over the limit of {max}; compaction waits"
+            ),
         }
     }
 }
@@ -1143,6 +1482,10 @@ impl BuiltCompaction<'_> {
         state.runs.retain(|run| !is_input(run));
         state.runs.extend(published(output.runs));
         state.run_bytes = total_bytes;
+        for input in &job.inputs {
+            let bytes = input.run.as_bytes().len();
+            state.retire(Arc::downgrade(input) as Weak<dyn Send + Sync>, bytes);
+        }
         drop(state);
         drop(job);
         Ok(report)
@@ -1194,7 +1537,7 @@ impl ReadGuard<'_> {
         key: &[u8],
         workspace: &'r mut EngineWorkspace,
     ) -> Result<Option<LiveValue<'r>>, ReadError> {
-        lookup(&self.0, key, &mut workspace.logical)
+        lookup_state(&self.0, key, &mut workspace.logical)
     }
 
     /// Returns a scan of every live key.
@@ -1208,31 +1551,15 @@ impl ReadGuard<'_> {
         prefix: &[u8],
         workspace: &'r mut EngineWorkspace,
     ) -> Scan<'r> {
-        let EngineWorkspace {
-            logical,
-            prefix: bound,
-            ..
-        } = workspace;
-        bound.clear();
-        bound.extend_from_slice(prefix);
-        let prefix: &'r [u8] = bound;
-
         let state = &*self.0;
-        let mut runs = LogicalCursor::over(state.runs.iter().map(|run| run.run.view()), logical);
-        // A failed seek is repeated by the first read of the cursor.
-        let _ = runs.seek_prefix(prefix);
-
-        let mut active = state.active.iter_from(prefix);
-        let mut frozen = state.frozen.as_deref().map(|table| table.iter_from(prefix));
-        Scan {
-            active_head: next_within(&mut active, prefix),
-            frozen_head: frozen.as_mut().and_then(|table| next_within(table, prefix)),
-            active,
-            frozen,
-            runs,
-            runs_stale: true,
-            prefix,
-        }
+        let tables = std::iter::once(state.active.iter_from(prefix)).chain(
+            state
+                .frozen
+                .iter()
+                .rev()
+                .map(|table| table.iter_from(prefix)),
+        );
+        Scan::new(tables, &state.runs, prefix, workspace)
     }
 }
 
@@ -1242,9 +1569,85 @@ impl fmt::Debug for ReadGuard<'_> {
     }
 }
 
-/// Newest first: every key's updates are in `active`, then `frozen`, then the
-/// runs, so the first source holding a key decides it.
-fn lookup<'r>(
+/// The engine's state when [`Engine::snapshot`] returned, holding no lock.
+///
+/// It owns shared references to the frozen memtables and runs that made up
+/// that state, which never change, so reads through it agree with each other
+/// and are unaffected by later writes, flushes and compactions. Each source
+/// is freed when neither the engine nor any snapshot holds it.
+///
+/// A snapshot is `Send` and `Sync`, may be read from several threads with a
+/// workspace each, and may outlive its engine. It cannot be refreshed: take a
+/// new one to see later writes. While it lives it keeps whatever the engine
+/// releases from its view, and the memtable history later writes copy away
+/// from it, reported in [`EngineStats::retained_bytes`], so drop it once read.
+/// Nothing bounds how long it lives, but while it retains too much, new
+/// snapshots and compactions are refused; see [Memory](self#memory).
+///
+/// It does not implement `Clone`, so that each one counts against
+/// [`SnapshotLimits::max_live`]. Share one by reference or in an `Arc`:
+///
+/// ```compile_fail,E0599
+/// # let engine = tessera::engine::Engine::new(Default::default());
+/// let snapshot = engine.snapshot().unwrap();
+/// let second = snapshot.clone();
+/// ```
+pub struct Snapshot {
+    /// Newest first.
+    tables: Vec<Arc<FrozenMemtable>>,
+    runs: Vec<SharedRun>,
+    last_seq: u64,
+    _live: Arc<()>,
+}
+
+impl Snapshot {
+    /// The last sequence number of the state this sees. Every update up to
+    /// it is visible and no later one is.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    /// Returns the value `key` had, or `None` if it was absent or deleted,
+    /// without copying it.
+    pub fn get<'r>(
+        &'r self,
+        key: &[u8],
+        workspace: &'r mut EngineWorkspace,
+    ) -> Result<Option<LiveValue<'r>>, ReadError> {
+        let in_memory = self.tables.iter().find_map(|table| table.get(key));
+        resolve(in_memory, &self.runs, key, &mut workspace.logical)
+    }
+
+    /// Returns a scan of every live key.
+    pub fn scan<'r>(&'r self, workspace: &'r mut EngineWorkspace) -> Scan<'r> {
+        self.scan_prefix(&[], workspace)
+    }
+
+    /// Returns a scan of every live key starting with `prefix`.
+    pub fn scan_prefix<'r>(
+        &'r self,
+        prefix: &[u8],
+        workspace: &'r mut EngineWorkspace,
+    ) -> Scan<'r> {
+        let tables = self.tables.iter().map(|table| table.iter_from(prefix));
+        Scan::new(tables, &self.runs, prefix, workspace)
+    }
+}
+
+impl fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("last_seq", &self.last_seq)
+            .field("tables", &self.tables.len())
+            .field("runs", &self.runs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Newest first: every key's updates are in `active`, then the frozen tables
+/// from newest to oldest, then the runs, so the first source holding a key
+/// decides it.
+fn lookup_state<'r>(
     state: &'r State,
     key: &[u8],
     logical: &'r mut LogicalWorkspace,
@@ -1252,14 +1655,24 @@ fn lookup<'r>(
     let in_memory = state
         .active
         .get(key)
-        .or_else(|| state.frozen.as_deref()?.get(key));
+        .or_else(|| state.frozen.iter().rev().find_map(|table| table.get(key)));
+    resolve(in_memory, &state.runs, key, logical)
+}
+
+/// Decides `key` from the newest table update, or else from the runs.
+fn resolve<'r>(
+    in_memory: Option<Version<'r>>,
+    runs: &'r [SharedRun],
+    key: &[u8],
+    logical: &'r mut LogicalWorkspace,
+) -> Result<Option<LiveValue<'r>>, ReadError> {
     match in_memory {
         Some(Version {
             seq,
             value: Value::Bytes(value),
         }) => Ok(Some(LiveValue { seq, value })),
         Some(_) => Ok(None),
-        None => latest_in(state.runs.iter().map(|run| run.run.view()), key, logical),
+        None => latest_in(runs.iter().map(|run| run.run.view()), key, logical),
     }
 }
 
@@ -1271,18 +1684,52 @@ fn next_within<'a>(records: &mut Records<'a>, prefix: &[u8]) -> Option<Record<'a
 
 /// Iterates live keys in ascending order, each once with its latest value.
 ///
-/// This merges the active table, the frozen table and the live keys of the
-/// runs. A table's update beats anything in the runs, so a tombstone in a table
-/// hides the key whatever the runs hold, and values are not copied.
+/// This merges the memtables and the live keys of the runs. A table's update
+/// beats anything in older tables or the runs, so a tombstone in a table hides
+/// the key whatever they hold, and values are not copied.
 pub struct Scan<'r> {
-    active: Records<'r>,
-    frozen: Option<Records<'r>>,
-    active_head: Option<Record<'r>>,
-    frozen_head: Option<Record<'r>>,
+    /// Each table's records and the next of them, newest table first.
+    tables: Vec<(Records<'r>, Option<Record<'r>>)>,
     runs: LogicalCursor<'r>,
     /// Whether the record the runs stand on has been used.
     runs_stale: bool,
     prefix: &'r [u8],
+}
+
+impl<'r> Scan<'r> {
+    /// Starts a scan of `tables`, newest first and each positioned at
+    /// `prefix`, over `runs`.
+    fn new(
+        tables: impl Iterator<Item = Records<'r>>,
+        runs: &'r [SharedRun],
+        prefix: &[u8],
+        workspace: &'r mut EngineWorkspace,
+    ) -> Self {
+        let EngineWorkspace {
+            logical,
+            prefix: bound,
+            ..
+        } = workspace;
+        bound.clear();
+        bound.extend_from_slice(prefix);
+        let prefix: &'r [u8] = bound;
+
+        let mut cursor = LogicalCursor::over(runs.iter().map(|run| run.run.view()), logical);
+        // A failed seek is repeated by the first read of the cursor.
+        let _ = cursor.seek_prefix(prefix);
+        let tables = tables
+            .map(|mut records| {
+                let head = next_within(&mut records, prefix);
+                (records, head)
+            })
+            .collect();
+        Self {
+            tables,
+            runs: cursor,
+            runs_stale: true,
+            prefix,
+        }
+    }
 }
 
 impl Scan<'_> {
@@ -1294,32 +1741,28 @@ impl Scan<'_> {
                 self.runs_stale = false;
             }
             let run_key = self.runs.live().map(|record| record.key);
-            let smallest = [
-                self.active_head.map(|record| record.key),
-                self.frozen_head.map(|record| record.key),
-                run_key,
-            ]
-            .into_iter()
-            .flatten()
-            .min();
+            let smallest = self
+                .tables
+                .iter()
+                .filter_map(|(_, head)| head.map(|record| record.key))
+                .chain(run_key)
+                .min();
             let Some(key) = smallest else {
                 return Ok(None);
             };
 
-            let active = self.active_head.filter(|record| record.key == key);
-            let frozen = self.frozen_head.filter(|record| record.key == key);
             self.runs_stale = run_key == Some(key);
-            if active.is_some() {
-                self.active_head = next_within(&mut self.active, self.prefix);
-            }
-            if frozen.is_some() {
-                self.frozen_head = self
-                    .frozen
-                    .as_mut()
-                    .and_then(|table| next_within(table, self.prefix));
+            // The newest table holding the key decides it; every table
+            // holding it moves past it.
+            let mut decided = None;
+            for (records, head) in &mut self.tables {
+                if let Some(record) = head.filter(|record| record.key == key) {
+                    decided.get_or_insert(record);
+                    *head = next_within(records, self.prefix);
+                }
             }
 
-            match active.or(frozen) {
+            match decided {
                 Some(Record {
                     key,
                     seq,
@@ -1343,7 +1786,9 @@ mod tests {
     use super::*;
 
     fn frozen_handle(engine: &Engine) -> Arc<FrozenMemtable> {
-        Arc::clone(engine.core.read_state().frozen.as_ref().unwrap())
+        let state = engine.core.read_state();
+        assert_eq!(state.frozen.len(), 1);
+        Arc::clone(&state.frozen[0])
     }
 
     /// The writer-priority rule: from the moment a writer waits for the state

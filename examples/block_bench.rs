@@ -5,6 +5,8 @@
 //! With the argument `merge`, instead measures merged iteration over many runs.
 //! With the argument `logical`, instead measures latest-state reads over runs.
 //! With the argument `ranges`, instead measures reads that key ranges can prune.
+//! With the argument `snapshot`, instead compares snapshots with read guards.
+//! With the argument `snapshot-frequency`, instead measures frequent snapshots.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -14,13 +16,15 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crc32fast::Hasher;
 use lz4_flex::block as lz4;
 use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Value};
-use tessera::engine::{CompactionOptions, Engine, EngineOptions, EngineWorkspace, UpdateError};
+use tessera::engine::{
+    CompactionOptions, Engine, EngineOptions, EngineWorkspace, SnapshotLimits, UpdateError,
+};
 use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN, WriteError};
 use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
@@ -3540,6 +3544,850 @@ fn compaction_sustained() {
     }
 }
 
+const SNAP_BUDGET: usize = 4 << 20;
+const SNAP_ROUNDS: usize = 3;
+const SNAP_PROBES: usize = 2_000;
+/// Smaller than `SNAP_BUDGET`, so that the shorter contention pass flushes
+/// several times. A writer behind guard-held full scans waits for about one
+/// scan per put, so a whole pass would take minutes.
+const CONTENTION_BUDGET: usize = 1 << 20;
+const CONTENTION_SHARE: usize = 8;
+const FREQUENCY_ROUNDS: usize = 2;
+const LARGE_VALUE: usize = 4 << 10;
+const LARGE_KEYS: u64 = 4096;
+const LARGE_PASSES: u64 = 4;
+
+/// Without compaction every flush stays a run, so the run limit is raised;
+/// with the background worker it is the default, and a flush refused at it
+/// waits for compaction.
+fn snapshot_options(budget: usize, background: bool) -> EngineOptions {
+    EngineOptions {
+        memtable_budget: budget,
+        max_runs: if background {
+            EngineOptions::default().max_runs
+        } else {
+            4096
+        },
+        max_run_bytes: usize::MAX,
+        background_compaction: background.then(CompactionOptions::default),
+        ..EngineOptions::default()
+    }
+}
+
+#[derive(Default)]
+struct FlushTally {
+    flushes: usize,
+    runs: usize,
+    bytes: usize,
+    /// Flushes refused at the run limit, each followed by a wait for
+    /// background compaction.
+    stalls: usize,
+    publish_ns: Vec<u64>,
+}
+
+impl FlushTally {
+    /// Flushes in stages, timing only publication: the wait for the lock.
+    fn flush(&mut self, engine: &Engine) {
+        for _ in 0..10_000 {
+            let Some(job) = engine.begin_flush() else {
+                return;
+            };
+            let built = job.build();
+            let start = Instant::now();
+            match built.publish() {
+                Ok(report) => {
+                    self.publish_ns.push(start.elapsed().as_nanos() as u64);
+                    self.flushes += 1;
+                    self.runs += report.runs;
+                    self.bytes += report.run_bytes;
+                }
+                Err(error) => {
+                    engine
+                        .wait_for_compaction()
+                        .unwrap_or_else(|_| panic!("{error}"));
+                    self.stalls += 1;
+                }
+            }
+        }
+        panic!("flushing did not finish");
+    }
+}
+
+/// Puts `value` under `key`, flushing first whenever the memtable is full.
+fn put_flushing(engine: &Engine, key: &[u8], value: &[u8], tally: &mut FlushTally) {
+    for _ in 0..3 {
+        match engine.put(key, value) {
+            Ok(_) => return,
+            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => tally.flush(engine),
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("a put failed after flushing");
+}
+
+/// Compacts with the default options until nothing is eligible, returning
+/// the stored bytes rewritten and the time each publication took.
+fn compact_done(engine: &Engine) -> (usize, Vec<u64>) {
+    let mut workspace = MergeWorkspace::new();
+    let (mut rewritten, mut publish) = (0, Vec::new());
+    for _ in 0..100_000 {
+        let Some(job) = engine
+            .begin_compaction(CompactionOptions::default())
+            .unwrap()
+        else {
+            return (rewritten, publish);
+        };
+        let built = job.build(&mut workspace).unwrap();
+        let start = Instant::now();
+        let report = built.publish().unwrap();
+        publish.push(start.elapsed().as_nanos() as u64);
+        rewritten += report.input_bytes;
+    }
+    panic!("compaction did not finish");
+}
+
+/// Every record in `order`, flushed and compacted, with an empty memtable
+/// and, with a worker, nothing left for it to do.
+fn snapshot_base(records: &[Owned], order: &[usize], options: EngineOptions) -> Engine {
+    let engine = Engine::new(options);
+    let mut tally = FlushTally::default();
+    for &index in order {
+        let record = &records[index];
+        put_flushing(
+            &engine,
+            &record.key,
+            record.value.as_deref().unwrap(),
+            &mut tally,
+        );
+    }
+    tally.flush(&engine);
+    if options.background_compaction.is_some() {
+        engine.wait_for_compaction().unwrap();
+    }
+    compact_done(&engine);
+    engine
+}
+
+fn drain(mut scan: tessera::engine::Scan<'_>) -> usize {
+    let mut records = 0;
+    while let Some(record) = scan.next_record().unwrap() {
+        black_box(record);
+        records += 1;
+    }
+    records
+}
+
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / (1 << 20) as f64
+}
+
+fn snapshot_large_values() -> Vec<Owned> {
+    let mut rng = Rng(23);
+    (0..LARGE_KEYS)
+        .map(|i| Owned {
+            key: tree_key(i, FLAT_TREE),
+            seq: BASE_SEQ + i,
+            value: Some(rng.bytes(LARGE_VALUE)),
+        })
+        .collect()
+}
+
+fn snapshot_acquisition(records: &[Owned], order: &[usize], probes: &[usize]) {
+    const ACQUIRE: usize = 20_000;
+    let engine = snapshot_base(records, order, snapshot_options(SNAP_BUDGET, false));
+    let stats = engine.stats();
+    let guard_ns = median_ns_of(SNAP_ROUNDS, ACQUIRE, || {
+        for _ in 0..ACQUIRE {
+            black_box(engine.read());
+        }
+    });
+    let shared_ns = median_ns_of(SNAP_ROUNDS, ACQUIRE, || {
+        for _ in 0..ACQUIRE {
+            black_box(engine.snapshot().unwrap());
+        }
+    });
+    let shared_allocs = allocations_during(|| drop(engine.snapshot().unwrap()));
+    // Heap held by snapshots that share everything, per snapshot.
+    let before = LIVE.load(Ordering::Relaxed);
+    let held: Vec<_> = (0..15).map(|_| engine.snapshot().unwrap()).collect();
+    let shared_heap = (LIVE.load(Ordering::Relaxed) - before) / 15;
+    drop(held);
+
+    // One put, then a snapshot of the table it went into.
+    let mut tally = FlushTally::default();
+    let mut after_put_ns = Vec::with_capacity(SNAP_PROBES);
+    let mut after_put_allocs = 0;
+    for (at, &index) in probes.iter().enumerate() {
+        let record = &records[index];
+        put_flushing(
+            &engine,
+            &record.key,
+            record.value.as_deref().unwrap(),
+            &mut tally,
+        );
+        let start = Instant::now();
+        let snapshot = engine.snapshot().unwrap();
+        after_put_ns.push(start.elapsed().as_nanos() as u64);
+        drop(snapshot);
+        if at == 0 {
+            engine.put(&record.key, b"again").unwrap();
+            after_put_allocs = allocations_during(|| drop(engine.snapshot().unwrap()));
+        }
+    }
+    after_put_ns.sort_unstable();
+    println!(
+        "| {} runs, {} keys | {guard_ns:.0} | {shared_ns:.0} | {shared_allocs} | {shared_heap} | {} | {} | {after_put_allocs} | {} | {} |",
+        stats.runs,
+        records.len(),
+        percentile(&after_put_ns, 0.5),
+        percentile(&after_put_ns, 0.99),
+        tally.flushes,
+        engine.stats().frozen_tables,
+    );
+}
+
+/// What a snapshot of an active table of a given size costs: acquisition,
+/// which with one thread is the exclusive lock's hold time, and what later
+/// writes pay to copy the nodes it shares.
+fn snapshot_table_size(name: &str, records: &[Owned], order: &[usize], target: usize) {
+    const TIMES: usize = 21;
+    const OVERWRITES: usize = 1_000;
+    let engine = Engine::new(snapshot_options(64 << 20, false));
+    let mut filled = 0;
+    for &index in order {
+        if engine.stats().active.charged >= target {
+            break;
+        }
+        let record = &records[index];
+        engine
+            .put(&record.key, record.value.as_deref().unwrap())
+            .unwrap();
+        filled += 1;
+    }
+    let active = engine.stats().active;
+    let keys = &order[..filled];
+    let mut rng = Rng(target as u64);
+    let mut pick = || {
+        let record = &records[keys[(rng.next() % keys.len() as u64) as usize]];
+        (&record.key, record.value.as_deref().unwrap())
+    };
+
+    let mut acquire_ns = Vec::with_capacity(TIMES);
+    for _ in 0..TIMES {
+        let (key, value) = pick();
+        engine.put(key, value).unwrap();
+        let start = Instant::now();
+        let snapshot = engine.snapshot().unwrap();
+        acquire_ns.push(start.elapsed().as_nanos() as u64);
+        drop(snapshot);
+    }
+    acquire_ns.sort_unstable();
+    let (key, value) = pick();
+    engine.put(key, value).unwrap();
+    let acquire_allocs = allocations_during(|| drop(engine.snapshot().unwrap()));
+
+    // Overwrites with no snapshot, after a fresh snapshot each, and under one
+    // snapshot held throughout. Values keep their length.
+    let timed = |each: &mut dyn FnMut()| {
+        let start = Instant::now();
+        for _ in 0..OVERWRITES {
+            each();
+        }
+        start.elapsed().as_nanos() as f64 / OVERWRITES as f64
+    };
+    let plain_ns = timed(&mut || {
+        let (key, value) = pick();
+        engine.put(key, value).unwrap();
+    });
+    let mut fresh_ns = 0;
+    let mut fresh_allocs = 0;
+    for at in 0..OVERWRITES {
+        let snapshot = engine.snapshot().unwrap();
+        let (key, value) = pick();
+        let start = Instant::now();
+        if at == 0 {
+            fresh_allocs = allocations_during(|| {
+                engine.put(key, value).unwrap();
+            });
+        } else {
+            engine.put(key, value).unwrap();
+        }
+        fresh_ns += start.elapsed().as_nanos();
+        drop(snapshot);
+    }
+    let held = engine.snapshot().unwrap();
+    let held_ns = timed(&mut || {
+        let (key, value) = pick();
+        engine.put(key, value).unwrap();
+    });
+    let pinned = engine.stats().active.pinned;
+    let before = LIVE.load(Ordering::Relaxed);
+    let start = Instant::now();
+    drop(held);
+    let drop_us = start.elapsed().as_nanos() as f64 / 1e3;
+    let freed = before.saturating_sub(LIVE.load(Ordering::Relaxed));
+    println!(
+        "| {name} | {:.0} | {filled} | {} | {} | {acquire_allocs} | {plain_ns:.0} | {:.0} | {fresh_allocs} | {held_ns:.0} | {:.0} | {:.0} | {drop_us:.0} |",
+        active.charged as f64 / 1024.0,
+        percentile(&acquire_ns, 0.5),
+        acquire_ns.last().copied().unwrap_or(0),
+        fresh_ns as f64 / OVERWRITES as f64,
+        pinned as f64 / OVERWRITES as f64,
+        freed as f64 / OVERWRITES as f64,
+    );
+}
+
+fn snapshot_reads(records: &[Owned], order: &[usize], probes: &[usize]) {
+    let engine = snapshot_base(records, order, snapshot_options(SNAP_BUDGET, false));
+    // Overwrite the probed keys, so that reads merge a memtable and gets
+    // find them in it.
+    for &index in probes {
+        engine.put(&records[index].key, b"{}").unwrap();
+    }
+    let groups: Vec<&[u8]> = probes
+        .iter()
+        .map(|&index| &records[index].key[..GROUP_LEN])
+        .collect();
+    let snapshot = engine.snapshot().unwrap();
+    let mut workspace = EngineWorkspace::new();
+
+    let mut short = [0.0; 3];
+    let mut found = 0;
+    short[0] = median_ns_of(SNAP_ROUNDS, SNAP_PROBES, || {
+        for group in &groups {
+            let guard = engine.read();
+            found = drain(guard.scan_prefix(group, &mut workspace));
+        }
+    });
+    short[1] = median_ns_of(SNAP_ROUNDS, SNAP_PROBES, || {
+        for group in &groups {
+            found = drain(snapshot.scan_prefix(group, &mut workspace));
+        }
+    });
+    short[2] = median_ns_of(SNAP_ROUNDS, SNAP_PROBES, || {
+        for group in &groups {
+            let taken = engine.snapshot().unwrap();
+            found = drain(taken.scan_prefix(group, &mut workspace));
+        }
+    });
+    let mut all = 0;
+    let long_guard = median_ns_of(SNAP_ROUNDS, 1, || {
+        all = drain(engine.read().scan(&mut workspace));
+    });
+    let long_snapshot = median_ns_of(SNAP_ROUNDS, 1, || {
+        all = drain(snapshot.scan(&mut workspace));
+    });
+    let get_engine = median_ns_of(SNAP_ROUNDS, SNAP_PROBES, || {
+        for &index in probes {
+            black_box(engine.get(&records[index].key, &mut workspace).unwrap());
+        }
+    });
+    let get_snapshot = median_ns_of(SNAP_ROUNDS, SNAP_PROBES, || {
+        for &index in probes {
+            black_box(snapshot.get(&records[index].key, &mut workspace).unwrap());
+        }
+    });
+    let scan_allocs = allocations_during(|| {
+        drain(snapshot.scan_prefix(groups[0], &mut workspace));
+    });
+    println!(
+        "| {found} per group, {all} in all | {:.0} | {:.0} | {:.0} | {:.1} | {:.1} | {get_engine:.0} | {get_snapshot:.0} | {scan_allocs} |",
+        short[0],
+        short[1],
+        short[2],
+        long_guard / all as f64,
+        long_snapshot / all as f64,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Reader {
+    None,
+    Guard,
+    Snapshot,
+}
+
+/// What one reader thread did while the writer ran.
+#[derive(Default)]
+struct ReaderTally {
+    scans: u64,
+    retained: usize,
+    frozen: usize,
+    acquire_ns: Vec<u64>,
+}
+
+/// A writer overwrites one key in `CONTENTION_SHARE` once, flushing and
+/// compacting synchronously, while `readers` threads repeat full scans.
+fn snapshot_contention(
+    records: &[Owned],
+    order: &[usize],
+    rewrite: &[usize],
+    kind: Reader,
+    readers: usize,
+) {
+    let engine = snapshot_base(records, order, snapshot_options(CONTENTION_BUDGET, false));
+    let done = AtomicBool::new(false);
+    let mut outcome = None;
+    let heap = {
+        let engine = &engine;
+        let done = &done;
+        peak_during(|| {
+            outcome = Some(std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..if kind == Reader::None { 0 } else { readers })
+                    .map(|_| {
+                        scope.spawn(move || {
+                            let mut workspace = EngineWorkspace::new();
+                            let mut tally = ReaderTally::default();
+                            while !done.load(Ordering::Relaxed) {
+                                if kind == Reader::Guard {
+                                    black_box(drain(engine.read().scan(&mut workspace)));
+                                    tally.scans += 1;
+                                    continue;
+                                }
+                                let start = Instant::now();
+                                let snapshot = engine.snapshot().unwrap();
+                                tally.acquire_ns.push(start.elapsed().as_nanos() as u64);
+                                black_box(drain(snapshot.scan(&mut workspace)));
+                                let stats = engine.stats();
+                                tally.retained = tally.retained.max(stats.retained_bytes);
+                                tally.frozen = tally.frozen.max(stats.frozen_tables);
+                                tally.scans += 1;
+                            }
+                            tally
+                        })
+                    })
+                    .collect();
+                let start = Instant::now();
+                let mut tally = FlushTally::default();
+                let mut latency = Vec::with_capacity(rewrite.len() / LATENCY_EVERY + 1);
+                let (mut rewritten, mut compact_publish) = (0, Vec::new());
+                for (at, &index) in rewrite.iter().enumerate() {
+                    let record = &records[index];
+                    let flushes = tally.flushes;
+                    let put = Instant::now();
+                    put_flushing(
+                        engine,
+                        &record.key,
+                        record.value.as_deref().unwrap(),
+                        &mut tally,
+                    );
+                    if tally.flushes != flushes {
+                        let (bytes, publish) = compact_done(engine);
+                        rewritten += bytes;
+                        compact_publish.extend(publish);
+                    } else if at % LATENCY_EVERY == 0 {
+                        latency.push(put.elapsed().as_nanos() as u64);
+                    }
+                }
+                let write_s = start.elapsed().as_secs_f64();
+                done.store(true, Ordering::Relaxed);
+                let reads: Vec<ReaderTally> =
+                    handles.into_iter().map(|h| h.join().unwrap()).collect();
+                ((write_s, tally, latency, rewritten, compact_publish), reads)
+            }));
+        })
+    };
+    let (writer, reads) = outcome.unwrap();
+    let (write_s, mut tally, mut latency, rewritten, mut compact_publish) = writer;
+    latency.sort_unstable();
+    tally.publish_ns.sort_unstable();
+    compact_publish.sort_unstable();
+    let scans: u64 = reads.iter().map(|r| r.scans).sum();
+    let retained = reads.iter().map(|r| r.retained).max().unwrap_or(0);
+    let frozen = reads.iter().map(|r| r.frozen).max().unwrap_or(0);
+    let mut acquire: Vec<u64> = reads.iter().flat_map(|r| r.acquire_ns.clone()).collect();
+    acquire.sort_unstable();
+    let stats = engine.stats();
+    let name = match kind {
+        Reader::None => "no reader",
+        Reader::Guard => "guard",
+        Reader::Snapshot => "snapshot",
+    };
+    println!(
+        "| {name} | {readers} | {:.2} | {} | {} | {:.0} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {} | {frozen} | {:.1} | {:.1} |",
+        rewrite.len() as f64 / write_s / 1e6,
+        percentile(&latency, 0.5),
+        percentile(&latency, 0.99),
+        latency.last().copied().unwrap_or(0) as f64 / 1e3,
+        tally.flushes,
+        percentile(&tally.publish_ns, 0.5) as f64 / 1e3,
+        tally.publish_ns.last().copied().unwrap_or(0) as f64 / 1e3,
+        percentile(&compact_publish, 0.5) as f64 / 1e3,
+        compact_publish.last().copied().unwrap_or(0) as f64 / 1e3,
+        scans,
+        percentile(&acquire, 0.5) as f64 / 1e3,
+        acquire.last().copied().unwrap_or(0) as f64 / 1e3,
+        tally.runs,
+        mib(tally.bytes),
+        mib(rewritten),
+        stats.runs,
+        mib(retained),
+        heap as f64 / (1 << 20) as f64,
+    );
+}
+
+/// One dataset for the frequency experiment.
+struct Workload {
+    name: &'static str,
+    records: Vec<Owned>,
+    order: Vec<usize>,
+    /// The overwrites of the measured pass, in order.
+    rewrite: Vec<usize>,
+}
+
+/// A writer runs `workload.rewrite`, taking a snapshot every `every` puts
+/// (never if 0). Each snapshot scans one 200-key group and, every tenth
+/// time, one 4,000-key tenant, gets one key, and is kept for `hold` further
+/// puts (`usize::MAX`: the first snapshot is kept for the whole pass and the
+/// others dropped at once). Then flushing and compaction complete, so every
+/// configuration ends with nothing eligible.
+fn snapshot_frequency(
+    workload: &Workload,
+    budget: usize,
+    background: bool,
+    every: usize,
+    hold: usize,
+) {
+    let records = &workload.records;
+    let engine = snapshot_base(
+        records,
+        &workload.order,
+        snapshot_options(budget, background),
+    );
+    let compacted_before = engine
+        .background_status()
+        .map_or(0, |status| status.input_bytes);
+    let mut tally = FlushTally::default();
+    let mut workspace = EngineWorkspace::new();
+    let mut snapshots = 0;
+    let mut acquire = Vec::new();
+    let mut latency = Vec::with_capacity(workload.rewrite.len() / LATENCY_EVERY + 1);
+    let (mut group_ns, mut tenant_ns, mut tenants, mut get_ns, mut drop_ns) =
+        (0u128, 0u128, 0, 0u128, 0u128);
+    let (mut peak_frozen, mut peak_retained, mut peak_pinned, mut peak_live) = (0, 0, 0, 0);
+    let mut kept: std::collections::VecDeque<(usize, tessera::engine::Snapshot)> =
+        std::collections::VecDeque::new();
+    let mut written_at = None;
+    let mut completion = None;
+    let heap = peak_during(|| {
+        let start = Instant::now();
+        for (at, &index) in workload.rewrite.iter().enumerate() {
+            let record = &records[index];
+            let put = Instant::now();
+            put_flushing(
+                &engine,
+                &record.key,
+                record.value.as_deref().unwrap(),
+                &mut tally,
+            );
+            if at % LATENCY_EVERY == 0 {
+                latency.push(put.elapsed().as_nanos() as u64);
+            }
+            while kept
+                .front()
+                .is_some_and(|&(taken, _)| hold != usize::MAX && taken + hold <= at)
+            {
+                let dropped = Instant::now();
+                kept.pop_front();
+                drop_ns += dropped.elapsed().as_nanos();
+            }
+            if every == 0 || at % every != every - 1 {
+                continue;
+            }
+            let begun = Instant::now();
+            let snapshot = engine.snapshot().unwrap();
+            acquire.push(begun.elapsed().as_nanos() as u64);
+            snapshots += 1;
+            let stats = engine.stats();
+            peak_frozen = peak_frozen.max(stats.frozen_tables);
+            peak_retained = peak_retained.max(stats.retained_bytes);
+            peak_pinned = peak_pinned.max(stats.active.pinned);
+            peak_live = peak_live.max(stats.snapshots);
+            let scan = Instant::now();
+            black_box(drain(
+                snapshot.scan_prefix(&record.key[..GROUP_LEN], &mut workspace),
+            ));
+            group_ns += scan.elapsed().as_nanos();
+            if snapshots % 10 == 1 {
+                let scan = Instant::now();
+                black_box(drain(
+                    snapshot.scan_prefix(&record.key[..TENANT_LEN], &mut workspace),
+                ));
+                tenant_ns += scan.elapsed().as_nanos();
+                tenants += 1;
+            }
+            let get = Instant::now();
+            black_box(snapshot.get(&record.key, &mut workspace).unwrap());
+            get_ns += get.elapsed().as_nanos();
+            if hold == 0 || (hold == usize::MAX && snapshots > 1) {
+                let dropped = Instant::now();
+                drop(snapshot);
+                drop_ns += dropped.elapsed().as_nanos();
+            } else {
+                kept.push_back((at, snapshot));
+            }
+        }
+        let write_s = start.elapsed().as_secs_f64();
+        written_at = Some((write_s, engine.stats()));
+        let dropped = Instant::now();
+        kept.clear();
+        drop_ns += dropped.elapsed().as_nanos();
+        tally.flush(&engine);
+        if background {
+            engine.wait_for_compaction().unwrap();
+        }
+        let (rewritten, _) = compact_done(&engine);
+        completion = Some((start.elapsed().as_secs_f64(), rewritten));
+    });
+    let (write_s, written) = written_at.unwrap();
+    let (total_s, sync_rewrite) = completion.unwrap();
+    let rewritten = sync_rewrite
+        + engine
+            .background_status()
+            .map_or(0, |status| status.input_bytes - compacted_before) as usize;
+    let end = engine.stats();
+    acquire.sort_unstable();
+    latency.sort_unstable();
+    let puts = workload.rewrite.len();
+    let mean = |total: u128, count: usize| total as f64 / count.max(1) as f64 / 1e3;
+    let every = if every == 0 {
+        "never".to_owned()
+    } else {
+        every.to_string()
+    };
+    let hold = match hold {
+        0 => "0".to_owned(),
+        usize::MAX => "first, whole pass".to_owned(),
+        puts => puts.to_string(),
+    };
+    println!(
+        "| {} | {} | {} | {every} | {hold} | {snapshots} | {peak_live} | {} | {} | {peak_frozen} | {} | {} | {:.1} | {} | {} | {} | {:.1} | {:.2} | {} | {} | {:.2} | {:.2} | {:.2} | {} | {:.0} | {:.1} | {:.0} | {:.0} | {:.1} | {:.0} | {:.1} | {:.1} | {:.1} |",
+        workload.name,
+        budget >> 20,
+        if background { "background" } else { "catch-up" },
+        percentile(&acquire, 0.5),
+        percentile(&acquire, 0.99),
+        tally.flushes,
+        tally.runs,
+        mib(tally.bytes),
+        written.runs,
+        written.max_overlap,
+        tally.stalls,
+        mib(rewritten),
+        rewritten as f64 / tally.bytes.max(1) as f64,
+        end.runs,
+        end.max_overlap,
+        write_s,
+        total_s,
+        puts as f64 / total_s / 1e6,
+        percentile(&latency, 0.99),
+        latency.last().copied().unwrap_or(0) as f64 / 1e3,
+        mean(group_ns, snapshots),
+        mean(tenant_ns, tenants),
+        mean(get_ns, snapshots) * 1e3,
+        mean(drop_ns, snapshots),
+        peak_pinned as f64 / 1024.0,
+        mib(peak_retained),
+        mib(written.retained_bytes),
+        heap as f64 / (1 << 20) as f64,
+    );
+}
+
+/// What one snapshot keeps once everything it saw is replaced, and the cost
+/// of freeing it.
+fn snapshot_reclamation(records: &[Owned], order: &[usize], rewrite: &[usize]) {
+    let engine = snapshot_base(records, order, snapshot_options(SNAP_BUDGET, false));
+    let mut tally = FlushTally::default();
+    for &index in rewrite.iter().step_by(16) {
+        engine.put(&records[index].key, b"{}").unwrap();
+    }
+    let charged = engine.stats().active.charged;
+    let start = Instant::now();
+    let snapshot = engine.snapshot().unwrap();
+    let acquire_us = start.elapsed().as_nanos() as f64 / 1e3;
+    let (view_runs, view_bytes) = (engine.stats().runs, engine.stats().run_bytes);
+    let mut peak_pinned = 0;
+    for &index in rewrite {
+        let record = &records[index];
+        put_flushing(
+            &engine,
+            &record.key,
+            record.value.as_deref().unwrap(),
+            &mut tally,
+        );
+        peak_pinned = peak_pinned.max(engine.stats().active.pinned);
+    }
+    tally.flush(&engine);
+    compact_done(&engine);
+    let held = engine.stats();
+    let before = LIVE.load(Ordering::Relaxed);
+    let start = Instant::now();
+    drop(snapshot);
+    let drop_us = start.elapsed().as_nanos() as f64 / 1e3;
+    let freed = before.saturating_sub(LIVE.load(Ordering::Relaxed));
+    let after = engine.stats();
+    println!(
+        "| {view_runs} runs of {:.1} MiB + a {:.1} MiB table | {acquire_us:.1} | {} | {:.1} | {:.1} | {} | {:.1} | {drop_us:.0} | {} | {} |",
+        mib(view_bytes),
+        mib(charged),
+        tally.flushes,
+        mib(peak_pinned),
+        mib(held.retained_bytes),
+        held.retained_sources,
+        mib(freed as usize),
+        after.retained_sources,
+        after.retained_bytes,
+    );
+}
+
+fn snapshot_bench() {
+    let records = tree_json(16 << 20);
+    let count = records.len();
+    let order = shuffled(count, 700);
+    let rewrite = shuffled(count, 701);
+    let probes: Vec<usize> = shuffled(count, 702).into_iter().take(SNAP_PROBES).collect();
+    println!(
+        "{count} json keys, flushed and compacted with default options into 4 MiB memtables; median of {SNAP_ROUNDS} rounds where timed in rounds; default snapshot limits {:?}",
+        SnapshotLimits::default()
+    );
+    println!();
+    println!(
+        "acquisition: ns per guard or snapshot; heap is bytes a held snapshot allocates; after a put, the snapshot takes a new view of the active table"
+    );
+    println!();
+    println!(
+        "| state | guard ns | shared snapshot ns | allocs | heap B | after-put p50 ns | after-put p99 ns | allocs | flushes forced | frozen tables |"
+    );
+    println!("|{}", "---|".repeat(10));
+    for _ in 0..SNAP_ROUNDS {
+        snapshot_acquisition(&records, &order, &probes);
+    }
+
+    let large = snapshot_large_values();
+    let large_order = shuffled(large.len(), 703);
+    println!();
+    println!(
+        "table size: an active table filled to about the size shown; acquire follows one put, so each takes a new view (one thread, so the time is the exclusive lock's hold time); then 1,000 overwrites of random keys each with no snapshot, after a fresh snapshot each (dropped after the put), and under one snapshot held throughout; pinned and freed are per overwrite under the held snapshot; json values average about 90 bytes, large values are {LARGE_VALUE} random bytes"
+    );
+    println!();
+    println!(
+        "| values | charged KiB | keys | acquire p50 ns | acquire max ns | acquire allocs | put ns, no snapshot | put ns, fresh snapshot each | allocs | put ns, one held snapshot | pinned B/overwrite | heap freed B/overwrite | held drop us |"
+    );
+    println!("|{}", "---|".repeat(13));
+    for target in [16 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20] {
+        snapshot_table_size("json", &records, &order, target);
+        snapshot_table_size("large", &large, &large_order, target);
+    }
+
+    println!();
+    println!(
+        "reads with {SNAP_PROBES} keys overwritten in the memtable: ns per group scan (200 keys), ns per record of a full scan, ns per get"
+    );
+    println!();
+    println!(
+        "| records | guard group scan | held snapshot group scan | snapshot taken per group scan | guard full scan /record | snapshot full scan /record | engine get | snapshot get | allocs per snapshot scan |"
+    );
+    println!("|{}", "---|".repeat(9));
+    for _ in 0..SNAP_ROUNDS {
+        snapshot_reads(&records, &order, &probes);
+    }
+    println!();
+    println!(
+        "contention: 1 MiB memtables; the writer overwrites one key in {CONTENTION_SHARE} once, flushing at a full memtable and then compacting until nothing is eligible; readers repeat full scans until it is done"
+    );
+    println!(
+        "write latency is every {LATENCY_EVERY}th put that did not flush; publish times are the lock wait of each flush or compaction publication; acquire is the reader's snapshot call, including any wait for the lock; heap is the Rust heap peak above the base state"
+    );
+    println!();
+    println!(
+        "| readers | threads | puts M/s | put p50 ns | put p99 ns | put max us | writer flushes | flush publish p50 us | flush publish max us | compaction publish p50 us | compaction publish max us | full scans | acquire p50 us | acquire max us | runs flushed | flushed MiB | compaction rewrite MiB | runs left | peak frozen | peak retained MiB | peak heap MiB |"
+    );
+    println!("|{}", "---|".repeat(21));
+    let share = &rewrite[..count / CONTENTION_SHARE];
+    for _ in 0..SNAP_ROUNDS {
+        for (kind, readers) in [
+            (Reader::None, 0),
+            (Reader::Guard, 1),
+            (Reader::Snapshot, 1),
+            (Reader::Snapshot, 2),
+        ] {
+            snapshot_contention(&records, &order, share, kind, readers);
+        }
+    }
+    println!();
+    println!(
+        "reclamation: a snapshot of the base state plus one memtable, then every key is overwritten, flushed and compacted away; heap freed is the Rust heap released by dropping it"
+    );
+    println!();
+    println!(
+        "| snapshot of | acquire us | flushes while held | peak pinned MiB | retained MiB | sources retained | heap freed MiB | drop us | sources left | bytes left |"
+    );
+    println!("|{}", "---|".repeat(10));
+    for _ in 0..SNAP_ROUNDS {
+        snapshot_reclamation(&records, &order, &rewrite);
+    }
+}
+
+fn snapshot_frequency_bench() {
+    let json = tree_json(16 << 20);
+    let count = json.len();
+    let workloads = [
+        Workload {
+            name: "json",
+            order: shuffled(count, 700),
+            rewrite: shuffled(count, 701),
+            records: json,
+        },
+        Workload {
+            name: "large",
+            order: shuffled(LARGE_KEYS as usize, 703),
+            rewrite: (0..LARGE_PASSES)
+                .flat_map(|pass| shuffled(LARGE_KEYS as usize, 704 + pass))
+                .collect(),
+            records: snapshot_large_values(),
+        },
+    ];
+    println!(
+        "frequency: each row starts from every key flushed and compacted, then runs one overwrite pass ({count} json puts, or {} passes over {LARGE_KEYS} keys of {LARGE_VALUE}-byte values) with a snapshot every N puts",
+        LARGE_PASSES
+    );
+    println!(
+        "each snapshot scans one 200-key group, every tenth also a 4,000-key tenant, gets one key, and is kept for the puts shown (0: dropped at once)"
+    );
+    println!(
+        "catch-up: no compaction during the pass, max_runs 4096, then compaction until nothing is eligible; background: the worker with default options and the default max_runs {}, a flush refused at it waits for compaction (a stall)",
+        EngineOptions::default().max_runs
+    );
+    println!(
+        "total s runs from the first put until flushing and compaction leave nothing eligible, and puts M/s is over that time; snapshot limits {:?}; {FREQUENCY_ROUNDS} rounds",
+        SnapshotLimits::default(),
+    );
+    println!();
+    println!(
+        "| values | budget MiB | compaction | every | held for | snapshots | peak live | acquire p50 ns | acquire p99 ns | peak frozen | flushes | runs flushed | flushed MiB | runs after writes | overlap after writes | stalls | rewrite MiB | rewrite / flushed | runs at end | overlap at end | write s | total s | puts M/s | put p99 ns | put max us | group scan us | tenant scan us | get ns | drop us | peak pinned KiB | peak retained MiB | retained after writes MiB | peak heap MiB |"
+    );
+    println!("|{}", "---|".repeat(33));
+    for _ in 0..FREQUENCY_ROUNDS {
+        for workload in &workloads {
+            for budget in [1 << 20, 4 << 20, 16 << 20] {
+                for background in [false, true] {
+                    for every in [0, 10_000, 1_000, 100] {
+                        snapshot_frequency(workload, budget, background, every, 0);
+                    }
+                }
+            }
+        }
+        // Lifetimes: snapshots every 1,000 puts kept for longer, up to the
+        // live limit, and one kept for the whole pass beside short ones.
+        let json = &workloads[0];
+        for hold in [4_000, 15_000, usize::MAX] {
+            for budget in [4 << 20, 16 << 20] {
+                snapshot_frequency(json, budget, true, 1_000, hold);
+            }
+        }
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("geometry") => return geometry(),
@@ -3549,6 +4397,8 @@ fn main() {
         Some("ranges") => return range_reads(),
         Some("engine") => return engine_baseline(),
         Some("compaction") => return compaction_sustained(),
+        Some("snapshot") => return snapshot_bench(),
+        Some("snapshot-frequency") => return snapshot_frequency_bench(),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}
