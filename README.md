@@ -139,6 +139,7 @@ scripts/validate.sh persistent # memtable tree costs under held snapshots
 scripts/validate.sh pacing   # background compaction under frequent snapshots
 scripts/validate.sh profile  # memtable and engine write cost by component
 scripts/validate.sh policy   # compaction selection cost across arrival rates
+scripts/validate.sh reads    # read amplification under sustained writes
 colima stop
 ```
 

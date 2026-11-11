@@ -22,6 +22,7 @@
 #   scripts/validate.sh pacing             background compaction under frequent snapshots
 #   scripts/validate.sh profile            memtable and engine write cost by component
 #   scripts/validate.sh policy             compaction selection policies and pacing (5G)
+#   scripts/validate.sh reads              read amplification under sustained writes (5H)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -139,7 +140,7 @@ fetch_crates() {
 
 check() {
   bounded fmt 60 cargo fmt --check
-  bounded clippy 300 cargo clippy --locked --all-targets -- -D warnings
+  bounded clippy 300 cargo clippy --locked --all-targets --all-features -- -D warnings
   bounded build-tests 300 cargo test --locked --no-run
   bounded test 300 cargo test --locked
   bounded doc 120 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
@@ -207,6 +208,10 @@ pacing() {
 
 policy() {
   bounded policy 1800 cargo run --locked --release --example block_bench -- policy
+}
+
+reads() {
+  bounded reads 1800 cargo run --locked --release --features diagnostics --example block_bench -- reads
 }
 
 profile() {
@@ -281,7 +286,8 @@ case "$command" in
   pacing) pacing ;;
   profile) profile ;;
   policy) policy ;;
+  reads) reads ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,26p' "$0"; exit 2 ;;
+  *) sed -n '2,27p' "$0"; exit 2 ;;
 esac

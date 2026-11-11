@@ -859,3 +859,99 @@ versions in the extra runs) and 0.1–0.2 MiB more for new keys. Peak heap fell
 for new keys (21.6–22.4 → 12.2–20.3 MiB), rose up to 3 MiB for uniform
 overwrites, and for the window fell unpaced (12.4 → 7.3) and rose 1.9–2.2
 MiB paced.
+
+## Read amplification (investigation)
+
+`scripts/validate.sh reads` (about 35 s; it builds with the `diagnostics`
+feature, which adds a read-only `ReadGuard::runs` used only here) drives the
+real engine and its
+background worker: 173,536 json keys put, flushed and compacted, then
+1.5 million puts unpaced or 600,000 at 200k/s with 1 MiB memtables and the
+default limits (64 runs). It samples every 100,000 puts, then dissects point
+lookups and prefix scans on the settled state, run by run, and consolidates
+it with `Engine::compact` at `max_overlap` 2 and then 1. The previous policy
+ran from a copy of commit `5e9208e` given the same read-only run accessor.
+Three sessions; within-session comparisons only. Settled states differ from
+round to round, because where ingestion stops decides which merge was last.
+
+### Sustained ingestion
+
+Unpaced, the worker was busy at every sample under both policies and overlap
+rose to 7–27 runs (uniform) and up to 54 (new keys); paced at 200k/s it was
+mostly idle and overlap stayed at 3–7. No flush was refused (the closest was
+54 of 64 runs), and catch-up after the last put took 0–0.57 s. Writer
+throughput did not differ between the policies.
+
+| workload, rate | rewrite previous → size-aware | worker CPU s |
+|---|---|---|
+| uniform, unpaced | 2.7–4.0 → 2.5–3.6 | 1.06–1.63 → 1.00–1.47 |
+| uniform, 200k/s | 9.63 → 5.02 | 1.61 → 0.81 |
+| window, unpaced | 3.1–3.9 → 2.9–3.3 | 0.72–0.93 → 0.67–0.76 |
+| window, 200k/s | 10.34 → 3.50–3.61 | 1.09 → 0.35 |
+| new keys, unpaced | 3.0–5.3 → 2.8–4.1 | 1.50–2.56 → 1.38–2.01 |
+| new keys, 200k/s | 11.8–12.6 → 4.26 | 2.17–2.32 → 0.81 |
+
+Over time at 200k/s, rewrite for new keys climbed 2.0 → 11.7 under the
+previous policy, rewriting a run that grew with the data, and 1.5 → 3.9
+under the size-aware one. Size tiers formed as expected where the data
+allowed: new keys settled into runs of under 1 MiB, 1–4 MiB and 4–16 MiB.
+With overwrites the key space is 3.4 MiB, so the largest tier is the whole
+key space, and runs either hold all of it or are recent flushes.
+
+### Point lookups
+
+Every run whose key range covers a key decodes one block (about 10 µs for
+these runs; a flush run's smaller blocks cost less), whether or not it holds
+the key, and nothing caches decoded blocks. Range metadata excluded nothing
+under overwrites, whose every run spans the key space, and 1.8–3.5 runs per
+lookup for new keys.
+
+| state | candidate runs | holding a present key | absent key in range |
+|---|---|---|---|
+| uniform settled | 4 | 1.6–3.2 | 4 candidates, 0 hold |
+| window settled | 1–3 | 1.0–1.2 | 1–2.3, 0 hold |
+| new keys settled | 2.5–3.75 | 1.0 | 2.5–3.75, 0 hold |
+| uniform, during unpaced writes | 9–22 | 1.5–2.7 | |
+| new keys, during unpaced writes | 4–19 | 1.0 | |
+
+Present and absent keys cost the same (33.4 µs for four runs, 8.2 µs for
+one). A run-local Bloom filter could skip the candidates without the key:
+almost all of them for absent keys, 80–95% during unpaced ingestion, 60–73%
+for settled new keys, but only 20–60% for settled overwrites, where older
+versions of the key sit in most runs and must still be read. These savings
+are estimated from the counts, not measured. At n·log2(1/p)/ln 2 bits per
+record, filters would take 3%, 6% and 9% of the stored bytes at 10%, 1% and
+0.1% false positives for these json records (0.64 MiB for 11.1 MiB of runs at
+1%); smaller values would make that share larger.
+
+### Prefix scans
+
+Seeking costs about one block per participating run (41 µs for four runs, 10
+µs for one), so 20-record scans are almost all seek. Long scans are paid per
+physical record: in settled overwrite states each logical record was stored
+1.6–3.2 times, and blocks decoded and time rose with it (tenant scans 803–1,508
+µs at 1.64–3.24 physical records per record against 372 µs once consolidated).
+With no duplicates (new keys) the cost of 2.6 overlapping runs was 1.2–1.3
+times one run, from merging. Merging the runs costs 35–60% over scanning them
+one by one. A Bloom filter cannot address any of this: not duplicated
+history, not merge work, and not the seek into every run whose range meets
+the prefix.
+
+### Consolidation
+
+| state | rewritten | CPU s | peak heap | runs/overlap | get p50 | tenant scan |
+|---|---|---|---|---|---|---|
+| uniform | 7.5–11.1 MiB (1.0–1.4 times stored) | 0.08–0.10 | 7.6 MiB | 4/4 → 1/1 | 33.4 → 8.2 µs | 803–1,508 → 372 µs |
+| window | 0–4.3 MiB | 0–0.05 | 7.5 MiB | 1–3 → 1/1 | 13.2 → 8.1 µs | 438 → 366 µs |
+| new keys | 33.6–52.8 MiB (1.0–1.6 times) | 0.45–0.70 | 39–61 MiB | 6–7/3–4 → 4–5/1 | 24.6–34.2 → 8.4 µs | 473–496 → 383 µs |
+
+That is 7–10% of the bytes the worker rewrote during ingestion for
+overwrites and 24–41% for new keys, once. No merge reached an input limit.
+A snapshot held through it kept every input allocated (5.2–33.6 MiB) until
+dropped, so transient memory is up to twice the rewritten runs. Overlap 2 was
+cheaper (0.1–0.7 times stored) but left two candidates.
+
+Unexplained: long scans of one consolidated run were 25–35% slower in the
+previous commit's build in both sessions, while scanning that run directly
+cost the same. The read path is identical, so this is taken as code layout,
+not policy.

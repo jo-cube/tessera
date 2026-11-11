@@ -6,6 +6,11 @@ description = "A RAM-first, compressed LSM key-value database"
 license = "MIT"
 publish = false
 
+[features]
+# Read-only access to engine internals for the benchmarks that measure them.
+# Not part of the supported API.
+diagnostics = []
+
 [dependencies]
 crc32fast = "1"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode"] }

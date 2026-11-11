@@ -12,7 +12,9 @@
 //! effect on background compaction; see `block_bench/retention.rs`. With
 //! `profile`, instead splits memtable and engine write cost by component. With
 //! `policy`, instead records each compaction's selection and cost across
-//! arrival rates; see `block_bench/policy.rs`.
+//! arrival rates; see `block_bench/policy.rs`. With `reads`, instead measures
+//! read amplification under sustained ingestion (with the `diagnostics`
+//! feature); see `block_bench/reads.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -41,6 +43,9 @@ use tessera::run::{
 mod policy;
 #[path = "block_bench/profile.rs"]
 mod profile;
+#[cfg(feature = "diagnostics")]
+#[path = "block_bench/reads.rs"]
+mod reads;
 #[path = "block_bench/retention.rs"]
 mod retention;
 
@@ -4421,6 +4426,10 @@ fn main() {
         Some("pacing") => return retention::pacing_bench(),
         Some("profile") => return profile::profile_bench(),
         Some("policy") => return policy::policy_bench(),
+        #[cfg(feature = "diagnostics")]
+        Some("reads") => return reads::reads_bench(),
+        #[cfg(not(feature = "diagnostics"))]
+        Some("reads") => panic!("the reads benchmark needs --features diagnostics"),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}

@@ -601,6 +601,13 @@ impl Engine {
 
     /// Compacts once with [`Engine::begin_compaction`]'s policy, building in
     /// `workspace`. Returns `None` if the policy finds nothing to do.
+    ///
+    /// Repeated until `None` with a [`CompactionOptions::max_overlap`] of 1,
+    /// this consolidates after ingestion slows: then no key lies in more than
+    /// one run and a lookup reads at most one run block, within the same input
+    /// limits (a merge beyond them fails instead). Runs that overlap no other
+    /// are rewritten only by the disjoint-tail rule, and inputs a snapshot
+    /// holds stay allocated until it is dropped.
     pub fn compact(
         &self,
         options: CompactionOptions,
@@ -1553,6 +1560,13 @@ impl EngineWorkspace {
 pub struct ReadGuard<'e>(RwLockReadGuard<'e, State>);
 
 impl ReadGuard<'_> {
+    /// Returns the published runs, in the order reads take them. Only with
+    /// the `diagnostics` feature, for benchmarks that measure read cost.
+    #[cfg(feature = "diagnostics")]
+    pub fn runs(&self) -> impl ExactSizeIterator<Item = &Run<Vec<u8>>> {
+        self.0.runs.iter().map(|run| &run.run)
+    }
+
     /// Returns the latest value of `key`, or `None` if it is absent or
     /// deleted, without copying it.
     pub fn get<'r>(
