@@ -204,6 +204,8 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     // was freed by the compaction.
     assert_eq!(held.retained_sources, 2);
     assert!(held.retained_bytes > pinned);
+    assert!(held.retained_run_bytes > 0);
+    assert!(held.retained_run_bytes < held.retained_bytes - pinned);
 
     drop(first);
     let stats = engine.stats();
@@ -217,7 +219,7 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     drop(second);
     let stats = engine.stats();
     assert_eq!((stats.snapshots, stats.retained_sources), (0, 0));
-    assert_eq!(stats.retained_bytes, 0);
+    assert_eq!((stats.retained_bytes, stats.retained_run_bytes), (0, 0));
 }
 
 #[test]

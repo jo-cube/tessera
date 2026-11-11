@@ -411,6 +411,9 @@ pub struct EngineStats {
     /// sources, and the history pinned in the engine's memtables, which
     /// `active` and `frozen` also report as [`MemoryUsage::pinned`].
     pub retained_bytes: usize,
+    /// The part of `retained_bytes` that is runs: stored bytes of runs that
+    /// compaction replaced and snapshots still hold.
+    pub retained_run_bytes: usize,
 }
 
 struct State {
@@ -440,6 +443,7 @@ struct State {
 struct Retired {
     source: Weak<dyn Send + Sync>,
     bytes: usize,
+    run: bool,
 }
 
 /// What snapshots alone keep.
@@ -447,14 +451,15 @@ struct Retired {
 struct Retained {
     sources: usize,
     bytes: usize,
+    run_bytes: usize,
 }
 
 impl State {
-    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize) {
+    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, run: bool) {
         self.retired
             .retain(|retired| retired.source.strong_count() > 0);
         if source.strong_count() > 0 {
-            self.retired.push(Retired { source, bytes });
+            self.retired.push(Retired { source, bytes, run });
         }
     }
 
@@ -474,10 +479,12 @@ impl State {
                 Retained {
                     sources: 0,
                     bytes: pinned,
+                    run_bytes: 0,
                 },
                 |sum, retired| Retained {
                     sources: sum.sources + 1,
                     bytes: sum.bytes + retired.bytes,
+                    run_bytes: sum.run_bytes + if retired.run { retired.bytes } else { 0 },
                 },
             )
     }
@@ -952,6 +959,7 @@ impl Core {
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
             retained_bytes: retained.bytes,
+            retained_run_bytes: retained.run_bytes,
         }
     }
 
@@ -1119,7 +1127,7 @@ impl BuiltFlush<'_> {
             } else {
                 table.held_by_snapshots()
             };
-            state.retire(table.family() as Weak<dyn Send + Sync>, bytes);
+            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, false);
         }
         let budget = job.engine.active_budget(state.frozen_charged());
         state.active.raise_budget(budget);
@@ -1484,7 +1492,7 @@ impl BuiltCompaction<'_> {
         state.run_bytes = total_bytes;
         for input in &job.inputs {
             let bytes = input.run.as_bytes().len();
-            state.retire(Arc::downgrade(input) as Weak<dyn Send + Sync>, bytes);
+            state.retire(Arc::downgrade(input) as Weak<dyn Send + Sync>, bytes, true);
         }
         drop(state);
         drop(job);

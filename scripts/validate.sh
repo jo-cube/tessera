@@ -17,6 +17,9 @@
 #   scripts/validate.sh compaction         sustained writes, three compaction modes
 #   scripts/validate.sh snapshot           snapshots compared with read guards
 #   scripts/validate.sh frequency          frequent and long-lived snapshots
+#   scripts/validate.sh retention          sustained snapshot retention and backpressure
+#   scripts/validate.sh persistent         memtable tree costs under held snapshots
+#   scripts/validate.sh pacing             background compaction under frequent snapshots
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -188,6 +191,18 @@ frequency() {
   bounded frequency 900 cargo run --locked --release --example block_bench -- snapshot-frequency
 }
 
+retention() {
+  bounded retention 900 cargo run --locked --release --example block_bench -- retention
+}
+
+persistent() {
+  bounded persistent 900 cargo run --locked --release --example block_bench -- persistent
+}
+
+pacing() {
+  bounded pacing 900 cargo run --locked --release --example block_bench -- pacing
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -251,7 +266,10 @@ case "$command" in
   compaction) compaction ;;
   snapshot) snapshot ;;
   frequency) frequency ;;
+  retention) retention ;;
+  persistent) persistent ;;
+  pacing) pacing ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,21p' "$0"; exit 2 ;;
+  *) sed -n '2,24p' "$0"; exit 2 ;;
 esac

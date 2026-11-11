@@ -84,7 +84,7 @@ against that memtable's budget, so a long-lived snapshot brings flushes
 forward instead of growing memory. `SnapshotLimits` bound live snapshots and
 retained bytes; over the retained limit, new snapshots and compactions are
 refused, which is the backpressure. `EngineStats` reports what snapshots
-retain.
+retain, as an upper estimate, and how much of it is runs.
 
 **Compaction** is explicit and synchronous. `compact` merges runs into new
 disjoint runs that keep only the newest version of each key, collapse identical
@@ -133,6 +133,9 @@ scripts/validate.sh engine   # integrated engine measurements
 scripts/validate.sh compaction # sustained writes: none, sync and background compaction
 scripts/validate.sh snapshot # snapshots compared with read guards
 scripts/validate.sh frequency # frequent and long-lived snapshots
+scripts/validate.sh retention # sustained snapshot retention and backpressure
+scripts/validate.sh persistent # memtable tree costs under held snapshots
+scripts/validate.sh pacing   # background compaction under frequent snapshots
 colima stop
 ```
 

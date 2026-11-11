@@ -7,6 +7,9 @@
 //! With the argument `ranges`, instead measures reads that key ranges can prune.
 //! With the argument `snapshot`, instead compares snapshots with read guards.
 //! With the argument `snapshot-frequency`, instead measures frequent snapshots.
+//! With `retention`, `persistent` and `pacing`, instead measures what snapshots
+//! retain under sustained writes, their cost to the memtable tree, and their
+//! effect on background compaction; see `block_bench/retention.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -30,6 +33,9 @@ use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
     RunBuilder, RunCursor, RunSet, RunView,
 };
+
+#[path = "block_bench/retention.rs"]
+mod retention;
 
 struct CountingAllocator;
 
@@ -4399,6 +4405,13 @@ fn main() {
         Some("compaction") => return compaction_sustained(),
         Some("snapshot") => return snapshot_bench(),
         Some("snapshot-frequency") => return snapshot_frequency_bench(),
+        Some("retention") => return retention::retention_bench(),
+        Some("retention-row") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            return retention::retention_row(&args[0], &args[1]);
+        }
+        Some("persistent") => return retention::persistent_bench(),
+        Some("pacing") => return retention::pacing_bench(),
         Some("memtable") => return memtable_baseline(),
         Some("memtable-memory") => return memtable_memory(),
         _ => {}

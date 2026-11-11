@@ -585,3 +585,142 @@ Hypotheses, not measured:
   newest view's charge plus the pinned history; these rows predate that.
 - With the default 64 MiB budget, the pinned history a snapshot causes would
   be bounded by the same budget; only 1, 4 and 16 MiB tables were measured.
+
+## Retention under sustained snapshots
+
+Three modes measure what copy-on-write snapshots cost once they are held:
+
+- `scripts/validate.sh retention` (about 15 s): 300,000 puts with the
+  background worker and 4 MiB memtables, from a base of every key flushed and
+  compacted, for four workloads (json values over 174k keys uniformly, the
+  same with 90% of puts to a hot tenth, json over 17k keys, and 8-byte values
+  over 214k keys) and five snapshot patterns. Each row is a fresh process.
+  Then a backpressure sequence with a small retained limit.
+- `scripts/validate.sh persistent` (about 50 s): memtable writes beside no
+  snapshot, one held snapshot, or a snapshot every 1,000 writes kept until the
+  next, and reads, scans and flushes of a table written that way.
+- `scripts/validate.sh pacing` (about 10 s): background rewrite with an event
+  every 100 puts that reads through a snapshot, only acquires one, spins or
+  sleeps for the reads' time, or does nothing.
+
+Sources of retained memory are reported apart: **pinned** is memtable history
+only snapshots need; **tables** and **runs** are released memtables and runs
+that snapshots hold (`EngineStats::retained_run_bytes` gives the runs).
+**Engine** is what the live engine reaches: memtable charges without pinned
+history, plus published run bytes.
+
+### Findings
+
+Reference environment, one pass each; counts repeated exactly where rerun.
+
+**Sustained workloads** (MiB unless stated; freed is the heap released by
+dropping the snapshots still held at the end of the writes):
+
+| workload | snapshots | puts M/s | flushes | rewrite / flushed | peak engine | peak pinned | peak tables | peak runs | peak heap growth | peak RSS growth | retained at end | freed | freed / retained |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| json 174k uniform | none | 1.45 | 16 | 3.32 | 10.5 | 0 | 0 | 0 | 10.2 | 10.2 | 0 | 0 | — |
+| | every 100, dropped | 0.67 | 16 | 3.28 | 9.1 | 0 | 0 | 0 | 9.0 | 12.3 | 0 | 0 | — |
+| | 8 held | 1.26 | 31 | 4.00 | 8.2 | 1.9 | 15.7 | 4.9 | 13.9 | 12.6 | 7.9 | 4.5 | 0.57 |
+| | 8 held + tenant scans | 0.64 | 31 | 5.45 | 6.7 | 1.9 | 15.6 | 4.3 | 15.0 | 15.3 | 12.7 | 7.1 | 0.56 |
+| | one, whole pass | 1.43 | 16 | 3.32 | 9.9 | 0 | 0 | 3.5 | 13.2 | 9.4 | 3.5 | 3.5 | 1.00 |
+| json 174k, 90% hot | none | 1.73 | 9 | 3.06 | 8.9 | 0 | 0 | 0 | 8.8 | 6.2 | 0 | 0 | — |
+| | 8 held | 1.50 | 28 | 3.86 | 7.8 | 2.1 | 11.9 | 4.8 | 14.4 | 9.3 | 8.1 | 4.1 | 0.51 |
+| | one, whole pass | 1.90 | 9 | 3.06 | 9.1 | 0 | 0 | 3.5 | 9.1 | 5.4 | 3.5 | 3.5 | 1.00 |
+| json 17k uniform | none | 3.11 | 8 | 1.20 | 5.5 | 0 | 0 | 0 | 4.8 | 3.7 | 0 | 0 | — |
+| | 8 held | 2.00 | 28 | 1.61 | 3.2 | 2.1 | 11.9 | 1.1 | 7.9 | 7.9 | 8.3 | 3.5 | 0.42 |
+| | one, whole pass | 2.93 | 8 | 1.20 | 5.5 | 0 | 0 | 0.4 | 4.8 | 4.2 | 0.4 | 0.4 | 1.00 |
+| 8-byte 214k uniform | none | 1.68 | 11 | 3.02 | 9.1 | 0 | 0 | 0 | 8.9 | 10.3 | 0 | 0 | — |
+| | 8 held | 1.42 | 27 | 5.02 | 6.2 | 2.4 | 11.9 | 3.9 | 10.4 | 11.5 | 4.4 | 1.7 | 0.39 |
+| | 8 held + tenant scans | 0.79 | 27 | 5.64 | 5.5 | 2.4 | 15.9 | 3.6 | 9.6 | 15.0 | 8.1 | 2.1 | 0.26 |
+| | one, whole pass | 1.67 | 11 | 3.02 | 9.1 | 0 | 0 | 3.0 | 11.9 | 12.1 | 3.0 | 3.0 | 1.00 |
+
+"8 held" takes a snapshot every 1,000 puts, keeps up to eight and drops a
+random one when a ninth arrives. No snapshot was refused and no flush
+stalled. Heap growth after flushing and compaction finished was at most
+0.5 MiB in every row. RSS at the start of a row was 14–59 MiB, mostly the
+dataset.
+
+**Backpressure** (json uniform, 1 MiB memtables, no worker, `max_runs` 16,
+`max_retained_bytes` 2 MiB, one snapshot held from the start):
+
+| event | puts | retained | retained runs | memtables | runs | frozen tables | heap growth |
+|---|---|---|---|---|---|---|---|
+| first compaction refused | 4,610 | 3.6 | 3.6 | 0.0 | 1 | 0 | 3.5 |
+| first snapshot refused | 5,000 | 3.6 | 3.6 | 0.1 | 1 | 0 | 3.6 |
+| first flush refused | 78,178 | 3.6 | 3.6 | 1.0 | 16 | 1 | 5.7 |
+| writes refused | 82,789 | 3.6 | 3.6 | 2.0 | 16 | 3 | 6.5 |
+| 50,000 puts after dropping it | 132,789 | 0 | 0 | 0.9 | 1 | 0 | 0.6 |
+
+Dropping the snapshot freed 3.6 MiB in 1 µs.
+
+**Persistent tree** (ns per operation, allocations per operation; 5D is the
+latest-only `BTreeMap` memtable, measured in the same session):
+
+| dataset | workload | 5D | none | one held | every 1,000, kept until the next |
+|---|---|---|---|---|---|
+| json | sequential insert | 215, 2.17 | 90, 1.10 | 90, 1.10 | 84, 1.11 |
+| json | random insert, half full | — | 660, 1.14 | 697, 1.23 | 1,256, 3.74 |
+| json | random overwrite | 582, 1.00 | 737, 1.00 | 826, 1.10 | 1,443, 3.87 |
+| json | random delete | 714, 0.00 | 773, 1.00 | 793, 1.10 | 1,470, 3.87 |
+| 8-byte | random insert, half full | — | 810, 1.14 | 895, 1.23 | 1,631, 4.64 |
+| 8-byte | random overwrite | 691, 1.00 | 895, 1.00 | 998, 1.10 | 1,960, 4.86 |
+| 8-byte | random delete | 686, 0.00 | 939, 1.00 | 952, 1.10 | 1,942, 4.86 |
+
+A held snapshot pins 52 bytes per insert and 94–171 per overwrite or delete.
+After a full overwrite pass under the rolling snapshot, all dropped since,
+reads of the resulting table against one written with none: gets 558 against
+510 ns (json) and 641 against 608 ns (8-byte), traversal 4.5 against 6.6 and
+7.8 against 7.5 ns per record, group scans of 200 records 2.2 against 2.1 µs
+and 2.8 against 2.8 µs, tenant scans of 4,000 records 40 against 52 µs and
+45 against 51 µs, and flushes 207 against 203 and 133 against 134 ns per
+record. 5D's gets were 511 (json) and 638 ns (8-byte), traversal 9.7 and 15.2.
+
+**Pacing** (json, 1 MiB memtables, worker, an event every 100 puts):
+
+| event | write s | flushes | passes | compactions | rewrite / flushed | mean input KiB | runs after writes |
+|---|---|---|---|---|---|---|---|
+| reads through a snapshot | 0.38–0.39 | 39 | 5 | 8 | 8.34 | 3,990 | 7 |
+| snapshot acquired only | 0.10 | 39 | 5 | 6 | 3.64 | 2,323 | 14 |
+| spin for the reads' time | 0.38–0.39 | 39 | 5 | 8 | 8.37 | 4,006 | 10–11 |
+| sleep for it (overshoots) | 0.59 | 39 | 21 | 9 | 9.23 | 3,927 | 7 |
+| nothing | 0.10–0.11 | 39 | 5 | 6 | 3.64 | 2,323 | 14 |
+
+Measured:
+
+- **Short-lived snapshots cost the write path nothing.** One dropped before
+  the next write leaves no node shared, so flushes and rewrite equal no
+  snapshots; the throughput drop is the snapshots' own scans.
+- **Held snapshots move flushes forward.** Eight held at once pinned up to
+  1.9–2.4 MiB of the 4 MiB budget, so flushes rose from 8–16 to 27–31 and
+  rewrite from 1.2–3.3 to 1.6–5.8 times what was flushed.
+- **A long-lived snapshot keeps exactly what it saw.** Held over a whole
+  pass of 300,000 puts and up to 16 flushes and their compactions, it kept the
+  base runs, 0.4–3.5 MiB, from the first compaction on, and the figure did not
+  grow; dropping it freed exactly that.
+- **Retained bytes are an upper bound.** Dropping the held snapshots freed
+  26–57% of what was reported for memtable history and released tables, and
+  100% where only runs were held. A tests/retention.rs check finds no case of
+  more freed than reported over random histories.
+- **Backpressure holds memory flat.** Under a 2 MiB retained limit, each
+  refusal began in the documented order, heap growth stayed under 6.5 MiB
+  until writes were refused, and dropping the snapshot restored progress.
+- **A snapshot that stays shared doubles random-write cost.** A new snapshot
+  every 1,000 writes, held until the next, makes each random write copy its
+  path: 3.7–4.9 allocations and 1.7–2.2 times the time. At the engine level,
+  eight held snapshots cost 13–36% of put throughput, flushes included.
+- **The higher background rewrite is pacing, not snapshots.** Spinning or
+  sleeping for the reads' time reproduces it without any snapshot, and
+  acquiring snapshots without reading matches none. A slower pass gives the
+  worker time to compact after fewer new runs, so it compacts more often with
+  larger inputs: 8–9 compactions of 3.9–4.0 MiB against 6 of 2.3 MiB.
+
+Hypotheses, not measured:
+
+- The retained overestimate for released tables comes mostly from the
+  128-byte entry charge, which exceeds what small entries allocate, and from
+  history pinned for snapshots already dropped.
+- At larger scale, a snapshot held across a full compaction keeps a second
+  copy of every run it saw, up to doubling run memory; `max_retained_bytes`
+  bounds that by refusing compactions, not by reclaiming.
+- Reads of a table written under frequent snapshots differ within noise from
+  one written without; copied nodes did not measurably hurt locality.
