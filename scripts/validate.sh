@@ -25,6 +25,7 @@
 #   scripts/validate.sh reads              read amplification under sustained writes (5H)
 #   scripts/validate.sh bloom              filtered against unfiltered point lookups
 #   scripts/validate.sh filtercost         key filter construction cost by component (5J)
+#   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -224,6 +225,10 @@ filtercost() {
   bounded filtercost 900 cargo run --locked --release --example block_bench -- filtercost
 }
 
+operate() {
+  bounded operate 1800 cargo run --locked --release --features diagnostics --example block_bench -- operate
+}
+
 profile() {
   bounded profile 900 cargo run --locked --release --example block_bench -- profile
 }
@@ -299,7 +304,8 @@ case "$command" in
   reads) reads ;;
   bloom) bloom ;;
   filtercost) filtercost ;;
+  operate) operate ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,29p' "$0"; exit 2 ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

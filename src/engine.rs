@@ -38,8 +38,10 @@
 //!   at most the guards already held.
 //! - A [`Snapshot`] holds no lock. See [Snapshots](self#snapshots).
 //!
-//! [`Engine::get`] holds the lock only for its own read, and sees every write
-//! that returned before it began. A snapshot's reads see the state when it
+//! [`Engine::get`] holds the lock only to search the memtables and take
+//! shared references to the published runs, which it then reads without the
+//! lock, so decoding a block delays no writer. It sees every write that
+//! returned before it began. A snapshot's reads see the state when it
 //! was taken, which grows older as writes continue.
 //!
 //! Do not call a method of the [`Engine`] on a thread that holds a guard: a
@@ -132,7 +134,10 @@
 //!
 //! A failed compaction ends its pass. It is recorded in
 //! [`Engine::background_status`] and not retried until the next request, so
-//! a lasting failure is reported once per flush, never in a loop.
+//! a lasting failure is reported once per flush, never in a loop. A flush
+//! refused by the run limits also requests a pass, so a writer that retries
+//! flushes recovers once compaction can run again, for example after the
+//! snapshots that blocked it are dropped.
 //! [`Engine::wait_for_compaction`] requests a pass, waits for it and returns
 //! its failure. A panic in the worker stops it for good and is reported the
 //! same way; the engine stays usable without it.
@@ -162,14 +167,17 @@
 //! limited by [`CompactionOptions`]. Only one compaction builds at a time,
 //! whether in the background or not. Its inputs stay published until it
 //! publishes, and are freed as it releases the lock: a reader holding the lock
-//! delays publication rather than keeping old runs. Run bytes can therefore
+//! delays publication rather than keeping old runs. An [`Engine::get`] in
+//! progress keeps the runs it is reading until it returns, a few blocks'
+//! decoding, and until then they count as retained. Run bytes can therefore
 //! briefly be the published total plus one output, beside two memtable
 //! budgets and one workspace. A compaction is refused only if it would leave
 //! more runs or bytes than both the limits, or what it replaces.
 //!
 //! When flushes outpace compaction, the run limits reject flushes, the
 //! memtables fill and writes are rejected with
-//! [`WriteError::BudgetExceeded`]. Nothing waits on its own. A caller can
+//! [`WriteError::BudgetExceeded`]. Nothing waits on its own: a refused flush
+//! asks the worker for a pass, and a caller can
 //! [`Engine::wait_for_compaction`] and retry.
 //!
 //! Snapshots keep memory in two ways, both reported as
@@ -212,6 +220,7 @@ use crate::run::{
 type SharedRun = Arc<Published>;
 
 /// A published run.
+#[derive(Debug)]
 struct Published {
     run: Run<Vec<u8>>,
     /// Whether this was the last run of its flush or compaction, the only one
@@ -414,7 +423,8 @@ pub struct EngineStats {
     pub max_overlap: usize,
     /// Live snapshots.
     pub snapshots: usize,
-    /// Memtables and runs the engine has released that snapshots still hold.
+    /// Memtables and runs the engine has released that snapshots still hold,
+    /// or that an [`Engine::get`] in progress is still reading.
     pub retained_sources: usize,
     /// Bytes kept only for snapshots: the charged or stored bytes of those
     /// sources with any runs' filters, and the history pinned in the engine's
@@ -801,15 +811,49 @@ impl Core {
         key: &[u8],
         workspace: &'w mut EngineWorkspace,
     ) -> Result<Option<LiveValue<'w>>, ReadError> {
-        let EngineWorkspace { logical, value, .. } = workspace;
+        let EngineWorkspace {
+            logical,
+            value,
+            runs,
+            ..
+        } = workspace;
         let state = self.read_state();
-        let Some(found) = lookup_state(&state, key, logical)? else {
-            return Ok(None);
-        };
-        let seq = found.seq;
-        value.clear();
-        value.extend_from_slice(found.value);
-        Ok(Some(LiveValue { seq, value }))
+        let in_memory = state
+            .active
+            .get(key)
+            .or_else(|| state.frozen.iter().rev().find_map(|table| table.get(key)));
+        if let Some(version) = in_memory {
+            let Value::Bytes(bytes) = version.value else {
+                return Ok(None);
+            };
+            value.clear();
+            value.extend_from_slice(bytes);
+            return Ok(Some(LiveValue {
+                seq: version.seq,
+                value,
+            }));
+        }
+        // The runs are immutable and shared, so they are read after the lock
+        // is released: the result is the state at the lock, and a writer or
+        // publication waits only for the memtable lookup, not for decoding.
+        runs.clear();
+        runs.extend(state.runs.iter().cloned());
+        drop(state);
+        let found = latest_in(
+            runs.iter().map(|run| (run.run.view(), run.run.filter())),
+            key,
+            logical,
+        )
+        .map(|found| {
+            found.map(|found| {
+                value.clear();
+                value.extend_from_slice(found.value);
+                found.seq
+            })
+        });
+        // Releases the runs at once, so that no workspace keeps one alive.
+        runs.clear();
+        Ok(found?.map(|seq| LiveValue { seq, value }))
     }
 
     fn read(&self) -> ReadGuard<'_> {
@@ -1146,12 +1190,17 @@ impl BuiltFlush<'_> {
         let total_bytes =
             state.run_bytes + state.filter_bytes + report.run_bytes + report.filter_bytes;
         if total_runs > state.max_runs || total_bytes > state.max_run_bytes {
-            return Err(FlushError {
+            let error = FlushError {
                 runs: total_runs,
                 max_runs: state.max_runs,
                 run_bytes: total_bytes,
                 max_run_bytes: state.max_run_bytes,
-            });
+            };
+            drop(state);
+            // Compaction is what makes room. A pass that failed earlier, say
+            // while snapshots retained too much, is otherwise not retried.
+            job.engine.notify_worker();
+            return Err(error);
         }
         let flushed = job.tables.len();
         assert!(
@@ -1601,6 +1650,9 @@ pub struct EngineWorkspace {
     logical: LogicalWorkspace,
     value: Vec<u8>,
     prefix: Vec<u8>,
+    /// The runs an [`Engine::get`] reads after releasing the lock; empty
+    /// between calls.
+    runs: Vec<SharedRun>,
 }
 
 impl EngineWorkspace {

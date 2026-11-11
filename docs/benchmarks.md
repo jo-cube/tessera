@@ -1069,3 +1069,158 @@ a reallocation as a copy:
   it held, and nothing after it was dropped.
 - Runs of more than 2^24 distinct keys are not built here (they would need a
   memtable of several GiB); unit tests cover the filterless fallback.
+
+## Sustained operation (assessment)
+
+`scripts/validate.sh operate` (Milestone 5K; about 3 minutes, `diagnostics`
+feature) drives the engine and its background worker with 4 MiB memtables and
+the default limits and compaction options. Overwrite workloads start from
+200,000 settled tree keys. A sampler thread reads one key every 2 ms and the
+run shape every 50 ms. `operate concurrency` and `operate pressure` run one
+section alone. Two sessions after the change below, one before; within-session
+comparisons only.
+
+### Sustained workloads
+
+1.2 million puts (60,000 of 4 KiB over 20,000 keys), unpaced, one writer that
+flushes when the memtable is full. "Sustainable" divides the puts by write time
+plus the catch-up after the last put. "Written per flushed byte" counts the
+flush and every compaction output.
+
+| values | workload | k puts/s | sustainable | put p99 µs | put max ms | worker CPU s | written per flushed byte | mean/max overlap | catch-up s | get p50/p99 µs while writing | runs after |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8-byte | new keys | 2,057–2,086 | 1,676–1,926 | 0.4–0.5 | 4–5 | 0.50–0.59 | 2.9–3.1 | 6–8 / 10–17 | 0.05–0.13 | 4–19 / 248–838 | 3–4 |
+| 8-byte | uniform overwrite | 2,109–2,193 | 2,075–2,157 | 0.4–0.5 | 0 | 0.41–0.42 | 2.4 | 5.6 / 9 | 0.01 | 34–36 / 110–208 | 4 |
+| 8-byte | hot: 90% to 1% of keys | 3,155–3,333 | same | 0.3 | 0 | 0.02 | 1.7 | 2.5 / 4 | 0 | 20–24 / 51–59 | 9 |
+| json | new keys | 1,693–1,823 | 1,199–1,254 | 0.4–0.5 | 4–5 | 0.87–0.93 | 3.1 | 11 / 25–26 | 0.29–0.30 | 12–15 / 50–70 | 3 |
+| json | uniform overwrite | 1,770–1,915 | 1,644–1,764 | 0.4 | 4–5 | 0.63–0.67 | 2.3 | 9 / 14–16 | 0.05 | 25–30 / 67–82 | 4 |
+| json | hot: 90% to 1% of keys | 3,116–3,275 | 2,868–3,018 | 0.3 | 4–5 | 0.06 | 2.2 | 3–3.5 / 6 | 0.03 | 14–17 / 37–50 | 12 |
+| 4 KiB | new keys | 355–375 | 147–154 | 0.5–0.6 | 3 | 0.38–0.39 | 2.9 | 13 / 25–28 | 0.23–0.24 | 5–6 / 14–20 | 5 |
+| 4 KiB | uniform overwrite | 338–353 | 158–164 | 0.5–0.6 | 3 | 0.35–0.36 | 2.6 | 13 / 23–25 | 0.20 | 14–17 / 31–44 | 6 |
+
+- Foreground writes run at memtable speed (p50 0.21–0.33 µs). The worst put
+  is a flush, 2–5 ms (build 2.2–4.1 ms per 4 MiB table; the longest
+  publication 0.1–4.5 ms, highest beside a busy reader). No flush was refused at the default 64 runs.
+- The worker kept up for small and json values: catch-up after 1.2 million
+  unpaced puts took 0.01–0.30 s, so sustainable throughput is 70–100% of the
+  foreground rate. 4 KiB values arrive at 1.4 GB/s of payload unpaced. There
+  the worker fell behind (overlap up to 28 runs) and the sustainable rate is
+  about 43% of the foreground rate.
+- Rewrite stayed at 0.7–2.1 compacted bytes per flushed byte (1.7–3.1 written
+  in all). Hot-key workloads rewrite least, because each flush is mostly
+  duplicates.
+- Reads during unpaced ingestion pay for the overlap; their p99 is dominated
+  by sampling on an oversubscribed 2-CPU machine (writer, worker and sampler).
+- Run bytes plus filters at the end: 2.9–25 MiB for small and json values.
+  The live Rust heap peaked 14–63 MiB above the start (the memtables are 8 MiB
+  of that), and RSS was 33–146 MiB for the whole benchmark process, which
+  includes the value pools and freed but unreturned memory.
+
+### Point reads held the state lock while decoding
+
+Before this milestone, `Engine::get` decoded run blocks while holding the
+state lock shared, about 10–20 µs per get. A writer waits for that lock, so
+one busy reader cut a writer from 1.95–1.98 million puts per second to
+0.76–0.79 million, with put p99 rising from 0.4 to 29 µs. `get` now takes the
+run list under the lock and decodes after releasing it, which is correct
+because runs are immutable and shared. Same session, two pairs:
+
+| writers, readers | before: k puts/s, put p99 µs, k gets/s | after |
+|---|---|---|
+| 1, 1 | 760–791, 28.7–29.3, 26–27 | 1,243–1,482, 0.5, 31–35 |
+| 1, 2 | 593–609, 31.6–32.2, 32–34 | 932–973, 0.5, 59–62 |
+| 2, 2 | 912–1,045, 0.8, 34–35 | 1,186–1,567, 0.7, 39–43 |
+
+The json uniform workload with a busy reader in the same thread mix went from
+800 to 1,066–1,128 k puts/s (8-byte: 672 to 1,427–1,472), put p99 from 24–42
+to 0.4–0.6 µs. Single-threaded get latency did not change (19.5–19.6 µs settled,
+9.8 µs on one run, both builds). What remains is CPU: on 2 CPUs a writer, a
+reader and the worker share two cores.
+
+### Concurrency (after the change)
+
+600,000 json uniform overwrites from 200,000 settled keys, split between
+writers; readers get as fast as they can.
+
+| writers | readers | worker | k puts/s | put p99 µs | k gets/s | process CPU s |
+|---|---|---|---|---|---|---|
+| 1 | 0 | off | 1,886–1,924 | 0.4 | | 0.32 |
+| 1 | 0 | on | 1,808–1,960 | 0.4 | | 0.56–0.61 |
+| 2 | 0 | on | 1,780–2,093 | 0.8–0.9 | | 0.58–0.67 |
+| 4 | 0 | on | 1,988–2,156 | 0.7–0.8 | | 0.56–0.60 |
+| 1 | 1 | on | 1,192–1,426 | 0.4–0.5 | 28–35 | 0.84–1.00 |
+| 1 | 2 | on | 841–950 | 0.5–0.6 | 48–50 | 1.26–1.43 |
+| 1 | 0, snapshot full scans | on | 1,377–1,477 | 0.4–0.5 | 6–7 scans of 70–76 ms | 0.96–0.97 |
+
+- Writes do not scale with writers: every write takes the exclusive lock, and
+  2 or 4 writers reach the throughput of one (within 10%). That costs little
+  here, because one writer already spends 0.2 µs per put. The lock limits
+  write throughput only if puts get cheaper or there are more cores than 2.
+- The background worker takes 0.25–0.3 CPU s per 600,000 puts, and with it a
+  lone writer is within 5% of no worker.
+- Snapshot scans of all 200,000 keys run beside a writer without blocking it.
+  The writer slows 25–30% for CPU, and its p99 is unchanged. Back-to-back
+  full scans through a `ReadGuard` let a writer in about once per scan (as
+  documented) and are not measured.
+
+### Limits, backpressure and recovery
+
+| scenario | result |
+|---|---|
+| 8 runs allowed, 1 MiB memtables, 600,000 new json keys | 13–17 of 133 flushes refused, 0.36–0.41 s spent waiting for compaction, 789–850 k puts/s; no compaction failed |
+| one snapshot of the settled 3.9 MiB state, 2 MiB retention limit, 16 runs | compaction refused once retention reached 2.1 MiB (2.0 run + 0.13 filter); flushes refused at 16 runs after 532,445 puts. Dropping the snapshot: flushes alone recovered in 45 ms (12 retries); 200,000 more puts with 1 refused flush; nothing retained |
+| dropping the engine with 18 overlapping runs, the worker busy, and a snapshot scan running | dropped in 7–10 ms (the compaction in progress is published); the scan finished all 400,000 records |
+
+A snapshot retains at most the state it saw: at the 8 MiB limit the same
+scenario never blocked. Before this milestone, the recovery in the second
+row did not happen. A refused flush did not ask the worker for a pass, and
+the pass that compaction refused was not retried after the snapshot was
+dropped, so a writer that only retries flushes stayed refused until something
+called `wait_for_compaction`. A refused flush now requests a pass (one line;
+`a_flush_refused_after_retention_blocked_compaction_recovers_on_its_own`).
+
+A refused flush drops the runs it built, and the retry builds them again; in
+the first row that is up to 17 extra builds of a 1 MiB table.
+
+### Decoded-block caching
+
+A simulated LRU of decoded 16 KiB blocks, replaying the blocks that filtered
+point lookups decode (only runs holding the key; filter false positives left
+out), 30,000 lookups after a 20% warm-up:
+
+| state | lookups | blocks in runs | hit at 1 MiB | 4 MiB | 16 MiB |
+|---|---|---|---|---|---|
+| settled, 3–4 runs (6.6–6.9 MiB stored) | uniform | 1,922–1,996 | 3.2–3.3% | 12–13% | 51–53% |
+| | 90% to 1% of keys, scattered | | 4.9–5.1% | 19% | 68–70% |
+| | 90% to 1% of keys, contiguous | | 90% | 91% | 95% |
+| one run (3.9 MiB stored) | uniform | 1,146 | 5.5% | 22% | 89% |
+| | scattered hot keys | | 8.2% | 32% | 98% |
+| | contiguous hot keys | | 91% | 92% | 98% |
+
+Every decoded block holds about 100 json records, so a cache hits only when
+lookups cluster in key order, or when it holds most of the decoded data:
+16 MiB of decoded blocks for 3.9 MiB stored. That gives up the compression
+that is the engine's reason to exist. A hit would save one decode (about
+10 µs of a 10–20 µs get). It would also need shared ownership of decoded
+blocks across readers, synchronization on every lookup and eviction. Not
+implemented: it pays only for key-clustered hot sets, and those can be
+measured if a workload needs them.
+
+### Deliberate consolidation
+
+`Engine::compact` with `max_overlap` 1 on the settled uniform state (3–4 runs):
+
+| | before | after |
+|---|---|---|
+| get p50 / p99 µs | 19.5–19.6 / 31.4–31.5 | 9.8 / 13.4–13.7 |
+| blocks per get | 1.68–1.74 | 1.00 |
+| gets/s, 1 and 2 threads | 57–59k, 112–116k | 101k, 197k |
+| 20-key / 4,000-key scan µs | 33.9–43.4 / 802–804 | 11.7–11.8 / 371–374 |
+
+It cost one compaction: 6.6–6.9 MiB read, 3.9 MiB written, 0.08 CPU s and a
+heap peak 10.1 MiB above the start. That is about 0.1 s of the worker's 0.63 s
+for the ingestion before it. For a read-heavy phase after ingestion, one
+consolidation roughly doubles point-read throughput and halves long-scan time.
+The existing `Engine::compact` with `max_overlap` 1 already does it, so no new
+API or scheduler is needed. In one session the worker happened to leave one
+run, and consolidation had nothing to do.

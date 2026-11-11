@@ -8,10 +8,11 @@
 
 use std::sync::Barrier;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use tessera::engine::{
-    CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace, Snapshot,
-    SnapshotError, SnapshotLimits, UpdateError,
+    BackgroundError, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
+    Snapshot, SnapshotError, SnapshotLimits, UpdateError,
 };
 use tessera::memtable::WriteError;
 use tessera::run::MergeWorkspace;
@@ -509,4 +510,83 @@ fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
     drop(engine);
     let reader = thread::spawn(move || scanned(&snapshot, b""));
     assert_eq!(reader.join().unwrap(), expected);
+}
+
+/// A compaction refused while snapshots retain too much is retried when a
+/// flush is next refused for want of it, so a writer that only flushes
+/// recovers once the snapshot is dropped.
+#[test]
+fn a_flush_refused_after_retention_blocked_compaction_recovers_on_its_own() {
+    let engine = Engine::new(EngineOptions {
+        max_runs: 2,
+        background_compaction: Some(merge_all()),
+        snapshots: SnapshotLimits {
+            max_live: 1,
+            max_retained_bytes: 0,
+        },
+        ..EngineOptions::default()
+    });
+    engine.put(b"a", b"1").unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    // Pins the snapshot's leaf, over the limit of zero.
+    engine.put(b"a", b"2").unwrap();
+    engine.flush().unwrap();
+    engine.put(b"a", b"3").unwrap();
+    engine.flush().unwrap();
+    assert!(matches!(
+        engine.wait_for_compaction(),
+        Err(BackgroundError::Failed(CompactionError::Retained { .. }))
+    ));
+    engine.put(b"a", b"4").unwrap();
+    assert!(engine.flush().is_err());
+    drop(snapshot);
+
+    // Only flushes from here: the refused one asks the worker for a pass.
+    let status = engine.background_status().unwrap();
+    assert!(engine.flush().is_err());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let now = engine.background_status().unwrap();
+        if now.passes > status.passes && !now.busy {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the worker was never asked");
+        thread::yield_now();
+    }
+    engine.flush().unwrap();
+    assert_eq!(
+        value(&engine.snapshot().unwrap(), b"a"),
+        Some(b"4".to_vec())
+    );
+}
+
+/// A point read takes the runs it reads without the lock, and lets go of
+/// them before it returns, so a workspace kept between reads holds nothing a
+/// compaction has replaced.
+#[test]
+fn a_point_read_keeps_no_replaced_run_alive_after_it_returns() {
+    let engine = Engine::new(EngineOptions::default());
+    // Overlapping ranges, so that compaction replaces both runs.
+    for keys in [[b"a", b"z"], [b"b", b"y"]] {
+        for key in keys {
+            engine.put(key, b"1").unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    let mut workspace = EngineWorkspace::new();
+    assert_eq!(
+        engine.get(b"a", &mut workspace).unwrap().unwrap().value,
+        b"1"
+    );
+    assert!(engine.get(b"c", &mut workspace).unwrap().is_none());
+    assert!(compact_all(&engine) > 0);
+    let stats = engine.stats();
+    assert_eq!(
+        (stats.runs, stats.retained_sources, stats.retained_bytes),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        engine.get(b"b", &mut workspace).unwrap().unwrap().value,
+        b"1"
+    );
 }

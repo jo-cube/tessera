@@ -16,7 +16,9 @@
 //! read amplification under sustained ingestion (with the `diagnostics`
 //! feature); see `block_bench/reads.rs`. With `filtercost`, instead splits
 //! key filter construction cost by component and reports filter memory on
-//! large runs; see `block_bench/filtercost.rs`.
+//! large runs; see `block_bench/filtercost.rs`. With `operate` (and the
+//! `diagnostics` feature), instead measures the engine under sustained and
+//! concurrent load and small limits; see `block_bench/operate.rs`.
 //!
 //! Run with `scripts/validate.sh bench`. Times are the median nanoseconds per
 //! record or lookup across a fixed number of rounds, and every loop has a
@@ -46,6 +48,9 @@ use tessera::run::{
 mod bloom;
 #[path = "block_bench/filtercost.rs"]
 mod filtercost;
+#[cfg(feature = "diagnostics")]
+#[path = "block_bench/operate.rs"]
+mod operate;
 #[path = "block_bench/policy.rs"]
 mod policy;
 #[path = "block_bench/profile.rs"]
@@ -4438,6 +4443,8 @@ fn main() {
         Some("reads") => return reads::reads_bench(),
         #[cfg(feature = "diagnostics")]
         Some("bloom") => return bloom::bloom_bench(),
+        #[cfg(feature = "diagnostics")]
+        Some("operate") => return operate::operate_bench(),
         #[cfg(not(feature = "diagnostics"))]
         Some("reads") => panic!("the reads benchmark needs --features diagnostics"),
         Some("memtable") => return memtable_baseline(),

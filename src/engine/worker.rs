@@ -44,7 +44,7 @@ pub enum BackgroundError {
     /// The worker is not running, because it panicked.
     Stopped,
     /// The pass waited for ended on this failure. Nothing is retried until
-    /// the next flush, limit change or wait.
+    /// the next flush, refused flush, limit change or wait.
     Failed(CompactionError),
 }
 

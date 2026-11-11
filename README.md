@@ -69,7 +69,9 @@ An **`Engine`** combines them: `put`, `delete`, `get`, ordered and prefix scans,
 and an explicit synchronous `flush`. It assigns sequence numbers and holds one
 active memtable, frozen memtables awaiting flush and the published runs behind
 a single reader-writer lock, with a gate that keeps readers from starving
-writers. Single-key reads and writes are linearizable. A `ReadGuard` gives a
+writers. Single-key reads and writes are linearizable; `get` holds the lock
+only to search the memtables and take the run list, and decodes blocks after
+releasing it. A `ReadGuard` gives a
 stable view for a few reads and **blocks writers while held**. A flush freezes
 the active table, compresses outside the lock, and publishes its runs while
 removing the frozen tables in one step; an abandoned or rejected flush leaves
@@ -109,7 +111,8 @@ With `EngineOptions::background_compaction` set, the engine owns one worker
 thread that runs the same compaction whenever a flush publishes runs. Requests
 made while it is busy coalesce into one pass, it sleeps when nothing is
 eligible, and a failed compaction is reported in `background_status` and not
-retried until the next flush. `wait_for_compaction` asks for a pass and waits
+retried until the next flush, or the next flush refused by the run limits.
+`wait_for_compaction` asks for a pass and waits
 for its outcome; dropping the engine finishes the compaction in progress and
 joins the thread.
 
@@ -146,6 +149,9 @@ scripts/validate.sh pacing   # background compaction under frequent snapshots
 scripts/validate.sh profile  # memtable and engine write cost by component
 scripts/validate.sh policy   # compaction selection cost across arrival rates
 scripts/validate.sh reads    # read amplification under sustained writes
+scripts/validate.sh bloom    # filtered against unfiltered point lookups
+scripts/validate.sh filtercost # key filter construction cost
+scripts/validate.sh operate  # sustained, concurrent and limited operation
 colima stop
 ```
 
