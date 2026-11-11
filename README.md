@@ -27,7 +27,13 @@ validates untrusted bytes completely. `RunView` offers the same reads on bytes
 already known to be valid. Each run stores its smallest key once, beside the index,
 and reuses the last block's index key as its largest, so `key_range`
 reports both bounds without decoding anything. `Run::new` checks them against
-the records.
+the records. A run its builder made also carries an in-memory Bloom filter
+over its distinct user keys (10 bits each, about 1% false positives), so a
+lookup of a key it lacks usually decodes nothing; the filter is not part of the
+bytes, and a run from `Run::new` has none and decodes as before. The engine's
+point reads use the filters; scans do not. `EngineOptions::max_run_bytes`
+limits stored and filter bytes together, as does a compaction's
+`max_output_bytes`, and `EngineStats` reports them apart.
 
 `MergeCursor` merges several runs, which may overlap and use different codecs
 and block sizes, into one stream in internal-key order, with the same `seek` and
@@ -107,7 +113,7 @@ retried until the next flush. `wait_for_compaction` asks for a pass and waits
 for its outcome; dropping the engine finishes the compaction in progress and
 joins the thread.
 
-There is no Bloom filter, transaction, sequence-filtered read of the runs,
+There is no transaction, sequence-filtered read of the runs, persisted filter,
 snapshot of a state older than the call, write-ahead log or persistence, and
 flushing never happens in the background.
 

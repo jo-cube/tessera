@@ -3,6 +3,7 @@ use std::fmt;
 use crate::block::{BlockBuilder, BuildError, MAX_KEY_LEN, Value};
 
 use super::codec::{Codec, Compressor};
+use super::filter::KeyHashes;
 use super::frame;
 use super::reader::Run;
 use super::{
@@ -19,6 +20,12 @@ use super::{
 /// at most one uncompressed block beside the frames already written. Block
 /// boundaries depend only on uncompressed sizes, so they are the same for
 /// every codec.
+///
+/// The builder also hashes each distinct user key, 8 bytes per key until
+/// [`finish`](Self::finish), for the run's in-memory key filter; see
+/// [`Run::filter_bytes`]. The hash buffer doubles as needed and stays below
+/// 16 bytes per distinct key; a run of more than 2^24 distinct keys gets no
+/// filter.
 ///
 /// # Block boundaries
 ///
@@ -41,6 +48,7 @@ pub struct RunBuilder {
     keys: Vec<u8>,
     min_key_len: usize,
     record_count: usize,
+    key_hashes: KeyHashes,
 }
 
 impl Default for RunBuilder {
@@ -70,6 +78,7 @@ impl RunBuilder {
             keys: Vec::new(),
             min_key_len: 0,
             record_count: 0,
+            key_hashes: KeyHashes::new(),
         }
     }
 
@@ -95,6 +104,7 @@ impl RunBuilder {
             self.min_key_len = user_key.len();
         }
         self.record_count += 1;
+        self.key_hashes.add(user_key);
         Ok(())
     }
 
@@ -112,6 +122,12 @@ impl RunBuilder {
     /// the open block.
     pub fn stored_len(&self) -> usize {
         self.frames.len() + self.table.len() + self.keys.len() + FOOTER_LEN
+    }
+
+    /// Builds the run without a filter if its distinct keys would need more
+    /// than `bytes` of hash buffer.
+    pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
+        self.key_hashes.limit_to(bytes / size_of::<u64>());
     }
 
     /// Returns the bytes held by a compression context, which Zstandard
@@ -142,7 +158,7 @@ impl RunBuilder {
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         data.shrink_to_fit();
-        Run::from_builder(data)
+        Run::from_builder(data, self.key_hashes.finish())
     }
 
     fn should_cut(&self, user_key: &[u8], value: Value<'_>) -> bool {

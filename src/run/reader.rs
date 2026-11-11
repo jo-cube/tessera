@@ -3,6 +3,7 @@ use std::fmt;
 use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
+use super::filter::{self as key_filter, KeyFilter};
 use super::frame::{self, Frame};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, TABLE_ENTRY_LEN, read_u32,
@@ -22,9 +23,16 @@ use super::{
 /// A run is immutable and has no interior mutability, so it can be shared
 /// between threads whenever its storage can. Each thread needs its own
 /// [`ReadWorkspace`].
+///
+/// A run its builder made also carries a Bloom filter over its user keys,
+/// kept in memory beside the bytes and not part of them, so that a lookup of
+/// a key the run does not hold usually decodes nothing. A run made with
+/// [`new`](Self::new) has none and reads as before.
 #[derive(Clone, Debug)]
 pub struct Run<B> {
     data: B,
+    /// Boxed so that a run without one costs no more than a pointer.
+    filter: Option<Box<KeyFilter>>,
 }
 
 const VALIDATED: &str = "run bytes were validated or built by this crate";
@@ -37,11 +45,29 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         validate(data.as_ref())?;
-        Ok(Self { data })
+        Ok(Self { data, filter: None })
     }
 
-    pub(super) fn from_builder(data: B) -> Self {
-        Self { data }
+    pub(super) fn from_builder(data: B, filter: Option<KeyFilter>) -> Self {
+        Self {
+            data,
+            filter: filter.map(Box::new),
+        }
+    }
+
+    /// Returns the bytes of the run's key filter, held beside the stored
+    /// bytes: about 1.25 per distinct user key, or 0 without a filter.
+    pub fn filter_bytes(&self) -> usize {
+        self.filter.as_deref().map_or(0, KeyFilter::bytes)
+    }
+
+    /// The bytes the builder held for key hashes while building the filter.
+    pub(crate) fn filter_build_bytes(&self) -> usize {
+        self.filter.as_deref().map_or(0, KeyFilter::build_bytes)
+    }
+
+    pub(crate) fn filter(&self) -> Option<&KeyFilter> {
+        self.filter.as_deref()
     }
 
     /// Returns the number of stored records, counting every version.
@@ -68,15 +94,19 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the newest version of `user_key`, which may be a tombstone, or
     /// `None` if the run has no record for that key.
     ///
-    /// Decodes at most one block, and none for a key outside the run's range.
-    /// Once the workspace has grown to the largest block read, this performs
-    /// no heap allocation.
+    /// Decodes at most one block, and none for a key outside the run's range
+    /// or one its filter excludes. Once the workspace has grown to the largest
+    /// block read, this performs no heap allocation.
     pub fn get<'r>(
         &'r self,
         user_key: &[u8],
         workspace: &'r mut ReadWorkspace,
     ) -> Result<Option<Version<'r>>, CorruptRun> {
-        self.view().get(user_key, workspace)
+        let view = self.view();
+        if excluded(view, self.filter(), user_key, &mut None)? {
+            return Ok(None);
+        }
+        view.get(user_key, workspace)
     }
 
     /// Returns a cursor positioned before the first record, which holds the
@@ -95,6 +125,26 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_ref()
     }
+}
+
+/// Whether `filter` proves `key` absent from the run `view`, checked only for
+/// a key inside the run's range. `hash` caches the key's hash across runs.
+pub(crate) fn excluded(
+    view: RunView<'_>,
+    filter: Option<&KeyFilter>,
+    key: &[u8],
+    hash: &mut Option<u64>,
+) -> Result<bool, CorruptRun> {
+    let Some(filter) = filter else {
+        return Ok(false);
+    };
+    let Some(range) = view.key_range()? else {
+        return Ok(false);
+    };
+    if key < range.min || key > range.max {
+        return Ok(false);
+    }
+    Ok(!filter.may_contain(*hash.get_or_insert_with(|| key_filter::hash(key))))
 }
 
 /// A run's smallest and largest user keys, bytewise.

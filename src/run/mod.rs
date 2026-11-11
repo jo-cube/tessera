@@ -131,6 +131,7 @@
 mod builder;
 mod codec;
 mod compact;
+mod filter;
 mod frame;
 mod logical;
 mod merge;

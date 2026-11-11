@@ -239,7 +239,8 @@ pub struct EngineOptions {
     pub target_run_len: usize,
     /// The most runs that may be published.
     pub max_runs: usize,
-    /// The most stored run bytes that may be published.
+    /// The most bytes of published runs: their stored bytes and their key
+    /// filters together.
     pub max_run_bytes: usize,
     /// The sequence number to continue after. The first write uses the next.
     pub last_seq: u64,
@@ -354,9 +355,9 @@ pub struct FlushError {
     pub runs: usize,
     /// The run count limit.
     pub max_runs: usize,
-    /// Stored bytes that would be published.
+    /// Stored and filter bytes of the runs that would be published.
     pub run_bytes: usize,
-    /// The stored byte limit.
+    /// The limit on those bytes.
     pub max_run_bytes: usize,
 }
 
@@ -383,6 +384,11 @@ pub struct FlushReport {
     pub runs: usize,
     /// Stored bytes published.
     pub run_bytes: usize,
+    /// Bytes of the published runs' key filters.
+    pub filter_bytes: usize,
+    /// The most bytes one run's filter construction held for key hashes,
+    /// freed when that run was finished.
+    pub filter_build_bytes: usize,
 }
 
 /// A summary of an engine's state.
@@ -400,6 +406,9 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
+    /// Bytes of the published runs' key filters, held beside `run_bytes`;
+    /// [`EngineOptions::max_run_bytes`] limits the two together.
+    pub filter_bytes: usize,
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes.
     pub max_overlap: usize,
@@ -408,12 +417,15 @@ pub struct EngineStats {
     /// Memtables and runs the engine has released that snapshots still hold.
     pub retained_sources: usize,
     /// Bytes kept only for snapshots: the charged or stored bytes of those
-    /// sources, and the history pinned in the engine's memtables, which
-    /// `active` and `frozen` also report as [`MemoryUsage::pinned`].
+    /// sources with any runs' filters, and the history pinned in the engine's
+    /// memtables, which `active` and `frozen` also report as
+    /// [`MemoryUsage::pinned`].
     pub retained_bytes: usize,
     /// The part of `retained_bytes` that is runs: stored bytes of runs that
     /// compaction replaced and snapshots still hold.
     pub retained_run_bytes: usize,
+    /// The part of `retained_bytes` that is those runs' filters.
+    pub retained_filter_bytes: usize,
 }
 
 struct State {
@@ -428,6 +440,7 @@ struct State {
     /// flushes publish beside them.
     runs: Vec<SharedRun>,
     run_bytes: usize,
+    filter_bytes: usize,
     max_runs: usize,
     max_run_bytes: usize,
     /// Sources removed from the state, kept track of until no snapshot holds
@@ -443,7 +456,8 @@ struct State {
 struct Retired {
     source: Weak<dyn Send + Sync>,
     bytes: usize,
-    run: bool,
+    /// For a run, its filter's bytes.
+    filter_bytes: Option<usize>,
 }
 
 /// What snapshots alone keep.
@@ -452,14 +466,20 @@ struct Retained {
     sources: usize,
     bytes: usize,
     run_bytes: usize,
+    filter_bytes: usize,
 }
 
 impl State {
-    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, run: bool) {
+    /// `filter_bytes` is `Some` for a run.
+    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, filter_bytes: Option<usize>) {
         self.retired
             .retain(|retired| retired.source.strong_count() > 0);
         if source.strong_count() > 0 {
-            self.retired.push(Retired { source, bytes, run });
+            self.retired.push(Retired {
+                source,
+                bytes,
+                filter_bytes,
+            });
         }
     }
 
@@ -480,11 +500,21 @@ impl State {
                     sources: 0,
                     bytes: pinned,
                     run_bytes: 0,
+                    filter_bytes: 0,
                 },
-                |sum, retired| Retained {
-                    sources: sum.sources + 1,
-                    bytes: sum.bytes + retired.bytes,
-                    run_bytes: sum.run_bytes + if retired.run { retired.bytes } else { 0 },
+                |sum, retired| {
+                    let filter = retired.filter_bytes.unwrap_or(0);
+                    let run = if retired.filter_bytes.is_some() {
+                        retired.bytes
+                    } else {
+                        0
+                    };
+                    Retained {
+                        sources: sum.sources + 1,
+                        bytes: sum.bytes + retired.bytes + filter,
+                        run_bytes: sum.run_bytes + run,
+                        filter_bytes: sum.filter_bytes + filter,
+                    }
                 },
             )
     }
@@ -689,6 +719,7 @@ impl Core {
                 frozen: Vec::new(),
                 runs: Vec::new(),
                 run_bytes: 0,
+                filter_bytes: 0,
                 max_runs: options.max_runs,
                 max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
@@ -965,11 +996,13 @@ impl Core {
             frozen_tables: state.frozen.len(),
             runs: state.runs.len(),
             run_bytes: state.run_bytes,
+            filter_bytes: state.filter_bytes,
             max_overlap: deepest_overlap(&state.runs),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
             retained_bytes: retained.bytes,
             retained_run_bytes: retained.run_bytes,
+            retained_filter_bytes: retained.filter_bytes,
         }
     }
 
@@ -1105,10 +1138,13 @@ impl BuiltFlush<'_> {
             records: job.records(),
             runs: runs.len(),
             run_bytes: runs.iter().map(|run| run.as_bytes().len()).sum(),
+            filter_bytes: runs.iter().map(Run::filter_bytes).sum(),
+            filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
         let mut state = job.engine.write_state();
         let total_runs = state.runs.len() + report.runs;
-        let total_bytes = state.run_bytes + report.run_bytes;
+        let total_bytes =
+            state.run_bytes + state.filter_bytes + report.run_bytes + report.filter_bytes;
         if total_runs > state.max_runs || total_bytes > state.max_run_bytes {
             return Err(FlushError {
                 runs: total_runs,
@@ -1126,7 +1162,8 @@ impl BuiltFlush<'_> {
             "a flush's tables are the oldest frozen ones"
         );
         state.runs.extend(published(runs));
-        state.run_bytes = total_bytes;
+        state.run_bytes += report.run_bytes;
+        state.filter_bytes += report.filter_bytes;
         for table in state.frozen.drain(..flushed).collect::<Vec<_>>() {
             // This and the job's are the engine's references, and snapshots
             // are taken only under the lock, so any other is a snapshot's,
@@ -1137,7 +1174,7 @@ impl BuiltFlush<'_> {
             } else {
                 table.held_by_snapshots()
             };
-            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, false);
+            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
         }
         let budget = job.engine.active_budget(state.frozen_charged());
         state.active.raise_budget(budget);
@@ -1164,10 +1201,14 @@ pub struct CompactionOptions {
     pub max_inputs: usize,
     /// The most stored bytes of input runs.
     pub max_input_bytes: usize,
-    /// The most stored bytes of output, built and held until publication.
+    /// The most bytes of output, stored bytes and key filters together,
+    /// built and held until publication, as for
+    /// [`EngineOptions::max_run_bytes`].
     pub max_output_bytes: usize,
-    /// The most estimated decoded-block, builder and codec-context bytes.
-    /// See [`crate::run::workspace_bytes`].
+    /// The most estimated decoded-block, builder and codec-context bytes,
+    /// see [`crate::run::workspace_bytes`]. What the estimate leaves bounds
+    /// the builder's key-hash buffer; an output run that would need more is
+    /// published without a filter. See [`crate::run::CompactLimits`].
     pub max_workspace_bytes: usize,
     /// The most runs whose key ranges may share a key. A point read decodes
     /// at most this many blocks once compaction has caught up. Values below 1
@@ -1256,10 +1297,17 @@ pub struct CompactionReport {
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
+    /// Their filters' bytes.
+    pub input_filter_bytes: usize,
     /// Runs published in their place.
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
+    /// Their filters' bytes.
+    pub output_filter_bytes: usize,
+    /// The most bytes one output's filter construction held for key hashes,
+    /// freed when that run was finished.
+    pub filter_build_bytes: usize,
     /// Whether no other run overlapped the inputs, so that every tombstone
     /// could be dropped.
     pub complete: bool,
@@ -1484,8 +1532,16 @@ impl BuiltCompaction<'_> {
         let report = CompactionReport {
             inputs: job.inputs.len(),
             input_bytes: job.input_bytes,
+            input_filter_bytes: job.inputs.iter().map(|run| run.run.filter_bytes()).sum(),
             outputs: output.runs.len(),
             output_bytes: output.output_bytes,
+            output_filter_bytes: output.filter_bytes,
+            filter_build_bytes: output
+                .runs
+                .iter()
+                .map(Run::filter_build_bytes)
+                .max()
+                .unwrap_or(0),
             complete: job.is_complete(),
             stats: output.stats,
             workspace_bytes: output.workspace_bytes,
@@ -1496,11 +1552,14 @@ impl BuiltCompaction<'_> {
             return Err(CompactionError::InputsChanged);
         }
         let total_runs = state.runs.len() - report.inputs + report.outputs;
-        let total_bytes = state.run_bytes - report.input_bytes + report.output_bytes;
+        let stored = state.run_bytes - report.input_bytes + report.output_bytes;
+        let filters = state.filter_bytes - report.input_filter_bytes + report.output_filter_bytes;
+        let (total_bytes, published_bytes) =
+            (stored + filters, state.run_bytes + state.filter_bytes);
         // Shrinking is always allowed, so that compaction can make room even
         // when the limits were lowered below what is published.
         let grows_runs = total_runs > state.max_runs.max(state.runs.len());
-        let grows_bytes = total_bytes > state.max_run_bytes.max(state.run_bytes);
+        let grows_bytes = total_bytes > state.max_run_bytes.max(published_bytes);
         if grows_runs || grows_bytes {
             return Err(CompactionError::RunLimit(FlushError {
                 runs: total_runs,
@@ -1511,10 +1570,15 @@ impl BuiltCompaction<'_> {
         }
         state.runs.retain(|run| !is_input(run));
         state.runs.extend(published(output.runs));
-        state.run_bytes = total_bytes;
+        state.run_bytes = stored;
+        state.filter_bytes = filters;
         for input in &job.inputs {
-            let bytes = input.run.as_bytes().len();
-            state.retire(Arc::downgrade(input) as Weak<dyn Send + Sync>, bytes, true);
+            let (bytes, filter) = (input.run.as_bytes().len(), input.run.filter_bytes());
+            state.retire(
+                Arc::downgrade(input) as Weak<dyn Send + Sync>,
+                bytes,
+                Some(filter),
+            );
         }
         drop(state);
         drop(job);
@@ -1709,7 +1773,11 @@ fn resolve<'r>(
             value: Value::Bytes(value),
         }) => Ok(Some(LiveValue { seq, value })),
         Some(_) => Ok(None),
-        None => latest_in(runs.iter().map(|run| run.run.view()), key, logical),
+        None => latest_in(
+            runs.iter().map(|run| (run.run.view(), run.run.filter())),
+            key,
+            logical,
+        ),
     }
 }
 
@@ -2094,7 +2162,7 @@ mod tests {
                 .unwrap()
         };
         let mut built = begin().build(&mut MergeWorkspace::new()).unwrap();
-        built.output.output_bytes = stats.run_bytes + 1;
+        built.output.output_bytes = stats.run_bytes + stats.filter_bytes + 1;
         assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
         assert_eq!(engine.stats(), stats);
 

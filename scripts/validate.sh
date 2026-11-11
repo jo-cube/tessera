@@ -23,6 +23,7 @@
 #   scripts/validate.sh profile            memtable and engine write cost by component
 #   scripts/validate.sh policy             compaction selection policies and pacing (5G)
 #   scripts/validate.sh reads              read amplification under sustained writes (5H)
+#   scripts/validate.sh bloom              filtered against unfiltered point lookups
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -214,6 +215,10 @@ reads() {
   bounded reads 1800 cargo run --locked --release --features diagnostics --example block_bench -- reads
 }
 
+bloom() {
+  bounded bloom 1800 cargo run --locked --release --features diagnostics --example block_bench -- bloom
+}
+
 profile() {
   bounded profile 900 cargo run --locked --release --example block_bench -- profile
 }
@@ -287,7 +292,8 @@ case "$command" in
   profile) profile ;;
   policy) policy ;;
   reads) reads ;;
+  bloom) bloom ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,27p' "$0"; exit 2 ;;
+  *) sed -n '2,28p' "$0"; exit 2 ;;
 esac

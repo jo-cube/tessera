@@ -955,3 +955,56 @@ Unexplained: long scans of one consolidated run were 25–35% slower in the
 previous commit's build in both sessions, while scanning that run directly
 cost the same. The read path is identical, so this is taken as code layout,
 not policy.
+
+## Run key filters
+
+Each run its builder makes carries an in-memory Bloom filter over its
+distinct user keys: 10 bits a key, 7 probes from one SipHash-1-3 hash by double
+hashing, about 0.8% false positives. Point lookups skip a run whose range
+covers the key only when its filter proves the key absent; scans do not use
+filters. `scripts/validate.sh bloom` (about 70 s, `diagnostics` feature)
+compares the engine's filtered lookup with an unfiltered `RunSet` over the
+same run views, 20,000 probes a row, every answer compared. The base state is
+compacted to one run; "16 flushes" adds sixteen 1 MiB memtables of overwrites
+or of new keys without compacting, as during ingestion.
+
+| dataset, state | runs | present: blocks, µs mean | absent in range: blocks, µs mean | filters of stored |
+|---|---|---|---|---|
+| json, base and 16 flushes | 17 | 17.0 → 1.83, 169 → 19.0 | 17.0 → 0.14, 169 → 1.8 | 5.9% |
+| json, compacted (overlap 4) | 3 | 3.0 → 1.62, 29.7 → 16.1 | 3.0 → 0.02, 29.6 → 0.34 | 5.9% |
+| json, base and 1 flush | 2 | 2.0 → 1.06, 18.2 → 10.4 | 2.0 → 0.02, 18.2 → 0.24 | 6.0% |
+| json, 1 run | 1 | 1.0 → 1.0, 9.84 → 9.86 | 1.0 → 0.01, 9.78 → 0.15 | 6.0% |
+| json, new keys, 16 flushes | 17 | 5.31 → 1.03, 53.9 → 10.7 | 5.31 → 0.04, 53.8 → 0.72 | 5.8% |
+| 8-byte, base and 16 flushes | 17 | 17.0 → 1.58, 262 → 25.6 | 17.0 → 0.14, 262 → 2.7 | 8.6% |
+| 8-byte, compacted (overlap 4) | 3 | 3.0 → 1.42, 46.5 → 22.6 | 3.0 → 0.02, 46.5 → 0.50 | 8.7% |
+| 8-byte, 1 run | 1 | 1.0 → 1.0, 15.6 → 15.7 | 1.0 → 0.01, 15.6 → 0.20 | 8.8% |
+| 8-byte, new keys, 16 flushes | 17 | 4.05 → 1.02, 62.0 → 16.6 | 4.05 → 0.03, 61.8 → 0.78 | 8.5% |
+
+Observed false positives were 0.7–0.9% of candidates without the key, and
+lookups allocated nothing. A present key still decodes every run holding a
+version of it (1.4–1.7 runs under overwrites), so present-key gains are
+largest with many small runs. With one run, where a filter can only help an
+absent key, present lookups cost 0.2–0.8% more. A proof of concept on the
+same states (filters built by the benchmark) gave the same counts at 5%, 1%
+and 0.1% targets: 3.7%, 5.6% and 8.4% of stored bytes for json, with absent
+lookups at 8.6, 2.0 and 0.5 µs on 17 runs; 1% was kept.
+
+End to end (`scripts/validate.sh reads`, the previous commit from a copy, two
+rounds each, one session): gets sampled during unpaced ingestion fell from
+40–60 to 21–43 µs p50 under uniform overwrites, 41–65 to 11–12 µs for new
+keys and 20–68 to 10–21 µs for the window. On the settled states, blocks per
+lookup fell from 4.0 to 1.55 (uniform present), 2.69 to 1.03 (new keys) and
+4.0 to 0.03 (absent), and get p50 from 34.2 to 8.8 µs, 25.8 to 8.5 µs and
+about 33 to 0.1 µs. Worker CPU rose 2–5%, unpaced writer throughput fell
+1.5–6%, and one of the two unpaced new-key rounds with filters had one flush
+refused at the 64-run limit (none without). Prefix scans of the same single
+consolidated run were within 4%.
+
+Building filters costs 8 bytes per distinct key while a run is built (the
+hashes, reported as `filter_build_bytes`; the buffer doubles explicitly, so it
+stays under 16 bytes per key, and in a compaction within what the workspace
+estimate leaves of `max_workspace_bytes`) and one hash per record. Flushing
+json records cost the same per record with and without filters in two
+alternating sessions (291–321 against 291–306 ns); 8-byte records cost 20–30%
+more (267–282 against 338–350 ns). The same sessions varied by up to 60% on
+rows that filters do not touch.

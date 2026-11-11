@@ -997,10 +997,13 @@ fn runs_work_over_shared_and_borrowed_storage() {
     }
 }
 
+/// Beside its storage a run holds one pointer, to the key filter its builder
+/// made, if any.
 #[test]
-fn runtime_descriptor_owns_only_its_storage() {
-    assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>());
-    assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>());
+fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
+    let pointer = size_of::<usize>();
+    assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>() + pointer);
+    assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>() + pointer);
 }
 
 #[test]
@@ -1663,4 +1666,66 @@ fn the_default_builder_uses_zstandard_and_16_kib_blocks() {
             .all(|block| block.len() <= (TARGET_BLOCK_LEN * 5) / 4)
     );
     assert_eq!(all(&run), records);
+}
+
+/// A built run's filter never hides a stored key, version or tombstone, and
+/// skips most absent keys without decoding; the same bytes reloaded have no
+/// filter and answer identically by decoding.
+#[test]
+fn a_built_runs_filter_never_hides_a_key_and_reloaded_bytes_fall_back() {
+    let large = vec![0xFF; 1_000];
+    let mut records: Vec<Owned> = vec![
+        (Vec::new(), 9, Some(b"empty".to_vec())),
+        (vec![0x00], 8, None),
+        (vec![0x00, 0xFF], 7, Some(b"v".to_vec())),
+    ];
+    // A key with versions spanning blocks, newest a tombstone.
+    records.extend((0..40).map(|i| {
+        (
+            b"chain".to_vec(),
+            1_000 - i,
+            (i > 0).then(|| vec![b'x'; 64]),
+        )
+    }));
+    records.extend((0..2_000u32).map(|i| {
+        (
+            format!("k{i:05}").into_bytes(),
+            5,
+            Some(i.to_le_bytes().to_vec()),
+        )
+    }));
+    records.push((vec![0xFF, 0xFF], 4, None));
+    records.push((large, 3, Some(b"large".to_vec())));
+    let run = build(Codec::Zstd, &records, 256);
+    let reloaded = Run::new(run.as_bytes().to_vec()).unwrap();
+    assert!(run.filter_bytes() > 0);
+    assert_eq!(reloaded.filter_bytes(), 0);
+
+    let mut workspace = ReadWorkspace::new();
+    let mut newest: BTreeMap<&[u8], (u64, &Option<Vec<u8>>)> = BTreeMap::new();
+    for (key, seq, value) in &records {
+        newest.entry(key).or_insert((*seq, value));
+    }
+    for (key, (seq, value)) in &newest {
+        for run in [&run, &reloaded] {
+            let found = run.get(key, &mut workspace).unwrap().unwrap();
+            assert_eq!((found.seq, found.value), (*seq, as_value(value)));
+        }
+    }
+
+    // Absent keys inside the range: the reloaded run decodes a block for
+    // each, the filtered one for about 1% (the hash is fixed, so exactly).
+    let absent: Vec<Vec<u8>> = (0..2_000u32)
+        .map(|i| format!("k{i:05}a").into_bytes())
+        .collect();
+    let mut blocks = Vec::new();
+    for run in [&run, &reloaded] {
+        let before = workspace.blocks_loaded();
+        for key in &absent {
+            assert!(run.get(key, &mut workspace).unwrap().is_none());
+        }
+        blocks.push(workspace.blocks_loaded() - before);
+    }
+    assert_eq!(blocks[1], 2_000);
+    assert!(blocks[0] < 60, "{} of 2000 absent keys decoded", blocks[0]);
 }

@@ -18,11 +18,16 @@ pub struct CompactLimits {
     /// Input per output run, as for a flush, reduced to
     /// [`MAX_TARGET_RUN_LEN`] if larger.
     pub target_run_len: usize,
-    /// The most stored bytes of output, checked after every record, including
-    /// the run being built.
+    /// The most bytes of output, stored bytes and key filters together. It is
+    /// checked after every record against the finished runs and the stored
+    /// bytes of the run being built, and again as each run is finished with
+    /// its filter.
     pub max_output_bytes: usize,
-    /// The most bytes the merge and builder may need beside the output, as
-    /// estimated by [`workspace_bytes`] before anything is decoded.
+    /// The most bytes the merge and builder may need beside the output. The
+    /// estimate from [`workspace_bytes`] is checked before anything is
+    /// decoded; what it leaves is the most the open builder may hold for key
+    /// hashes, and an output run whose distinct keys need more is built
+    /// without a filter.
     pub max_workspace_bytes: usize,
 }
 
@@ -72,6 +77,8 @@ pub struct Compacted {
     pub runs: Vec<Run<Vec<u8>>>,
     /// Their total stored length.
     pub output_bytes: usize,
+    /// The total bytes of their key filters.
+    pub filter_bytes: usize,
     /// The estimate from [`workspace_bytes`] that was checked.
     pub workspace_bytes: usize,
     /// What was read and written.
@@ -86,7 +93,7 @@ pub enum CompactError {
     Read(ReadError),
     /// The output would exceed [`CompactLimits::max_output_bytes`].
     OutputLimit {
-        /// Stored bytes of output when the limit was crossed.
+        /// Bytes of output, stored and filters, when the limit was crossed.
         output_bytes: usize,
         /// The limit.
         max_output_bytes: usize,
@@ -146,8 +153,10 @@ impl std::error::Error for CompactError {}
 /// Output is split like a flush and holds disjoint, ascending key ranges.
 /// Beside the output, the merge holds one decoded block and decompression
 /// context per input in `workspace`, and one run builder is open; see
-/// [`workspace_bytes`]. Both limits are checked as described on
-/// [`CompactLimits`], and on any error the partial output is dropped.
+/// [`workspace_bytes`]. The builder's key hashes are held within what the
+/// estimate leaves of the workspace limit. Both limits are checked as
+/// described on [`CompactLimits`], and on any error the partial output is
+/// dropped.
 pub fn compact<'a>(
     inputs: &[RunView<'a>],
     mut keep_tombstone: impl FnMut(&[u8]) -> bool,
@@ -162,7 +171,7 @@ pub fn compact<'a>(
         });
     }
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
-    let mut output = Output::new(limits);
+    let mut output = Output::new(limits, limits.max_workspace_bytes - needed);
     let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
@@ -193,7 +202,8 @@ pub fn compact<'a>(
     output.finish_run()?;
     Ok(Compacted {
         runs: output.runs,
-        output_bytes: output.bytes,
+        output_bytes: output.bytes - output.filter_bytes,
+        filter_bytes: output.filter_bytes,
         workspace_bytes: needed,
         stats,
     })
@@ -221,28 +231,38 @@ fn collapse_copies(
 
 struct Output {
     limits: CompactLimits,
+    /// The most bytes the open builder may hold for key hashes.
+    hash_bytes: usize,
     builder: Option<RunBuilder>,
     input: usize,
     runs: Vec<Run<Vec<u8>>>,
+    /// Stored and filter bytes of the finished runs.
     bytes: usize,
+    filter_bytes: usize,
 }
 
 impl Output {
-    fn new(limits: CompactLimits) -> Self {
+    fn new(limits: CompactLimits, hash_bytes: usize) -> Self {
         Self {
             limits: CompactLimits {
                 target_run_len: limits.target_run_len.min(MAX_TARGET_RUN_LEN),
                 ..limits
             },
+            hash_bytes,
             builder: None,
             input: 0,
             runs: Vec::new(),
             bytes: 0,
+            filter_bytes: 0,
         }
     }
 
     fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
-        let builder = self.builder.get_or_insert_with(RunBuilder::default);
+        let builder = self.builder.get_or_insert_with(|| {
+            let mut builder = RunBuilder::default();
+            builder.limit_filter_build_bytes(self.hash_bytes);
+            builder
+        });
         builder
             .add(record.key, record.seq, record.value)
             .expect(BUILDABLE);
@@ -275,7 +295,8 @@ impl Output {
         };
         let run = builder.finish();
         self.input = 0;
-        self.bytes += run.as_bytes().len();
+        self.filter_bytes += run.filter_bytes();
+        self.bytes += run.as_bytes().len() + run.filter_bytes();
         self.check(self.bytes)?;
         self.runs.push(run);
         Ok(())

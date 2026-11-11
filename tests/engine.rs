@@ -441,10 +441,14 @@ fn limited(max_runs: usize, max_run_bytes: usize) -> Engine {
     })
 }
 
+/// What one small flush counts against the run byte limit: its stored bytes
+/// and its filter.
 fn flushed_size() -> usize {
     let engine = engine();
     engine.put(b"a", b"v").unwrap();
-    engine.flush().unwrap().run_bytes
+    let report = engine.flush().unwrap();
+    assert!(report.filter_bytes > 0);
+    report.run_bytes + report.filter_bytes
 }
 
 #[test]

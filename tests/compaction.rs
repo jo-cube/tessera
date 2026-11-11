@@ -166,22 +166,27 @@ fn limits_fail_the_merge_with_the_amount_needed() {
     let newer = run(&[("a", 3, Some("three"))]);
     let full = merge(&[&older, &newer], |_| true, UNLIMITED).unwrap();
 
+    // Output counts the stored bytes and the filters together.
+    let output = full.output_bytes + full.filter_bytes;
+    assert!(full.filter_bytes > 0);
     let error = merge(
         &[&older, &newer],
         |_| true,
         CompactLimits {
-            max_output_bytes: full.output_bytes - 1,
+            max_output_bytes: output - 1,
             ..UNLIMITED
         },
     )
     .unwrap_err();
-    assert!(matches!(
+    assert_eq!(
         error,
-        CompactError::OutputLimit { output_bytes, max_output_bytes }
-            if output_bytes > max_output_bytes && max_output_bytes == full.output_bytes - 1
-    ));
+        CompactError::OutputLimit {
+            output_bytes: output,
+            max_output_bytes: output - 1
+        }
+    );
     let at_limit = CompactLimits {
-        max_output_bytes: full.output_bytes,
+        max_output_bytes: output,
         ..UNLIMITED
     };
     merge(&[&older, &newer], |_| true, at_limit).unwrap();
@@ -201,6 +206,23 @@ fn limits_fail_the_merge_with_the_amount_needed() {
         }
     );
     assert_eq!(workspace.blocks_loaded(), 0);
+
+    // What the estimate leaves of the workspace limit holds the key hashes:
+    // none left means output without a filter, which reads the same.
+    for (spare, filtered) in [(0, false), (15, false), (16, true)] {
+        let limits = CompactLimits {
+            max_workspace_bytes: full.workspace_bytes + spare,
+            ..UNLIMITED
+        };
+        let out = merge(&[&older, &newer], |_| true, limits).unwrap();
+        assert_eq!(out.filter_bytes > 0, filtered, "{spare}");
+        assert_eq!(merged(&out), merged(&full));
+        let key = b"a".as_slice();
+        assert_eq!(
+            out.runs[0].get(key, &mut ReadWorkspace::new()).unwrap(),
+            full.runs[0].get(key, &mut ReadWorkspace::new()).unwrap()
+        );
+    }
 }
 
 /// The workspace estimate allows a fixed amount per codec context; the real
@@ -373,6 +395,87 @@ fn small_runs_are_merged_without_rewriting_a_large_run_over_them() {
     assert_eq!(get(&engine, b"k1999").unwrap(), b"3");
     assert_eq!(get(&engine, b"k1000").unwrap(), b"base");
     assert_eq!(everything(&engine).len(), 2_000);
+}
+
+/// Every flushed or compacted run, including each part of a split output,
+/// gets a filter covering its own keys. Filters are counted beside the stored
+/// bytes, charged to snapshots that hold replaced runs, and released with them.
+#[test]
+fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
+    let engine = Engine::new(EngineOptions {
+        target_run_len: 4_096,
+        max_runs: usize::MAX,
+        max_run_bytes: usize::MAX,
+        ..EngineOptions::default()
+    });
+    let key = |i: u32| format!("key{i:04}").into_bytes();
+    let mut model = Model::new();
+    for i in 0..1_000 {
+        engine.put(&key(i), b"old").unwrap();
+        model.insert(key(i), b"old".to_vec());
+    }
+    let flushed = engine.flush().unwrap();
+    assert!(flushed.runs > 1);
+    assert!(flushed.filter_bytes > 0 && flushed.filter_build_bytes > 0);
+    // Newer tombstones and values over the same range.
+    for i in (0..1_000).step_by(3) {
+        engine.delete(&key(i)).unwrap();
+        model.remove(&key(i));
+    }
+    for i in (1..1_000).step_by(7) {
+        engine.put(&key(i), b"new").unwrap();
+        model.insert(key(i), b"new".to_vec());
+    }
+    let second = engine.flush().unwrap();
+    let stats = engine.stats();
+    assert_eq!(
+        stats.filter_bytes,
+        flushed.filter_bytes + second.filter_bytes
+    );
+
+    let snapshot = engine.snapshot().unwrap();
+    let mut workspace = MergeWorkspace::new();
+    let mut inputs = (0, 0usize);
+    let options = CompactionOptions {
+        max_inputs: usize::MAX,
+        max_input_bytes: usize::MAX,
+        max_workspace_bytes: usize::MAX,
+        ..options(0)
+    };
+    while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
+        assert!(report.outputs == 0 || report.output_filter_bytes > 0);
+        inputs.0 += report.input_bytes;
+        inputs.1 += report.input_filter_bytes;
+    }
+    let compacted = engine.stats();
+    assert!(compacted.runs > 1, "the output was split");
+    assert!(compacted.filter_bytes > 0 && inputs.1 > 0);
+    // Every run published when the snapshot was taken overlapped another, so
+    // all were replaced; the snapshot keeps exactly those, filters included.
+    // Intermediate runs no snapshot saw were freed.
+    assert_eq!(
+        (
+            compacted.retained_run_bytes,
+            compacted.retained_filter_bytes
+        ),
+        (stats.run_bytes, stats.filter_bytes)
+    );
+    assert!(inputs.1 > stats.filter_bytes);
+    // Every key, deleted ones included, reads as the model says, from the
+    // compacted runs and from the snapshot's replaced ones.
+    let mut read = EngineWorkspace::new();
+    for i in 0..1_000 {
+        let expected = model.get(&key(i)).cloned();
+        assert_eq!(get(&engine, &key(i)), expected);
+        let held = snapshot.get(&key(i), &mut read).unwrap();
+        assert_eq!(held.map(|found| found.value.to_vec()), expected);
+    }
+    drop(snapshot);
+    let released = engine.stats();
+    assert_eq!(
+        (released.retained_run_bytes, released.retained_filter_bytes),
+        (0, 0)
+    );
 }
 
 /// Runs flushed between selection and publication, and the memtables, are

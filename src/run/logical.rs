@@ -3,8 +3,9 @@ use std::fmt;
 use crate::block::Value;
 
 use super::CorruptRun;
+use super::filter::KeyFilter;
 use super::merge::{MergeCursor, MergeWorkspace};
-use super::reader::RunView;
+use super::reader::{RunView, excluded};
 
 /// A fixed collection of immutable runs, read as the latest state of each key.
 ///
@@ -161,7 +162,7 @@ impl<'a> RunSet<'a> {
     where
         'a: 'r,
     {
-        latest_in(self.runs.iter().copied(), key, workspace)
+        latest_in(self.runs.iter().map(|&run| (run, None)), key, workspace)
     }
 
     /// Returns a cursor before the first live key. Nothing is decoded until
@@ -175,21 +176,26 @@ impl<'a> RunSet<'a> {
     }
 }
 
-/// Finds the latest value of `key` across `runs`, as [`RunSet::get`] does.
+/// Finds the latest value of `key` across `runs`, as [`RunSet::get`] does,
+/// skipping a run only where its filter, if any, proves the key absent.
 pub(crate) fn latest_in<'a, 'r, I>(
     runs: I,
     key: &[u8],
     workspace: &'r mut LogicalWorkspace,
 ) -> Result<Option<LiveValue<'r>>, ReadError>
 where
-    I: ExactSizeIterator<Item = RunView<'a>>,
+    I: ExactSizeIterator<Item = (RunView<'a>, Option<&'a KeyFilter>)>,
     'a: 'r,
 {
     let reads = workspace.merge.reads(runs.len());
     let mut newest = None;
+    let mut hash = None;
     // Held until every run is read: a later run may supersede both copies.
     let mut disagreement = None;
-    for (input, (run, read)) in runs.zip(reads).enumerate() {
+    for (input, ((run, filter), read)) in runs.zip(reads).enumerate() {
+        if excluded(run, filter, key, &mut hash)? {
+            continue;
+        }
         let Some(version) = run.get(key, read)? else {
             continue;
         };

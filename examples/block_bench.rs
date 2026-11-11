@@ -39,6 +39,9 @@ use tessera::run::{
     RunBuilder, RunCursor, RunSet, RunView,
 };
 
+#[cfg(feature = "diagnostics")]
+#[path = "block_bench/bloom.rs"]
+mod bloom;
 #[path = "block_bench/policy.rs"]
 mod policy;
 #[path = "block_bench/profile.rs"]
@@ -4428,6 +4431,8 @@ fn main() {
         Some("policy") => return policy::policy_bench(),
         #[cfg(feature = "diagnostics")]
         Some("reads") => return reads::reads_bench(),
+        #[cfg(feature = "diagnostics")]
+        Some("bloom") => return bloom::bloom_bench(),
         #[cfg(not(feature = "diagnostics"))]
         Some("reads") => panic!("the reads benchmark needs --features diagnostics"),
         Some("memtable") => return memtable_baseline(),
