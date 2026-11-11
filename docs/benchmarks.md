@@ -724,3 +724,60 @@ Hypotheses, not measured:
   bounds that by refusing compactions, not by reclaiming.
 - Reads of a table written under frequent snapshots differ within noise from
   one written without; copied nodes did not measurably hurt locality.
+
+## Where write time goes
+
+`scripts/validate.sh profile` (about 40 s) attributes memtable and engine
+cost by measuring components separately, since the bounded container has no
+sampling profiler or hardware counters. Absolute times on the reference host
+varied by more than twofold between runs, so only ratios within one run are
+compared.
+
+### Findings
+
+One run whose times matched the memtable benchmark (json, 174k entries;
+8-byte values in parentheses):
+
+| component | ns/op | allocs/op |
+|---|---|---|
+| get, random order | 460 (556) | 0 |
+| get, the same keys ascending | 145 (139) | 0 |
+| get, 1,000-key table | 88 (83) | 0 |
+| one entry allocated and freed, no tree | 102 (85) | 1 |
+| overwrite, no snapshot | 725 (891) | 1 |
+| overwrite, snapshot every 1,000 dropped at once | 708 (886) | 1 |
+| overwrite, snapshot every 10,000 kept until the next | 1,288 (1,701) | 2.2 (2.8) |
+| overwrite, snapshot every 1,000 kept until the next | 1,413 (1,873) | 3.9 (4.9) |
+| overwrite, snapshot every 100 kept until the next | 1,535 (1,992) | 6.1 (6.9) |
+| engine.put overwrite, never flushing | 746 (891) | 1 |
+| freeing a snapshot's history, per entry | 49 (38) | — |
+| flush, per record | 287 (279) | — |
+
+Sustained engine writes (300,000 random puts, 4 MiB memtables, worker):
+
+| values | snapshots held | writer s | in puts | flush build | worker CPU s | flushes |
+|---|---|---|---|---|---|---|
+| json | 0 | 0.18 | 0.12 | 0.05 | 0.15 | 15 |
+| json | 1 | 0.20 | 0.13 | 0.05 | 0.17 | 18 |
+| json | 8 | 0.21 | 0.13 | 0.06 | 0.19 | 29 |
+| 8-byte | 0 | 0.17 | 0.13 | 0.04 | 0.15 | 10 |
+| 8-byte | 8 | 0.19 | 0.13 | 0.04 | 0.18 | 25 |
+
+- A random lookup in a table larger than the cache is about 70% memory
+  latency: the same lookups in key order take a third of the time. Keys are
+  compared through a pointer at every level.
+- An overwrite is that search plus about 100 ns of entry allocation; the
+  engine's lock and sequence number add about 3%.
+- Puts are about two thirds of the writer's time and flush builds most of
+  the rest; the worker's compaction CPU is about the writer's total.
+- A snapshot dropped before the next write costs nothing. One kept until the
+  next doubles a random write.
+
+A temporary comparison with `im::OrdMap`, holding the same single key and
+value allocation per entry, measured in the same process twice: random
+inserts, overwrites, deletes and gets within 0.90–1.04 times the tree,
+sequential inserts 1.40–1.44 times, ordered iteration 3.3–5.0 times,
+prefix scans 1.14–1.52 times, writes under kept snapshots 1.14–1.17 times,
+and 1.10–1.19 times the heap. It offers no view of which nodes a write
+copies, so pinned history could not be charged. `bbtree` was not measured:
+its documentation states that a scan is not a snapshot.

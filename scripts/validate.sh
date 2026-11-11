@@ -20,6 +20,7 @@
 #   scripts/validate.sh retention          sustained snapshot retention and backpressure
 #   scripts/validate.sh persistent         memtable tree costs under held snapshots
 #   scripts/validate.sh pacing             background compaction under frequent snapshots
+#   scripts/validate.sh profile            memtable and engine write cost by component
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -203,6 +204,10 @@ pacing() {
   bounded pacing 900 cargo run --locked --release --example block_bench -- pacing
 }
 
+profile() {
+  bounded profile 900 cargo run --locked --release --example block_bench -- profile
+}
+
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -269,7 +274,8 @@ case "$command" in
   retention) retention ;;
   persistent) persistent ;;
   pacing) pacing ;;
+  profile) profile ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,24p' "$0"; exit 2 ;;
+  *) sed -n '2,25p' "$0"; exit 2 ;;
 esac

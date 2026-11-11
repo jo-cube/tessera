@@ -136,6 +136,7 @@ scripts/validate.sh frequency # frequent and long-lived snapshots
 scripts/validate.sh retention # sustained snapshot retention and backpressure
 scripts/validate.sh persistent # memtable tree costs under held snapshots
 scripts/validate.sh pacing   # background compaction under frequent snapshots
+scripts/validate.sh profile  # memtable and engine write cost by component
 colima stop
 ```
 
