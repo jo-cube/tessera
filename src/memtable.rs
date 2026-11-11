@@ -184,9 +184,10 @@ impl Slot {
         self.data.len() - self.key_len as usize
     }
 
-    /// What this update's allocation holds, header included.
+    /// What this update's allocation holds: its counts and data, padded to
+    /// the alignment of the counts.
     fn bytes(&self) -> usize {
-        ARC_HEADER + self.data.len()
+        (ARC_HEADER + self.data.len()).next_multiple_of(align_of::<usize>())
     }
 }
 

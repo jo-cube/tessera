@@ -120,6 +120,36 @@ fn memtable_checkpoints(seed: u64) -> usize {
     checked
 }
 
+/// The tight case: one snapshot of a whole table, then every entry replaced
+/// once, so everything detached is held only by the snapshot. Keys and values
+/// whose lengths leave the allocation unaligned make padding count.
+fn whole_table_replaced() {
+    let mut table = Memtable::new(64 << 20, None);
+    let keys: Vec<Vec<u8>> = (0..20_000u32)
+        .map(|i| format!("key{i:06}").into_bytes())
+        .collect();
+    let mut seq = 0;
+    for key in &keys {
+        seq += 1;
+        table.put(key, seq, b"12345678").unwrap();
+    }
+    let snapshot = table.snapshot();
+    for key in &keys {
+        seq += 1;
+        table.put(key, seq, b"abcdefgh").unwrap();
+    }
+    let pinned = table.memory().pinned;
+    let freed = freed_by(|| drop(snapshot));
+    assert!(
+        freed <= pinned + 16,
+        "freed {freed} bytes, {pinned} were pinned"
+    );
+    assert!(
+        freed * 100 >= pinned * 95,
+        "freed {freed} bytes, {pinned} were pinned"
+    );
+}
+
 fn engine_options() -> EngineOptions {
     EngineOptions {
         memtable_budget: 96 << 10,
@@ -210,6 +240,7 @@ fn engine_checkpoints(seed: u64) -> usize {
 
 #[test]
 fn dropping_snapshots_frees_no_more_than_was_reported_retained() {
+    whole_table_replaced();
     let mut checked = 0;
     for seed in 1..=6 {
         checked += memtable_checkpoints(seed * 0x9e37_79b9);
