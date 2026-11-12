@@ -4,8 +4,8 @@
 //! explicit bound, so a cursor that stops advancing fails an assertion instead
 //! of exhausting memory. Blocks are kept small so most operations cross them.
 
-use tessera::block::{MAX_KEY_LEN, Record, Value};
-use tessera::run::{
+use crate::block::{MAX_KEY_LEN, Record, Value};
+use crate::run::{
     Codec, CorruptRun, ReadWorkspace, Run, RunBuilder, RunCorruption, RunCursor, RunView,
 };
 
@@ -753,7 +753,7 @@ fn an_oversized_prefix_discards_a_peeked_record() {
     let mut cursor = run.cursor(&mut workspace);
     assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[0]);
     cursor
-        .seek_prefix(&vec![b'k'; tessera::block::MAX_KEY_LEN + 1])
+        .seek_prefix(&vec![b'k'; crate::block::MAX_KEY_LEN + 1])
         .unwrap();
     assert_eq!(cursor.peek().unwrap(), None);
     assert_eq!(cursor.next_record().unwrap(), None);

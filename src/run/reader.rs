@@ -43,6 +43,10 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// This costs O(run length) and reports the first problem found. Temporary
     /// memory is one decoded block, at most
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         validate(data.as_ref())?;
         Ok(Self { data, filter: None })
@@ -76,11 +80,19 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 
     /// Returns whether the run stores no records.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns the number of blocks.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn block_count(&self) -> usize {
         self.view().block_count()
     }
@@ -97,6 +109,10 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Decodes at most one block, and none for a key outside the run's range
     /// or one its filter excludes. Once the workspace has grown to the largest
     /// block read, this performs no heap allocation.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn get<'r>(
         &'r self,
         user_key: &[u8],
@@ -112,6 +128,10 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns a cursor positioned before the first record, which holds the
     /// workspace for as long as it lives. Use [`RunCursor::seek`] or
     /// [`RunCursor::seek_prefix`] to start elsewhere.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn cursor<'r>(&'r self, workspace: &'r mut ReadWorkspace) -> RunCursor<'r> {
         self.view().cursor(workspace)
     }
@@ -280,28 +300,6 @@ impl fmt::Debug for ReadWorkspace {
 /// [`seek`](Self::seek) and [`seek_prefix`](Self::seek_prefix) reposition a
 /// cursor any number of times, forward or backward. All stored versions and
 /// tombstones are yielded in internal order; a cursor applies no visibility.
-///
-/// ```
-/// use tessera::block::Value;
-/// use tessera::run::{Codec, ReadWorkspace, RunBuilder};
-///
-/// let mut builder = RunBuilder::new(Codec::Zstd);
-/// builder.add(b"user:1", 7, Value::Bytes(b"a"))?;
-/// builder.add(b"user:2", 8, Value::Tombstone)?;
-/// builder.add(b"zone:1", 9, Value::Bytes(b"b"))?;
-/// let run = builder.finish();
-///
-/// let mut workspace = ReadWorkspace::new();
-/// let mut cursor = run.cursor(&mut workspace);
-/// cursor.seek_prefix(b"user:")?;
-/// let mut seen = 0;
-/// while let Some(record) = cursor.next_record()? {
-///     assert!(record.key.starts_with(b"user:"));
-///     seen += 1;
-/// }
-/// assert_eq!(seen, 2);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
 #[derive(Debug)]
 pub struct RunCursor<'a> {
     view: RunView<'a>,
@@ -336,6 +334,10 @@ impl<'a> RunCursor<'a> {
     /// target is already in the block being walked or above every key. If this
     /// fails, [`next_record`](Self::next_record) reports the same error until a
     /// later seek succeeds.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.workspace.prefix.clear();
         self.reposition(target)
@@ -420,6 +422,10 @@ impl<'a> RunCursor<'a> {
 
     /// Returns the record [`next_record`](Self::next_record) would return,
     /// without advancing. Repeated peeks decode nothing further.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn peek(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
         self.fill_head()?;
         Ok(self.head.map(|head| self.record_of(head)))
@@ -626,12 +632,11 @@ impl<'a> RunView<'a> {
         self.record_count
     }
 
-    /// Returns whether the footer declares no records.
-    pub fn is_empty(self) -> bool {
-        self.record_count == 0
-    }
-
     /// Returns the number of blocks.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn block_count(self) -> usize {
         self.table.len()
     }
@@ -646,6 +651,10 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns the bytes used by the table and key area.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn index_len(self) -> usize {
         size_of_val(self.table) + self.keys.len()
     }

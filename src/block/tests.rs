@@ -1,10 +1,10 @@
-//! Executable specification of the block format and its public API.
+//! Executable specification of the block format and its API.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tessera::block::{
+use crate::block::{
     Block, BlockBuilder, BlockPosition, BlockView, BuildError, CorruptBlock, Corruption,
     MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL, Record, Value, Version,
 };

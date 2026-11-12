@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
-use tessera::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
-use tessera::memtable::{
+use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
+use crate::memtable::{
     ENTRY_OVERHEAD, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable, TARGET_RUN_LEN,
     WriteError,
 };
-use tessera::run::{
+use crate::run::{
     LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunSet, RunView,
 };
 

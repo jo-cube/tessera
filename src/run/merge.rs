@@ -3,7 +3,7 @@ use crate::block::{Record, cmp_internal};
 use super::CorruptRun;
 use super::reader::{ReadWorkspace, RunCursor, RunView};
 
-/// Reusable storage for merging runs: one [`ReadWorkspace`] per input and the
+/// Reusable storage for merging runs: a decoding buffer per input and the
 /// merge order. It retains the largest fan-in it has served.
 #[derive(Debug, Default)]
 pub struct MergeWorkspace {
@@ -65,24 +65,6 @@ impl MergeWorkspace {
 /// compares heads in place. So state is one cursor and at most one decoded block
 /// per input, and values are never copied. Records need no allocation; creating
 /// a cursor makes one, and [`seek`](Self::seek) makes none on a warm workspace.
-///
-/// ```
-/// use tessera::block::Value;
-/// use tessera::run::{Codec, MergeCursor, MergeWorkspace, RunBuilder};
-///
-/// let mut older = RunBuilder::new(Codec::Lz4);
-/// older.add(b"a", 1, Value::Bytes(b"old"))?;
-/// let mut newer = RunBuilder::new(Codec::Zstd);
-/// newer.add(b"a", 2, Value::Tombstone)?;
-/// let (older, newer) = (older.finish(), newer.finish());
-///
-/// let mut workspace = MergeWorkspace::new();
-/// let mut merged = MergeCursor::new([newer.view(), older.view()], &mut workspace);
-/// assert_eq!(merged.next_record()?.unwrap().seq, 2);
-/// assert_eq!(merged.next_record()?.unwrap().seq, 1);
-/// assert_eq!(merged.next_record()?, None);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
 #[derive(Debug)]
 pub struct MergeCursor<'a> {
     cursors: Vec<RunCursor<'a>>,
@@ -136,6 +118,10 @@ impl<'a> MergeCursor<'a> {
     /// the merge reaches its first key. Any other input decodes one block. If
     /// this fails, [`next_record`](Self::next_record) reports the same error
     /// until a later seek succeeds.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.reposition(|cursor| cursor.seek(target))
     }

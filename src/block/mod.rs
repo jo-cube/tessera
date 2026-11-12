@@ -5,27 +5,6 @@
 //! that order and [`Block`] validates the bytes once, after which lookups and
 //! iteration cannot fail.
 //!
-//! ```
-//! use tessera::block::{Block, BlockBuilder, Value};
-//!
-//! let mut builder = BlockBuilder::new();
-//! builder.add(b"apple", 9, Value::Bytes(b"red"))?;
-//! builder.add(b"apple", 7, Value::Tombstone)?;
-//! builder.add(b"pear", 3, Value::Bytes(b""))?;
-//! let block = Block::new(builder.finish())?;
-//!
-//! // Lookup returns the newest version, including tombstones.
-//! let newest = block.get(b"apple").unwrap();
-//! assert_eq!((newest.seq, newest.value), (9, Value::Bytes(b"red")));
-//!
-//! // A cursor visits every stored version.
-//! let mut cursor = block.cursor();
-//! while let Some(record) = cursor.next_record() {
-//!     println!("{:?}@{} = {:?}", record.key, record.seq, record.value);
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
 //! # Reading
 //!
 //! Full validation costs O(block length), so it is separated from access:
@@ -79,13 +58,16 @@ mod builder;
 mod reader;
 mod varint;
 
+#[cfg(test)]
+mod tests;
+
 use std::cmp::Ordering;
 
 pub use builder::{BlockBuilder, BuildError};
+#[cfg(test)]
+pub use reader::Block;
 pub(crate) use reader::RecordWalk;
-pub use reader::{
-    Block, BlockPosition, BlockView, CorruptBlock, Corruption, Cursor, Record, Version,
-};
+pub use reader::{BlockPosition, BlockView, CorruptBlock, Corruption, Record, Version};
 
 /// Number of records between restart points written by [`BlockBuilder`].
 pub const RESTART_INTERVAL: usize = 16;

@@ -91,15 +91,17 @@ pub enum CompactError {
     /// An input is damaged, or two inputs hold different records under one
     /// internal key, at any version.
     Read(ReadError),
-    /// The output would exceed [`CompactLimits::max_output_bytes`].
+    /// The output would exceed its byte limit, in the engine
+    /// [`CompactionOptions::max_output_bytes`](crate::engine::CompactionOptions::max_output_bytes).
     OutputLimit {
         /// Bytes of output, stored and filters, when the limit was crossed.
         output_bytes: usize,
         /// The limit.
         max_output_bytes: usize,
     },
-    /// The estimate from [`workspace_bytes`] exceeds
-    /// [`CompactLimits::max_workspace_bytes`]. Nothing was decoded.
+    /// The workspace estimate exceeds its limit, in the engine
+    /// [`CompactionOptions::max_workspace_bytes`](crate::engine::CompactionOptions::max_workspace_bytes).
+    /// Nothing was decoded.
     WorkspaceLimit {
         /// The estimate.
         workspace_bytes: usize,

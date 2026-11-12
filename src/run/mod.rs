@@ -4,51 +4,12 @@
 //! sparse index holding each block's last user key. [`RunBuilder`] consumes
 //! records in internal-key order and compresses each block as it is cut.
 //!
-//! ```
-//! use tessera::block::Value;
-//! use tessera::run::{Codec, ReadWorkspace, Run, RunBuilder};
-//!
-//! let mut builder = RunBuilder::new(Codec::Lz4);
-//! builder.add(b"apple", 9, Value::Bytes(b"red"))?;
-//! builder.add(b"apple", 7, Value::Tombstone)?;
-//! builder.add(b"pear", 3, Value::Bytes(b"green"))?;
-//! let run = builder.finish();
-//!
-//! // One workspace per reader, reused for every read.
-//! let mut workspace = ReadWorkspace::new();
-//!
-//! // Lookup returns the newest version, including tombstones.
-//! let newest = run.get(b"apple", &mut workspace)?.unwrap();
-//! assert_eq!((newest.seq, newest.value), (9, Value::Bytes(b"red")));
-//!
-//! // A cursor visits every stored version, across block boundaries.
-//! let mut cursor = run.cursor(&mut workspace);
-//! while let Some(record) = cursor.next_record()? {
-//!     println!("{:?}@{} = {:?}", record.key, record.seq, record.value);
-//! }
-//!
-//! // Bytes of unknown origin are validated in full before they become a Run.
-//! let reloaded = Run::new(run.as_bytes())?;
-//! assert_eq!(reloaded.len(), 3);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
 //! # Reading and ownership
 //!
 //! Every read takes a [`ReadWorkspace`], which owns the decompression buffer.
 //! Returned values borrow from the run for uncompressed blocks and from the
 //! workspace otherwise, under one signature. The borrow checker therefore
-//! rejects a second read through the workspace while a result is alive:
-//!
-//! ```compile_fail
-//! # use tessera::block::Value;
-//! # use tessera::run::{Codec, ReadWorkspace, RunBuilder};
-//! # let run = RunBuilder::new(Codec::Lz4).finish();
-//! let mut workspace = ReadWorkspace::new();
-//! let first = run.get(b"a", &mut workspace).unwrap();
-//! let second = run.get(b"b", &mut workspace).unwrap();
-//! println!("{first:?} {second:?}");
-//! ```
+//! rejects a second read through the workspace while a result is alive.
 //!
 //! # Trust
 //!
@@ -137,22 +98,31 @@ mod logical;
 mod merge;
 mod reader;
 
+#[cfg(test)]
+mod tests;
+
 use std::fmt;
 
 use crate::block::Corruption;
 
 pub use builder::RunBuilder;
-pub use codec::Codec;
-pub use compact::{
-    CONTEXT_ALLOWANCE, CompactError, CompactLimits, CompactStats, Compacted, compact,
-    workspace_bytes,
-};
+pub use compact::{CompactError, CompactLimits, CompactStats, Compacted, compact};
 pub(crate) use logical::latest_in;
 pub use logical::{
-    ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunSet,
+    ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError,
 };
 pub use merge::{MergeCursor, MergeWorkspace};
-pub use reader::{KeyRange, ReadWorkspace, Run, RunCursor, RunView};
+pub use reader::{Run, RunView};
+
+// Used beyond this module only by its tests.
+#[cfg(test)]
+pub use codec::Codec;
+#[cfg(test)]
+pub use compact::CONTEXT_ALLOWANCE;
+#[cfg(test)]
+pub use logical::RunSet;
+#[cfg(test)]
+pub use reader::{KeyRange, ReadWorkspace, RunCursor};
 
 /// Encoded block length that [`RunBuilder::new`] aims for. Provisional: see
 /// `docs/benchmarks.md` for the measurements behind it.
@@ -189,7 +159,8 @@ fn read_u64<const N: usize>(bytes: &[u8; N], at: usize) -> u64 {
     low | (high << 32)
 }
 
-/// Why bytes were rejected by [`Run::new`] or a [`RunView`] read.
+/// Why a run's bytes were rejected as damaged: on loading a checkpoint,
+/// which validates every run in full, or while reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorruptRun {
     /// Byte offset in the run of the offending structure.

@@ -20,28 +20,11 @@ use super::reader::{RunView, excluded};
 /// [`ReadError::ConflictingCopies`] rather than letting run order choose. A
 /// tombstone and an empty value differ. Only the newest version of a key is
 /// checked, because no older copy can affect a result.
-///
-/// ```
-/// use tessera::block::Value;
-/// use tessera::run::{Codec, LogicalWorkspace, RunBuilder, RunSet};
-///
-/// let mut older = RunBuilder::new(Codec::Lz4);
-/// older.add(b"a", 1, Value::Bytes(b"old"))?;
-/// older.add(b"b", 1, Value::Bytes(b"kept"))?;
-/// let mut newer = RunBuilder::new(Codec::Zstd);
-/// newer.add(b"a", 2, Value::Tombstone)?;
-/// let (older, newer) = (older.finish(), newer.finish());
-/// let views = [older.view(), newer.view()];
-/// let set = RunSet::new(&views);
-///
-/// let mut workspace = LogicalWorkspace::new();
-/// assert_eq!(set.get(b"a", &mut workspace)?, None);
-/// let mut cursor = set.cursor(&mut workspace);
-/// assert_eq!(cursor.next_record()?.unwrap().key, b"b");
-/// assert_eq!(cursor.next_record()?, None);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "tested component API the engine does not use")
+)]
 pub struct RunSet<'a> {
     runs: &'a [RunView<'a>],
 }
@@ -126,6 +109,10 @@ pub(super) fn conflict(key: &[u8], seq: u64, lower: usize, higher: usize) -> Rea
 
 impl LogicalWorkspace {
     /// Creates an empty workspace, which allocates nothing until first used.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn new() -> Self {
         Self::default()
     }
@@ -141,6 +128,10 @@ impl LogicalWorkspace {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "tested component API the engine does not use")
+)]
 impl<'a> RunSet<'a> {
     /// Creates a set over `runs`. Their order does not affect any result.
     pub fn new(runs: &'a [RunView<'a>]) -> Self {
@@ -255,6 +246,10 @@ impl<'r> LogicalCursor<'r> {
     }
 
     /// Moves before the first live key at or above `target`, with no bound.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), ReadError> {
         self.reposition(|merge| merge.seek(target))
     }

@@ -64,6 +64,10 @@ impl Compressor {
 
     /// Returns the bytes Zstandard holds for this compressor, allocated outside
     /// the Rust heap.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)
     }

@@ -9,10 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use tessera::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions,
-    EngineWorkspace, LogDamage, RecoveryError, UpdateError, Verdict,
+    EngineWorkspace, LogDamage, MAX_KEY_LEN, MAX_VALUE_LEN, RecoveryError, UpdateError, Verdict,
 };
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -748,38 +747,4 @@ fn concurrent_durable_writers_flush_beside_checkpoints_and_recover() {
     let (engine, report) = Engine::open(&scratch.0, options, durable).unwrap();
     assert_eq!(report.last_seq, total);
     assert_eq!(contents(&engine), expected);
-}
-
-/// A durable write needing room does not wait for a flush job its caller
-/// holds, which would deadlock: it is refused, unlogged, until the job is
-/// published.
-#[test]
-fn a_durable_write_needing_room_beside_a_held_flush_job_is_refused_unlogged() {
-    let scratch = Scratch::new("held-job");
-    let options = EngineOptions {
-        memtable_budget: 4 << 10,
-        ..EngineOptions::default()
-    };
-    let engine = Engine::create(&scratch.0, options, small()).unwrap();
-    engine.put(b"a", &[1; 100]).unwrap();
-    let job = engine.begin_flush().unwrap();
-    let mut at = 0u32;
-    let refused = loop {
-        match engine.put(&at.to_be_bytes(), &[2; 100]) {
-            Ok(_) => at += 1,
-            Err(error) => break error,
-        }
-    };
-    assert!(
-        matches!(
-            refused,
-            UpdateError::Rejected(tessera::memtable::WriteError::BudgetExceeded { .. })
-        ),
-        "{refused}"
-    );
-    let records = engine.log_status().unwrap().records;
-    assert_eq!(records, engine.stats().last_seq);
-    job.build().publish().unwrap();
-    engine.put(&at.to_be_bytes(), &[2; 100]).unwrap();
-    assert_eq!(engine.log_status().unwrap().records, records + 1);
 }

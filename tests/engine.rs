@@ -9,13 +9,11 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use tessera::block::MAX_KEY_LEN;
 use tessera::engine::{
-    BuiltFlush, CompactionError, CompactionOptions, Engine, EngineOptions, EngineStats,
-    EngineWorkspace, FlushError, FlushJob, ReadGuard, SnapshotLimits, UpdateError,
+    CompactionError, CompactionOptions, ENTRY_OVERHEAD, Engine, EngineOptions, EngineStats,
+    EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, ReadGuard, SnapshotLimits,
+    UpdateError, WriteError,
 };
-use tessera::memtable::{ENTRY_OVERHEAD, WriteError};
-use tessera::run::MergeWorkspace;
 
 type Live = (Vec<u8>, u64, Vec<u8>);
 
@@ -47,13 +45,6 @@ fn scanned(engine: &Engine, prefix: &[u8]) -> Vec<Live> {
 
 fn live(key: &[u8], seq: u64, value: &[u8]) -> Live {
     (key.to_vec(), seq, value.to_vec())
-}
-
-fn budget_rejection(error: UpdateError) -> bool {
-    matches!(
-        error,
-        UpdateError::Rejected(WriteError::BudgetExceeded { .. })
-    )
 }
 
 fn no_frozen(stats: EngineStats) -> bool {
@@ -268,24 +259,11 @@ fn a_flushed_tombstone_hides_a_value_in_an_older_run() {
     assert_eq!(scanned(&engine, b""), [live(b"a", seq, b"back")]);
 }
 
-#[test]
-fn a_tombstone_in_the_frozen_table_hides_a_value_in_a_run() {
-    let engine = engine();
-    engine.put(b"a", b"v").unwrap();
-    engine.flush().unwrap();
-    engine.delete(b"a").unwrap();
-    let job = engine.begin_flush().unwrap();
-    assert_eq!(value_of(&engine, b"a"), None);
-    assert_eq!(scanned(&engine, b""), []);
-    drop(job);
-}
-
 // Flush stages.
 
 #[test]
 fn an_empty_flush_creates_nothing() {
     let engine = engine();
-    assert!(engine.begin_flush().is_none());
     assert_eq!(engine.flush().unwrap().tables, 0);
     let stats = engine.stats();
     assert!(no_frozen(stats));
@@ -323,132 +301,6 @@ fn a_report_describes_what_was_published() {
     assert_eq!((report.tables, report.records, report.runs), (1, 2, 1));
     assert_eq!(report.run_bytes, stats.run_bytes);
     assert!(report.run_bytes > 0);
-}
-
-#[test]
-fn every_flush_stage_shows_the_same_reads() {
-    let engine = engine();
-    let a = engine.put(b"a", b"1").unwrap();
-    engine.flush().unwrap();
-    let b = engine.put(b"b", b"2").unwrap();
-    let expected = [live(b"a", a, b"1"), live(b"b", b, b"2")];
-    assert_eq!(scanned(&engine, b""), expected);
-
-    let job = engine.begin_flush().unwrap();
-    assert_eq!(scanned(&engine, b""), expected);
-    assert_eq!(value_of(&engine, b"b"), Some((b, b"2".to_vec())));
-    assert!(engine.stats().frozen.is_some());
-
-    let built = job.build();
-    assert_eq!(built.runs().len(), 1);
-    assert_eq!(scanned(&engine, b""), expected);
-    assert_eq!(engine.stats().runs, 1, "built runs are not visible yet");
-
-    built.publish().unwrap();
-    assert_eq!(scanned(&engine, b""), expected);
-    assert_eq!(value_of(&engine, b"b"), Some((b, b"2".to_vec())));
-    let stats = engine.stats();
-    assert!(no_frozen(stats));
-    assert_eq!(stats.runs, 2);
-}
-
-#[test]
-fn writes_during_a_flush_land_in_the_new_table_and_win() {
-    let engine = engine();
-    engine.put(b"a", b"frozen").unwrap();
-    engine.put(b"b", b"frozen").unwrap();
-    let job = engine.begin_flush().unwrap();
-
-    let a = engine.put(b"a", b"during").unwrap();
-    engine.delete(b"b").unwrap();
-    let c = engine.put(b"c", b"during").unwrap();
-    let expected = [live(b"a", a, b"during"), live(b"c", c, b"during")];
-    assert_eq!(scanned(&engine, b""), expected);
-
-    let built = job.build();
-    assert_eq!(scanned(&engine, b""), expected);
-    built.publish().unwrap();
-    assert_eq!(scanned(&engine, b""), expected);
-    assert_eq!(value_of(&engine, b"b"), None);
-    assert_eq!(engine.stats().active.payload, 1 + 6 + 1 + 1 + 6);
-}
-
-#[test]
-fn a_frozen_table_receives_no_later_writes() {
-    let engine = engine();
-    engine.put(b"a", b"frozen").unwrap();
-    let job = engine.begin_flush().unwrap();
-    engine.put(b"a", b"during").unwrap();
-    assert_eq!(job.tables().map(|table| table.len()).sum::<usize>(), 1);
-    let built = job.build();
-    assert_eq!(built.runs()[0].len(), 1);
-    built.publish().unwrap();
-    assert_eq!(value_of(&engine, b"a").unwrap().1, b"during");
-}
-
-#[test]
-fn an_abandoned_flush_keeps_the_table_readable_and_is_retried() {
-    let engine = engine();
-    let seq = engine.put(b"a", b"v").unwrap();
-    drop(engine.begin_flush().unwrap());
-    assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
-    assert!(engine.stats().frozen.is_some());
-
-    drop(engine.begin_flush().unwrap().build());
-    assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
-    assert_eq!(engine.stats().runs, 0);
-
-    engine.begin_flush().unwrap().build().publish().unwrap();
-    assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
-    assert!(no_frozen(engine.stats()));
-    assert_eq!(engine.stats().runs, 1);
-}
-
-#[test]
-fn a_retry_does_not_freeze_the_newer_active_table() {
-    let engine = engine();
-    engine.put(b"a", b"v").unwrap();
-    drop(engine.begin_flush().unwrap());
-    engine.put(b"b", b"v").unwrap();
-    let before = engine.stats().active;
-
-    let job = engine.begin_flush().unwrap();
-    assert_eq!(job.tables().map(|table| table.len()).sum::<usize>(), 1);
-    assert_eq!(engine.stats().active, before);
-    job.build().publish().unwrap();
-    assert_eq!(engine.stats().active, before);
-}
-
-#[test]
-fn a_full_flush_writes_a_retried_table_and_the_active_one_as_one_set_of_runs() {
-    let engine = engine();
-    engine.put(b"a", b"v").unwrap();
-    drop(engine.begin_flush().unwrap());
-    engine.put(b"b", b"v").unwrap();
-
-    let report = engine.flush().unwrap();
-    assert_eq!((report.tables, report.records, report.runs), (2, 2, 1));
-    let stats = engine.stats();
-    assert!(no_frozen(stats));
-    assert_eq!(stats.active.payload, 0);
-    assert_eq!(scanned(&engine, b"").len(), 2);
-}
-
-#[test]
-fn a_flush_can_follow_a_panic_during_an_earlier_one() {
-    let engine = engine();
-    engine.put(b"a", b"v").unwrap();
-    let result = thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let _job = engine.begin_flush().unwrap();
-                panic!("flush interrupted");
-            })
-            .join()
-    });
-    assert!(result.is_err());
-    assert_eq!(engine.flush().unwrap().tables, 1);
-    assert_eq!(value_of(&engine, b"a").unwrap().1, b"v");
 }
 
 // Run limits.
@@ -563,29 +415,18 @@ fn at_most_one_table_is_frozen_while_the_new_one_fills() {
         ..EngineOptions::default()
     });
     engine.put(b"a", b"v").unwrap();
-    let job = engine.begin_flush().unwrap();
+    // A refused flush leaves its table frozen.
+    engine.set_run_limits(0, 0);
+    engine.flush().unwrap_err();
     engine.put(b"b", b"v").unwrap();
-    assert!(budget_rejection(engine.put(b"c", b"v").unwrap_err()));
+    let refused = engine.put(b"c", b"v").unwrap_err();
+    assert!(matches!(refused, UpdateError::FlushRefused(_)), "{refused}");
     let stats = engine.stats();
     assert_eq!(stats.active.charged, budget);
     assert_eq!(stats.frozen.unwrap().charged, budget);
-    job.build().publish().unwrap();
+    engine.set_run_limits(usize::MAX, usize::MAX);
+    engine.put(b"c", b"v").unwrap();
     assert_eq!(engine.stats().frozen, None);
-}
-
-#[test]
-fn a_flush_accounts_for_each_table_separately() {
-    let engine = engine();
-    engine.put(b"a", b"12345").unwrap();
-    let job = engine.begin_flush().unwrap();
-    engine.put(b"bb", b"1").unwrap();
-    let stats = engine.stats();
-    assert_eq!(stats.frozen.unwrap().payload, 6);
-    assert_eq!(stats.active.payload, 3);
-    job.build().publish().unwrap();
-    let stats = engine.stats();
-    assert_eq!(stats.active.payload, 3);
-    assert!(stats.run_bytes > 0);
 }
 
 // Automatic flushing.
@@ -735,49 +576,6 @@ fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
 }
 
 // Scans.
-
-/// Fills runs and an active table that the caller then freezes, and returns
-/// the live records.
-fn fill_mixed(engine: &Engine) -> Vec<Live> {
-    let k1 = engine.put(b"k1", b"run").unwrap();
-    engine.put(b"k2", b"run").unwrap();
-    engine.put(b"k3", b"run").unwrap();
-    engine.put(b"k4", b"run").unwrap();
-    engine.flush().unwrap();
-    let k2 = engine.put(b"k2", b"frozen").unwrap();
-    engine.delete(b"k3").unwrap();
-    let k4 = engine.put(b"k4", b"frozen").unwrap();
-    let k5 = engine.put(b"k5", b"frozen").unwrap();
-    vec![
-        live(b"k1", k1, b"run"),
-        live(b"k2", k2, b"frozen"),
-        live(b"k4", k4, b"frozen"),
-        live(b"k5", k5, b"frozen"),
-    ]
-}
-
-#[test]
-fn a_scan_merges_every_source_with_the_newest_update_winning() {
-    let engine = engine();
-    let mut expected = fill_mixed(&engine);
-    let _job = engine.begin_flush().unwrap();
-    engine.delete(b"k5").unwrap();
-    let k6 = engine.put(b"k6", b"active").unwrap();
-    expected.pop();
-    expected.push(live(b"k6", k6, b"active"));
-    assert_eq!(scanned(&engine, b""), expected);
-    assert_eq!(value_of(&engine, b"k3"), None);
-    assert_eq!(value_of(&engine, b"k5"), None);
-}
-
-#[test]
-fn a_key_in_the_active_table_replaces_the_frozen_and_run_versions() {
-    let engine = engine();
-    fill_mixed(&engine);
-    let _job = engine.begin_flush().unwrap();
-    let seq = engine.put(b"k2", b"active").unwrap();
-    assert_eq!(scanned(&engine, b"k2"), [live(b"k2", seq, b"active")]);
-}
 
 #[test]
 fn scans_return_each_key_once_in_bytewise_order() {
@@ -962,26 +760,6 @@ fn a_held_view_stays_stable_while_a_flush_waits() {
 
     assert_eq!(engine.stats().runs, 1);
     assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
-}
-
-#[test]
-fn reads_and_writes_proceed_while_a_flush_has_built_its_runs() {
-    let engine = engine();
-    let seq = engine.put(b"a", b"v").unwrap();
-    let built: BuiltFlush<'_> = engine.begin_flush().unwrap().build();
-
-    thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
-                engine.put(b"b", b"during").unwrap();
-                assert_eq!(value_of(&engine, b"b").unwrap().1, b"during");
-            })
-            .join()
-            .unwrap();
-    });
-    built.publish().unwrap();
-    assert_eq!(scanned(&engine, b"").len(), 2);
 }
 
 #[test]
@@ -1182,23 +960,17 @@ fn assert_engine_matches(engine: &Engine, model: &Model, pool: &[Vec<u8>], prefi
     assert_eq!(scanned(engine, prefix), expected_live(model, prefix));
 }
 
-enum Stage<'e> {
-    Idle,
-    Begun(FlushJob<'e>),
-    Built(BuiltFlush<'e>),
-}
-
-/// Updates interleaved with every flush stage, abandonment and rejected
-/// publication. Whatever the stage, reads must equal the single latest-update
-/// map: a flush never changes what is visible.
+/// Updates interleaved with flushes, refused flushes that leave tables
+/// frozen, and flushes that writes start for room. Reads must always equal
+/// the single latest-update map: a flush never changes what is visible.
 #[test]
-fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
+fn randomized_operations_match_an_independent_model_across_flushes() {
     const SEEDS: u64 = 40;
     const OPERATIONS: usize = 300;
 
     let pool = key_pool();
     let long_key = vec![b'x'; MAX_KEY_LEN + 1];
-    let (mut rejected, mut flushes, mut abandoned, mut refused) = (0, 0, 0, 0);
+    let (mut rejected, mut flushes, mut refused) = (0, 0, 0);
     let mut automatic = 0;
 
     for seed in 0..SEEDS {
@@ -1214,11 +986,11 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
             snapshots: SnapshotLimits::default(),
         });
         let mut model = Model::new();
-        // Charged per key in the active table, and whether one table is frozen.
+        // Charged per key in the active table, and what frozen tables are
+        // charged: a refused flush leaves its tables frozen.
         let mut active: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut has_frozen = false;
+        let (mut has_frozen, mut frozen_charged) = (false, 0);
         let mut last_seq = 0;
-        let mut stage = Stage::Idle;
 
         for _ in 0..OPERATIONS {
             let prefix = &pool[rng.below(pool.len())];
@@ -1248,7 +1020,10 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
                     let charge = entry_charge(&key, len);
                     let total: usize = active.values().sum();
                     let held = active.get(&key).copied().unwrap_or(0);
-                    let fits = charge <= budget && total - held + charge <= budget;
+                    // Frozen tables lower the active table's budget so that
+                    // all of them stay within two budgets.
+                    let active_budget = budget.min(2 * budget - frozen_charged);
+                    let fits = charge <= budget && total - held + charge <= active_budget;
 
                     let result = if delete {
                         engine.delete(&key)
@@ -1256,14 +1031,14 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
                         engine.put(&key, &value)
                     };
                     // A write with no room flushes every table and lands
-                    // alone in a new one, unless a staged flush is held.
-                    let flushes_first = !fits && charge <= budget && matches!(stage, Stage::Idle);
+                    // alone in a new one.
+                    let flushes_first = !fits && charge <= budget;
                     if fits || flushes_first {
                         last_seq += 1;
                         assert_eq!(result, Ok(last_seq), "seed {seed}");
                         if flushes_first {
                             active.clear();
-                            has_frozen = false;
+                            (has_frozen, frozen_charged) = (false, 0);
                             automatic += 1;
                         }
                         active.insert(key.clone(), charge);
@@ -1274,40 +1049,26 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
                     }
                 }
                 75..=85 => {
-                    stage = match stage {
-                        Stage::Idle => {
-                            let job = engine.begin_flush();
-                            assert_eq!(job.is_none(), !has_frozen && active.is_empty());
-                            match job {
-                                Some(job) => {
-                                    if !has_frozen {
-                                        has_frozen = true;
-                                        active.clear();
-                                    }
-                                    Stage::Begun(job)
-                                }
-                                None => Stage::Idle,
-                            }
+                    let empty = !has_frozen && active.is_empty();
+                    if rng.below(5) == 0 {
+                        engine.set_run_limits(0, 0);
+                        let result = engine.flush();
+                        engine.set_run_limits(100_000, usize::MAX);
+                        if empty {
+                            assert_eq!(result.unwrap().tables, 0);
+                        } else {
+                            assert!(result.is_err(), "seed {seed}");
+                            frozen_charged += active.values().sum::<usize>();
+                            active.clear();
+                            has_frozen = true;
+                            refused += 1;
                         }
-                        Stage::Begun(job) => Stage::Built(job.build()),
-                        Stage::Built(built) => {
-                            if rng.below(5) == 0 {
-                                engine.set_run_limits(0, 0);
-                                built.publish().unwrap_err();
-                                engine.set_run_limits(100_000, usize::MAX);
-                                refused += 1;
-                            } else {
-                                built.publish().unwrap();
-                                has_frozen = false;
-                                flushes += 1;
-                            }
-                            Stage::Idle
-                        }
-                    };
-                }
-                86..=89 if !matches!(stage, Stage::Idle) => {
-                    stage = Stage::Idle;
-                    abandoned += 1;
+                    } else {
+                        assert_eq!(engine.flush().unwrap().tables == 0, empty);
+                        active.clear();
+                        (has_frozen, frozen_charged) = (false, 0);
+                        flushes += usize::from(!empty);
+                    }
                 }
                 _ => {}
             }
@@ -1318,7 +1079,6 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
     }
 
     assert!(flushes > 100, "{flushes}");
-    assert!(abandoned > 50, "{abandoned}");
     assert!(refused > 10, "{refused}");
     assert!(rejected > 20, "{rejected}");
     assert!(automatic > 50, "{automatic}");

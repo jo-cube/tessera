@@ -109,11 +109,19 @@ impl RunBuilder {
     }
 
     /// Returns the number of records added so far.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn len(&self) -> usize {
         self.record_count
     }
 
     /// Returns whether no records have been added.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn is_empty(&self) -> bool {
         self.record_count == 0
     }
@@ -132,6 +140,10 @@ impl RunBuilder {
 
     /// Returns the bytes held by a compression context, which Zstandard
     /// allocates outside the Rust heap.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn context_bytes(&self) -> usize {
         self.compressor.context_bytes()
     }

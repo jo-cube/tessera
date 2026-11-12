@@ -6,12 +6,14 @@ description = "A RAM-first, compressed LSM key-value database"
 license = "MIT"
 publish = false
 
-[features]
-# Read-only access to engine internals for the benchmarks that measure them.
-# Not part of the supported API.
-diagnostics = []
-
 [dependencies]
 crc32fast = "1"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode"] }
 zstd-safe = { version = "8", default-features = false, features = ["std", "vendored"] }
+
+# Tests run in a container and are not stepped through in a debugger, so
+# line tables, which keep file and line numbers in panics and backtraces,
+# are enough. Full debug info made each test binary, which every rebuild
+# writes again, 30–65% larger (the unit-test binary 33 MiB against 20 MiB).
+[profile.dev]
+debug = "line-tables-only"

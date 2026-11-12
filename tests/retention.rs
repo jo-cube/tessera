@@ -10,10 +10,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tessera::engine::{
-    CompactionOptions, Engine, EngineOptions, EngineWorkspace, Snapshot, SnapshotLimits,
+    CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot,
+    SnapshotLimits,
 };
-use tessera::memtable::{FrozenMemtable, Memtable};
-use tessera::run::MergeWorkspace;
 
 struct Counting;
 
@@ -80,39 +79,55 @@ fn drop_one<T>(rng: &mut Rng, held: &mut Vec<T>) {
     }
 }
 
-/// A table's pinned bytes cover what only its snapshots hold. Each snapshot
-/// is a `FrozenMemtable` held inline, whose own allocation is its pin.
+/// A snapshot's own small allocations, its source list and its view of the
+/// active table, are not charged, so each is allowed this many bytes and a
+/// pointer per source.
+const OWN: usize = 1 << 10;
+
+/// An engine whose memtable never fills in these tests, so that only the
+/// history its snapshots pin is retained.
+fn memtable_only() -> Engine {
+    Engine::new(EngineOptions {
+        memtable_budget: 64 << 20,
+        snapshots: SnapshotLimits {
+            max_live: 64,
+            max_retained_bytes: usize::MAX,
+        },
+        ..EngineOptions::default()
+    })
+}
+
+/// The active table's pinned bytes cover what only its snapshots hold.
 fn memtable_checkpoints(seed: u64) -> usize {
-    const PIN: usize = 16;
     let mut rng = Rng(seed);
-    let mut table = Memtable::new(64 << 20, None);
-    let mut held: Vec<FrozenMemtable> = Vec::with_capacity(64);
-    let mut seq = 0;
+    let engine = memtable_only();
+    let mut held: Vec<Snapshot> = Vec::with_capacity(64);
     let mut checked = 0;
     for step in 0..12_000 {
-        seq += 1;
         let key = key(&mut rng, 1_500);
         if rng.chance(15) {
-            table.delete(&key, seq).unwrap();
+            engine.delete(&key).unwrap();
         } else {
-            table.put(&key, seq, &value(&mut rng)).unwrap();
+            engine.put(&key, &value(&mut rng)).unwrap();
         }
         if rng.chance(2) && held.len() < 60 {
-            held.push(table.snapshot());
+            held.push(engine.snapshot().unwrap());
         }
         if rng.chance(1) {
             drop_one(&mut rng, &mut held);
         }
         if step % 1_500 == 1_499 {
-            let pinned = table.memory().pinned;
-            let count = held.len();
+            let stats = engine.stats();
+            assert_eq!(stats.runs, 0);
+            let (pinned, count) = (stats.active.pinned, held.len());
+            assert_eq!(stats.retained_bytes, pinned);
             let freed = freed_by(|| held.clear());
             assert!(
-                freed <= pinned + count * PIN,
+                freed <= pinned + count * (OWN + 8),
                 "seed {seed} step {step}: dropping {count} snapshots freed {freed} bytes, \
                  {pinned} were pinned"
             );
-            assert_eq!(table.memory().pinned, 0);
+            assert_eq!(engine.stats().active.pinned, 0);
             checked += 1;
         }
     }
@@ -123,24 +138,21 @@ fn memtable_checkpoints(seed: u64) -> usize {
 /// once, so everything detached is held only by the snapshot. Keys and values
 /// whose lengths leave the allocation unaligned make padding count.
 fn whole_table_replaced() {
-    let mut table = Memtable::new(64 << 20, None);
+    let engine = memtable_only();
     let keys: Vec<Vec<u8>> = (0..20_000u32)
         .map(|i| format!("key{i:06}").into_bytes())
         .collect();
-    let mut seq = 0;
     for key in &keys {
-        seq += 1;
-        table.put(key, seq, b"12345678").unwrap();
+        engine.put(key, b"12345678").unwrap();
     }
-    let snapshot = table.snapshot();
+    let snapshot = engine.snapshot().unwrap();
     for key in &keys {
-        seq += 1;
-        table.put(key, seq, b"abcdefgh").unwrap();
+        engine.put(key, b"abcdefgh").unwrap();
     }
-    let pinned = table.memory().pinned;
+    let pinned = engine.stats().active.pinned;
     let freed = freed_by(|| drop(snapshot));
     assert!(
-        freed <= pinned + 16,
+        freed <= pinned + OWN + 8,
         "freed {freed} bytes, {pinned} were pinned"
     );
     assert!(
@@ -176,11 +188,8 @@ fn compact_some(engine: &Engine, rng: &mut Rng, workspace: &mut MergeWorkspace) 
 }
 
 /// The engine's retained bytes cover what only its snapshots hold: pinned
-/// memtable history and released tables and runs. A snapshot's own small
-/// allocations, its source lists and its view of the active table, are not
-/// charged, so each is allowed `OWN` bytes and a pointer per source.
+/// memtable history and released tables and runs.
 fn engine_checkpoints(seed: u64) -> usize {
-    const OWN: usize = 1 << 10;
     let mut rng = Rng(seed);
     let engine = Engine::new(engine_options());
     let mut held: Vec<Snapshot> = Vec::with_capacity(64);

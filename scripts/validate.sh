@@ -6,30 +6,9 @@
 #   scripts/validate.sh [check]            fmt, Clippy, tests and docs (default)
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
-#   scripts/validate.sh bench              the block and run benchmark
-#   scripts/validate.sh geometry           run block size and codec comparison
-#   scripts/validate.sh prefix             prefix scan comparison
-#   scripts/validate.sh merge              multi-run merge measurements
-#   scripts/validate.sh logical            latest-state read measurements
-#   scripts/validate.sh ranges             key-range pruning measurements
-#   scripts/validate.sh memtable           memtable and flush measurements
-#   scripts/validate.sh engine             integrated engine measurements
-#   scripts/validate.sh compaction         sustained writes, three compaction modes
-#   scripts/validate.sh snapshot           snapshots compared with read guards
-#   scripts/validate.sh frequency          frequent and long-lived snapshots
-#   scripts/validate.sh retention          sustained snapshot retention and backpressure
-#   scripts/validate.sh persistent         memtable tree costs under held snapshots
-#   scripts/validate.sh pacing             background compaction under frequent snapshots
-#   scripts/validate.sh profile            memtable and engine write cost by component
-#   scripts/validate.sh policy             compaction selection policies and pacing (5G)
-#   scripts/validate.sh reads              read amplification under sustained writes (5H)
-#   scripts/validate.sh bloom              filtered against unfiltered point lookups
-#   scripts/validate.sh filtercost         key filter construction cost by component (5J)
-#   scripts/validate.sh operate            sustained, concurrent and limited operation (5K)
-#   scripts/validate.sh checkpoint         checkpoint and recovery cost, tmpfs (5L)
-#   scripts/validate.sh checkpoint-disk    the same on the VM disk, which writes to the host SSD
-#   scripts/validate.sh durable            durable writes and log recovery, tmpfs (5M, 5N)
-#   scripts/validate.sh durable-disk       the same on the VM disk, which writes to the host SSD
+#   scripts/validate.sh bench [MODE…]      the benchmark suite, or some of its modes:
+#                                          memtable reads maintenance snapshots
+#                                          ingest mixed durable recovery
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -169,116 +148,24 @@ check() {
 }
 
 limits() {
-  bounded limits 180 cargo test --locked --test block_limits -- --ignored --test-threads=1
+  bounded limits 180 cargo test --locked --lib limits_tests -- --ignored --test-threads=1
 }
 
-bench() {
-  bounded bench 900 cargo run --locked --release --example block_bench
-}
-
-geometry() {
-  bounded geometry 900 cargo run --locked --release --example block_bench -- geometry
-}
-
-prefix() {
-  bounded prefix 900 cargo run --locked --release --example block_bench -- prefix
-}
-
-merge() {
-  bounded merge 900 cargo run --locked --release --example block_bench -- merge
-}
-
-logical() {
-  bounded logical 900 cargo run --locked --release --example block_bench -- logical
-}
-
-ranges() {
-  bounded ranges 900 cargo run --locked --release --example block_bench -- ranges
-}
-
-memtable() {
-  bounded memtable 900 cargo run --locked --release --example block_bench -- memtable
-}
-
-engine() {
-  bounded engine 900 cargo run --locked --release --example block_bench -- engine
-}
-
-compaction() {
-  bounded compaction 900 cargo run --locked --release --example block_bench -- compaction
-}
-
-snapshot() {
-  bounded snapshot 900 cargo run --locked --release --example block_bench -- snapshot
-}
-
-frequency() {
-  bounded frequency 900 cargo run --locked --release --example block_bench -- snapshot-frequency
-}
-
-retention() {
-  bounded retention 900 cargo run --locked --release --example block_bench -- retention
-}
-
-persistent() {
-  bounded persistent 900 cargo run --locked --release --example block_bench -- persistent
-}
-
-pacing() {
-  bounded pacing 900 cargo run --locked --release --example block_bench -- pacing
-}
-
-policy() {
-  bounded policy 1800 cargo run --locked --release --example block_bench -- policy
-}
-
-reads() {
-  bounded reads 1800 cargo run --locked --release --features diagnostics --example block_bench -- reads
-}
-
-bloom() {
-  bounded bloom 1800 cargo run --locked --release --features diagnostics --example block_bench -- bloom
-}
-
-filtercost() {
-  bounded filtercost 900 cargo run --locked --release --example block_bench -- filtercost
-}
-
-# Write budgets for durability work: tests and fixtures stay on the 512 MiB
-# /tmp tmpfs (charged to the container's 3 GiB), a few MiB per database and
-# never more than a few hundred MiB at once; each test removes its
-# directory. Builds write the cache volume (measured: 20–40 MiB for an
-# incremental test build, about 300 MiB when every test binary relinks);
-# prefer one final `full` to repeated ones.
+# Write budgets: tests and fixtures stay on the 512 MiB /tmp tmpfs (charged
+# to the container's 3 GiB), a few MiB per database and never more than a
+# few hundred MiB at once; each test removes its directory. Builds write the
+# cache volume (measured: 20–40 MiB for an incremental test build, a few
+# hundred MiB when every test binary relinks); prefer one final `full` to
+# repeated ones.
 #
-# Routine runs use the tmpfs only. The -disk variants write into the cache
-# volume, on the VM's disk and so the host's SSD, so that fsync costs
-# something. By estimate they can write well over a GiB each, mostly the
-# rows that take checkpoints back to back, each a full copy of the database
-# (disk_written reports at least what was written). Run them only when a disk number is needed; each
-# benchmark removes its directory.
-checkpoint() {
-  bounded checkpoint-tmpfs 900 cargo run --locked --release --example block_bench -- checkpoint /tmp
-}
-
-checkpoint_disk() {
-  bounded checkpoint-disk 900 cargo run --locked --release --example block_bench -- checkpoint /cache
-}
-
-durable() {
-  bounded durable-tmpfs 900 cargo run --locked --release --example block_bench -- durable /tmp
-}
-
-durable_disk() {
-  bounded durable-disk 900 cargo run --locked --release --example block_bench -- durable /cache
-}
-
-operate() {
-  bounded operate 1800 cargo run --locked --release --features diagnostics --example block_bench -- operate
-}
-
-profile() {
-  bounded profile 900 cargo run --locked --release --example block_bench -- profile
+# The benchmarks write their fixtures to the /tmp tmpfs only, never to the
+# VM disk (and so the host's SSD): `durable` and `recovery` measure the
+# engine's own costs, with fsync free. Release builds share one cache entry
+# with no features, so every mode reuses the same binary.
+bench() {
+  local modes=("$@")
+  [ ${#modes[@]} -gt 0 ] || modes=(memtable reads maintenance snapshots ingest mixed durable recovery)
+  bounded bench 1800 sh -c 'cargo build --locked --release --example bench && for mode; do /cache/target/release/examples/bench "$mode" /tmp || exit; done' sh "${modes[@]}"
 }
 
 # Each probe is bounded on its own, so a failed limit cannot run away.
@@ -333,31 +220,8 @@ case "$command" in
   check) check ;;
   limits) limits ;;
   full) check; limits ;;
-  bench) bench ;;
-  geometry) geometry ;;
-  prefix) prefix ;;
-  merge) merge ;;
-  logical) logical ;;
-  ranges) ranges ;;
-  memtable) memtable ;;
-  engine) engine ;;
-  compaction) compaction ;;
-  snapshot) snapshot ;;
-  frequency) frequency ;;
-  retention) retention ;;
-  persistent) persistent ;;
-  pacing) pacing ;;
-  profile) profile ;;
-  policy) policy ;;
-  reads) reads ;;
-  bloom) bloom ;;
-  filtercost) filtercost ;;
-  operate) operate ;;
-  checkpoint) checkpoint ;;
-  checkpoint-disk) checkpoint_disk ;;
-  durable) durable ;;
-  durable-disk) durable_disk ;;
+  bench) bench "$@" ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
-  *) sed -n '2,34p' "$0"; exit 2 ;;
+  *) sed -n '2,15p' "$0"; exit 2 ;;
 esac

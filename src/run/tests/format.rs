@@ -10,8 +10,8 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tessera::block::{Block, BuildError, Corruption, MAX_BLOCK_LEN, Record, Value};
-use tessera::run::{
+use crate::block::{Block, BuildError, Corruption, MAX_BLOCK_LEN, Record, Value};
+use crate::run::{
     Codec, CorruptRun, ReadWorkspace, Run, RunBuilder, RunCorruption, RunView, TARGET_BLOCK_LEN,
 };
 
@@ -945,7 +945,7 @@ fn ordering_is_enforced_across_block_boundaries() {
 #[test]
 fn limit_rejections_are_reported() {
     let mut builder = RunBuilder::new(Codec::Lz4);
-    let key = vec![b'k'; tessera::block::MAX_KEY_LEN + 1];
+    let key = vec![b'k'; crate::block::MAX_KEY_LEN + 1];
     assert_eq!(
         builder.add(&key, 1, Value::Tombstone),
         Err(BuildError::KeyTooLong { len: key.len() })

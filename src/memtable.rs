@@ -2,32 +2,7 @@
 //!
 //! A [`Memtable`] accepts updates. [`Memtable::freeze`] consumes it and returns
 //! a [`FrozenMemtable`], which has no way to change, and
-//! [`FrozenMemtable::flush`] builds compressed runs from it:
-//!
-//! ```
-//! use tessera::block::Value;
-//! use tessera::memtable::{Memtable, TARGET_RUN_LEN};
-//!
-//! let mut table = Memtable::new(1 << 20, None);
-//! table.put(b"apple", 1, b"red")?;
-//! table.put(b"apple", 2, b"green")?;
-//! table.delete(b"pear", 3)?;
-//! assert_eq!(table.get(b"apple").unwrap().value, Value::Bytes(b"green"));
-//!
-//! let frozen = table.freeze();
-//! let runs: Vec<_> = frozen.flush(TARGET_RUN_LEN).collect();
-//! assert_eq!(runs[0].len(), 2);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! A frozen memtable cannot be written to:
-//!
-//! ```compile_fail,E0599
-//! # use tessera::memtable::Memtable;
-//! let mut table = Memtable::new(1 << 20, None);
-//! let frozen = table.freeze();
-//! frozen.put(b"apple", 1, b"red");
-//! ```
+//! [`FrozenMemtable::flush`] builds compressed runs from it.
 //!
 //! # Versions
 //!
@@ -42,21 +17,6 @@
 //! An update replaces the previous update of its key in the table. A delete is
 //! stored as a tombstone, even when the table holds nothing for that key,
 //! because older runs may.
-//!
-//! ```
-//! use tessera::block::Value;
-//! use tessera::memtable::Memtable;
-//!
-//! let mut table = Memtable::new(1 << 20, None);
-//! table.put(b"apple", 1, b"red")?;
-//! let then = table.snapshot();
-//! table.put(b"apple", 2, b"green")?;
-//! assert_eq!(then.get(b"apple").unwrap().value, Value::Bytes(b"red"));
-//! assert!(table.memory().pinned > 0);
-//! drop(then);
-//! assert_eq!(table.memory().pinned, 0);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
 //!
 //! # Sequence numbers
 //!
@@ -104,6 +64,9 @@ use std::sync::{Arc, Weak};
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::run::{RECORD_INPUT_OVERHEAD, Run, RunBuilder};
+
+#[cfg(test)]
+mod tests;
 
 /// Bytes charged per entry beyond its key and value.
 ///
@@ -682,7 +645,7 @@ pub struct MemoryUsage {
     pub charged: usize,
     /// The part of `charged` that only snapshots of the table still need:
     /// nodes and values its writes copied or replaced since the oldest live
-    /// snapshot. See [Memory](self#memory).
+    /// snapshot. See [Memory](crate::engine#memory).
     pub pinned: usize,
     /// The table's budget.
     pub budget: usize,
@@ -820,6 +783,10 @@ impl Memtable {
     }
 
     /// Returns each key's latest update, in ascending key order.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn iter(&self) -> Records<'_> {
         self.0.iter_from(&[])
     }
@@ -831,6 +798,10 @@ impl Memtable {
     }
 
     /// Returns the number of keys held, including tombstones.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn len(&self) -> usize {
         self.0.len
     }
@@ -841,6 +812,10 @@ impl Memtable {
     }
 
     /// Returns the sequence number every update must exceed, if any.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn last_seq(&self) -> Option<u64> {
         self.0.last_seq
     }
@@ -915,11 +890,19 @@ impl FrozenMemtable {
     }
 
     /// Returns whether the table holds no keys.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn is_empty(&self) -> bool {
         self.table.len == 0
     }
 
     /// Returns the sequence number a successor's updates must exceed, if any.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn last_seq(&self) -> Option<u64> {
         self.table.last_seq
     }

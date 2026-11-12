@@ -37,8 +37,8 @@
 //!    publication.
 //!
 //! If writes were deferred, the leader, holding the log no longer, makes room
-//! (see "Automatic flushing" in `engine.rs`): it waits for any flush the
-//! engine is running, freezes the active table, and commits the deferred
+//! (see "Automatic flushing" in `engine.rs`): it waits for any flush in
+//! progress, freezes the active table, and commits the deferred
 //! writes again, in order, as the rest of its batch. It builds and publishes
 //! the flush only after finishing the batch, so the next batch commits into
 //! the new table meanwhile, and its own write returns after the flush, which
@@ -49,8 +49,9 @@
 //! rounds are bounded by the batch. If a round after a flush accepts
 //! nothing, the deferred writes fail, having logged nothing: with
 //! [`UpdateError::FlushRefused`] if the run limits refused it. While the
-//! leader holds the flush slot it takes the log and state locks; nothing
-//! takes the slot while holding either, so the order is slot, log, state.
+//! leader holds the flush lock it takes the log and state locks; nothing
+//! takes the flush lock while holding either, so the order is flush, log,
+//! state.
 //!
 //! So a write is visible only after its record is synced, acknowledged only
 //! after it is visible, a refused write logs nothing and uses no number, and
@@ -423,14 +424,13 @@ impl Core {
             }
             let error = match flushed {
                 None => match self.freeze_for_room() {
-                    Some(Ok(job)) => {
+                    Ok(job) => {
                         // Nothing in memory leaves nothing to flush.
                         flushed = job.is_none().then_some(Ok(()));
                         frozen = job;
                         continue;
                     }
-                    Some(Err(refused)) => UpdateError::FlushRefused(refused),
-                    None => round.full,
+                    Err(refused) => UpdateError::FlushRefused(refused),
                 },
                 Some(Err(refused)) => UpdateError::FlushRefused(refused),
                 // A flush published and the table still had no room.

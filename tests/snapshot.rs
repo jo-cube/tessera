@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use tessera::engine::{
     BackgroundError, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
-    Snapshot, SnapshotError, SnapshotLimits,
+    MergeWorkspace, Snapshot, SnapshotError, SnapshotLimits,
 };
-use tessera::run::MergeWorkspace;
 
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -246,15 +245,15 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     assert_eq!(retained, seen + pinned);
     assert!(retained * 20 < full, "{retained} of {full}");
 
-    // A snapshot holding the frozen table itself keeps all of it.
+    // A snapshot holding the frozen table itself keeps all of it. A refused
+    // flush leaves the table frozen.
     engine.put(b"seen", b"2").unwrap();
-    let job = engine.begin_flush().unwrap();
+    engine.set_run_limits(0, 0);
+    engine.flush().unwrap_err();
     let whole = engine.snapshot().unwrap();
-    let frozen = job
-        .tables()
-        .map(|table| table.memory().charged)
-        .sum::<usize>();
-    job.build().publish().unwrap();
+    let frozen = engine.stats().frozen.unwrap().charged;
+    engine.set_run_limits(usize::MAX, usize::MAX);
+    engine.flush().unwrap();
     assert_eq!(engine.stats().retained_bytes, retained + frozen);
 
     assert_eq!(value(&small, b"seen").unwrap(), b"1");
@@ -382,45 +381,6 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
 
     drop(snapshot);
     assert_eq!(engine.stats().retained_bytes, 0);
-}
-
-/// A snapshot taken while a flush or compaction is part way through sees
-/// the same state as one taken before or after it.
-#[test]
-fn no_source_transition_leaves_a_gap() {
-    let engine = Engine::new(EngineOptions::default());
-    let mut expected: Pairs = Vec::new();
-    let mut held: Vec<(Snapshot, Pairs)> = Vec::new();
-    let mut take = |engine: &Engine, expected: &Pairs| {
-        let snapshot = engine.snapshot().unwrap();
-        assert_eq!(&scanned(&snapshot, b""), expected);
-        held.push((snapshot, expected.clone()));
-    };
-    for round in 0..3u8 {
-        for key in [&b"a"[..], b"m", b"z"] {
-            engine.put(key, &[round]).unwrap();
-        }
-        engine.delete(b"m").unwrap();
-        expected = pairs(&[(b"a", &[round]), (b"z", &[round])]);
-        take(&engine, &expected);
-        let job = engine.begin_flush().unwrap();
-        take(&engine, &expected);
-        let built = job.build();
-        take(&engine, &expected);
-        built.publish().unwrap();
-        take(&engine, &expected);
-    }
-    let job = engine.begin_compaction(merge_all()).unwrap().unwrap();
-    take(&engine, &expected);
-    let built = job.build(&mut MergeWorkspace::new()).unwrap();
-    take(&engine, &expected);
-    built.publish().unwrap();
-    take(&engine, &expected);
-    assert_eq!(engine.stats().runs, 1);
-    for (snapshot, then) in &held {
-        assert_eq!(&scanned(snapshot, b""), then);
-        assert_eq!(value(snapshot, b"m"), None);
-    }
 }
 
 /// A writer appends keys in order, flushing as it goes, while snapshots are

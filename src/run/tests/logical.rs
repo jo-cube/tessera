@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use tessera::block::{MAX_KEY_LEN, Value};
-use tessera::run::{
+use crate::block::{MAX_KEY_LEN, Value};
+use crate::run::{
     Codec, ConflictingCopies, CorruptRun, LiveRecord, LogicalCursor, LogicalWorkspace, ReadError,
     Run, RunBuilder, RunCorruption, RunSet, RunView,
 };

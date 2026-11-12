@@ -12,9 +12,8 @@ use std::thread;
 
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, Damage, Engine, EngineOptions,
-    EngineWorkspace, RecoveryError, SnapshotLimits,
+    EngineWorkspace, MergeWorkspace, RecoveryError, SnapshotLimits,
 };
-use tessera::run::MergeWorkspace;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 

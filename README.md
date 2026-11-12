@@ -32,6 +32,38 @@ A directory is used by one engine at a time, through an advisory lock.
 `recover` refuses a durable database and `open` a checkpoint-only directory,
 so the guarantees of the two never mix.
 
+## Using it
+
+Everything public lives in `tessera::engine`:
+
+```rust
+use tessera::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
+
+let dir = std::env::temp_dir().join("tessera-readme");
+let engine = Engine::create(&dir, EngineOptions::default(), DurableOptions::default())?;
+engine.put(b"user/1", b"ada")?;
+engine.put(b"user/2", b"grace")?;
+engine.delete(b"user/1")?;
+
+// One workspace per reading thread, reused across reads.
+let mut workspace = EngineWorkspace::new();
+assert!(engine.get(b"user/1", &mut workspace)?.is_none());
+
+// A snapshot holds no lock; writes, flushes and compactions continue.
+let snapshot = engine.snapshot()?;
+let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
+while let Some(record) = scan.next_record()? {
+    println!("{:?} = {:?}", record.key, record.value);
+}
+
+// Bound the log: checkpoint, then drop the segments it covers.
+engine.durable_checkpoint(Default::default())?;
+```
+
+`Engine::new(options)` makes a RAM-only engine with the same reads and
+writes. Writes never need the caller to flush or retry for room; see
+**Flushing** under [Engine](#engine).
+
 ## Engine
 
 `put` and `delete` return the write's sequence number. `get` returns a key's
@@ -58,28 +90,34 @@ snapshots and retained bytes.
 waits for any flush in progress, freezes the table if it is still full,
 lands in the new one and flushes the frozen table before returning, so
 writers that run out of room together share one flush. A flush compresses
-outside the lock and publishes its runs in one step; a refused or abandoned
-flush leaves the tables readable for a retry. `flush` flushes on demand. If
-the run limits refuse the flush, writes that need room fail with
+outside the lock and publishes its runs in one step; a refused flush leaves
+its tables frozen and readable, and the next flush takes them with the
+active table. `Engine::flush` flushes everything written before the call,
+which is only needed to bound what the memtables hold or to measure a
+flush; it is not needed before a checkpoint, which includes the memtables.
+If the run limits refuse the flush, writes that need room fail with
 `UpdateError::FlushRefused` until compaction or `set_run_limits` makes room;
 the refusal is kept, not rebuilt for every write.
 
 **Compaction** merges runs into disjoint runs that keep only the newest
-version of each key. `Engine::compact` selects inputs under the shared lock,
-merges without it and replaces exactly its inputs; the policy merges the
-smallest runs covering the most deeply overlapped key, and neighbouring
-short runs once there are many disjoint ones. It is not leveled. With
-`EngineOptions::background_compaction` set, one worker thread compacts after
-each flush; `wait_for_compaction` waits for a pass and `background_status`
-reports failures.
+version of each key. `Engine::compact` performs one compaction, or returns
+`None` when its policy finds nothing to do: it selects inputs under the
+shared lock, merges without it and replaces exactly its inputs, so reads,
+writes and flushes continue. The policy merges the smallest runs covering
+the most deeply overlapped key, and neighbouring short runs once there are
+many disjoint ones. It is not leveled. Calling `compact` until it returns
+`None` with `max_overlap: 1` consolidates the runs so that a lookup reads at
+most one. With `EngineOptions::background_compaction` set, one worker thread
+compacts after each flush; `wait_for_compaction` waits for a pass and
+`background_status` reports failures.
 
 **Durable writes** are committed by bounded group commit: the first writer
 in the queue leads a batch of those behind it, appends it, syncs once and
 publishes it in sequence order; a lone writer never waits for company. The
 sync happens outside the state lock, so reads continue meanwhile. If the
 memtable has no room for a write, the leader logs the writes before it,
-flushes, and commits the rest, so nothing is logged for a write that is then
-refused. A failed
+freezes the table, commits the rest, and builds the flush after handing on
+leadership, so nothing is logged for a write that is then refused. A failed
 append or sync fails every write of its batch, whose outcome is then
 uncertain until the database is reopened, and closes the log.
 `Engine::inspect` reads a database as `open` would, changing nothing, and
@@ -88,6 +126,7 @@ do. Nothing is ever repaired automatically.
 
 ## Storage layers
 
+These are internal: the engine's contracts above are the supported surface.
 A **block** stores versioned records, ordered by user key ascending then
 sequence number descending, with prefix-compressed keys and a restart point
 every 16 records. A **run** is a self-contained sequence of independently
@@ -95,8 +134,8 @@ compressed blocks (uncompressed, LZ4 or Zstandard) with a sparse index of each
 block's last key and its key range; a point lookup decodes at most one
 block. Runs the engine builds carry an in-memory Bloom filter (10 bits a
 key), so lookups of absent keys usually decode nothing; filters are rebuilt
-on recovery, not stored. `MergeCursor` merges overlapping runs and `RunSet`
-reads a set of runs as the latest state of each key.
+on recovery, not stored. Reads merge the memtables and overlapping runs into
+the latest state of each key.
 
 A **memtable** holds the latest update of each key in a copy-on-write B+
 tree under a memory budget, so snapshots are constant-time.
@@ -130,10 +169,23 @@ it.
 
 - Writes wait for flushes when the memtables are full, and are refused with
   `FlushRefused` when the run limits are reached, until compaction makes
-  room; with no background compaction, call `compact`.
-- A durable log grows until `durable_checkpoint` is called.
-- Do not call engine methods while holding a `ReadGuard`; use the guard's own
-  reads.
+  room; with no background compaction, call `compact`. A caller that wants
+  to wait can call `wait_for_compaction` or `compact` and retry.
+- A durable log grows until `durable_checkpoint` is called; writes past
+  `max_log_bytes` are refused with `LogFull`. Checkpoints are never taken
+  automatically.
+- A failed log append or sync is terminal for the open engine: that batch's
+  writes return `LogFailed` (their outcome is uncertain until reopening) and
+  every later durable write `LogClosed`. Reopen the database to continue.
+  Reads keep working.
+- While snapshots retain more than `SnapshotLimits::max_retained_bytes`, new
+  snapshots and compactions are refused, so runs accumulate until flushes,
+  and then writes, are refused. Dropping snapshots lifts this.
+- A `ReadGuard` blocks writers, flushes and compaction publication while
+  held; keep it short. Do not call engine methods while holding one; use the
+  guard's own reads. A `Snapshot` holds no lock.
+- A panic in the background worker stops it; `background_status` reports it
+  and the engine keeps working without it.
 - The dataset must fit in memory: there is no disk tiering.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.
@@ -151,7 +203,8 @@ not been tested. After a failed sync, check the device before reopening.
 
 ## Performance
 
-Measured in a 2-CPU, 4 GiB Linux VM, not on characterised hardware. RAM-only
+Measured in a 2-CPU, 4 GiB Linux VM, not on characterised hardware, with the
+benchmarks of earlier milestones. RAM-only
 writes run at about 1.2–1.7 million a second from 1–4 writers. One durable
 writer on the VM's virtual disk manages about 6,000–8,000 writes a second
 (one sync each, p50 about 125 µs); group commit reaches about 30,000–36,000
@@ -173,12 +226,11 @@ scripts/validate.sh deps     # once, fetches pinned crates (uses the network)
 scripts/validate.sh verify   # prove the limits are enforced
 scripts/validate.sh          # fmt, Clippy, tests and docs
 scripts/validate.sh full     # also the large-allocation boundary tests
-scripts/validate.sh durable  # durable writes and log recovery, on tmpfs
+scripts/validate.sh bench    # the benchmark suite, or e.g. `bench durable`
 ```
 
-The script's header lists every benchmark. The `checkpoint-disk` and
-`durable-disk` modes write to the VM's disk, and so to the host's SSD; the
-others use tmpfs.
+The benchmarks, `examples/bench.rs`, use only the public API and keep their
+files on tmpfs.
 
 Each step gets a 3 GiB cgroup with no swap, 2 CPUs, 256 processes, 2 build jobs,
 2 test threads, a 512 MiB tmpfs at `/tmp` for test databases, and a timeout,

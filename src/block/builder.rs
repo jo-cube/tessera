@@ -28,6 +28,10 @@ impl BlockBuilder {
     }
 
     /// Appends one record.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn add(&mut self, user_key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
         self.check(user_key, seq, value)?;
         self.append(user_key, seq, value)
@@ -112,6 +116,10 @@ impl BlockBuilder {
     }
 
     /// Returns the number of records added so far.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn len(&self) -> usize {
         self.record_count
     }
@@ -130,6 +138,10 @@ impl BlockBuilder {
     ///
     /// The result is never longer than [`MAX_BLOCK_LEN`] because
     /// [`add`](Self::add) accounts for the directory before accepting a record.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
     pub fn finish(self) -> Vec<u8> {
         let mut block = self.entries;
         block.reserve_exact(self.restarts.len() * U32_LEN + U32_LEN);

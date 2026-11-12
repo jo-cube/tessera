@@ -1,28 +1,169 @@
 # Benchmarks
 
-The benchmarks are one example, `examples/block_bench.rs`. Datasets are generated
-from fixed seeds, so the bytes and probes are identical on every run. Timings
-vary with the machine; compare configurations only within one environment.
+The benchmark suite is `examples/bench.rs`. It drives the engine through its
+public API only, with data from fixed seeds, so every run sees the same keys
+and values. Run it through `scripts/validate.sh`, which applies the memory,
+CPU, process and time limits and keeps every fixture on the `/tmp` tmpfs:
 
-Run them through `scripts/validate.sh`, which applies the memory, CPU, process
-and time limits, and repeat a whole pass rather than trusting one:
+```sh
+scripts/validate.sh bench                  # every mode, one release build
+scripts/validate.sh bench reads durable    # some modes
+```
+
+Timings vary with the machine and between passes; compare configurations
+only within one environment, and repeat a pass rather than trusting one:
 
 ```sh
 mkdir -p target/bench
-for pass in 1 2 3; do
-  scripts/validate.sh geometry > "target/bench/geometry-$pass.log"
-done
-scripts/summarize_bench.py target/bench/geometry-*.log
+for pass in 1 2 3; do scripts/validate.sh bench > "target/bench/suite-$pass.log"; done
+scripts/summarize_bench.py target/bench/suite-*.log
 ```
 
-`summarize_bench.py` takes the median of each cell across passes, reports how
-far passes disagree, and fits the Zstandard decode model below.
+`summarize_bench.py` takes the median of each cell across passes and reports
+how far passes disagree.
 
-The provisional run defaults, 16 KiB blocks and Zstandard level 3, follow from the
-findings below. `RunBuilder::with_target_block_len` and an explicit `Codec` keep
-every configuration available for experiments.
+| mode | workload | what it shows |
+|---|---|---|
+| `memtable` | 500,000 records of 8 + 100 bytes in a 1 GiB memtable: inserts, overwrites, gets, a scan and deletes | the cost of the write and read paths with nothing flushed |
+| `reads` | 1,000,000 records flushed from a 16 MiB memtable, as flushed and consolidated; 200,000 probes | point lookups, blocks decoded per lookup, absent keys decided by key filters, prefix and full scans |
+| `maintenance` | a 250,000-record flush; a compaction of 8 overlapping runs | flush and compaction throughput, stored size, and key filter size and construction memory |
+| `snapshots` | snapshots taken after a write; 1,000,000 overwrites with 0–16 live snapshots replaced in turn | snapshot cost, and what live snapshots cost writes and memory |
+| `ingest` | 1,000,000 writes by 1–4 writers over 400,000 keys, 4 MiB memtable, background compaction | sustained ingestion with automatic flushes, its latency tail and run shape |
+| `mixed` | 500,000 writes beside 1–3 readers doing gets and prefix scans | readers and writers sharing the engine |
+| `durable` | 200,000 durable writes from 1, 4 and 8 writers | group commit: throughput, latency and writes per sync |
+| `recovery` | checkpoints of 500,000 records, recovery, and a reopen replaying 100,000 logged writes | checkpoint, recovery and replay rates |
 
-## `geometry`: block size and codec
+Key filters are built as each run is written, so flush and compaction times
+include their construction; the reports give the filter's size and the
+memory its construction held. On tmpfs a sync costs almost nothing, so
+`durable` and `recovery` measure the engine's own costs, not a device's.
+
+## Baseline (5S)
+
+One pass in the bounded container (2 CPUs of the 4 GiB Colima VM, release
+build). The whole suite took about 66 s, peaked at 237 MiB and wrote 5 MiB
+to the VM disk (the build's own outputs; fixtures stayed on tmpfs).
+
+#### Memtable: 500000 records of 8 + 100 bytes
+
+| operation | ns/op | M ops/s |
+|---|---|---|
+| insert, ascending keys | 99 | 10.14 |
+| insert, random keys | 660 | 1.52 |
+| overwrite, random keys | 777 | 1.29 |
+| get, present | 702 | 1.42 |
+| get, absent | 705 | 1.42 |
+| scan, per record | 32 | 31.68 |
+| delete, random keys | 941 | 1.06 |
+
+charged 112.5 MiB for 51.5 MiB of keys and values
+
+#### Reads: 1000000 records in runs, 200000 probes
+
+| runs | max overlap | filter bits/key | get present ns | blocks/get | get absent ns | blocks/absent get | prefix scan ns (16 records) | full scan ns/record |
+|---|---|---|---|---|---|---|---|---|
+| 15 (as flushed) | 15 | 10.0 | 9725 | 1.11 | 1426 | 0.122 | 128077 | 152.7 |
+| 2 (consolidated) | 1 | 10.0 | 7980 | 1.00 | 136 | 0.008 | 9470 | 85.5 |
+
+#### Flush: 250000 records of 8 + 100 bytes
+
+| ms | MB/s of keys and values | stored / payload | runs | filter bits/key | filter build KiB |
+|---|---|---|---|---|---|
+| 77.9 | 346 | 0.31 | 1 | 10.0 | 2048 |
+
+#### Compaction: 8 overlapping runs of 250000 random keys each
+
+| ms | MB/s of input runs | input MiB | output MiB | versions dropped | filter build KiB | workspace KiB |
+|---|---|---|---|---|---|---|
+| 415.6 | 145 | 57.3 | 28.1 | 904749 | 8192 | 9376 |
+
+#### Taking a snapshot after one write
+
+| records in memtable | runs | snapshot ns |
+|---|---|---|
+| 1000 | 0 | 49 |
+| 100000 | 0 | 50 |
+| 1000000 | 2 | 57 |
+
+#### Overwrites of 200000 keys with live snapshots, one replaced every 20000 writes, 16 MiB memtable
+
+| live snapshots | writes k/s | p99 µs | flushes | peak retained MiB | peak pinned MiB | retained after drop |
+|---|---|---|---|---|---|---|
+| 0 | 1958 | 0.5 | 11 | 0.0 | 0.0 | 0 |
+| 1 | 1909 | 0.5 | 14 | 14.9 | 2.4 | 0 |
+| 4 | 1708 | 0.8 | 16 | 31.7 | 3.4 | 0 |
+| 16 | 1899 | 0.7 | 16 | 94.9 | 3.4 | 0 |
+
+#### Sustained ingestion: 1000000 writes over 400000 keys, 4 MiB memtable, background compaction
+
+| writers | writes k/s | p50 µs | p99 µs | max µs | flushes | compactions | runs at end | max overlap | run MiB | peak RSS MiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1865 | 0.2 | 0.4 | 6734 | 55 | 13 | 4 | 4 | 19.6 | 61 |
+| 2 | 1963 | 0.2 | 0.8 | 13069 | 55 | 11 | 1 | 1 | 11.9 | 96 |
+| 4 | 2020 | 0.2 | 0.8 | 46995 | 55 | 9 | 4 | 4 | 21.8 | 111 |
+
+#### Readers beside writers: 500000 writes over 400000 preloaded keys, 4 MiB memtable, background compaction; one read in 16 is a prefix scan
+
+| writers | readers | writes k/s | write p99 µs | gets k/s | get p99 µs | scan p99 µs |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1199 | 0.5 | 31 | 39.7 | 2097.1 |
+| 1 | 3 | 607 | 0.5 | 64 | 433.4 | 2264.9 |
+| 2 | 2 | 1088 | 0.8 | 36 | 1042.5 | 2236.1 |
+
+#### Durable writes: 200000 writes, 16 MiB memtable, log on /tmp
+
+| writers | writes k/s | p50 µs | p99 µs | syncs | writes/sync | flushes | log MiB |
+|---|---|---|---|---|---|---|---|
+| 1 | 762 | 1.0 | 2.0 | 200000 | 1.0 | 2 | 26.1 |
+| 4 | 332 | 3.8 | 39.3 | 137230 | 1.5 | 2 | 26.1 |
+| 8 | 324 | 22.6 | 57.2 | 71859 | 2.8 | 2 | 26.1 |
+
+#### Checkpoint and recovery: 500000 records, files on /tmp
+
+| engine | step | ms | MiB | records/s |
+|---|---|---|---|---|
+| RAM-only | checkpoint | 148.6 | 15.9 | 3364450 |
+| RAM-only | recover | 71.4 | 15.9 | 7006743 |
+| durable | checkpoint | 152.7 | 15.9 | 3274259 |
+| durable | open, replaying 100000 records | 101.0 | 30.3 | 5941366 |
+
+Reading it:
+
+- Point lookups are dominated by decoding one compressed block (no block
+  cache): about 8 µs once consolidated. As flushed, 15 overlapping runs add
+  filter checks and occasional false-positive decodes. Absent keys decode
+  0.12 blocks a lookup across 15 runs and 0.008 in one, which is the
+  10-bit filters' false-positive rate at work.
+- A prefix scan pays one block decode per run it touches, so consolidation
+  matters most there (128 µs against 9 µs for 16 records).
+- Snapshots cost about 50 ns whatever the table size. Live snapshots raise
+  the flush count, since pinned history counts against the budget, and
+  retained memory grows with how many are held across flushes; it returns
+  to zero when they are dropped.
+- The `durable` rows on tmpfs show the queue's own overhead: with free
+  syncs, one writer is fastest, and group commit pays off only when syncs
+  cost something (see the historical disk rows).
+- Automatic flushes appear as the write-latency maximum in `ingest` (a
+  write that flushes a 4 MiB table), not in the p99.
+
+These numbers are a reference point for the suite, not a comparison with
+the historical results below, which used other workloads and harnesses.
+
+## Historical results
+
+Everything below was measured with the former suite, `examples/block_bench.rs`
+and its modules (removed in 5S; last present at commit `8d3d244`), through
+`scripts/validate.sh` modes that no longer exist. Results describe the
+engine as it was at each milestone and have not been re-run. Several
+measured components directly (block geometry and codecs, merge and logical
+cursors, memtable trees), which are now internal.
+
+Each mode was run as `scripts/validate.sh MODE`, usually over three passes
+summarized with `scripts/summarize_bench.py`, which then also fitted the
+Zstandard decode model in the `geometry` section. The run defaults, 16 KiB
+blocks and Zstandard level 3, follow from those findings.
+
+### `geometry`: block size and codec
 
 Compares run block targets of 4 to 128 KiB (encoded, uncompressed) for no
 compression, LZ4 and Zstandard level 3, over 32 MiB of logical data in each of
@@ -45,7 +186,7 @@ What the columns mean:
 Later tables time the codecs on real blocks and on controlled 64 KiB blocks that
 vary one property at a time, and show what each Zstandard block contains.
 
-### Findings
+#### Findings
 
 Reference environment: 2-CPU, 4 GiB aarch64 Colima VM, 3 GiB container, three
 passes. `get` differs between passes by a median of 3%, p99 by 14% and p99.9 by
@@ -60,7 +201,7 @@ passes. `get` differs between passes by a median of 3%, p99 by 14% and p99.9 by
 - These runs are small enough to sit largely in CPU caches, and lookups are
   uniform and single-threaded, so effects at larger scale are untested.
 
-## `prefix`: seeks and prefix scans
+### `prefix`: seeks and prefix scans
 
 Compares 8, 16, 32 and 64 KiB targets for the same three codecs over three
 datasets of hierarchical keys (`t0000:g00:s00:d000`), at 32 MiB of logical
@@ -81,7 +222,7 @@ an earlier query. Results are checked against the input records.
 - `block end` is that worst case, and `block crossing` a prefix spanning a block
   boundary.
 
-### Findings
+#### Findings
 
 Same reference environment, three passes. Per-query scan time differs between
 passes by a median of 3%, and 6 of 264 rows differ by more than 25%, mostly
@@ -97,7 +238,7 @@ transient slowdowns in one pass.
 - Sparse-index overhead stays below 3% even at 8 KiB and halves with each
   doubling of block size.
 
-## Merged iteration
+### Merged iteration
 
 `block_bench merge` splits 32 MiB of logical data across 1, 2, 4, 8 and 16 runs
 of Zstandard at 16 KiB, and at fan-in 8 also compares other codecs, block sizes
@@ -115,7 +256,7 @@ as above.
   retains on the Rust heap. Each Zstandard input also keeps one 94 KiB context
   on the C heap, outside both figures.
 
-### Findings
+#### Findings
 
 Same reference environment, three passes. Full-scan time differs between passes
 by a median of 0.7% and at most 4.6%. Seek and scan medians agree within about
@@ -148,7 +289,7 @@ are not reliable.
   at 64 KiB makes a seek about 3 times more expensive than at 16 KiB (254 vs
   81 us).
 
-## Latest-state reads
+### Latest-state reads
 
 `block_bench logical` splits 32 MiB of logical data across 1, 4, 8 and 16 runs
 of Zstandard at 16 KiB, plus a mix of codecs and block sizes at 8. Run it with
@@ -166,7 +307,7 @@ of Zstandard at 16 KiB, plus a mix of codecs and block sizes at 8. Run it with
   range metadata; `ranges` below measures the real thing.
 - Every result is checked against the input records.
 
-### Findings
+#### Findings
 
 Same reference environment, three passes. Full-scan times differ between passes
 by a median of under 1.5% and at most 7.4%. `filter` is a difference of two
@@ -193,7 +334,7 @@ unreliable, with p99 varying by up to 154%.
 - Retained buffers grow with fan-in: 257 KiB decoded and 5 KiB of state at 16
   runs, plus the 94 KiB Zstandard context per input outside these figures.
 
-## Key-range pruning
+### Key-range pruning
 
 `block_bench ranges` splits 32 MiB of logical data across 1, 2, 4, 8 and 16 runs
 of Zstandard at 16 KiB, with unique keys and with version chains, in the
@@ -202,7 +343,7 @@ short and medium prefixes and forward seeks through `RunSet`, using only API tha
 existed before runs stored a key range, so the same harness runs on older code.
 Run it with `scripts/validate.sh ranges`.
 
-### Findings
+#### Findings
 
 Same reference environment, three alternating passes of format 2 and format 3
 code. Medians differ between passes by a median of 3.5% and at most 9.8%. Warm
@@ -240,7 +381,7 @@ At 16 runs, with times in microseconds and blocks decoded per query:
 - Ranges reduce the runs consulted, not the cost of the runs that remain, so
   fully overlapping runs need fan-in control or Bloom filters.
 
-## Memtable
+### Memtable
 
 `block_bench memtable` measures three datasets through `Memtable` and
 `FrozenMemtable`: `json` (173,536 records, about 100 bytes each), `tiny` (428,865
@@ -250,7 +391,7 @@ with `scripts/validate.sh memtable`. Each memory row is a fresh process.
 process's resident memory, so it includes allocator rounding and headers. It is
 a baseline, not a target. Times include the counting allocator.
 
-### Findings
+#### Findings
 
 Reference environment, one pass of the copy-on-write B+ tree (32 entries per
 node) and one of the `BTreeMap` memtable it replaced (5E), in the same session.
@@ -305,7 +446,7 @@ the left node full.
 - Dropping a frozen table takes 12 ms for `json` and 16 ms for `tiny` (5E: 11
   and 28 ms), because each entry is freed individually.
 
-## Integrated engine
+### Integrated engine
 
 `block_bench engine` drives `Engine` with the `json` dataset (173,536 records,
 17.1 MiB of payload), beside the memtable and run-set operations it is built on,
@@ -313,7 +454,7 @@ so the engine's own cost shows as the difference. Run it with
 `scripts/validate.sh engine`. Contention rows sample every sixteenth write's
 latency, on the reference environment's 2 CPUs.
 
-### Findings
+#### Findings
 
 Same reference environment, three passes. Times differ between passes by a
 median of 2.9% and at most 15.9%.
@@ -356,7 +497,7 @@ median of 2.9% and at most 15.9%.
   is the whole write amplification. Rust heap peaked 6.8 MiB above its start
   and kept 3.6 MiB, equal to the stored runs.
 
-## Compaction
+### Compaction
 
 `block_bench compaction` writes 1,041,216 puts over the 173,536 keys of the
 `json` dataset through a 4 MiB memtable, in two workloads:
@@ -375,7 +516,7 @@ every 5 ms throughout, so that slow reads cost writers little. Every 16th
 put's latency is sampled, including any flush or synchronous compaction it
 triggers. Run it with `scripts/validate.sh compaction`.
 
-### Findings
+#### Findings
 
 Reference environment (2 CPUs), three rounds in one pass. Rounds 0 and 1
 agree within 2%. Round 2 ran about 20% slower in every mode, including none,
@@ -420,7 +561,7 @@ measured from key ranges was as high as for random writes (56 runs without
 compaction), and compaction cost as much. Key ranges cannot describe a run
 that is dense in two separate places.
 
-## Snapshots
+### Snapshots
 
 A snapshot takes a copy-on-write view of the active memtable, so acquisition
 neither copies nor freezes it; later writes copy the tree nodes the view still
@@ -448,7 +589,7 @@ tenant, then gets one key and is dropped. Total time runs from the first put
 until flushing and compaction leave nothing eligible, so every configuration
 is compared at the same completion point.
 
-### Findings
+#### Findings
 
 Reference environment (2 CPUs), with the uncommitted 5E implementation, which
 froze or copied the active table, measured in the same session as the
@@ -586,7 +727,7 @@ Hypotheses, not measured:
 - With the default 64 MiB budget, the pinned history a snapshot causes would
   be bounded by the same budget; only 1, 4 and 16 MiB tables were measured.
 
-## Retention under sustained snapshots
+### Retention under sustained snapshots
 
 Three modes measure what copy-on-write snapshots cost once they are held:
 
@@ -609,7 +750,7 @@ that snapshots hold (`EngineStats::retained_run_bytes` gives the runs).
 **Engine** is what the live engine reaches: memtable charges without pinned
 history, plus published run bytes.
 
-### Findings
+#### Findings
 
 Reference environment, one pass each; counts repeated exactly where rerun.
 
@@ -725,7 +866,7 @@ Hypotheses, not measured:
 - Reads of a table written under frequent snapshots differ within noise from
   one written without; copied nodes did not measurably hurt locality.
 
-## Where write time goes
+### Where write time goes
 
 `scripts/validate.sh profile` (about 40 s) attributes memtable and engine
 cost by measuring components separately, since the bounded container has no
@@ -733,7 +874,7 @@ sampling profiler or hardware counters. Absolute times on the reference host
 varied by more than twofold between runs, so only ratios within one run are
 compared.
 
-### Findings
+#### Findings
 
 One run whose times matched the memtable benchmark (json, 174k entries;
 8-byte values in parentheses):
@@ -782,7 +923,7 @@ and 1.10–1.19 times the heap. It offers no view of which nodes a write
 copies, so pinned history could not be charged. `bbtree` was not measured:
 its documentation states that a scan is not a snapshot.
 
-## Compaction selection
+### Compaction selection
 
 `scripts/validate.sh policy` (about 40 s) records every compaction the
 worker's loop runs: input sizes, the largest input's share and age, input
@@ -795,7 +936,7 @@ and 100k puts per second, for three workloads: uniform overwrites, an
 Total time runs until nothing is eligible. Two rounds agreed within a few
 percent, and paced rows almost exactly.
 
-### Where the work went
+#### Where the work went
 
 The earlier policy took the smallest runs at the deepest key up to
 `max_inputs` (8). A flush of random keys covers the whole key space, so
@@ -808,7 +949,7 @@ and the largest input was 89–91% of all input bytes. Rewrite (compaction
 input per flushed byte) rose with pacing: uniform 3.6, 8.8 and 9.8; window
 8.4, 10.5 and 10.5; new keys 3.6, 6.3 and 9.3.
 
-### Alternatives (same session, `max_overlap` 4 unless noted)
+#### Alternatives (same session, `max_overlap` 4 unless noted)
 
 | alternative | effect |
 |---|---|
@@ -821,7 +962,7 @@ Size-tiered selection is now the policy. It keeps every invariant of the
 merge (inputs share the deepest key, so the overlap there falls and nowhere
 rises), and needs no new state.
 
-### Before and after
+#### Before and after
 
 The earlier policy from a copy of the previous commit and the current one,
 run in the same session, medians of two rounds:
@@ -860,7 +1001,7 @@ for new keys (21.6–22.4 → 12.2–20.3 MiB), rose up to 3 MiB for uniform
 overwrites, and for the window fell unpaced (12.4 → 7.3) and rose 1.9–2.2
 MiB paced.
 
-## Read amplification (investigation)
+### Read amplification (investigation)
 
 `scripts/validate.sh reads` (about 35 s; it builds with the `diagnostics`
 feature, which adds a read-only `ReadGuard::runs` used only here) drives the
@@ -874,7 +1015,7 @@ ran from a copy of commit `5e9208e` given the same read-only run accessor.
 Three sessions; within-session comparisons only. Settled states differ from
 round to round, because where ingestion stops decides which merge was last.
 
-### Sustained ingestion
+#### Sustained ingestion
 
 Unpaced, the worker was busy at every sample under both policies and overlap
 rose to 7–27 runs (uniform) and up to 54 (new keys); paced at 200k/s it was
@@ -898,7 +1039,7 @@ allowed: new keys settled into runs of under 1 MiB, 1–4 MiB and 4–16 MiB.
 With overwrites the key space is 3.4 MiB, so the largest tier is the whole
 key space, and runs either hold all of it or are recent flushes.
 
-### Point lookups
+#### Point lookups
 
 Every run whose key range covers a key decodes one block (about 10 µs for
 these runs; a flush run's smaller blocks cost less), whether or not it holds
@@ -924,7 +1065,7 @@ record, filters would take 3%, 6% and 9% of the stored bytes at 10%, 1% and
 0.1% false positives for these json records (0.64 MiB for 11.1 MiB of runs at
 1%); smaller values would make that share larger.
 
-### Prefix scans
+#### Prefix scans
 
 Seeking costs about one block per participating run (41 µs for four runs, 10
 µs for one), so 20-record scans are almost all seek. Long scans are paid per
@@ -937,7 +1078,7 @@ one by one. A Bloom filter cannot address any of this: not duplicated
 history, not merge work, and not the seek into every run whose range meets
 the prefix.
 
-### Consolidation
+#### Consolidation
 
 | state | rewritten | CPU s | peak heap | runs/overlap | get p50 | tenant scan |
 |---|---|---|---|---|---|---|
@@ -956,7 +1097,7 @@ previous commit's build in both sessions, while scanning that run directly
 cost the same. The read path is identical, so this is taken as code layout,
 not policy.
 
-## Run key filters
+### Run key filters
 
 Each run its builder makes carries an in-memory Bloom filter over its
 distinct user keys: 10 bits a key, 7 probes from one SipHash-1-3 hash by double
@@ -1011,7 +1152,7 @@ rows that filters do not touch. Those flush rows are single timed passes; the
 repeated measurements under "Filter construction cost" put the cost at
 5–17%.
 
-## Filter construction cost
+### Filter construction cost
 
 `scripts/validate.sh filtercost` (Milestone 5J) times the filter steps alone,
 copied from `src/run/filter.rs`, on the sorted records that `RunBuilder`
@@ -1070,7 +1211,7 @@ a reallocation as a copy:
 - Runs of more than 2^24 distinct keys are not built here (they would need a
   memtable of several GiB); unit tests cover the filterless fallback.
 
-## Sustained operation (assessment)
+### Sustained operation (assessment)
 
 `scripts/validate.sh operate` (Milestone 5K; about 3 minutes, `diagnostics`
 feature) drives the engine and its background worker with 4 MiB memtables and
@@ -1080,7 +1221,7 @@ run shape every 50 ms. `operate concurrency` and `operate pressure` run one
 section alone. Two sessions after the change below, one before; within-session
 comparisons only.
 
-### Sustained workloads
+#### Sustained workloads
 
 1.2 million puts (60,000 of 4 KiB over 20,000 keys), unpaced, one writer that
 flushes when the memtable is full. "Sustainable" divides the puts by write time
@@ -1116,7 +1257,7 @@ flush and every compaction output.
   of that), and RSS was 33–146 MiB for the whole benchmark process, which
   includes the value pools and freed but unreturned memory.
 
-### Point reads held the state lock while decoding
+#### Point reads held the state lock while decoding
 
 Before this milestone, `Engine::get` decoded run blocks while holding the
 state lock shared, about 10–20 µs per get. A writer waits for that lock, so
@@ -1137,7 +1278,7 @@ to 0.4–0.6 µs. Single-threaded get latency did not change (19.5–19.6 µs se
 9.8 µs on one run, both builds). What remains is CPU: on 2 CPUs a writer, a
 reader and the worker share two cores.
 
-### Concurrency (after the change)
+#### Concurrency (after the change)
 
 600,000 json uniform overwrites from 200,000 settled keys, split between
 writers; readers get as fast as they can.
@@ -1163,7 +1304,7 @@ writers; readers get as fast as they can.
   full scans through a `ReadGuard` let a writer in about once per scan (as
   documented) and are not measured.
 
-### Limits, backpressure and recovery
+#### Limits, backpressure and recovery
 
 | scenario | result |
 |---|---|
@@ -1182,7 +1323,7 @@ called `wait_for_compaction`. A refused flush now requests a pass (one line;
 A refused flush drops the runs it built, and the retry builds them again; in
 the first row that is up to 17 extra builds of a 1 MiB table.
 
-### Decoded-block caching
+#### Decoded-block caching
 
 A simulated LRU of decoded 16 KiB blocks, replaying the blocks that filtered
 point lookups decode (only runs holding the key; filter false positives left
@@ -1206,7 +1347,7 @@ blocks across readers, synchronization on every lookup and eviction. Not
 implemented: it pays only for key-clustered hot sets, and those can be
 measured if a workload needs them.
 
-### Deliberate consolidation
+#### Deliberate consolidation
 
 `Engine::compact` with `max_overlap` 1 on the settled uniform state (3–4 runs):
 
@@ -1225,7 +1366,7 @@ The existing `Engine::compact` with `max_overlap` 1 already does it, so no new
 API or scheduler is needed. In one session the worker happened to leave one
 run, and consolidation had nothing to do.
 
-## Checkpoints
+### Checkpoints
 
 `scripts/validate.sh checkpoint` (Milestone 5L) loads an engine (16 MiB
 memtables, default limits, the worker), checkpoints it, reads the files and
@@ -1267,7 +1408,7 @@ holds. Two sessions agree within 15% except where noted.
   checkpoint's snapshot, up to 45 MiB retained here, with 16 MiB memtables and
   18 MiB of runs.
 
-## Durable writes
+### Durable writes
 
 These are the Milestone 5M results; 5N replaced the benchmark with the one
 under [Group commit](#group-commit), so they are not rerun as written.
@@ -1338,7 +1479,7 @@ databases. Ranges are two sessions.
   was pruned.
 - Compaction ran beside the log with no failures.
 
-## Group commit
+### Group commit
 
 `scripts/validate.sh durable` (Milestone 5N) runs W writer threads of
 uniform json overwrites over a million keys (16 MiB memtables, the
@@ -1425,7 +1566,7 @@ tmpfs (the sync does nothing; this is the software cost):
   second lock is not established; the single-lock path was kept since it
   does no more work. W=1–4 were unchanged throughout.
 
-### Recovery hardening (5O)
+#### Recovery hardening (5O)
 
 One regression run of the same benchmark after Milestone 5O (open syncs
 the last segment, recovery opens one segment at a time and bounds its file
@@ -1446,7 +1587,7 @@ to 6.1 k in one run with p95 351 µs, a disk hiccup, not a code change).
 Nothing here is outside that spread, and the one extra sync at open is not
 visible in recovery time.
 
-## Automatic flushing (5R)
+### Automatic flushing (5R)
 
 Writes now flush the memtables themselves when they are full. One A/B
 harness, built against the 5Q commit (`3fb2c9f`), where the caller flushes
@@ -1495,7 +1636,6 @@ harness was not kept.
 - No disk rows were run: the change does not touch the sync path, and the
   disk rows write to the host SSD.
 
-The older benchmark modes drove flushes from `BudgetExceeded`. They now
-rely on the engine's flushes, handle `FlushRefused` where they waited for
-compaction, and use `EngineStats::flushes`; results recorded above for those
-modes predate 5R and were not re-run.
+The older benchmark modes drove flushes from `BudgetExceeded`. In 5R they
+were changed to rely on the engine's flushes; results recorded above for
+those modes predate 5R and were not re-run.

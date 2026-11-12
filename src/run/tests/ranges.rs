@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use tessera::block::{MAX_KEY_LEN, Value};
-use tessera::run::{
+use crate::block::{MAX_KEY_LEN, Value};
+use crate::run::{
     Codec, KeyRange, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadError,
     ReadWorkspace, Run, RunBuilder, RunCorruption, RunSet, RunView,
 };
@@ -85,7 +85,7 @@ fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn kind_of(error: tessera::run::CorruptRun) -> RunCorruption {
+fn kind_of(error: crate::run::CorruptRun) -> RunCorruption {
     error.kind
 }
 

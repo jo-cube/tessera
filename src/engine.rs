@@ -63,14 +63,14 @@
 //! A panic while the state lock is held for writing poisons it, and every later
 //! operation then panics too. No write section is expected to panic short of a
 //! bug, and the engine does not try to recover from one. A panic anywhere else,
-//! including in a caller holding a [`ReadGuard`] or a flush job, leaves the
-//! engine usable, and so does a panic in the background worker, which stops
+//! including in a caller holding a [`ReadGuard`] or while a flush or
+//! compaction builds without the lock, leaves the engine usable, and so does a panic in the background worker, which stops
 //! it. [`Engine::new`] panics if the worker's thread cannot be created.
 //!
 //! # Snapshots
 //!
 //! [`Engine::snapshot`] takes, under the exclusive lock and in constant time
-//! per source, a [`Memtable::snapshot`] of the active table and shared
+//! per source, a snapshot of the active memtable and shared
 //! references to the frozen tables and the published runs. The memtable is a
 //! copy-on-write tree, so its snapshot shares every node, and later writes
 //! copy only the nodes they change that a snapshot still shares. Nothing is
@@ -97,38 +97,39 @@
 //!
 //! A write the memtables have no room for flushes them itself; see
 //! [Automatic flushing](self#automatic-flushing). [`Engine::flush`] flushes
-//! on demand, and [`Engine::begin_flush`] exposes its stages:
+//! everything written before it on demand, for example before a checkpoint
+//! or to bound what the memtables hold. Either way a flush has three stages:
 //!
-//! 1. The active memtable is frozen and replaced, under the lock, unless
-//!    frozen tables are waiting from an abandoned or refused flush.
+//! 1. The active memtable is frozen and replaced, under the lock.
 //! 2. Runs are built from every frozen table without the lock, so reads and
-//!    writes continue.
+//!    writes that fit continue.
 //! 3. The runs are published and the tables they came from are removed in one
 //!    step under the lock.
 //!
 //! Frozen tables stay readable throughout, and no reader sees their runs
-//! until they replace them. A flush abandoned or rejected at any stage leaves
-//! the tables frozen, and the next flush retries them.
+//! until they replace them. Flushes run one at a time. A flush refused by the
+//! run limits, or interrupted by a panic while building, leaves its tables
+//! frozen, and the next flush merges them with the active table into one set
+//! of runs.
 //!
 //! # Automatic flushing
 //!
-//! A write refused only because the memtables are full
-//! ([`WriteError::BudgetExceeded`]) makes room and is retried within the
-//! call, so callers never flush for room. The write waits for the flush slot,
-//! that is for any flush in progress, and retries; if the active table is
-//! still full it freezes it and retries in the successor in the same hold of
-//! the lock, then builds and publishes the flush itself before returning. So
-//! writers that run out of room together wait for one flush, and only the
-//! first to find the table full again starts the next. The successful path
-//! is unchanged: a write that fits takes the lock once, as before.
+//! A write refused only because the memtables are full makes room and is
+//! retried within the call, so callers never flush for room and never see
+//! [`WriteError::BudgetExceeded`]. The write waits for any flush in progress
+//! and retries; if the active table is still full it freezes it and retries
+//! in the successor in the same hold of the lock, then builds and publishes
+//! the flush itself before returning. So writers that run out of room
+//! together wait for one flush, and only the first to find the table full
+//! again starts the next. The successful path is unchanged: a write that
+//! fits takes the lock once.
 //!
 //! A write applied once is never applied again: a retry follows only a
 //! refusal, which changes nothing and uses no sequence number. A write's
 //! record fits a new table, so it fails to land after freezing only if
 //! earlier tables were still frozen; it then retries only after its own
-//! flush of all of them published. So a write runs at most two flushes,
-//! unless callers abandon flush jobs meanwhile, and never retries without a
-//! flush having published.
+//! flush of all of them published. So a write runs at most two flushes and
+//! never retries without a flush having published.
 //!
 //! A refused flush (see [Memory](self#memory)) is remembered until a flush
 //! or compaction publishes or the run limits change, which is when it could
@@ -139,22 +140,19 @@
 //! larger than a whole budget ([`WriteError::RecordExceedsBudget`]) and every
 //! other refusal are returned as they are.
 //!
-//! Durable writes do the same in their batch's leader; see `group.rs`.
-//!
-//! A write needing room waits only for flushes the engine runs. While a
-//! caller holds a job from [`Engine::begin_flush`], it is refused with
-//! [`WriteError::BudgetExceeded`] as before, since that job's publication is
-//! what makes room; waiting could deadlock if the caller's own thread wrote,
-//! or a durable write of its waited for this writer's batch.
+//! Durable writes do the same in their batch's leader, which freezes for room
+//! while it holds the log and builds the flush after handing leadership on;
+//! see `src/engine/group.rs`.
 //!
 //! # Compaction
 //!
-//! Compaction is explicit and synchronous. [`Engine::compact`] does one, and
-//! [`Engine::begin_compaction`] exposes the same stages as a flush: inputs are
-//! selected under the shared lock, merged without any lock, and replaced by the
-//! output in one step under the exclusive lock. Readers see either all of the
-//! inputs or all of the output. Compactions run one at a time; flushes, reads
-//! and writes continue beside them.
+//! Compaction is explicit unless [background
+//! compaction](self#background-compaction) is configured. [`Engine::compact`]
+//! does one in three stages, like a flush: inputs are selected under the
+//! shared lock, merged without any lock, and replaced by the output in one
+//! step under the exclusive lock. Readers see either all of the inputs or all
+//! of the output. Compactions run one at a time; flushes, reads and writes
+//! continue beside them.
 //!
 //! Only the newest version of each key is kept, which is correct because no
 //! reader can ask for an older one. A tombstone is dropped only if no run
@@ -192,9 +190,9 @@
 //! # Memory
 //!
 //! Memtables are limited to two budgets in all: the active table and at most
-//! one frozen table, or several left by abandoned flushes, whose charge
-//! lowers the active table's budget until a flush removes them. When the
-//! active table is full a write flushes it. A table's charge includes the nodes and values
+//! one frozen table, or several left by refused flushes, whose charge lowers
+//! the active table's budget until a flush removes them. When the active
+//! table is full a write flushes it. A table's charge includes the nodes and values
 //! its writes copied or replaced while a snapshot still shares them
 //! ([`MemoryUsage::pinned`]), so the two budgets bound the memtables together
 //! with the history their snapshots pin, and a long-lived snapshot makes
@@ -258,24 +256,31 @@ mod group;
 mod wal;
 mod worker;
 
+#[cfg(test)]
+mod staged_tests;
+
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, RecoveryError};
 pub use wal::{
     DurableOptions, Inspection, LogDamage, LogPosition, LogStatus, OpenReport, TornTail, Verdict,
 };
 pub use worker::{BackgroundError, BackgroundStatus};
 
+pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
+pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage, WriteError};
+pub use crate::run::{
+    CompactError, CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue,
+    MergeWorkspace, ReadError, RunCorruption,
+};
+
 use std::fmt;
 use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
 
 use crate::block::{Record, Value, Version};
-use crate::memtable::{
-    FrozenMemtable, MemoryUsage, Memtable, Records, TARGET_RUN_LEN, WriteError, flush_merged,
-};
+use crate::memtable::{FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, flush_merged};
 use crate::run::{
-    CompactError, CompactLimits, CompactStats, LiveRecord, LiveValue, LogicalCursor,
-    LogicalWorkspace, MergeWorkspace, ReadError, Run, RunView, compact, latest_in,
+    CompactLimits, LogicalCursor, LogicalWorkspace, Run, RunView, compact, latest_in,
 };
 
 type SharedRun = Arc<Published>;
@@ -305,7 +310,9 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
 pub struct EngineOptions {
     /// Charged bytes each memtable may hold.
     pub memtable_budget: usize,
-    /// Input per run when flushing. See [`FrozenMemtable::flush`].
+    /// Bytes of memtable records per run a flush writes, so that a large
+    /// flush writes several runs with disjoint key ranges. Values above
+    /// 1 GiB are treated as 1 GiB.
     pub target_run_len: usize,
     /// The most runs that may be published.
     pub max_runs: usize,
@@ -401,10 +408,9 @@ impl std::error::Error for SnapshotError {}
 /// table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateError {
-    /// The memtable refused the update. A write that does not fit flushes
-    /// instead, so [`WriteError::BudgetExceeded`] is returned only while a
-    /// job from [`Engine::begin_flush`] is held. See
-    /// [Automatic flushing](self#automatic-flushing).
+    /// The update can never be applied: its key or value is too long, or its
+    /// record exceeds a whole memtable budget. A write that only needs room
+    /// flushes instead; see [Automatic flushing](self#automatic-flushing).
     Rejected(WriteError),
     /// The memtables are full and the flush that would make room is refused
     /// by the run limits, now or since they or the runs last changed. Compaction or
@@ -544,7 +550,7 @@ struct State {
     /// Oldest first. Each table's sequence numbers are above the runs' and
     /// those of the tables before it, and below `active`'s. Only flushes
     /// freeze tables, so there is more than one only after a flush was
-    /// abandoned or refused.
+    /// refused or panicked.
     frozen: Vec<Arc<FrozenMemtable>>,
     /// Shared so that a compaction can read its inputs without the lock while
     /// flushes publish beside them.
@@ -649,7 +655,7 @@ struct Core {
     /// overtaking a waiting writer. The standard lock does not promise this.
     gate: Mutex<()>,
     /// Held by a flush from start to end, so that flushes run one at a time.
-    flushing: FlushSlot,
+    flushing: Mutex<()>,
     /// Held by a compaction from selection to publication, so that runs are
     /// removed by one compaction at a time.
     compacting: Mutex<()>,
@@ -739,40 +745,20 @@ impl Engine {
     }
 
     /// Flushes everything written before this call: the active table and any
-    /// frozen tables, left by an abandoned or refused flush, are merged into
-    /// one set of runs. An empty engine does nothing.
+    /// frozen tables left by a refused flush are merged into one set of runs
+    /// and published in place of them. Waits for any flush in progress. An
+    /// engine with nothing in memory does nothing.
+    ///
+    /// Writes never need this to make room. Refused with a [`FlushError`],
+    /// leaving the tables frozen and readable, if publishing would exceed
+    /// the run limits.
     pub fn flush(&self) -> Result<FlushReport, FlushError> {
         self.core.flush()
     }
 
-    /// Starts a flush of every frozen table, freezing the active table first
-    /// only if none is waiting, so that a retry leaves newer writes in place.
-    /// Returns `None` if there is nothing to flush.
-    ///
-    /// Waits for any flush already in progress, including one this thread
-    /// holds, so drop or publish a job before starting another.
-    pub fn begin_flush(&self) -> Option<FlushJob<'_>> {
-        self.core.begin_flush()
-    }
-
-    /// Compacts once with [`Engine::begin_compaction`]'s policy, building in
-    /// `workspace`. Returns `None` if the policy finds nothing to do.
-    ///
-    /// Repeated until `None` with a [`CompactionOptions::max_overlap`] of 1,
-    /// this consolidates after ingestion slows: then no key lies in more than
-    /// one run and a lookup reads at most one run block, within the same input
-    /// limits (a merge beyond them fails instead). Runs that overlap no other
-    /// are rewritten only by the disjoint-tail rule, and inputs a snapshot
-    /// holds stay allocated until it is dropped.
-    pub fn compact(
-        &self,
-        options: CompactionOptions,
-        workspace: &mut MergeWorkspace,
-    ) -> Result<Option<CompactionReport>, CompactionError> {
-        self.core.compact(options, workspace)
-    }
-
-    /// Selects runs to compact, or returns `None` if nothing needs it.
+    /// Compacts once, building in `workspace`, or returns `None` if nothing
+    /// needs it. Waits for any compaction in progress, including the
+    /// background worker's.
     ///
     /// If some key lies in the ranges of more than
     /// [`CompactionOptions::max_overlap`] runs, the runs covering the most
@@ -795,12 +781,21 @@ impl Engine {
     /// Each kind of merge reduces a count that the other cannot raise, so
     /// compacting repeatedly with the same options and no new flushes stops.
     ///
-    /// Waits for any compaction in progress, including one this thread holds.
-    pub fn begin_compaction(
+    /// The merge runs without the state lock: reads, writes and flushes
+    /// proceed beside it, and its output is published in one step. Inputs a
+    /// snapshot holds stay allocated until it is dropped.
+    ///
+    /// Repeated until `None` with a [`CompactionOptions::max_overlap`] of 1,
+    /// this consolidates after ingestion slows: then no key lies in more than
+    /// one run and a lookup reads at most one run block, within the same input
+    /// limits (a merge beyond them fails instead). Runs that overlap no other
+    /// are rewritten only by the disjoint-tail rule.
+    pub fn compact(
         &self,
         options: CompactionOptions,
-    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
-        self.core.begin_compaction(options)
+        workspace: &mut MergeWorkspace,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        self.core.compact(options, workspace)
     }
 
     /// Replaces the limits on published runs.
@@ -855,7 +850,7 @@ impl Core {
                 flushed_bytes: 0,
             }),
             gate: Mutex::new(()),
-            flushing: FlushSlot::default(),
+            flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             checkpointing: Mutex::new(()),
             durable: std::sync::OnceLock::new(),
@@ -885,28 +880,20 @@ impl Core {
         }
         let written = self.write(&mut self.write_state(), key, value);
         if is_full(&written) {
-            return self.write_making_room(key, value, written);
+            return self.write_making_room(key, value);
         }
         written
     }
 
-    /// A RAM-only write the memtables had no room for, refused with
-    /// `written`. See [Automatic flushing](self#automatic-flushing).
+    /// A RAM-only write the memtables had no room for. See
+    /// [Automatic flushing](self#automatic-flushing).
     #[cold]
-    fn write_making_room(
-        &self,
-        key: &[u8],
-        value: Value<'_>,
-        mut written: Result<u64, UpdateError>,
-    ) -> Result<u64, UpdateError> {
+    fn write_making_room(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
         loop {
-            // While a caller holds the slot, that job's publication makes room.
-            let Some(serial) = self.flushing.take_for_room() else {
-                return written;
-            };
+            let serial = self.serialize_flush();
             let mut state = self.write_state();
             // A flush that finished while this waited may have made room.
-            written = self.write(&mut state, key, value);
+            let mut written = self.write(&mut state, key, value);
             if !is_full(&written) {
                 return written;
             }
@@ -928,19 +915,26 @@ impl Core {
 
     /// Freezes the active table for durable writes the memtables refused,
     /// returning the flush of every frozen table, which its batch's leader
-    /// publishes after committing the batch; `None` while a caller holds a
-    /// flush job. See [Automatic flushing](self#automatic-flushing).
-    pub(super) fn freeze_for_room(&self) -> Option<Result<Option<FlushJob<'_>>, FlushError>> {
-        let serial = self.flushing.take_for_room()?;
-        Some(self.begin_making_room(serial, &mut self.write_state()))
+    /// publishes after committing the batch. See
+    /// [Automatic flushing](self#automatic-flushing).
+    fn freeze_for_room(&self) -> Result<Option<FlushJob<'_>>, FlushError> {
+        let serial = self.serialize_flush();
+        self.begin_making_room(serial, &mut self.write_state())
     }
 
-    /// With the flush slot `serial`, freezes the active table and returns a
+    /// Waits for any flush in progress and holds off others until the guard
+    /// is dropped. The mutex guards no data, so a panic elsewhere leaves
+    /// nothing to distrust, and the flush stays retryable.
+    fn serialize_flush(&self) -> MutexGuard<'_, ()> {
+        self.flushing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holding the flush guard `serial`, freezes the active table and returns a
     /// flush of every frozen table, or `None` if nothing is in memory. Returns
     /// the last refusal instead if it still stands.
     fn begin_making_room<'e>(
         &'e self,
-        serial: SlotGuard<'e>,
+        serial: MutexGuard<'e, ()>,
         state: &mut State,
     ) -> Result<Option<FlushJob<'e>>, FlushError> {
         if let Some(refused) = state.refused {
@@ -1102,22 +1096,18 @@ impl Core {
     }
 
     fn flush(&self) -> Result<FlushReport, FlushError> {
-        match self.begin(true, Holder::Engine) {
+        match self.begin_flush() {
             Some(job) => job.build().publish(),
             None => Ok(FlushReport::default()),
         }
     }
 
+    /// Freezes the active table, unless it is empty, and starts a flush of
+    /// every frozen table. Returns `None` if there is nothing to flush.
     fn begin_flush(&self) -> Option<FlushJob<'_>> {
-        self.begin(false, Holder::Caller)
-    }
-
-    /// Starts a flush of every frozen table, freezing the active one first if
-    /// `with_active` or if no table is frozen.
-    fn begin(&self, with_active: bool, holder: Holder) -> Option<FlushJob<'_>> {
-        let serial = self.flushing.take(holder);
+        let serial = self.serialize_flush();
         let mut state = self.write_state();
-        if !state.active.is_empty() && (with_active || state.frozen.is_empty()) {
+        if !state.active.is_empty() {
             self.freeze_active(&mut state);
         }
         if state.frozen.is_empty() {
@@ -1325,102 +1315,27 @@ impl fmt::Debug for Engine {
     }
 }
 
-/// A flush whose tables are frozen and whose runs are not built yet.
+/// A flush whose tables are frozen and whose runs are not built yet: the
+/// staging that lets a flush compress without the state lock.
 ///
 /// Dropping it abandons the flush and keeps the tables frozen. Holding it
-/// blocks other flushes, but not reads, writes or snapshots; a write that
-/// needs room meanwhile is refused with [`WriteError::BudgetExceeded`].
-pub struct FlushJob<'e> {
+/// blocks other flushes, including a write's that needs room, but not reads,
+/// writes that fit, or snapshots.
+struct FlushJob<'e> {
     engine: &'e Core,
-    _serial: SlotGuard<'e>,
+    _serial: MutexGuard<'e, ()>,
     /// Oldest first: a prefix of the state's frozen tables, since only
     /// flushes, one at a time, add or remove them.
     tables: Vec<Arc<FrozenMemtable>>,
 }
 
-/// Who holds the [`FlushSlot`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Holder {
-    /// A flush the engine runs to completion: [`Engine::flush`] or a write's.
-    Engine,
-    /// A [`FlushJob`] from [`Engine::begin_flush`], which its caller holds
-    /// for as long as it likes.
-    Caller,
-}
-
-/// Lets one flush run at a time. A write that needs room waits for a flush
-/// the engine is running, but not for a job a caller holds: that caller may
-/// be the writer's own thread, or wait for the writer, as a durable write
-/// waits for its batch's leader.
-#[derive(Default)]
-struct FlushSlot {
-    // Guards no data beyond itself, so a panic elsewhere leaves nothing to
-    // distrust, and the flush must stay retryable.
-    held: Mutex<Option<Holder>>,
-    freed: Condvar,
-}
-
-impl FlushSlot {
-    fn lock(&self) -> MutexGuard<'_, Option<Holder>> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Waits for the slot and takes it.
-    fn take(&self, holder: Holder) -> SlotGuard<'_> {
-        let mut held = self.lock();
-        while held.is_some() {
-            held = self
-                .freed
-                .wait(held)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *held = Some(holder);
-        SlotGuard(self)
-    }
-
-    /// Waits for the slot and takes it for a write that needs room, or
-    /// returns `None` once a caller holds it.
-    fn take_for_room(&self) -> Option<SlotGuard<'_>> {
-        let mut held = self.lock();
-        loop {
-            match *held {
-                None => break,
-                Some(Holder::Caller) => return None,
-                Some(Holder::Engine) => {
-                    held = self
-                        .freed
-                        .wait(held)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-            }
-        }
-        *held = Some(Holder::Engine);
-        Some(SlotGuard(self))
-    }
-}
-
-/// Frees the [`FlushSlot`] when dropped.
-struct SlotGuard<'s>(&'s FlushSlot);
-
-impl Drop for SlotGuard<'_> {
-    fn drop(&mut self) {
-        *self.0.lock() = None;
-        self.0.freed.notify_all();
-    }
-}
-
 impl<'e> FlushJob<'e> {
     /// Builds the runs, compressing without the state lock. Several tables
     /// are merged as one, keeping each key's newest update.
-    pub fn build(self) -> BuiltFlush<'e> {
+    fn build(self) -> BuiltFlush<'e> {
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
         let runs = flush_merged(&tables, self.engine.target_run_len);
         BuiltFlush { job: self, runs }
-    }
-
-    /// Returns the frozen tables being flushed, oldest first.
-    pub fn tables(&self) -> impl ExactSizeIterator<Item = &FrozenMemtable> {
-        self.tables.iter().map(Arc::as_ref)
     }
 
     /// The records in the tables, counting a key once per table.
@@ -1439,22 +1354,17 @@ impl fmt::Debug for FlushJob<'_> {
 }
 
 /// A flush with its runs built but not visible to anyone.
-pub struct BuiltFlush<'e> {
+struct BuiltFlush<'e> {
     job: FlushJob<'e>,
     runs: Vec<Run<Vec<u8>>>,
 }
 
 impl BuiltFlush<'_> {
-    /// Returns the runs built, in key order.
-    pub fn runs(&self) -> &[Run<Vec<u8>>] {
-        &self.runs
-    }
-
     /// Publishes the runs and removes the frozen tables in one step.
     ///
     /// On a [`FlushError`] the built runs are dropped and the tables stay
     /// frozen and readable.
-    pub fn publish(self) -> Result<FlushReport, FlushError> {
+    fn publish(self) -> Result<FlushReport, FlushError> {
         let Self { job, runs } = self;
         let report = FlushReport {
             tables: job.tables.len(),
@@ -1526,7 +1436,7 @@ impl fmt::Debug for BuiltFlush<'_> {
     }
 }
 
-/// Bounds and policy for one compaction. See [`Engine::begin_compaction`].
+/// Bounds and policy for one compaction. See [`Engine::compact`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
     /// The most runs merged at once.
@@ -1537,10 +1447,12 @@ pub struct CompactionOptions {
     /// built and held until publication, as for
     /// [`EngineOptions::max_run_bytes`].
     pub max_output_bytes: usize,
-    /// The most estimated decoded-block, builder and codec-context bytes,
-    /// see [`crate::run::workspace_bytes`]. What the estimate leaves bounds
-    /// the builder's key-hash buffer; an output run that would need more is
-    /// published without a filter. See [`crate::run::CompactLimits`].
+    /// The most estimated workspace bytes: per input, a decoded copy of its
+    /// largest block and a decompression context, and for the output, two
+    /// copies of the largest block and a compression context. A merge whose
+    /// estimate exceeds it fails before decoding anything. What the estimate
+    /// leaves bounds the buffer of key hashes for the output's key filter;
+    /// an output run that would need more is published without a filter.
     pub max_workspace_bytes: usize,
     /// The most runs whose key ranges may share a key. A point read decodes
     /// at most this many blocks once compaction has caught up. Values below 1
@@ -1657,7 +1569,7 @@ struct Candidate<'a> {
 }
 
 /// Chooses run indices to compact, as documented on
-/// [`Engine::begin_compaction`]. Quadratic in the number of runs.
+/// [`Engine::compact`]. Quadratic in the number of runs.
 fn select(
     runs: &[Candidate<'_>],
     options: CompactionOptions,
@@ -1765,9 +1677,8 @@ fn input_limit(input_bytes: usize, options: CompactionOptions) -> CompactionErro
 /// allocated until it is dropped even if no longer published. Holding it
 /// blocks other compactions, including the background worker's, but not
 /// reads, writes or flushes. Dropping it abandons the compaction and changes
-/// nothing. It stays on the thread that began it; the worker runs whole
-/// compactions on its own thread instead of receiving jobs.
-pub struct CompactionJob<'e> {
+/// nothing.
+struct CompactionJob<'e> {
     engine: &'e Core,
     _serial: MutexGuard<'e, ()>,
     inputs: Vec<SharedRun>,
@@ -1779,14 +1690,9 @@ pub struct CompactionJob<'e> {
 }
 
 impl<'e> CompactionJob<'e> {
-    /// Returns the runs selected.
-    pub fn inputs(&self) -> impl ExactSizeIterator<Item = &Run<Vec<u8>>> {
-        self.inputs.iter().map(|run| &run.run)
-    }
-
     /// Returns whether no other run overlaps the inputs, so that every
     /// tombstone can be dropped.
-    pub fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.others.is_empty()
     }
 
@@ -1796,10 +1702,7 @@ impl<'e> CompactionJob<'e> {
     /// range covering its key, since that run may hold an older value; runs
     /// published later come from flushes and hold only newer updates. On an
     /// error nothing is built and the engine is unchanged.
-    pub fn build(
-        self,
-        workspace: &mut MergeWorkspace,
-    ) -> Result<BuiltCompaction<'e>, CompactionError> {
+    fn build(self, workspace: &mut MergeWorkspace) -> Result<BuiltCompaction<'e>, CompactionError> {
         let views: Vec<RunView<'_>> = self.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = self
             .others
@@ -1841,17 +1744,12 @@ impl fmt::Debug for CompactionJob<'_> {
 }
 
 /// A compaction with its output built but not visible to anyone.
-pub struct BuiltCompaction<'e> {
+struct BuiltCompaction<'e> {
     job: CompactionJob<'e>,
     output: crate::run::Compacted,
 }
 
 impl BuiltCompaction<'_> {
-    /// Returns the runs built, in key order.
-    pub fn runs(&self) -> &[Run<Vec<u8>>] {
-        &self.output.runs
-    }
-
     /// Replaces the inputs with the output in one step under the lock.
     ///
     /// Every input must still be published. Runs published since selection
@@ -1859,7 +1757,7 @@ impl BuiltCompaction<'_> {
     /// than what it replaces. On an error the output is dropped and the engine is
     /// unchanged. The inputs are freed after the lock is released, once no
     /// reader holds them.
-    pub fn publish(self) -> Result<CompactionReport, CompactionError> {
+    fn publish(self) -> Result<CompactionReport, CompactionError> {
         let Self { job, output } = self;
         let report = CompactionReport {
             inputs: job.inputs.len(),
@@ -1960,13 +1858,6 @@ impl EngineWorkspace {
 pub struct ReadGuard<'e>(RwLockReadGuard<'e, State>);
 
 impl ReadGuard<'_> {
-    /// Returns the published runs, in the order reads take them. Only with
-    /// the `diagnostics` feature, for benchmarks that measure read cost.
-    #[cfg(feature = "diagnostics")]
-    pub fn runs(&self) -> impl ExactSizeIterator<Item = &Run<Vec<u8>>> {
-        self.0.runs.iter().map(|run| &run.run)
-    }
-
     /// Returns the latest value of `key`, or `None` if it is absent or
     /// deleted, without copying it.
     pub fn get<'r>(
@@ -2266,7 +2157,7 @@ mod tests {
     fn publication_releases_every_engine_reference_to_the_frozen_table() {
         let engine = Engine::new(EngineOptions::default());
         engine.put(b"k", b"v").unwrap();
-        let job = engine.begin_flush().unwrap();
+        let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         assert_eq!(Arc::strong_count(&held), 3);
         job.build().publish().unwrap();
@@ -2277,7 +2168,7 @@ mod tests {
     fn an_abandoned_flush_releases_only_its_own_reference() {
         let engine = Engine::new(EngineOptions::default());
         engine.put(b"k", b"v").unwrap();
-        let job = engine.begin_flush().unwrap();
+        let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         drop(job);
         assert_eq!(Arc::strong_count(&held), 2);
@@ -2290,7 +2181,7 @@ mod tests {
             ..EngineOptions::default()
         });
         engine.put(b"k", b"v").unwrap();
-        let job = engine.begin_flush().unwrap();
+        let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         job.build().publish().unwrap_err();
         assert_eq!(Arc::strong_count(&held), 2);
@@ -2425,6 +2316,7 @@ mod tests {
         let engine = Engine::new(EngineOptions::default());
         overlapping_runs(&engine);
         let built = engine
+            .core
             .begin_compaction(options(8, usize::MAX))
             .unwrap()
             .unwrap()
@@ -2446,6 +2338,7 @@ mod tests {
         let engine = Engine::new(EngineOptions::default());
         overlapping_runs(&engine);
         let job = engine
+            .core
             .begin_compaction(options(8, usize::MAX))
             .unwrap()
             .unwrap();
@@ -2493,6 +2386,7 @@ mod tests {
         engine.set_run_limits(1, 1);
         let begin = || {
             engine
+                .core
                 .begin_compaction(options(8, usize::MAX))
                 .unwrap()
                 .unwrap()

@@ -4,12 +4,12 @@
 //! plain `cargo test`. Run them one at a time under explicit limits with
 //! `scripts/validate.sh limits`.
 
-use tessera::block::{
+use crate::block::{
     Block, BlockBuilder, BuildError, MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL,
     Value,
 };
-use tessera::memtable::{Memtable, TARGET_RUN_LEN};
-use tessera::run::{Codec, MAX_TARGET_BLOCK_LEN, ReadWorkspace, Run, RunBuilder};
+use crate::memtable::{Memtable, TARGET_RUN_LEN};
+use crate::run::{Codec, MAX_TARGET_BLOCK_LEN, ReadWorkspace, Run, RunBuilder};
 
 #[test]
 #[ignore = "large allocations; run with scripts/validate.sh limits"]

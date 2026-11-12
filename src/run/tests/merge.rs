@@ -5,8 +5,8 @@
 //! Every collecting loop bounds records and bytes, so a stuck cursor fails an
 //! assertion instead of exhausting memory.
 
-use tessera::block::{Record, Value};
-use tessera::run::{
+use crate::block::{Record, Value};
+use crate::run::{
     Codec, CorruptRun, MergeCursor, MergeWorkspace, Run, RunBuilder, RunCorruption, RunView,
 };
 
