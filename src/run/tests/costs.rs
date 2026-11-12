@@ -328,3 +328,164 @@ fn block_cache_hit_rates() {
         }
     }
 }
+
+/// The consolidated state of the comparison harness's dataset (`tools/compare`,
+/// `PAYLOAD:GROUPS`): its keys, values and sequence numbers, rebuilt from
+/// its load and update orders, in key order. One record in 16 is deleted and
+/// one in 16 holds its update.
+mod compare {
+    use super::Rng;
+
+    const GROUP: u64 = 16_384;
+    const WORDS: [&str; 32] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra",
+        "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu", "red", "green", "blue",
+        "amber", "north", "south",
+    ];
+
+    fn words(rng: &mut Rng, count: u64) -> String {
+        (0..count)
+            .map(|_| WORDS[rng.below(32) as usize])
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn json(index: u64, version: u64) -> Vec<u8> {
+        let mut rng = Rng::new(2_000 + index + (version << 40));
+        let (first, last) = (WORDS[rng.below(32) as usize], WORDS[rng.below(32) as usize]);
+        let bio_words = rng.below(120);
+        format!(
+            r#"{{"id":{index},"name":"{first} {last}","email":"{first}.{last}{}@example.com","active":{},"score":{},"plan":"{}","tags":["{}","{}"],"created":"2026-{:02}-{:02}T{:02}:{:02}:00Z","bio":"{}"}}"#,
+            rng.below(100),
+            rng.below(2) == 0,
+            rng.below(100_000),
+            ["free", "pro", "team"][rng.below(3) as usize],
+            WORDS[rng.below(32) as usize],
+            WORDS[rng.below(32) as usize],
+            1 + rng.below(12),
+            1 + rng.below(28),
+            rng.below(24),
+            rng.below(60),
+            words(&mut rng, bio_words),
+        )
+        .into_bytes()
+    }
+
+    pub(super) fn sensor(index: u64, version: u64) -> Vec<u8> {
+        let mut rng = Rng::new(1_000 + index + (version << 40));
+        let mut value = Vec::with_capacity(32);
+        value.extend_from_slice(&(1_700_000_000_000 + index * 250 + version).to_be_bytes());
+        value.extend_from_slice(&((index % 1_000) as u32).to_be_bytes());
+        value.extend_from_slice(&[rng.below(4) as u8, 0]);
+        let extra = rng.below(19);
+        value.extend((0..extra).map(|_| rng.below(256) as u8));
+        value
+    }
+
+    fn key(groups: u64, index: u64) -> [u8; 8] {
+        let (group, rest) = (index / GROUP, index % GROUP);
+        let (sub, rest) = (rest / 512, rest % 512);
+        let (leaf, place) = (rest / 32, rest % 32);
+        let head = if group == groups - 1 {
+            [0xFF, 0xFF]
+        } else {
+            [group as u8, if group % 2 == 1 { 0xFF } else { 0x00 }]
+        };
+        [
+            head[0],
+            head[1],
+            (sub / 4) as u8,
+            (sub % 4 * 0x40) as u8,
+            0x00,
+            leaf as u8,
+            place as u8,
+            0xFF,
+        ]
+    }
+
+    /// `(key, seq, value)` of every live record, in key order.
+    pub(super) fn consolidated(
+        groups: u64,
+        value: fn(u64, u64) -> Vec<u8>,
+    ) -> impl Iterator<Item = ([u8; 8], u64, Vec<u8>)> {
+        let records = groups * GROUP;
+        let shuffled = move |j: u64, multiplier: u64| {
+            (j.wrapping_mul(multiplier).wrapping_add(0x7F4A_7C15)) & (records - 1)
+        };
+        let mut seqs = vec![0u64; records as usize];
+        for j in 0..records {
+            seqs[shuffled(j, 0x9E37_79B1) as usize] = j + 1;
+        }
+        let mut next = records;
+        for j in 0..records {
+            let index = shuffled(j, 0x85EB_CA6B);
+            if matches!(index % 16, 0 | 8) {
+                next += 1;
+                seqs[index as usize] = next;
+            }
+        }
+        (0..records)
+            .filter(|index| index % 16 != 8)
+            .map(move |index| {
+                let version = u64::from(index % 16 == 0);
+                (
+                    key(groups, index),
+                    seqs[index as usize],
+                    value(index, version),
+                )
+            })
+    }
+}
+
+/// Where a consolidated run's bytes go, on the comparison harness's data:
+/// compressed block payload, frame headers, the sparse index, the footer
+/// and the filter beside it; and, from the same records built uncompressed
+/// and with every sequence number zero, what record framing and sequence
+/// numbers cost before and after compression.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn density_breakdown() {
+    type Payload = fn(u64, u64) -> Vec<u8>;
+    let datasets: [(&str, u64, Payload); 2] = [
+        ("sensor:256", 256, compare::sensor),
+        ("json:64", 64, compare::json),
+    ];
+    let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
+    println!(
+        "\n| dataset | codec | seqs | records | key + value MiB | run MiB | block payload MiB | frame headers KiB | index KiB | blocks | records/block | filter MiB | run B/record | payload B/record |"
+    );
+    println!("|{}", "---|".repeat(14));
+    for (name, groups, value) in datasets {
+        for codec in [Codec::Zstd, Codec::None] {
+            for zero in [false, true] {
+                let mut builder = RunBuilder::new(codec);
+                let (mut records, mut logical) = (0usize, 0usize);
+                for (key, seq, value) in compare::consolidated(groups, value) {
+                    let seq = if zero { 0 } else { seq };
+                    builder.add(&key, seq, Value::Bytes(&value)).unwrap();
+                    records += 1;
+                    logical += key.len() + value.len();
+                }
+                let run = builder.finish();
+                let blocks = run.block_count();
+                let headers = blocks * 12;
+                let index = run.view().index_len();
+                let payload = run.as_bytes().len() - headers - index - 32;
+                println!(
+                    "| {name} | {codec:?} | {} | {records} | {:.2} | {:.2} | {:.2} | {:.1} | {:.1} | {blocks} | {:.1} | {:.2} | {:.2} | {:.2} |",
+                    if zero { "zero" } else { "real" },
+                    mib(logical),
+                    mib(run.as_bytes().len()),
+                    mib(payload),
+                    headers as f64 / 1024.0,
+                    index as f64 / 1024.0,
+                    records as f64 / blocks as f64,
+                    mib(run.filter_bytes()),
+                    run.as_bytes().len() as f64 / records as f64,
+                    payload as f64 / records as f64,
+                );
+            }
+        }
+    }
+}

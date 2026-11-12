@@ -55,6 +55,8 @@ Kinds of result in this file:
 - **Engine change, paired:** the 5Z section, sequence-bound lookups
   measured against the 5Y commit with the same benchmark source, plus the
   harness's memory-cycle mode.
+- **Memory accounting:** the 5AA section, stored bytes against RocksDB's,
+  allocator state and compaction peaks.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -896,6 +898,10 @@ or more.
   keys read through one held `ReadGuard`, and a `tessera-cycles` engine
   name that runs the memory cycles of the 5Z section instead of the
   comparison phases.
+- **Memory additions (5AA):** a `details` line with RocksDB's aggregated
+  table properties after consolidation, `tessera-cycles-16m` (the cycles
+  with a 16 MiB memtable) and `tessera-compactions` /
+  `tessera-compactions-lz4` (single compactions and their peaks).
 
 ### Datasets and states
 
@@ -959,7 +965,8 @@ untrimmed figure is what a process that never trims holds.
 - **Density: RocksDB is denser, slightly on JSON and clearly on small
   records.** Tessera's runs are 2–3% larger than RocksDB's SST files on
   JSON (which also hold RocksDB's index and filters) and 10% larger on
-  sensor records, plus filters; complete resident footprints are 6% (JSON,
+  sensor records, plus filters (data blocks alone: 17%, all of it from
+  sequence numbers; see 5AA); complete resident footprints are 6% (JSON,
   4.2M) and 30% (sensor) larger. On the smallest dataset Tessera is 6%
   smaller, from RocksDB's fixed costs.
 - **Allocator retention is Tessera's largest memory cost.** Right after
@@ -1387,6 +1394,179 @@ and leaves the policy to the application. A deployment that wants stable
 resident memory can set the tunable (or a different global allocator)
 without code changes; the measurement supports that, not a custom
 allocator or trimming in the engine.
+
+## Memory density (5AA)
+
+*Investigation; the engine is unchanged.* Where Tessera's memory goes
+beside RocksDB's on the 5Y datasets, separating what each engine stores,
+what the allocator holds and what compaction needs transiently. Three
+sources, each measured, not estimated:
+
+- **Stored bytes:** the `density_breakdown` measurement in
+  `src/run/tests/costs.rs` rebuilds the 5Y harness's consolidated state
+  record for record (keys, values, load and update orders, hence sequence
+  numbers) and accounts every byte of the run. Its totals equal the
+  engine's in the 5Y runs exactly (87.11 and 138.17 MiB). The same records
+  are also built uncompressed and with every sequence number zero.
+  RocksDB's split comes from `rocksdb.aggregated-table-properties`, which
+  the harness now prints after consolidation (a `details` line).
+- **Allocations and resident memory:** `mallinfo2` (live bytes, free heap,
+  mapped bytes) and `/proc/self/status` (anonymous resident memory), from
+  the harness's `tessera-cycles` (64 MiB memtable) and
+  `tessera-cycles-16m` modes, under glibc's defaults and with
+  `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072`.
+- **Compaction peaks:** the harness's `tessera-compactions` and
+  `tessera-compactions-lz4` modes load without background compaction, then
+  compact the two smallest overlapping runs at a time, sampling live
+  allocations and anonymous memory every 5 ms; a snapshot is held through
+  the fourth compaction.
+
+Engine charges (`run_bytes`, `filter_bytes`, memtable `charged`,
+`retained_bytes`) are compared with allocator figures, not substituted for
+them.
+
+### Stored bytes against RocksDB
+
+Consolidated state, Zstandard level 3 and 16 KiB blocks in both,
+10-bit filters; MiB, and bytes per live record for the data.
+
+| dataset | engine | data blocks | B/record | index | filter |
+|---|---|---|---|---|---|
+| sensor, 3.93M records of 8 + 23 B | RocksDB | 74.36 | 19.8 | 0.16 | 4.69 |
+| | Tessera | 86.97 | 23.2 | 0.15 | 4.69 |
+| | Tessera, sequence numbers zero | 72.53 | 19.3 | 0.14 | 4.69 |
+| JSON, 983k records of 8 + 545 B | RocksDB | 133.68 | 142.6 | 0.62 | 1.17 |
+| | Tessera | 137.53 | 146.7 | 0.64 | 1.17 |
+| | Tessera, sequence numbers zero | 134.21 | 143.2 | 0.63 | 1.17 |
+
+Tessera's data blocks include their 12-byte frame headers (0.09 and
+0.38 MiB), RocksDB's its 5-byte trailers. Footers are 32 bytes a run.
+
+- **The gap is almost entirely sequence numbers.** Tessera's
+  data blocks are 17% larger than RocksDB's on small records (5Y compared
+  runs with SST files, which hold RocksDB's filters too, hence its 10%)
+  and 2.9% on JSON. With sequence numbers zeroed, Tessera's blocks are
+  2.5% *smaller* than RocksDB's on small records and 0.4% larger on JSON:
+  sequence numbers account for all of the small-record gap and about 85%
+  of the JSON one, and everything else (block encoding, prefix
+  compression, framing, the index, the filter) is within 0.4%.
+- **Why:** every record keeps its sequence number, a varint of 3–4 bytes
+  here, and after a random-order load those bytes are close to random.
+  Uncompressed they add 2.5 bytes a record over a zero; compressed they
+  cost 3.9 (sensor) and 3.5 (JSON) bytes a record, more than their raw
+  size; presumably they also break up matches across neighbouring fields
+  (not separated here). RocksDB stores an 8-byte sequence-and-type trailer
+  per key; that it compresses to almost nothing here is a hypothesis, not
+  inspected: RocksDB documents rewriting bottom-level sequence numbers to
+  zero once no snapshot needs them, and its 19.8 bytes a record sit beside
+  Tessera's 19.3 with zeros.
+- **Everything else is small:** frame headers, index and footer are 0.27%
+  of a sensor run and 0.75% of a JSON run; record framing (four varints a
+  record, a 4-byte restart offset per 16 records) less prefix compression
+  costs a net 1.2 bytes a record uncompressed on 8-byte keys. Filters
+  match RocksDB's within 0.1 MiB (10 bits a key in both).
+- **Larger values** were not compared against RocksDB; the per-record
+  costs above are fixed, so they shrink in proportion as values grow.
+
+### Allocations and resident memory
+
+`json:64`, 150 MiB of live allocations in every cycle (runs 148–149 MiB,
+filters 1.3 MiB); resident memory after each cycle without trimming, for
+the cycles without a snapshot, and the per-cycle peak:
+
+| memtable | allocator | stable resident MiB | free heap MiB | mapped MiB | peak MiB | after `malloc_trim` MiB |
+|---|---|---|---|---|---|---|
+| 64 MiB | glibc defaults | 244–301 | 106–158 | 83–147 | 294–360 | 170 |
+| 64 MiB | fixed threshold | 211–214 | 61–64 | 147–148 | 263–290 | 152 |
+| 16 MiB | glibc defaults | 209–255 | 59–106 | 50–133 | 289–329 | 178 |
+| 16 MiB | fixed threshold | 166–168 | 16–17 | 147–148 | 248–255 | 153 |
+
+- **Live allocations are flat and match the charges:** 150 MiB in every
+  cycle and configuration; after loading, live allocations equal runs +
+  filters + the memtable's charge within 2 MiB (179.2 against 180.9 MiB in
+  the 5Z harness run), so the charges are faithful.
+- **Free heap has two sources, both reused.** With every run buffer mapped
+  separately (fixed threshold), what remains is about one memtable budget
+  (61–64 MiB at 64 MiB, 16–17 MiB at 16 MiB): the freed nodes and values of
+  the last flushed memtable, which the next memtable reuses. Under glibc's
+  defaults, the dynamic threshold rises past the run buffers' size once the
+  first mapped buffer is freed, so later run buffers come from the heap and
+  leave 40–95 MiB more of free heap as compactions replace them. Neither
+  grows over the six cycles measured.
+- **Stable resident memory** is therefore live data plus about one memtable
+  budget with the fixed threshold (1.1× live at 16 MiB, 1.4× at 64 MiB),
+  and 1.4–2.0× live under defaults. `malloc_trim` returns most of it
+  (152–178 MiB), which the engine does not do.
+- **Throughput** is the same under both allocator settings (cycle times
+  within 1%, 5Z).
+
+### Compaction peaks
+
+Per compaction, live allocations above their level before it (sampled):
+
+| data | codec | input MiB | output MiB | filter build MiB | peak above MiB |
+|---|---|---|---|---|---|
+| JSON | Zstandard | 22.8 | 22.8 | 1.0 | 25.9 |
+| | | 27.8 | 27.8 | 1.0 | 34.6 |
+| | | 33.2 | 33.2 | 1.0 | 49.9–50.5 |
+| JSON | LZ4 | 38.9 | 38.8 | 1.0 | 46.6 |
+| | | 56.6 | 56.6 | 1.0 | 64.1–64.9 |
+| sensor | Zstandard | 19.5 | 19.1 | 8.0 | 40.8 |
+| | | 62.0 | 61.7 | 16.0 | 82.4 |
+
+- **What coexists:** the inputs stay live until publication (they are
+  already counted), and beside them the output's stored bytes and filters,
+  the filter-construction buffer of 8 bytes per distinct key of the open
+  output run (bounded by the workspace limit), the merge workspace (3.1 MiB
+  estimated) and the open run's spare capacity while its buffer doubles:
+  0–16 MiB here (measured as the residual), and by the buffer's doubling
+  growth at most the open run's own size (derived, not measured).
+- **Scaling:** the peak follows the output of the largest single
+  compaction, not the data set: proportional to output bytes, so to input
+  bytes and codec (LZ4 outputs are 1.7× Zstandard's), plus 8 bytes per
+  key in the open run for small records. A consolidation is a sequence of
+  such compactions, each freeing its inputs at publication (5Y: 41–154 MiB
+  above the live level across datasets); background compaction is bounded
+  by `max_input_bytes` and `max_output_bytes` (256 MiB each by default).
+- **Snapshots:** a snapshot held across a compaction keeps exactly its
+  inputs (25.2, 42.9 and 20.5 MiB here, equal to `retained_bytes`) until
+  it is dropped, when they are freed.
+- **Admission:** the limits behave as documented: `max_output_bytes`
+  counts stored and filter bytes, the workspace limit bounds the hash
+  buffer. Neither counts the doubling slack of the open run, now stated
+  in the option's documentation; it is transient and at most one run's
+  stored size.
+
+### Improvements considered
+
+| candidate | memory now | expected saving | cost | decision |
+|---|---|---|---|---|
+| Zero sequence numbers of records no other run or snapshot can need | 3.5–3.9 B a record | 17% of sensor runs (14.4 MiB), 2.4% of JSON runs (3.3 MiB) | compaction must prove no other run holds the key; interacts with conflict checks, pruning bounds and recovery's sequence ceiling | not here: a design of its own (below) |
+| Reserve an output run's buffer from its expected size | 0–16 MiB of slack per compaction | that slack, at peak only | an estimate that can be wrong both ways; nothing at steady state | not done |
+| Keep parsed key ranges beside each run | about 30 ns a run per missing key (5Z) | up to 1 µs a missing key at 38 runs, none in memory | 24–64 bytes a run, a second representation of the footer | not done |
+| Smaller frame headers or index | 0.27–0.75% of run bytes | under 1% | a format change | not done |
+| Allocator policy (threshold, trimming) | 40–95 MiB of free heap under defaults | to 1.1–1.4× live | process-wide settings that belong to the application | documented, not set by the engine |
+
+### Reading it
+
+- **Established:** Tessera's storage format is as dense as RocksDB's in
+  everything but sequence numbers, which explain the whole small-record
+  gap and 85% of the JSON one; live allocations match the engine's
+  charges within 2 MiB and do not grow; the free heap is reused, one memtable's worth plus, under
+  glibc's defaults, run buffers in the heap; compaction peaks follow its
+  output.
+- **Not changed:** no production code, beyond one sentence of
+  documentation. No improvement is both substantial and simple: the large
+  one changes what a stored sequence number means.
+- **Next:** dropping sequence numbers where no reader can need them. The
+  condition is local to a compaction: no run outside its inputs holds the
+  key, so the version it writes is the key's only one in any run. The
+  open questions are
+  equal-sequence conflict checks between zeroed copies, sequence-bound
+  pruning (a zeroed run's bound falls, which is still correct by the 5Z
+  proof, since bounds come from stored numbers), checkpoint recovery's
+  ceiling check, and snapshots, which pin runs and so never read a zeroed
+  copy of a version they need.
 
 ## Historical results
 

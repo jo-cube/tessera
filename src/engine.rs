@@ -1636,7 +1636,9 @@ pub struct CompactionOptions {
     pub max_input_bytes: usize,
     /// The most bytes of output, stored bytes and key filters together,
     /// built and held until publication, as for
-    /// [`EngineOptions::max_run_bytes`].
+    /// [`EngineOptions::max_run_bytes`]. It counts bytes written, not
+    /// allocated: the run being built grows its buffer by doubling, so it may
+    /// hold up to its own size again in unused capacity until it is finished.
     pub max_output_bytes: usize,
     /// The most estimated workspace bytes: per input, a decoded copy of its
     /// largest block and a decompression context, and for the output, two

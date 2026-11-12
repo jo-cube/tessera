@@ -237,6 +237,10 @@ trait Store {
     }
     /// The directory whose files hold the data, if any.
     fn dir(&self) -> Option<PathBuf>;
+    /// The engine's own breakdown of its stored bytes, where it gives one.
+    fn details(&self) -> Option<String> {
+        None
+    }
 }
 
 struct Tessera {
@@ -456,6 +460,17 @@ impl Store for Rocks {
 
     fn dir(&self) -> Option<PathBuf> {
         Some(self.dir.clone())
+    }
+
+    /// Data, index and filter block sizes, raw key and value sizes and entry
+    /// counts, summed over the live SST files.
+    fn details(&self) -> Option<String> {
+        Some(
+            self.db
+                .string("rocksdb.aggregated-table-properties")
+                .trim()
+                .to_string(),
+        )
     }
 }
 
@@ -1008,13 +1023,114 @@ fn checked_reads<S: Store>(store: &mut S, data: Dataset, state: &str, seed: u64)
     );
 }
 
+// Memory of single compactions.
+
+/// Loads without background compaction, then compacts the two smallest
+/// overlapping runs at a time, reporting for each compaction its input and
+/// output against the peak, sampled every 5 ms, of live allocations
+/// (`mallinfo2`) and of anonymous memory above their level before it. A
+/// snapshot is held through the fourth compaction, so its inputs stay.
+fn compactions(data: Dataset, compression: Compression) {
+    let engine = Engine::new(EngineOptions {
+        max_runs: 256,
+        background_compaction: None,
+        compression,
+        ..EngineOptions::default()
+    });
+    let records = data.records();
+    for j in 0..records {
+        let index = data.shuffled(j, 0x9E37_79B1);
+        engine
+            .put(&data.key(index), &value(data.payload, index, 0))
+            .unwrap();
+    }
+    engine.flush().unwrap();
+    let allocated = || {
+        // SAFETY: mallinfo2 has no preconditions.
+        let heap = unsafe { mallinfo2() };
+        (heap.uordblks + heap.hblkhd) as u64
+    };
+    let peak_alloc = Arc::new(AtomicU64::new(0));
+    let peak_anon = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let (peak_alloc, peak_anon, stop) = (peak_alloc.clone(), peak_anon.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Relaxed) {
+                peak_alloc.fetch_max(allocated(), Relaxed);
+                peak_anon.fetch_max(resident().0 << 10, Relaxed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let stats = engine.stats();
+    println!(
+        "loaded\truns={}\tmax_overlap={}\trun_mib={:.1}\tallocated_mib={:.1}\tanon_mib={:.1}",
+        stats.runs,
+        stats.max_overlap,
+        mib(stats.run_bytes as u64),
+        mib(allocated()),
+        resident().0 as f64 / 1024.0,
+    );
+    let options = CompactionOptions {
+        max_overlap: 1,
+        max_inputs: 2,
+        max_input_bytes: usize::MAX,
+        max_output_bytes: usize::MAX,
+        ..CompactionOptions::default()
+    };
+    let mut workspace = MergeWorkspace::new();
+    for at in 1..=12 {
+        let snapshot = (at == 4).then(|| engine.snapshot().unwrap());
+        let (alloc_before, anon_before) = (allocated(), resident().0 << 10);
+        peak_alloc.store(alloc_before, Relaxed);
+        peak_anon.store(anon_before, Relaxed);
+        let start = Instant::now();
+        let Some(report) = engine.compact(options, &mut workspace).unwrap() else {
+            break;
+        };
+        let wall = start.elapsed();
+        let (alloc_after, anon_after) = (allocated(), resident().0 << 10);
+        let retained = engine.stats().retained_bytes;
+        drop(snapshot);
+        let freed = allocated();
+        let delta = |a: u64, b: u64| (a as f64 - b as f64) / f64::from(1 << 20);
+        println!(
+            "compaction\t{at}\tinputs={}\tinput_mib={:.1}\toutput_mib={:.1}\tfilters_mib={:.1}\tfilter_build_mib={:.1}\tworkspace_estimate_mib={:.1}\tpeak_alloc_above_mib={:.1}\tpeak_anon_above_mib={:.1}\tafter_alloc_change_mib={:.1}\tafter_anon_change_mib={:.1}\tretained_mib={:.1}\tafter_snapshot_drop_alloc_change_mib={:.1}\twall_s={:.2}",
+            report.inputs,
+            mib(report.input_bytes as u64),
+            mib(report.output_bytes as u64),
+            mib(report.output_filter_bytes as u64),
+            mib(report.filter_build_bytes as u64),
+            mib(report.workspace_bytes as u64),
+            delta(peak_alloc.load(Relaxed), alloc_before),
+            delta(peak_anon.load(Relaxed), anon_before),
+            delta(alloc_after, alloc_before),
+            delta(anon_after, anon_before),
+            mib(retained as u64),
+            delta(freed, alloc_before),
+            wall.as_secs_f64(),
+        );
+    }
+    stop.store(true, Relaxed);
+    thread.join().unwrap();
+}
+
 // Memory over repeated cycles.
 
 /// Loads and consolidates, then repeats: overwrite a quarter of the records,
 /// flush, settle and consolidate, reporting memory after each cycle without
 /// trimming. A snapshot is held through cycle 3 and released in cycle 4.
-fn cycles(data: Dataset) {
+fn cycles(data: Dataset, memtable_budget: Option<usize>) {
     let mut store = Tessera::new(Compression::Zstd);
+    if let Some(memtable_budget) = memtable_budget {
+        store.engine = Engine::new(EngineOptions {
+            memtable_budget,
+            max_runs: 256,
+            background_compaction: Some(CompactionOptions::default()),
+            ..EngineOptions::default()
+        });
+    }
     let (sampler, thread) = Sampler::start(None);
     let records = data.records();
     let report = |store: &Tessera, cycle: u64, phase: Phase, sampler: &Sampler| {
@@ -1160,6 +1276,9 @@ fn run<S: Store>(mut store: S, data: Dataset) {
             phase.end("consolidate", &sampler, dir, "");
         }
         memory(&store, state);
+        if let Some(details) = store.details().filter(|_| state == "consolidated") {
+            println!("details\t{state}\t{details}");
+        }
         let phase = Phase::start();
         timed_reads(&mut store, data, state, seed);
         phase.end(&format!("reads-{state}"), &sampler, dir, "");
@@ -1195,7 +1314,10 @@ fn main() {
     match engine.as_str() {
         "tessera" => run(Tessera::new(Compression::Zstd), data),
         "tessera-lz4" => run(Tessera::new(Compression::Lz4), data),
-        "tessera-cycles" => cycles(data),
+        "tessera-cycles" => cycles(data, None),
+        "tessera-cycles-16m" => cycles(data, Some(16 << 20)),
+        "tessera-compactions" => compactions(data, Compression::Zstd),
+        "tessera-compactions-lz4" => compactions(data, Compression::Lz4),
         "rocksdb" => run(rocks(false, None), data),
         "rocksdb-lz4" => run(rocks(true, None), data),
         "rocksdb-tuned" => run(rocks(false, Some(64 << 20)), data),
