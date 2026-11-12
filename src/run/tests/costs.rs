@@ -15,14 +15,14 @@ use crate::block::Value;
 use crate::run::{Codec, ReadWorkspace, Run, RunBuilder};
 
 /// Deterministic xorshift generator, as in the benchmark.
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
     }
 
-    fn below(&mut self, bound: u64) -> u64 {
+    pub(super) fn below(&mut self, bound: u64) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -65,7 +65,7 @@ fn json(index: u64) -> Vec<u8> {
 }
 
 /// An order document of about 1 to 6 KiB.
-fn document(index: u64) -> Vec<u8> {
+pub(super) fn document(index: u64) -> Vec<u8> {
     let mut rng = Rng::new(3_000 + index);
     let items = 10 + rng.below(51);
     let lines: Vec<String> = (0..items)
@@ -333,7 +333,7 @@ fn block_cache_hit_rates() {
 /// `PAYLOAD:GROUPS`): its keys, values and sequence numbers, rebuilt from
 /// its load and update orders, in key order. One record in 16 is deleted and
 /// one in 16 holds its update.
-mod compare {
+pub(super) mod compare {
     use super::Rng;
 
     const GROUP: u64 = 16_384;
@@ -351,7 +351,7 @@ mod compare {
             .join(" ")
     }
 
-    pub(super) fn json(index: u64, version: u64) -> Vec<u8> {
+    pub(crate) fn json(index: u64, version: u64) -> Vec<u8> {
         let mut rng = Rng::new(2_000 + index + (version << 40));
         let (first, last) = (WORDS[rng.below(32) as usize], WORDS[rng.below(32) as usize]);
         let bio_words = rng.below(120);
@@ -372,7 +372,7 @@ mod compare {
         .into_bytes()
     }
 
-    pub(super) fn sensor(index: u64, version: u64) -> Vec<u8> {
+    pub(crate) fn sensor(index: u64, version: u64) -> Vec<u8> {
         let mut rng = Rng::new(1_000 + index + (version << 40));
         let mut value = Vec::with_capacity(32);
         value.extend_from_slice(&(1_700_000_000_000 + index * 250 + version).to_be_bytes());
@@ -383,7 +383,7 @@ mod compare {
         value
     }
 
-    fn key(groups: u64, index: u64) -> [u8; 8] {
+    pub(crate) fn key(groups: u64, index: u64) -> [u8; 8] {
         let (group, rest) = (index / GROUP, index % GROUP);
         let (sub, rest) = (rest / 512, rest % 512);
         let (leaf, place) = (rest / 32, rest % 32);
@@ -405,10 +405,19 @@ mod compare {
     }
 
     /// `(key, seq, value)` of every live record, in key order.
-    pub(super) fn consolidated(
+    pub(crate) fn consolidated(
         groups: u64,
         value: fn(u64, u64) -> Vec<u8>,
     ) -> impl Iterator<Item = ([u8; 8], u64, Vec<u8>)> {
+        history(groups, value).filter_map(|(key, seq, value)| Some((key, seq, value?)))
+    }
+
+    /// As [`consolidated`], with the deleted records kept as tombstones
+    /// (`None`), as a run holds them while older runs overlap it.
+    pub(crate) fn history(
+        groups: u64,
+        value: fn(u64, u64) -> Vec<u8>,
+    ) -> impl Iterator<Item = ([u8; 8], u64, Option<Vec<u8>>)> {
         let records = groups * GROUP;
         let shuffled = move |j: u64, multiplier: u64| {
             (j.wrapping_mul(multiplier).wrapping_add(0x7F4A_7C15)) & (records - 1)
@@ -425,16 +434,15 @@ mod compare {
                 seqs[index as usize] = next;
             }
         }
-        (0..records)
-            .filter(|index| index % 16 != 8)
-            .map(move |index| {
-                let version = u64::from(index % 16 == 0);
-                (
-                    key(groups, index),
-                    seqs[index as usize],
-                    value(index, version),
-                )
-            })
+        (0..records).map(move |index| {
+            let version = u64::from(index % 16 == 0);
+            let live = index % 16 != 8;
+            (
+                key(groups, index),
+                seqs[index as usize],
+                live.then(|| value(index, version)),
+            )
+        })
     }
 }
 

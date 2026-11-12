@@ -57,6 +57,9 @@ Kinds of result in this file:
   harness's memory-cycle mode.
 - **Memory accounting:** the 5AA section, stored bytes against RocksDB's,
   allocator state and compaction peaks.
+- **Layout research, run layer:** the 5AB section, candidate run layouts
+  built and read beside the production run in `src/run/tests/layouts.rs`;
+  none is used by the engine.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -1567,6 +1570,327 @@ Per compaction, live allocations above their level before it (sampled):
   proof, since bounds come from stored numbers), checkpoint recovery's
   ceiling check, and snapshots, which pin runs and so never read a zeroed
   copy of a version they need.
+
+## Immutable-run layouts (5AB)
+
+*Research; the engine and the run format are unchanged.* Whether another
+layout for a memory-resident immutable run moves the density–latency
+frontier that 5W–5AA measured: Zstandard's 16 KiB blocks are dense but
+cost 13–16 µs a point lookup, and smaller blocks or LZ4 buy speed with
+memory. Everything here is run-layer only, in
+`src/run/tests/layouts.rs` (a test module; the one new dependency
+feature, Zstandard's dictionary builder, is a dev-dependency feature, so
+only test, example and benchmark builds compile it). The second pass sets
+`LAYOUTS_REVERSED=1`, which reverses the order of the layouts:
+
+```sh
+scripts/validate.sh exec 2400 cargo test --locked --release --lib \
+  run::tests::layouts::layout_tradeoffs -- --ignored --nocapture
+scripts/validate.sh exec 2400 env LAYOUTS_REVERSED=1 cargo test --locked --release --lib \
+  run::tests::layouts::layout_tradeoffs -- --ignored --nocapture
+```
+
+### Candidates
+
+- **Production run** (the baseline), built by `RunBuilder` at 16, 4 and
+  2 KiB block targets with Zstandard level 3, and 16 and 4 KiB with LZ4.
+  Only 16 KiB is what the engine builds; the other targets are the same
+  format, which readers already accept (`with_target_block_len`).
+- **Dictionary blocks** (candidates A and B): production-format blocks
+  behind the same kind of sparse index, each compressed against a
+  Zstandard dictionary of 64 KiB trained on the run's own records
+  (samples of about 100 times the dictionary size, spread evenly over the
+  run), at 4 and 2 KiB targets. The same layout without a dictionary is a
+  control: it must, and does, reproduce the production run at 4 KiB.
+  LZ4 blocks were measured through the production run alone (LZ4 has no
+  trained dictionaries).
+- **Split** (candidate C): each record's key, sequence number and a
+  reference to its value in uncompressed production-format key blocks,
+  searched without decoding; each key block's values in one compressed
+  group (1 or 4 KiB, Zstandard with a dictionary, or LZ4), decoded only
+  to read a value.
+
+Every candidate keeps what the production run keeps: every sequence
+number, tombstones, version order, the cut rule that keeps a key's
+versions together, a 10-bit Bloom filter per run, and a CRC-32 over
+every compressed frame, verified on each decode. Blocks and key blocks
+are written by the production `BlockBuilder`, so they refuse duplicate
+or out-of-order versions as it does.
+
+### Method
+
+- **Data:** the 5Y harness's datasets rebuilt record for record (keys,
+  values, sequence numbers from the load and update orders), with the
+  deletes kept as tombstones: one key in 16 is a tombstone, one in 16 is
+  at a later version. Sensor, 4.19M keys of 8 + 14–32 bytes; JSON, 1.05M
+  of 8 + about 545 bytes; documents, 65.5k of 8 + 1–6 KiB. One run of
+  each, one dataset in memory at a time.
+- **Correctness first:** before timing, each built layout is scanned
+  whole and compared with its records, and 600 lookups (present, deleted,
+  missing) and 20 prefix scans are compared with a binary search of the
+  records. `layouts_agree_with_the_production_run` (in the default suite)
+  checks every layout with tiny blocks against 2,000 shared-prefix and
+  binary keys (`0x00`, `0xFF` and their combinations), a 300-version
+  chain spanning blocks, three-version chains with a tombstone between,
+  keys whose newest version is a tombstone, empty values, every absent
+  neighbour and shorter prefix of a third of the keys, and empty, single
+  byte and boundary prefixes.
+- **Point lookups:** 30,000 present, deleted and missing keys each, in
+  random order, through a reader workspace held across calls; a warm-up
+  quarter, then the median of three rounds, then a timed round per
+  operation for p99.
+- **Scans:** 2,000 prefixes of 32 keys and 200 of 512, three rounds,
+  and two full scans; the seek is the time to the first record.
+- **Pairing:** every layout reads the same keys in the same order on the
+  same records. The matrix ran twice, the second time with the layouts
+  in reverse order. The ranges below are the two passes: 199 of 231
+  cells agree within 10%, the rest within 18% for present lookups and
+  29% for Split's sub-microsecond deleted lookups and seeks, and every
+  comparison the decision rests on goes the same way in both. Within a
+  pass the three rounds of a cell differ by at most 8%. A first pass
+  that held all three datasets at once read the production rows about 2×
+  slower than an isolated probe of the same binary did (28.8 against
+  13.75 µs on JSON); with one dataset at a time it matches the isolated
+  probe and the 5Y run figures, so that pass is discarded.
+- **Accounting:** everything a run holds for as long as it lives:
+  compressed blocks or groups, uncompressed key blocks, frame headers,
+  footers and checksums, the index of block offsets and last keys, the
+  filter, and the dictionary in its decoding form (`DDict`, 89 KiB for a
+  64 KiB dictionary). Per reader, the decoding context and buffers. Not
+  counted: the encoder's dictionary (`CDict`) and samples, which live
+  only while building.
+
+### Results
+
+Two passes; MiB of the whole run, and change against the production 16
+KiB run.
+
+| dataset | layout | total MiB | vs run 16 KiB | present µs | deleted µs | missing ns | seek µs | 32-key scan µs | 512-key scan µs | full scan ns/record |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sensor | production, Zstd 16 KiB blocks | 93.7 | +0% | 15.03–15.57 | 14.94–14.96 | 151 | 15.0 | 16.6 | 39–40 | 48 |
+|  | production, Zstd 4 KiB blocks | 97.2 | +4% | 5.21–5.23 | 5.20–5.23 | 72–73 | 5.0–5.1 | 6.9–7.0 | 34 | 56 |
+|  | production, Zstd 2 KiB blocks | 101.3 | +8% | 3.79–3.86 | 3.83–3.85 | 61–62 | 3.7 | 6.0 | 40 | 70 |
+|  | production, Lz4 16 KiB blocks | 111.2 | +19% | 4.66–4.68 | 4.65–4.66 | 67–70 | 4.6 | 5.6 | 19 | 29 |
+|  | production, Lz4 4 KiB blocks | 114.3 | +22% | 1.48 | 1.46–1.47 | 45 | 1.4 | 2.3–2.4 | 16 | 28 |
+|  | blocks, Zstd 4 KiB, no dict | 97.1 | +4% | 5.17–5.24 | 5.14–5.15 | 62 | 5.0–5.1 | 6.8 | 32 | 51 |
+|  | blocks, Zstd 4 KiB + 64 KiB dict | 104.8 | +12% | 4.95–4.98 | 4.99–5.01 | 61–63 | 4.9–5.0 | 6.6–6.7 | 31 | 50 |
+|  | blocks, Zstd 2 KiB + 64 KiB dict | 108.5 | +16% | 3.49–3.55 | 3.52–3.72 | 49–59 | 3.4–4.0 | 5.4–6.1 | 35–39 | 61–63 |
+|  | split, Zstd 4 KiB groups + 64 KiB dict | 123.8 | +32% | 5.94–6.32 | 0.55–0.66 | 27–35 | 5.6–5.8 | 7.1–7.3 | 28–31 | 44–46 |
+|  | split, Zstd 1 KiB groups + 64 KiB dict | 129.4 | +38% | 3.20–3.92 | 0.50–0.58 | 27–28 | 2.8–3.4 | 5.0–5.7 | 37–39 | 67–72 |
+|  | split, Lz4 4 KiB groups | 130.3 | +39% | 2.06–2.19 | 0.52–0.67 | 27–28 | 1.8–1.9 | 2.6–2.7 | 14 | 24–25 |
+| JSON | production, Zstd 16 KiB blocks | 140.2 | +0% | 13.56–13.85 | 13.54–13.82 | 155–157 | 13.6–13.8 | 27.3–27.7 | 232–236 | 427–437 |
+|  | production, Zstd 4 KiB blocks | 173.2 | +24% | 5.53–6.07 | 5.50–6.05 | 80–89 | 5.5–6.4 | 26.3–29.2 | 337–371 | 647–711 |
+|  | production, Zstd 2 KiB blocks | 209.8 | +50% | 4.09–4.46 | 4.02–4.42 | 66–74 | 4.2–4.8 | 33.9–37.2 | 481–524 | 922–996 |
+|  | production, Lz4 16 KiB blocks | 237.6 | +70% | 5.60–6.00 | 5.68–6.10 | 80–87 | 5.6–6.2 | 11.2–12.2 | 95–98 | 174–184 |
+|  | production, Lz4 4 KiB blocks | 265.9 | +90% | 1.72–1.85 | 1.69–1.83 | 45–50 | 1.8–2.1 | 7.3–8.2 | 90–97 | 171–182 |
+|  | blocks, Zstd 4 KiB, no dict | 172.7 | +23% | 5.43–5.70 | 5.41–5.56 | 70 | 5.5–5.7 | 26.0–26.4 | 333–349 | 637–652 |
+|  | blocks, Zstd 4 KiB + 64 KiB dict | 130.0 | −7% | 2.98–3.19 | 2.95–3.14 | 49–52 | 3.0–3.3 | 13.6–14.7 | 172–174 | 330–349 |
+|  | blocks, Zstd 2 KiB + 64 KiB dict | 139.0 | −1% | 1.58–1.84 | 1.53–1.69 | 36–38 | 1.5–1.9 | 11.6–12.4 | 162–164 | 313–332 |
+|  | split, Zstd 4 KiB groups + 64 KiB dict | 130.4 | −7% | 2.97–3.34 | 0.24–0.33 | 26–29 | 2.9–3.4 | 13.0–14.2 | 165–167 | 315–333 |
+|  | split, Zstd 1 KiB groups + 64 KiB dict | 160.9 | +15% | 1.24–1.50 | 0.31–0.35 | 26 | 1.2–1.8 | 11.8–13.2 | 170–185 | 326–351 |
+|  | split, Lz4 4 KiB groups | 268.4 | +92% | 1.87–1.99 | 0.27–0.29 | 26 | 1.8–2.0 | 7.3–7.6 | 89–90 | 171–176 |
+| documents | production, Zstd 16 KiB blocks | 21.4 | +0% | 12.20–12.53 | 12.11–12.81 | 119–125 | 12.1–12.9 | 54.3–57.1 | 685–714 | 1414–1464 |
+|  | production, Zstd 4 KiB blocks | 26.3 | +23% | 4.85–5.20 | 4.60–4.98 | 61–65 | 4.9–5.5 | 68.5–74.1 | 1023–1076 | 1987–2097 |
+|  | production, Zstd 2 KiB blocks | 31.2 | +46% | 3.72–3.90 | 2.51–2.65 | 52–54 | 3.9–4.6 | 93.0–98.7 | 1427–1432 | 2786–2787 |
+|  | production, Lz4 16 KiB blocks | 39.1 | +83% | 4.57 | 4.47 | 58–61 | 4.5–4.6 | 19.5–19.6 | 242–243 | 465–466 |
+|  | production, Lz4 4 KiB blocks | 43.4 | +103% | 1.38–1.39 | 1.21–1.22 | 34 | 1.4 | 16.7 | 243 | 474–476 |
+|  | blocks, Zstd 4 KiB, no dict | 26.2 | +22% | 4.76–4.78 | 4.51–5.21 | 54–64 | 4.8–4.9 | 67.8–68.0 | 1009 | 1961–1965 |
+|  | blocks, Zstd 4 KiB + 64 KiB dict | 21.9 | +2% | 2.88–2.90 | 2.70–2.72 | 40 | 2.9 | 39.5–39.6 | 588–589 | 1144–1149 |
+|  | blocks, Zstd 2 KiB + 64 KiB dict | 23.6 | +10% | 1.65 | 1.02–1.03 | 31 | 1.8 | 39.1–39.2 | 596–597 | 1163–1177 |
+|  | split, Zstd 4 KiB groups + 64 KiB dict | 22.1 | +3% | 2.82–2.88 | 0.16 | 20–21 | 2.9 | 38.4–38.6 | 572–576 | 1119–1125 |
+|  | split, Zstd 1 KiB groups + 64 KiB dict | 24.5 | +15% | 1.45–1.46 | 0.16–0.17 | 20 | 1.6 | 37.8 | 577–579 | 1121–1125 |
+|  | split, Lz4 4 KiB groups | 43.8 | +105% | 1.39 | 0.17 | 20–21 | 1.5 | 16.8–16.9 | 243–247 | 475–477 |
+
+p99s are 1.1–2.0× the medians (highest for Split, whose lookups decode
+a key block's group of varying size); they are in the test's output, not
+repeated here.
+
+### Where the bytes go
+
+MiB by role, for the rows that matter:
+
+| dataset | layout | compressed | key blocks | index | framing | dictionary | filter |
+|---|---|---|---|---|---|---|---|
+| sensor | production, Zstd 16 KiB | 88.43 | — | 0.15 | 0.09 | — | 5.00 |
+| | production, Zstd 4 KiB | 91.27 | — | 0.60 | 0.36 | — | 5.00 |
+| | blocks, Zstd 4 KiB + dict | 98.88 | — | 0.60 | 0.24 | 0.089 | 5.00 |
+| | split, Zstd 4 KiB + dict | 69.73 | 48.15 | 0.59 | 0.25 | 0.089 | 5.00 |
+| JSON | production, Zstd 16 KiB | 137.89 | — | 0.64 | 0.38 | — | 1.25 |
+| | production, Zstd 4 KiB | 167.87 | — | 2.55 | 1.53 | — | 1.25 |
+| | blocks, Zstd 4 KiB + dict | 125.09 | — | 2.55 | 1.02 | 0.089 | 1.25 |
+| | blocks, Zstd 2 KiB + dict | 130.49 | — | 5.10 | 2.04 | 0.089 | 1.25 |
+| | split, Zstd 4 KiB + dict | 110.71 | 13.39 | 3.49 | 1.50 | 0.089 | 1.25 |
+| documents | production, Zstd 16 KiB | 21.10 | — | 0.14 | 0.08 | — | 0.08 |
+| | blocks, Zstd 4 KiB + dict | 20.97 | — | 0.56 | 0.22 | 0.089 | 0.08 |
+
+The candidates' frame headers are 8 bytes against production's 12 (no
+codec byte; one codec a run), worth 0.12 MiB on sensor at 4 KiB and
+less elsewhere; their index and filter are the production run's.
+Readers hold 96–111 KiB each in every Zstandard layout (the decoding
+context and a decoded block or group) and 4–18 KiB with production's
+LZ4 (the candidates' harness holds a Zstandard context in any case); the
+dictionary's decoding form is per run and shared by its readers.
+
+### Dictionaries and block size
+
+- **On structured values a dictionary decouples density from block
+  size.** Without one, a 4 KiB block costs JSON 24% and documents 23%
+  more memory than a 16 KiB block, because each block compresses only
+  what it holds; with a 64 KiB dictionary trained on the run, 4 KiB
+  blocks are 7% *smaller* than production's 16 KiB blocks on JSON and
+  2.4% larger on documents, and 2 KiB blocks are 1% smaller and 10%
+  larger. The dictionary holds what the records share (field names,
+  structure, vocabulary), which large blocks otherwise learn afresh in
+  every block.
+- **On small binary records it does the opposite.** Sensor values are
+  mostly numbers and the block's own neighbours are its best context: the
+  dictionary makes 4 KiB blocks 7.9% larger than the same blocks without
+  it, for 4% faster lookups. Plain smaller blocks are the better point:
+  production's own format at 4 KiB costs 3.8% more memory than at 16 KiB
+  and looks up 2.9–3.0× faster; LZ4 at 4 KiB, 22% more for 10×.
+- **Lookup time follows decoded bytes.** A dictionary does not slow
+  decoding measurably (4.95–4.98 against 5.17–5.24 µs at 4 KiB
+  on sensor, where the blocks hold the same records), so its speed comes
+  entirely from the smaller blocks it makes affordable.
+- **Scans:** dictionary blocks scan JSON 1.9–2.0× faster than
+  production's 16 KiB blocks for 32-key prefixes, 1.3–1.4× for 512 keys
+  and 1.2–1.3× for a full scan, and documents 1.2–1.4×: blocks that
+  compress better decode faster per record. LZ4 remains the fastest to scan at
+  any block size, at 1.7–2× the memory on structured values.
+
+### Split
+
+- **No density advantage.** Separating keys from values compresses the
+  values better (JSON value groups are 110.7 MiB against 125.1 MiB of
+  dictionary blocks), but the uncompressed key blocks give it all back:
+  13.4 MiB on JSON (a tie, 130.4 against 130.0 MiB) and 48.2 MiB on
+  sensor, where keys and sequence numbers are most of the record (+32%
+  against production). Compressing the key blocks would remove the
+  reason for separating them.
+- **Present lookups are no faster** than dictionary blocks of the same
+  decoded size (2.97–3.34 against 2.98–3.19 µs on JSON), since the value
+  group is still decoded.
+- **What it does better is answering without values:** deleted keys
+  cost 0.16–0.66 µs against 1.0–5.0 µs, because a tombstone and its
+  sequence number are found without decompressing anything; the same
+  would hold for existence checks and key-only scans, which the engine
+  does not offer.
+
+### Construction
+
+- **CPU:** one build per layout per pass (two in all; they agreed
+  within about 0.1 s). Training on samples of about 6.4 MiB took 0.21–0.23 s
+  on JSON, 0.14–0.15 s on documents and 0.66–0.68 s on sensor (many
+  small samples); compressing against the dictionary cost no more than
+  without it. Builds of the whole run: JSON 1.52 s with a dictionary at
+  4 KiB against 1.31 s for production's 16 KiB blocks and 1.88 s for its
+  4 KiB blocks; documents 0.36 against 0.21 s; sensor 1.55 against
+  0.67 s.
+- **Transient memory:** not isolated. The high-water mark of resident
+  memory above its level before each build (in the test's output)
+  reflects reuse of the previous layout's freed heap, so it understates
+  every row; it shows nothing above the stored size beyond what the
+  production builder's doubling buffer already causes (5AA). By
+  construction, a dictionary adds the sample copy (about 100 times the
+  dictionary, 6.4 MiB here), the trainer's workspace and the encoder's
+  dictionary for the length of the build; their sizes were not measured.
+
+### Correctness and differences from production
+
+- **Checked:** every layout returns exactly the production run's
+  records, newest versions, absences and prefix scans, on the tricky
+  records above (in the default suite) and on every dataset before it is
+  timed. Ordering, missing keys, prefix boundaries, iteration across
+  blocks, tombstones, version precedence and long chains are covered;
+  duplicate copies of a version are refused by the block builder all
+  layouts use; each frame is decoded independently, from its own offset
+  and the run's dictionary.
+- **Not production:** the candidates are in-memory structures, not a
+  serialized format: no footer parsing, no format version, no recovery
+  path, and no errors (damage is an assertion). A dictionary block
+  depends on the run's dictionary, so it is independent of other blocks
+  but not of its run. Split checks its key blocks' CRCs once at build,
+  as production checks uncompressed frames once at load. The engine's
+  own lookups go through more than one run, a memtable and snapshots;
+  none of that is here, and the gaps above are run-layer gaps.
+
+### What adopting dictionary blocks would involve
+
+Not designed, but these are the questions it raises:
+
+- **Format:** a dictionary section in the run (the 64 KiB of raw
+  dictionary, which the run's bytes would hold beside its decoding form:
+  an estimated 0.15 MiB a run in all), a codec value meaning "Zstandard
+  with the run's dictionary", a format version, and the dictionary
+  covered by the run's integrity checks.
+- **When to train:** a flush of a small memtable gives a small run and
+  few samples, and 64 KiB is 1.6% of a 4 MiB run; compactions, which
+  write the large runs that hold the data, could train on their own
+  output and leave flushes as they are. Every compaction would retrain
+  (0.14–0.68 s a run here, roughly fixed by the capped sample size) or
+  reuse an input's dictionary.
+- **Choosing:** sensor shows a dictionary can hurt; a builder would
+  need to compare, an adaptive selection this milestone excluded.
+- **Recovery and checkpoints:** a checkpoint stores runs as they are,
+  so it would carry each run's dictionary; recovery validates the
+  dictionary before any block; old runs stay readable.
+- **Snapshots:** unaffected: runs are immutable and own their
+  dictionaries, and snapshots pin runs.
+- **Memory admission:** the dictionary's two forms belong in
+  `run_bytes`; the encoder's dictionary and samples in the compaction
+  workspace.
+
+### Sequence numbers
+
+Not changed here. Sequence numbers are most of the gap to RocksDB on
+small records (5AA: 3.9 bytes a record compressed on sensor, 3.5 on
+JSON). For this milestone:
+
+- **Why they cost memory:** every record stores the sequence number of
+  the write that committed it, and after a random-order load
+  neighbouring records' numbers are unrelated, so they compress poorly.
+  An encoding that keeps the exact numbers cannot go below their entropy:
+  for 4.19M records whose numbers are a permutation of about as many
+  writes, log2 of the orderings is about 20.6 bits, or 2.6 bytes, a
+  record. Against 3.9 bytes now, a better encoding with the same meaning
+  could save at most about 1.3 bytes a record, about 6% of a sensor run
+  (an estimate, not measured; it is a separate opportunity, not pursued);
+  Split's uncompressed key blocks, which store them as plain varints, save
+  nothing.
+- **What zeroing would change:** a zero no longer says when a version was
+  written, so it is only correct where no reader can need that: no other
+  run, the memtable or a snapshot holds an older or newer version of the
+  key that a reader must order against it. Compaction would have to
+  prove that for each key it zeroes (5AA's "Next" lists the open
+  questions: equal-sequence conflict checks, sequence-bound pruning,
+  recovery's sequence ceiling, and snapshots).
+- **Original and compacted representations:** the committed sequence
+  number is part of a version's identity: snapshots, write ordering and
+  recovery depend on it. A compacted representation that stores less
+  (zero, or a rank within the run) is a different value with a narrower
+  meaning, valid only under the proof above, and anything that compares
+  sequence numbers across runs must then know which kind it holds. None
+  of the layouts measured here needs that; all of them keep the
+  committed numbers exactly.
+
+### Decision
+
+- **The frontier moves for compressible structured values.** Dictionary
+  blocks at 4 KiB are 7% smaller than production's 16 KiB blocks on JSON
+  and look up 4.3–4.6× faster; at 2 KiB they are 1% smaller and 7.4–8.8×
+  faster. On documents they cost 2.4% more memory for 4.2–4.4×. Both
+  exceed the milestone's bar (about 2× at similar density). This is
+  measured at the run layer only.
+- **It does not move for small binary records** through dictionaries;
+  there, production's own format at 4 KiB blocks gives 2.9–3.0× for
+  3.8% more memory, with no format change.
+- **Split is not worth pursuing** as a whole: no density gain over
+  dictionary blocks and none of their lookup gain beyond tombstones.
+- **Not implemented:** the run format, the engine's block size and its
+  codecs are unchanged. The evidence is compelling enough for a design
+  milestone, not for a format change without one: the engine-level gain
+  (more than one run, the memtable, mixed workloads), building and
+  training on compaction, and the format questions above are untested.
 
 ## Historical results
 

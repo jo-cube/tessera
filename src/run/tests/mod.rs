@@ -4,6 +4,7 @@
 mod compact;
 mod costs;
 mod format;
+mod layouts;
 mod logical;
 mod merge;
 mod ranges;
