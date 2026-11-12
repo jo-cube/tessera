@@ -127,7 +127,7 @@ use crate::run::{
 };
 
 use super::{
-    Core, Engine, EngineOptions, EngineWorkspace, FlushError, SnapshotError, UpdateError, published,
+    Core, Engine, EngineOptions, EngineWorkspace, FlushError, SnapshotError, WriteError, published,
 };
 
 pub(super) const LOCK: &str = "LOCK";
@@ -337,9 +337,9 @@ pub enum RecoveryError {
         /// How.
         damage: super::LogDamage,
     },
-    /// A logged record was refused by the memtable on replay, which happens
-    /// only if the options are smaller than when it was written.
-    Replay(UpdateError),
+    /// A logged record was refused on replay, which happens only if the
+    /// memtable budget is smaller than when the record was written.
+    Replay(WriteError),
     /// A file could not be read.
     Io {
         /// The file.
@@ -356,6 +356,17 @@ pub enum RecoveryError {
     },
     /// The checkpoint holds more runs or bytes than the options allow.
     RunLimit(FlushError),
+    /// [`DurableOptions::max_log_bytes`](super::DurableOptions::max_log_bytes)
+    /// leaves no room to start a segment beside a full one. A checkpoint
+    /// cannot prune the active segment, so once it filled, every write would
+    /// be refused with [`UpdateError::LogFull`](super::UpdateError::LogFull)
+    /// until the database was reopened.
+    LogTooSmall {
+        /// The limit.
+        max_log_bytes: u64,
+        /// The least it must exceed: a full segment and a segment header.
+        min_exceeded: u64,
+    },
 }
 
 impl fmt::Display for RecoveryError {
@@ -392,6 +403,15 @@ impl fmt::Display for RecoveryError {
                 )
             }
             Self::RunLimit(error) => write!(f, "recovered runs exceed the limits: {error}"),
+            Self::LogTooSmall {
+                max_log_bytes,
+                min_exceeded,
+            } => write!(
+                f,
+                "a log limit of {max_log_bytes} bytes must exceed {min_exceeded}, \
+                 a full segment and a segment header, or the log could fill \
+                 with nothing a checkpoint can prune"
+            ),
         }
     }
 }

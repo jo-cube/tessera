@@ -12,6 +12,7 @@ use std::thread;
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions,
     EngineWorkspace, LogDamage, MAX_KEY_LEN, MAX_VALUE_LEN, RecoveryError, UpdateError, Verdict,
+    WriteError,
 };
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -747,4 +748,69 @@ fn concurrent_durable_writers_flush_beside_checkpoints_and_recover() {
     let (engine, report) = Engine::open(&scratch.0, options, durable).unwrap();
     assert_eq!(report.last_seq, total);
     assert_eq!(contents(&engine), expected);
+}
+
+/// A logged record that no memtable of a smaller budget can hold is refused
+/// on replay, naming that budget, and the database opens again with the
+/// budget it was written with.
+#[test]
+fn replay_refuses_a_record_larger_than_a_reduced_budget() {
+    let scratch = Scratch::new("replay-budget");
+    let engine = Engine::create(
+        &scratch.0,
+        EngineOptions::default(),
+        DurableOptions::default(),
+    )
+    .unwrap();
+    engine.put(b"k", &[1; 4096]).unwrap();
+    drop(engine);
+    let small = EngineOptions {
+        memtable_budget: 1024,
+        ..EngineOptions::default()
+    };
+    let refused = Engine::open(&scratch.0, small, DurableOptions::default()).map(drop);
+    assert!(
+        matches!(
+            refused,
+            Err(RecoveryError::Replay(WriteError::RecordExceedsBudget {
+                budget: 1024,
+                ..
+            }))
+        ),
+        "{refused:?}"
+    );
+    let engine = open(&scratch.0);
+    assert_eq!(contents(&engine).get(&b"k"[..]), Some(&vec![1; 4096]));
+}
+
+/// A checkpoint cannot prune the active segment, so a log limit that one
+/// full segment and the next one's header would reach is refused before
+/// anything is created.
+#[test]
+fn a_log_limit_without_room_beside_a_full_segment_is_refused() {
+    let scratch = Scratch::new("log-too-small");
+    let dir = scratch.0.join("db");
+    let durable = DurableOptions {
+        segment_bytes: 4096,
+        max_log_bytes: 4096,
+        ..DurableOptions::default()
+    };
+    let refused = Engine::create(&dir, EngineOptions::default(), durable).map(drop);
+    assert!(
+        matches!(
+            refused,
+            Err(RecoveryError::LogTooSmall {
+                max_log_bytes: 4096,
+                min_exceeded,
+            }) if min_exceeded > 4096
+        ),
+        "{refused:?}"
+    );
+    assert!(!dir.exists());
+    Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+    let refused = Engine::open(&dir, EngineOptions::default(), durable).map(drop);
+    assert!(
+        matches!(refused, Err(RecoveryError::LogTooSmall { .. })),
+        "{refused:?}"
+    );
 }

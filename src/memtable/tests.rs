@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::memtable::{
     ENTRY_OVERHEAD, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable, TARGET_RUN_LEN,
-    WriteError,
+    TableError,
 };
 use crate::run::{
     LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunSet, RunView,
@@ -71,7 +71,7 @@ fn state(table: &Memtable) -> (Vec<Entry>, MemoryUsage, Option<u64>, usize) {
 }
 
 #[track_caller]
-fn assert_rejected(table: &mut Memtable, expected: WriteError, key: &[u8], seq: u64, value: &[u8]) {
+fn assert_rejected(table: &mut Memtable, expected: TableError, key: &[u8], seq: u64, value: &[u8]) {
     let before = state(table);
     assert_eq!(table.put(key, seq, value), Err(expected));
     assert_eq!(state(table), before);
@@ -177,7 +177,7 @@ fn the_first_update_may_use_sequence_number_zero() {
     let mut table = table();
     table.put(b"a", 0, b"v").unwrap();
     assert_eq!(table.last_seq(), Some(0));
-    let expected = WriteError::SequenceNotIncreasing { seq: 0, last: 0 };
+    let expected = TableError::SequenceNotIncreasing { seq: 0, last: 0 };
     assert_rejected(&mut table, expected, b"b", 0, b"v");
 }
 
@@ -194,7 +194,7 @@ fn a_repeated_or_lower_sequence_number_is_rejected_on_any_key() {
     let mut table = table();
     table.put(b"a", 5, b"v").unwrap();
     for (key, seq) in [(&b"a"[..], 5), (b"a", 4), (b"b", 5), (b"b", 0)] {
-        let expected = WriteError::SequenceNotIncreasing { seq, last: 5 };
+        let expected = TableError::SequenceNotIncreasing { seq, last: 5 };
         assert_rejected(&mut table, expected, key, seq, b"new");
     }
 }
@@ -206,7 +206,7 @@ fn a_rejected_delete_keeps_the_previous_value() {
     let before = state(&table);
     assert_eq!(
         table.delete(b"a", 5),
-        Err(WriteError::SequenceNotIncreasing { seq: 5, last: 5 })
+        Err(TableError::SequenceNotIncreasing { seq: 5, last: 5 })
     );
     assert_eq!(state(&table), before);
 }
@@ -216,7 +216,7 @@ fn the_starting_bound_is_exclusive() {
     let mut table = Memtable::new(ROOMY, Some(10));
     assert_eq!(table.last_seq(), Some(10));
     for seq in [9, 10] {
-        let expected = WriteError::SequenceNotIncreasing { seq, last: 10 };
+        let expected = TableError::SequenceNotIncreasing { seq, last: 10 };
         assert_rejected(&mut table, expected, b"a", seq, b"v");
     }
     table.put(b"a", 11, b"v").unwrap();
@@ -227,7 +227,7 @@ fn the_largest_sequence_number_is_usable_and_ends_the_table() {
     let mut table = table();
     table.put(b"a", u64::MAX, b"v").unwrap();
     for seq in [u64::MAX, u64::MAX - 1, 0] {
-        let expected = WriteError::SequenceNotIncreasing {
+        let expected = TableError::SequenceNotIncreasing {
             seq,
             last: u64::MAX,
         };
@@ -240,7 +240,7 @@ fn the_largest_sequence_number_is_usable_and_ends_the_table() {
 #[test]
 fn a_table_after_the_largest_sequence_number_accepts_nothing() {
     let mut table = Memtable::new(ROOMY, Some(u64::MAX));
-    let expected = WriteError::SequenceNotIncreasing {
+    let expected = TableError::SequenceNotIncreasing {
         seq: u64::MAX,
         last: u64::MAX,
     };
@@ -266,7 +266,7 @@ fn a_key_at_the_limit_is_accepted_and_one_byte_more_is_rejected() {
     let long = vec![b'k'; MAX_KEY_LEN + 1];
     let mut table = table();
     table.put(&long[..MAX_KEY_LEN], 1, b"v").unwrap();
-    let expected = WriteError::KeyTooLong {
+    let expected = TableError::KeyTooLong {
         len: MAX_KEY_LEN + 1,
     };
     assert_rejected(&mut table, expected, &long, 2, b"v");
@@ -280,7 +280,7 @@ fn an_oversized_value_is_rejected_before_it_is_copied() {
     // Never written or read, so its pages are not touched.
     let huge = vec![0; MAX_VALUE_LEN + 1];
     let mut table = table();
-    let expected = WriteError::ValueTooLong {
+    let expected = TableError::ValueTooLong {
         len: MAX_VALUE_LEN + 1,
     };
     assert_rejected(&mut table, expected, b"a", 1, &huge);
@@ -293,23 +293,23 @@ fn limits_are_reported_before_sequence_order_and_budget() {
     let mut table = Memtable::new(0, Some(5));
     assert_eq!(
         table.put(&long_key, 1, &huge),
-        Err(WriteError::KeyTooLong {
+        Err(TableError::KeyTooLong {
             len: MAX_KEY_LEN + 1
         })
     );
     assert_eq!(
         table.put(b"a", 1, &huge),
-        Err(WriteError::ValueTooLong {
+        Err(TableError::ValueTooLong {
             len: MAX_VALUE_LEN + 1
         })
     );
     assert_eq!(
         table.put(b"a", 1, b"v"),
-        Err(WriteError::SequenceNotIncreasing { seq: 1, last: 5 })
+        Err(TableError::SequenceNotIncreasing { seq: 1, last: 5 })
     );
     assert_eq!(
         table.put(b"a", 6, b"v"),
-        Err(WriteError::RecordExceedsBudget {
+        Err(TableError::RecordExceedsBudget {
             charge: charge(b"a", b"v"),
             budget: 0
         })
@@ -346,7 +346,7 @@ fn a_record_that_exactly_fills_the_budget_is_admitted() {
 fn a_record_one_byte_over_the_budget_can_never_be_admitted() {
     let budget = charge(b"k", b"value") - 1;
     let mut table = Memtable::new(budget, None);
-    let expected = WriteError::RecordExceedsBudget {
+    let expected = TableError::RecordExceedsBudget {
         charge: budget + 1,
         budget,
     };
@@ -359,7 +359,7 @@ fn a_new_entry_that_does_not_fit_reports_what_it_needs() {
     let second = charge(b"b", b"v");
     let mut table = Memtable::new(first + second - 1, None);
     table.put(b"a", 1, b"v").unwrap();
-    let expected = WriteError::BudgetExceeded {
+    let expected = TableError::BudgetExceeded {
         needed: second,
         available: second - 1,
     };
@@ -410,7 +410,7 @@ fn a_replacement_that_grows_too_far_keeps_the_old_value() {
     let mut table = Memtable::new(budget, None);
     table.put(b"k", 1, b"abc").unwrap();
     table.put(b"other", 2, b"").unwrap();
-    let expected = WriteError::BudgetExceeded {
+    let expected = TableError::BudgetExceeded {
         needed: 4,
         available: 3,
     };
@@ -453,7 +453,7 @@ fn a_delete_of_an_absent_key_is_subject_to_the_budget() {
     let before = state(&table);
     assert_eq!(
         table.delete(b"b", 2),
-        Err(WriteError::BudgetExceeded {
+        Err(TableError::BudgetExceeded {
             needed: charge(b"b", b""),
             available: 0
         })
@@ -474,7 +474,7 @@ fn a_reinsertion_is_charged_only_its_value() {
 #[test]
 fn a_zero_budget_admits_nothing() {
     let mut table = Memtable::new(0, None);
-    let expected = WriteError::RecordExceedsBudget {
+    let expected = TableError::RecordExceedsBudget {
         charge: charge(b"", b""),
         budget: 0,
     };
@@ -535,7 +535,7 @@ fn a_successor_cannot_reuse_a_frozen_tables_sequence_numbers() {
     let (table, _) = sample();
     let frozen = table.freeze();
     let mut next = Memtable::new(ROOMY, frozen.last_seq());
-    let expected = WriteError::SequenceNotIncreasing { seq: 3, last: 3 };
+    let expected = TableError::SequenceNotIncreasing { seq: 3, last: 3 };
     assert_rejected(&mut next, expected, b"z", 3, b"v");
     next.put(b"z", 4, b"v").unwrap();
 }
@@ -866,13 +866,13 @@ fn expected_outcome(
     Ok(())
 }
 
-fn kind(error: WriteError) -> &'static str {
+fn kind(error: TableError) -> &'static str {
     match error {
-        WriteError::KeyTooLong { .. } => "key",
-        WriteError::ValueTooLong { .. } => "value",
-        WriteError::SequenceNotIncreasing { .. } => "sequence",
-        WriteError::RecordExceedsBudget { .. } => "record",
-        WriteError::BudgetExceeded { .. } => "budget",
+        TableError::KeyTooLong { .. } => "key",
+        TableError::ValueTooLong { .. } => "value",
+        TableError::SequenceNotIncreasing { .. } => "sequence",
+        TableError::RecordExceedsBudget { .. } => "record",
+        TableError::BudgetExceeded { .. } => "budget",
     }
 }
 
@@ -1082,7 +1082,7 @@ fn snapshots_keep_their_state_through_random_writes() {
                         Ok(()) => {
                             model.insert(key.clone(), (seq, value));
                         }
-                        Err(WriteError::BudgetExceeded { .. }) => {
+                        Err(TableError::BudgetExceeded { .. }) => {
                             let after = (table.memory(), table.len(), table.last_seq());
                             assert_eq!(after, before, "seed {seed}");
                             refused += 1;
@@ -1152,7 +1152,7 @@ fn a_snapshot_pins_only_what_later_writes_replace() {
     let large = vec![0; 4_000 - table.memory().charged];
     assert!(matches!(
         table.put(b"c", 6, &large),
-        Err(WriteError::BudgetExceeded { .. })
+        Err(TableError::BudgetExceeded { .. })
     ));
     assert_eq!(state(&table), before);
     assert_eq!(

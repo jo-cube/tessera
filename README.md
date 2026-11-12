@@ -167,13 +167,21 @@ it.
 
 ## Operating requirements and limitations
 
+- A refused write (`UpdateError`) was not applied and used no sequence
+  number. `Rejected` means the options can never admit it (key, value or
+  record too large); `FlushRefused` and `LogFull` are backpressure, cleared by
+  compaction or a durable checkpoint, after which the write can be retried;
+  `LogFailed`, `LogClosed` and `SequencesExhausted` are terminal for the open
+  engine.
 - Writes wait for flushes when the memtables are full, and are refused with
   `FlushRefused` when the run limits are reached, until compaction makes
   room; with no background compaction, call `compact`. A caller that wants
   to wait can call `wait_for_compaction` or `compact` and retry.
 - A durable log grows until `durable_checkpoint` is called; writes past
   `max_log_bytes` are refused with `LogFull`. Checkpoints are never taken
-  automatically.
+  automatically, and cannot prune the active segment, so `max_log_bytes`
+  must exceed `segment_bytes` (creating or opening checks this) and leave
+  room beside a full segment for the largest record.
 - A failed log append or sync is terminal for the open engine: that batch's
   writes return `LogFailed` (their outcome is uncertain until reopening) and
   every later durable write `LogClosed`. Reopen the database to continue.

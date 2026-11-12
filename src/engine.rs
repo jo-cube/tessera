@@ -115,8 +115,9 @@
 //! # Automatic flushing
 //!
 //! A write refused only because the memtables are full makes room and is
-//! retried within the call, so callers never flush for room and never see
-//! [`WriteError::BudgetExceeded`]. The write waits for any flush in progress
+//! retried within the call, so callers never flush for room, and no error
+//! means "no room yet": only a record charged more than a whole budget is
+//! refused, with [`WriteError::RecordExceedsBudget`]. The write waits for any flush in progress
 //! and retries; if the active table is still full it freezes it and retries
 //! in the successor in the same hold of the lock, then builds and publishes
 //! the flush itself before returning. So writers that run out of room
@@ -125,11 +126,11 @@
 //! fits takes the lock once.
 //!
 //! A write applied once is never applied again: a retry follows only a
-//! refusal, which changes nothing and uses no sequence number. A write's
-//! record fits a new table, so it fails to land after freezing only if
-//! earlier tables were still frozen; it then retries only after its own
-//! flush of all of them published. So a write runs at most two flushes and
-//! never retries without a flush having published.
+//! refusal, which changes nothing and uses no sequence number. Every retry
+//! follows a flush that published, and a flush the run limits refuse ends
+//! the write with [`UpdateError::FlushRefused`], so a write never spins
+//! without progress. Writers running beside it can fill each new table
+//! first, so the number of flushes one write waits for is not bounded.
 //!
 //! A refused flush (see [Memory](self#memory)) is remembered until a flush
 //! or compaction publishes or the run limits change, which is when it could
@@ -266,7 +267,7 @@ pub use wal::{
 pub use worker::{BackgroundError, BackgroundStatus};
 
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
-pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage, WriteError};
+pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub use crate::run::{
     CompactError, CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue,
     MergeWorkspace, ReadError, RunCorruption,
@@ -278,7 +279,9 @@ use std::sync::{
 };
 
 use crate::block::{Record, Value, Version};
-use crate::memtable::{FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, flush_merged};
+use crate::memtable::{
+    FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
+};
 use crate::run::{
     CompactLimits, LogicalCursor, LogicalWorkspace, Run, RunView, compact, latest_in,
 };
@@ -305,21 +308,33 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
     })
 }
 
-/// The configuration of an [`Engine`].
+/// The configuration of an [`Engine`], fixed when it starts except for the
+/// run limits, which [`Engine::set_run_limits`] replaces.
+///
+/// Every limit is an admission check on accounted bytes or counts: none
+/// reserves memory or disk up front, and none bounds the process's resident
+/// memory, which also holds snapshots, workspaces and allocator overhead. See
+/// [Memory](self#memory).
 #[derive(Clone, Copy, Debug)]
 pub struct EngineOptions {
-    /// Charged bytes each memtable may hold.
+    /// Charged bytes each memtable may hold. The active table and the tables
+    /// being flushed share twice this. A record charged more is refused with
+    /// [`WriteError::RecordExceedsBudget`].
     pub memtable_budget: usize,
     /// Bytes of memtable records per run a flush writes, so that a large
     /// flush writes several runs with disjoint key ranges. Values above
-    /// 1 GiB are treated as 1 GiB.
+    /// 1 GiB are treated as 1 GiB; a run holds at least one record.
     pub target_run_len: usize,
     /// The most runs that may be published.
     pub max_runs: usize,
     /// The most bytes of published runs: their stored bytes and their key
     /// filters together.
     pub max_run_bytes: usize,
-    /// The sequence number to continue after. The first write uses the next.
+    /// The sequence number a new engine continues after: the first write
+    /// uses the next. [`Engine::new`] and [`Engine::create`] use it;
+    /// [`Engine::open`] ignores it, as the checkpoint and log decide; and
+    /// [`Engine::recover`] continues after the larger of it and the
+    /// checkpoint's ceiling.
     pub last_seq: u64,
     /// Starts a background worker that compacts with these options whenever
     /// a flush publishes runs. See [Background compaction](self#background-compaction).
@@ -402,21 +417,82 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
-/// Why a write was rejected. It was not applied and used no sequence number,
+/// Why a write can never be applied with the engine's current options. A
+/// write that only needs room flushes instead; see
+/// [Automatic flushing](self#automatic-flushing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The key exceeds [`MAX_KEY_LEN`].
+    KeyTooLong {
+        /// Length of the rejected key.
+        len: usize,
+    },
+    /// The value exceeds [`MAX_VALUE_LEN`].
+    ValueTooLong {
+        /// Length of the rejected value.
+        len: usize,
+    },
+    /// The record alone would be charged more than a whole memtable budget
+    /// ([`EngineOptions::memtable_budget`]), so no memtable can hold it.
+    RecordExceedsBudget {
+        /// What the record would be charged: its key and value and
+        /// [`ENTRY_OVERHEAD`].
+        charge: usize,
+        /// The budget.
+        budget: usize,
+    },
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::KeyTooLong { len } => {
+                write!(f, "key of {len} bytes exceeds the limit of {MAX_KEY_LEN}")
+            }
+            Self::ValueTooLong { len } => {
+                write!(
+                    f,
+                    "value of {len} bytes exceeds the limit of {MAX_VALUE_LEN}"
+                )
+            }
+            Self::RecordExceedsBudget { charge, budget } => write!(
+                f,
+                "record charged {charge} bytes exceeds the memtable budget of {budget}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Why a write was refused. It was not applied and used no sequence number,
 /// and reads see no change, though after [`Self::LogFailed`] the record may
 /// survive in the log. A flush the write started may have frozen the active
 /// table.
+///
+/// The variants fall into three kinds:
+///
+/// - **Permanent for this write**: [`Self::Rejected`]. Retrying the same
+///   write cannot succeed.
+/// - **Backpressure**, which clears once the engine is maintained:
+///   [`Self::FlushRefused`] (compact, or raise the run limits),
+///   [`Self::LogFull`] (take a [durable checkpoint](Engine::durable_checkpoint)).
+///   Nothing was applied, and the write can be retried.
+/// - **Terminal for this engine**: [`Self::LogFailed`] and [`Self::LogClosed`]
+///   (reopen the database) and [`Self::SequencesExhausted`]. Reads keep
+///   working.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateError {
-    /// The update can never be applied: its key or value is too long, or its
-    /// record exceeds a whole memtable budget. A write that only needs room
-    /// flushes instead; see [Automatic flushing](self#automatic-flushing).
+    /// The write can never be applied: its key or value is too long, or its
+    /// record exceeds a whole memtable budget.
     Rejected(WriteError),
     /// The memtables are full and the flush that would make room is refused
-    /// by the run limits, now or since they or the runs last changed. Compaction or
-    /// [`Engine::set_run_limits`] can make room.
+    /// by the run limits, now or since they or the runs last changed.
+    /// Compaction or [`Engine::set_run_limits`] can make room, after which
+    /// the write can be retried.
     FlushRefused(FlushError),
-    /// Every sequence number has been used.
+    /// Every sequence number has been used, which only an engine started
+    /// near `u64::MAX` ([`EngineOptions::last_seq`]) can reach.
     SequencesExhausted,
     /// Logging this write failed (its append or sync, or the thread logging
     /// its batch panicked: [`std::io::ErrorKind::Other`]), so it was not
@@ -441,15 +517,23 @@ impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(error) => error.fmt(f),
-            Self::FlushRefused(error) => write!(f, "the memtables are full and {error}"),
+            Self::FlushRefused(error) => write!(
+                f,
+                "the memtables are full and {error}; compaction can make room"
+            ),
             Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
-            Self::LogFailed(kind) => {
-                write!(f, "logging the write failed ({kind}); the log is closed")
+            Self::LogFailed(kind) => write!(
+                f,
+                "logging the write failed ({kind}), so its outcome is uncertain; \
+                 the log is closed until the database is reopened"
+            ),
+            Self::LogClosed => {
+                f.write_str("the log closed after an earlier failure; reopen the database to write")
             }
-            Self::LogClosed => f.write_str("the log closed after an earlier failure"),
             Self::LogFull { bytes, max_bytes } => write!(
                 f,
-                "the log would reach {bytes} bytes, over the limit of {max_bytes}"
+                "the log would reach {bytes} bytes, over the limit of {max_bytes}; \
+                 a durable checkpoint frees space"
             ),
         }
     }
@@ -878,11 +962,12 @@ impl Core {
         if let Some(durable) = self.durable.get() {
             return self.update_durable(durable, key, value);
         }
+        // Bound first, so the state lock is released before making room.
         let written = self.write(&mut self.write_state(), key, value);
-        if is_full(&written) {
-            return self.write_making_room(key, value);
+        match written {
+            Err(Refusal::Full) => self.write_making_room(key, value),
+            written => written.map_err(Refusal::into_error),
         }
-        written
     }
 
     /// A RAM-only write the memtables had no room for. See
@@ -893,23 +978,26 @@ impl Core {
             let serial = self.serialize_flush();
             let mut state = self.write_state();
             // A flush that finished while this waited may have made room.
-            let mut written = self.write(&mut state, key, value);
-            if !is_full(&written) {
-                return written;
+            match self.write(&mut state, key, value) {
+                Err(Refusal::Full) => {}
+                written => return written.map_err(Refusal::into_error),
             }
             let job = match self.begin_making_room(serial, &mut state) {
                 Ok(Some(job)) => job,
-                Ok(None) => return written,
+                Ok(None) => {
+                    drop(state);
+                    unreachable!("an empty memtable has room for any record within its budget")
+                }
                 Err(refused) => return Err(UpdateError::FlushRefused(refused)),
             };
             // Fits the new active table unless tables were already frozen.
-            written = self.write(&mut state, key, value);
+            let written = self.write(&mut state, key, value);
             drop(state);
             let flushed = job.build().publish();
-            if !is_full(&written) {
-                return written;
-            }
-            flushed.map_err(UpdateError::FlushRefused)?;
+            match written {
+                Err(Refusal::Full) => flushed.map_err(UpdateError::FlushRefused)?,
+                written => return written.map_err(Refusal::into_error),
+            };
         }
     }
 
@@ -951,7 +1039,7 @@ impl Core {
     }
 
     /// Applies a RAM-only write to the active table.
-    fn write(&self, state: &mut State, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
+    fn write(&self, state: &mut State, key: &[u8], value: Value<'_>) -> Result<u64, Refusal> {
         let seq = state
             .last_seq
             .checked_add(1)
@@ -960,27 +1048,34 @@ impl Core {
             Value::Bytes(bytes) => state.active.put(key, seq, bytes),
             Value::Tombstone => state.active.delete(key, seq),
         };
-        written.map_err(|error| UpdateError::Rejected(self.reason(state, error)))?;
+        written.map_err(|error| self.refusal(error))?;
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         Ok(seq)
     }
 
-    /// While frozen tables hold memory, the active table's budget is lowered
-    /// so that all of them stay within two budgets. A record refused only by
-    /// the lowered budget fits once a flush frees it, so it is reported as
-    /// not fitting now rather than never.
-    fn reason(&self, state: &State, error: WriteError) -> WriteError {
+    /// Sorts a memtable's refusal into a lack of room, which a flush makes,
+    /// and a rejection for the caller. While frozen tables hold memory, the
+    /// active table's budget is lowered so that all of them stay within two
+    /// budgets, so a record refused only by the lowered budget fits once a
+    /// flush frees it.
+    fn refusal(&self, error: TableError) -> Refusal {
+        let rejected = |error| Refusal::Error(UpdateError::Rejected(error));
         match error {
-            WriteError::RecordExceedsBudget { charge, budget }
-                if charge <= self.memtable_budget =>
-            {
-                WriteError::BudgetExceeded {
-                    needed: charge,
-                    available: budget.saturating_sub(state.active.memory().charged),
-                }
+            TableError::KeyTooLong { len } => rejected(WriteError::KeyTooLong { len }),
+            TableError::ValueTooLong { len } => rejected(WriteError::ValueTooLong { len }),
+            TableError::RecordExceedsBudget { charge, .. } if charge > self.memtable_budget => {
+                rejected(WriteError::RecordExceedsBudget {
+                    charge,
+                    budget: self.memtable_budget,
+                })
             }
-            error => error,
+            TableError::RecordExceedsBudget { .. } | TableError::BudgetExceeded { .. } => {
+                Refusal::Full
+            }
+            TableError::SequenceNotIncreasing { .. } => {
+                unreachable!("the engine assigns, and the log checks, increasing numbers")
+            }
         }
     }
 
@@ -1255,12 +1350,30 @@ impl Core {
     }
 }
 
-/// Whether a write was refused only because the memtables are full.
-fn is_full<T>(outcome: &Result<T, UpdateError>) -> bool {
-    matches!(
-        outcome,
-        Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. }))
-    )
+/// Why a write did not land.
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    /// The memtables have no room for the record until a flush makes some.
+    /// Never returned to a caller.
+    Full,
+    /// A refusal for the caller.
+    Error(UpdateError),
+}
+
+impl Refusal {
+    /// The caller's error, for a refusal that cannot be [`Refusal::Full`].
+    fn into_error(self) -> UpdateError {
+        match self {
+            Self::Error(error) => error,
+            Self::Full => unreachable!("a write with no room flushes"),
+        }
+    }
+}
+
+impl From<UpdateError> for Refusal {
+    fn from(error: UpdateError) -> Self {
+        Self::Error(error)
+    }
 }
 
 /// Returns the most runs whose inclusive key ranges share a key.
@@ -1490,8 +1603,6 @@ pub enum CompactionError {
     },
     /// Merging failed or would exceed a limit. See [`CompactError`].
     Compact(CompactError),
-    /// An input was no longer published when the output was ready.
-    InputsChanged,
     /// Publishing would leave more runs or run bytes than both the engine's
     /// limit and what is published now.
     RunLimit(FlushError),
@@ -1522,7 +1633,6 @@ impl fmt::Display for CompactionError {
                 "compaction needs {input_bytes} input bytes, over the limit of {max_input_bytes}"
             ),
             Self::Compact(error) => error.fmt(f),
-            Self::InputsChanged => f.write_str("compaction inputs changed before publication"),
             Self::RunLimit(error) => error.fmt(f),
             Self::Retained { bytes, max } => write!(
                 f,
@@ -1779,7 +1889,8 @@ impl BuiltCompaction<'_> {
         let is_input = |run: &SharedRun| job.inputs.iter().any(|input| Arc::ptr_eq(input, run));
         let mut state = job.engine.write_state();
         if state.runs.iter().filter(|run| is_input(run)).count() != job.inputs.len() {
-            return Err(CompactionError::InputsChanged);
+            drop(state);
+            unreachable!("compactions are serialized, so only this one removes runs");
         }
         let total_runs = state.runs.len() - report.inputs + report.outputs;
         let stored = state.run_bytes - report.input_bytes + report.output_bytes;
@@ -2310,9 +2421,11 @@ mod tests {
     }
 
     /// Compactions are serialized, so in the engine nothing else removes a
-    /// run. Publication still checks, and must change nothing if one went.
+    /// run. Publication still checks rather than resurrect a removed run's
+    /// records.
     #[test]
-    fn publication_fails_if_an_input_is_no_longer_published() {
+    #[should_panic(expected = "compactions are serialized")]
+    fn publication_checks_that_its_inputs_are_published() {
         let engine = Engine::new(EngineOptions::default());
         overlapping_runs(&engine);
         let built = engine
@@ -2322,11 +2435,8 @@ mod tests {
             .unwrap()
             .build(&mut MergeWorkspace::new())
             .unwrap();
-        let removed = engine.core.write_state().runs.remove(1);
-        let stats = engine.stats();
-        assert_eq!(built.publish(), Err(CompactionError::InputsChanged));
-        assert_eq!(engine.stats(), stats);
-        assert_eq!(Arc::strong_count(&removed), 1);
+        engine.core.write_state().runs.remove(1);
+        let _ = built.publish();
     }
 
     /// Building takes no lock: it completes while a waiting writer holds the

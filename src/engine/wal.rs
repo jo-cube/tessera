@@ -215,7 +215,8 @@
 //! checkpoints, so the log can stay near that limit until one is taken, and
 //! the previous checkpoint stays on disk beside the new one until the new one
 //! commits. A checkpoint can always free every segment but the active one,
-//! so keep `max_log_bytes` well above two segments and the largest record.
+//! so `max_log_bytes` must leave room beside it: see
+//! [`DurableOptions::max_log_bytes`].
 //!
 //! The filesystem assumptions of checkpoints apply: see
 //! `src/engine/checkpoint.rs`.
@@ -228,8 +229,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crc32fast::Hasher;
 
+use super::Refusal;
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
-use crate::memtable::WriteError;
 
 use super::checkpoint::{
     self, CheckpointError, CheckpointOptions, CheckpointReport, RecoveryError,
@@ -256,7 +257,14 @@ pub struct DurableOptions {
     /// this many bytes.
     pub segment_bytes: u64,
     /// The most bytes all segments may hold. A write beyond it is refused
-    /// with [`UpdateError::LogFull`] until a checkpoint prunes segments.
+    /// with [`UpdateError::LogFull`] until a checkpoint prunes segments. A
+    /// checkpoint cannot prune the active segment, so this must exceed
+    /// `segment_bytes` and a segment header, or creating and opening fail
+    /// with [`RecoveryError::LogTooSmall`]. Beyond that, after a checkpoint
+    /// a record is admitted if it fits beside the active segment. With
+    /// records of at most `r` bytes logged (29 plus the key and value for a
+    /// put) and 36-byte segment headers, `segment_bytes + 2 * (r + 36)` is
+    /// always enough.
     pub max_log_bytes: u64,
     /// The most writes one batch logs with one sync, at most 256. 1 syncs
     /// every write on its own.
@@ -269,6 +277,23 @@ pub struct DurableOptions {
     /// would exceed it waits, and a single larger write is admitted alone
     /// once the queue is empty.
     pub max_queue_bytes: usize,
+}
+
+impl DurableOptions {
+    /// Refuses a log limit that a full active segment would exhaust: the next
+    /// record starts a segment, which needs room for its header and the
+    /// record beside the full one, and a checkpoint cannot prune the active
+    /// segment.
+    fn check(&self) -> Result<(), RecoveryError> {
+        let min_exceeded = self.segment_bytes.saturating_add(SEGMENT_HEADER_LEN as u64);
+        if self.max_log_bytes <= min_exceeded {
+            return Err(RecoveryError::LogTooSmall {
+                max_log_bytes: self.max_log_bytes,
+                min_exceeded,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for DurableOptions {
@@ -1322,6 +1347,7 @@ impl Engine {
         options: EngineOptions,
         durable: DurableOptions,
     ) -> Result<Engine, RecoveryError> {
+        durable.check()?;
         let io = |path: &Path| {
             let path = path.to_owned();
             move |error| RecoveryError::Io { path, error }
@@ -1374,6 +1400,7 @@ impl Engine {
         options: EngineOptions,
         durable: DurableOptions,
     ) -> Result<(Engine, OpenReport), RecoveryError> {
+        durable.check()?;
         let lock = checkpoint::lock_existing(dir)?;
         let loaded = checkpoint::load(dir, &options)?;
         let (generation, ceiling) = (loaded.generation, loaded.ceiling);
@@ -1581,11 +1608,16 @@ impl Engine {
         loop {
             match self.core.apply_logged(seq, key, value) {
                 Ok(()) => return Ok(()),
-                Err(WriteError::BudgetExceeded { .. }) if !made_room => {
+                Err(Refusal::Full) if !made_room => {
                     self.make_room()?;
                     made_room = true;
                 }
-                Err(error) => return Err(RecoveryError::Replay(UpdateError::Rejected(error))),
+                Err(Refusal::Error(UpdateError::Rejected(error))) => {
+                    return Err(RecoveryError::Replay(error));
+                }
+                // The scan checked lengths and sequence numbers, and an empty
+                // table has room for any record within its budget.
+                Err(refusal) => unreachable!("replay refused: {refusal:?}"),
             }
         }
     }
@@ -1608,13 +1640,13 @@ impl Engine {
 
 impl Core {
     /// Applies a recovered record with its own sequence number.
-    fn apply_logged(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), WriteError> {
+    fn apply_logged(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), Refusal> {
         let mut state = self.write_state();
         let applied = match value {
             Value::Bytes(bytes) => state.active.put(key, seq, bytes),
             Value::Tombstone => state.active.delete(key, seq),
         };
-        applied.map_err(|error| self.reason(&state, error))?;
+        applied.map_err(|error| self.refusal(error))?;
         state.last_seq = seq;
         Ok(())
     }
@@ -1633,6 +1665,7 @@ mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
     use crate::engine::checkpoint::{CRASH_AT, Crash};
+    use crate::memtable::TableError;
 
     fn scratch(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("tessera-wal-{name}-{}", std::process::id()));
@@ -1814,7 +1847,7 @@ mod tests {
         // Shrinking the value by less than the excess is refused...
         assert!(matches!(
             table.put(&key, seq + 2, &vec![3; len - 49]),
-            Err(WriteError::BudgetExceeded { .. })
+            Err(TableError::BudgetExceeded { .. })
         ));
         // ...and shrinking it by the excess is admitted, within the budget.
         table.put(&key, seq + 2, &vec![3; len - 50]).unwrap();

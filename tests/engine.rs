@@ -143,11 +143,13 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
             len: MAX_KEY_LEN + 1
         }))
     );
+    // The configured budget is reported, whatever the active table's.
     assert!(matches!(
         engine.put(b"b", &[0; 300]),
-        Err(UpdateError::Rejected(
-            WriteError::RecordExceedsBudget { .. }
-        ))
+        Err(UpdateError::Rejected(WriteError::RecordExceedsBudget {
+            charge,
+            budget: 200,
+        })) if charge > 300
     ));
     assert_eq!(engine.stats(), before);
 

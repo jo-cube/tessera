@@ -27,7 +27,7 @@
 //!
 //! Every value of `u64` is usable. After `u64::MAX` no number is larger, so
 //! every further update is rejected as
-//! [`SequenceNotIncreasing`](WriteError::SequenceNotIncreasing). Nothing is
+//! [`SequenceNotIncreasing`](TableError::SequenceNotIncreasing). Nothing is
 //! ever incremented, so nothing can wrap.
 //!
 //! A rejected update changes nothing, and its sequence number stays unused, so
@@ -442,11 +442,11 @@ impl Table {
         seq: u64,
         value: Value<'_>,
         reserved: usize,
-    ) -> Result<(), WriteError> {
+    ) -> Result<(), TableError> {
         self.admit(key, seq, value, Some(reserved)).map(|_| ())
     }
 
-    fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
+    fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), TableError> {
         let admitted = self.admit(key, seq, value, Some(0))?;
         self.insert(key, seq, admitted);
         Ok(())
@@ -455,7 +455,7 @@ impl Table {
     /// Writes an update [`Self::check`] once admitted, though the budget may
     /// have shrunk or snapshots pinned more since; the other checks still
     /// apply.
-    fn write_admitted(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), WriteError> {
+    fn write_admitted(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), TableError> {
         let admitted = self.admit(key, seq, value, None)?;
         self.insert(key, seq, admitted);
         Ok(())
@@ -500,25 +500,25 @@ impl Table {
         seq: u64,
         value: Value<'v>,
         budget: Option<usize>,
-    ) -> Result<Admitted<'v>, WriteError> {
+    ) -> Result<Admitted<'v>, TableError> {
         let bytes = match value {
             Value::Bytes(bytes) => Some(bytes),
             Value::Tombstone => None,
         };
         let value_len = bytes.map_or(0, <[u8]>::len);
         if key.len() > MAX_KEY_LEN {
-            return Err(WriteError::KeyTooLong { len: key.len() });
+            return Err(TableError::KeyTooLong { len: key.len() });
         }
         if value_len > MAX_VALUE_LEN {
-            return Err(WriteError::ValueTooLong { len: value_len });
+            return Err(TableError::ValueTooLong { len: value_len });
         }
         if let Some(last) = self.last_seq.filter(|&last| seq <= last) {
-            return Err(WriteError::SequenceNotIncreasing { seq, last });
+            return Err(TableError::SequenceNotIncreasing { seq, last });
         }
         // Both lengths are within the limits above, so this cannot overflow.
         let charge = key.len() + value_len + ENTRY_OVERHEAD;
         if budget.is_some() && charge > self.budget {
-            return Err(WriteError::RecordExceedsBudget {
+            return Err(TableError::RecordExceedsBudget {
                 charge,
                 budget: self.budget,
             });
@@ -545,7 +545,7 @@ impl Table {
         if let Some(reserved) = budget
             && needed.saturating_add(reserved) > available
         {
-            return Err(WriteError::BudgetExceeded { needed, available });
+            return Err(TableError::BudgetExceeded { needed, available });
         }
         Ok(Admitted {
             path,
@@ -653,7 +653,7 @@ pub struct MemoryUsage {
 
 /// Why an update was rejected. The table is unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
+pub enum TableError {
     /// The key exceeds [`MAX_KEY_LEN`].
     KeyTooLong {
         /// Length of the rejected key.
@@ -689,7 +689,7 @@ pub enum WriteError {
     },
 }
 
-impl fmt::Display for WriteError {
+impl fmt::Display for TableError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::KeyTooLong { len } => {
@@ -717,7 +717,7 @@ impl fmt::Display for WriteError {
     }
 }
 
-impl std::error::Error for WriteError {}
+impl std::error::Error for TableError {}
 
 /// An ordered, bounded table of the latest update to each key.
 ///
@@ -739,13 +739,13 @@ impl Memtable {
     ///
     /// Key and value limits are checked first, then the sequence number, then
     /// the budget. A rejected update changes nothing.
-    pub fn put(&mut self, key: &[u8], seq: u64, value: &[u8]) -> Result<(), WriteError> {
+    pub fn put(&mut self, key: &[u8], seq: u64, value: &[u8]) -> Result<(), TableError> {
         self.0.write(key, seq, Value::Bytes(value))
     }
 
     /// Stores a tombstone for `key` at sequence number `seq`, under the same
     /// rules as [`put`](Self::put).
-    pub fn delete(&mut self, key: &[u8], seq: u64) -> Result<(), WriteError> {
+    pub fn delete(&mut self, key: &[u8], seq: u64) -> Result<(), TableError> {
         self.0.write(key, seq, Value::Tombstone)
     }
 
@@ -758,7 +758,7 @@ impl Memtable {
         seq: u64,
         value: Value<'_>,
         reserved: usize,
-    ) -> Result<(), WriteError> {
+    ) -> Result<(), TableError> {
         self.0.check(key, seq, value, reserved)
     }
 
@@ -772,7 +772,7 @@ impl Memtable {
         key: &[u8],
         seq: u64,
         value: Value<'_>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<(), TableError> {
         self.0.write_admitted(key, seq, value)
     }
 

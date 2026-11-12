@@ -110,8 +110,8 @@ use crate::memtable::ENTRY_OVERHEAD;
 
 use super::wal::{Durable, MAX_BATCH_RECORDS, Unsealed, encode, encoded_len};
 use super::{Core, FlushError, FlushJob, UpdateError};
+use super::{Refusal, WriteError};
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
-use crate::memtable::WriteError;
 
 /// Bytes charged to the queue per write beside its record.
 pub(super) const REQUEST_OVERHEAD: usize = 128;
@@ -406,8 +406,8 @@ impl Core {
         // Tables frozen for room and not yet flushed: freezing is what makes
         // room, so the flush is left until the batch is committed.
         let mut frozen: Option<FlushJob<'_>> = None;
-        // The flush published since a write was last accepted.
-        let mut flushed: Option<Result<(), FlushError>> = None;
+        // The refusal of the flush published since a write was last accepted.
+        let mut refused: Option<FlushError> = None;
         loop {
             let round = self.commit(durable, batch, &mut outcomes);
             if round.closed || round.deferred.is_empty() {
@@ -415,27 +415,29 @@ impl Core {
             }
             batch = round.deferred;
             if round.accepted {
-                flushed = None;
+                refused = None;
             }
             // Freezing made too little room: earlier tables were frozen.
             if let Some(job) = frozen.take() {
-                flushed = Some(job.build().publish().map(drop));
+                refused = job.build().publish().err();
                 continue;
             }
-            let error = match flushed {
+            // Writes accepted since the last flush may have filled the new
+            // table, so a successful flush is followed by another.
+            let refused = match refused {
+                Some(refused) => refused,
                 None => match self.freeze_for_room() {
-                    Ok(job) => {
-                        // Nothing in memory leaves nothing to flush.
-                        flushed = job.is_none().then_some(Ok(()));
-                        frozen = job;
+                    Ok(Some(job)) => {
+                        frozen = Some(job);
                         continue;
                     }
-                    Err(refused) => UpdateError::FlushRefused(refused),
+                    Ok(None) => {
+                        unreachable!("an empty memtable has room for any record within its budget")
+                    }
+                    Err(refused) => refused,
                 },
-                Some(Err(refused)) => UpdateError::FlushRefused(refused),
-                // A flush published and the table still had no room.
-                Some(Ok(())) => round.full,
             };
+            let error = UpdateError::FlushRefused(refused);
             outcomes.extend(batch.iter().map(|request| (request.ticket, Err(error))));
             return (outcomes, false, frozen);
         }
@@ -476,41 +478,35 @@ impl Core {
             let (mut last, mut reserved) = (state.last_seq, 0usize);
             for (index, request) in batch.iter().enumerate() {
                 let write = &request.write;
-                let admitted = last
-                    .checked_add(1)
-                    .ok_or(UpdateError::SequencesExhausted)
-                    .and_then(|seq| {
-                        state
-                            .active
-                            .check(write.key(), seq, write.value(), reserved)
-                            .map_err(|error| UpdateError::Rejected(self.reason(&state, error)))?;
-                        let rotate = wal.admit(&mut plan, write.record.len() as u64)?;
-                        Ok((seq, rotate))
-                    });
+                let admitted = (|| -> Result<_, Refusal> {
+                    let seq = last.checked_add(1).ok_or(UpdateError::SequencesExhausted)?;
+                    state
+                        .active
+                        .check(write.key(), seq, write.value(), reserved)
+                        .map_err(|error| self.refusal(error))?;
+                    let rotate = wal.admit(&mut plan, write.record.len() as u64)?;
+                    Ok((seq, rotate))
+                })();
                 match admitted {
                     Ok((seq, rotate)) => {
                         accepted.push((index, seq, rotate.then(|| seq - 1)));
                         last = seq;
                         reserved += request.charge();
                     }
-                    Err(error @ UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                        full = Some((index, error));
+                    Err(Refusal::Full) => {
+                        full = Some(index);
                         break;
                     }
-                    Err(error) => outcomes.push((request.ticket, Err(error))),
+                    Err(Refusal::Error(error)) => outcomes.push((request.ticket, Err(error))),
                 }
             }
         }
         // Unlogged, for the next round.
-        let (deferred, full) = match full {
-            Some((index, error)) => (batch.split_off(index), error),
-            None => (Vec::new(), UpdateError::LogClosed),
-        };
+        let deferred = full.map_or_else(Vec::new, |index| batch.split_off(index));
         let round = |any_accepted: bool| Round {
             closed: false,
             accepted: any_accepted,
             deferred,
-            full,
         };
         if accepted.is_empty() {
             return round(false);
@@ -586,8 +582,6 @@ struct Round {
     accepted: bool,
     /// Writes from the first the memtables had no room for, unlogged.
     deferred: Vec<Request>,
-    /// That first write's refusal.
-    full: UpdateError,
 }
 
 impl Round {
@@ -596,7 +590,6 @@ impl Round {
             closed: true,
             accepted: false,
             deferred: Vec::new(),
-            full: UpdateError::LogClosed,
         }
     }
 }
@@ -613,7 +606,6 @@ mod tests {
     use crate::block::MAX_KEY_LEN;
     use crate::engine::wal::{BEFORE_PUBLISH, Fault};
     use crate::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
-    use crate::memtable::WriteError;
 
     fn scratch(name: &str) -> PathBuf {
         let path =
@@ -808,6 +800,48 @@ mod tests {
         assert_eq!(report.last_seq, 5);
         assert_eq!(get(&engine, b"c"), Some(vec![7; 6 << 10]));
         assert_eq!(get(&engine, b"z"), None);
+        drop(engine);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A batch larger than two tables fills the table that replaced the
+    /// frozen one before that flush publishes, so the leader flushes again
+    /// rather than giving up.
+    #[test]
+    fn a_batch_larger_than_two_tables_flushes_again() {
+        let dir = scratch("twice");
+        let options = EngineOptions {
+            memtable_budget: 16 << 10,
+            ..EngineOptions::default()
+        };
+        let engine = Engine::create(&dir, options, DurableOptions::default()).unwrap();
+        let outcomes = thread::scope(|scope| {
+            let (leader, writers) = behind_a_held_leader(
+                &engine,
+                scope,
+                |_| {},
+                || {
+                    (0..8u8)
+                        .map(|at| {
+                            let engine = &engine;
+                            let writer = scope.spawn(move || engine.put(&[at], &[at; 6 << 10]));
+                            until_queued(engine, at as usize + 1, 0);
+                            writer
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
+            assert_eq!(leader.join().unwrap(), Ok(1));
+            writers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes, (2..10).map(Ok).collect::<Vec<_>>());
+        assert!(engine.stats().flushes >= 2, "{:?}", engine.stats());
+        for at in 0..8u8 {
+            assert_eq!(get(&engine, &[at]), Some(vec![at; 6 << 10]));
+        }
         drop(engine);
         fs::remove_dir_all(&dir).unwrap();
     }
