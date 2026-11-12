@@ -16,6 +16,7 @@
 //! | `snapshots`   | snapshot cost, and writes and retained memory beside them  |
 //! | `ingest`      | sustained writes with automatic flushes and compaction     |
 //! | `mixed`       | concurrent readers beside sustained writers                |
+//! | `workloads-*` | read-heavy, balanced and write-heavy mixes, per codec      |
 //! | `durable`     | durable writes and group commit                            |
 //! | `recovery`    | checkpoints, recovery and log replay                       |
 //!
@@ -34,8 +35,8 @@ use std::thread;
 use std::time::Instant;
 
 use tessera::engine::{
-    CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions, EngineWorkspace,
-    MergeWorkspace, Scan, Snapshot, SnapshotLimits,
+    CheckpointOptions, CompactionOptions, Compression, DurableOptions, Engine, EngineOptions,
+    EngineStats, EngineWorkspace, MergeWorkspace, Scan, Snapshot, SnapshotLimits,
 };
 
 /// Records in a key group, which a prefix scan of the group's first four
@@ -1669,6 +1670,546 @@ fn mixed() {
     }
 }
 
+// Mixed workloads.
+
+/// One client operation of [`workloads`], on an index of the scan layout.
+#[derive(Clone, Copy)]
+enum Op {
+    Get(u64),
+    Absent(u64),
+    Short(u64),
+    Medium(u64),
+    Put(u64, u64),
+    Delete(u64),
+}
+
+/// What [`workloads`] reports per operation: the first four are point
+/// lookups, by what the key was before the timed run.
+const CLASSES: [&str; 7] = [
+    "get, present",
+    "get, overwritten before the run",
+    "get, deleted before the run",
+    "get, absent",
+    "scan, 6-byte prefix",
+    "scan of a snapshot, 4-byte prefix",
+    "write",
+];
+const WRITE: usize = 6;
+
+/// A mix of operations, per mille; the rest are writes.
+struct Scenario {
+    name: &'static str,
+    ops_per_client: usize,
+    gets: u64,
+    short: u64,
+    medium: u64,
+    /// Whether a snapshot of the starting state is held throughout, as a
+    /// long-lived reader would, and checked afterwards.
+    long_snapshot: bool,
+}
+
+const SCENARIOS: [Scenario; 3] = [
+    Scenario {
+        name: "read-heavy",
+        ops_per_client: 400_000,
+        gets: 800,
+        short: 120,
+        medium: 30,
+        long_snapshot: false,
+    },
+    Scenario {
+        name: "balanced",
+        ops_per_client: 200_000,
+        gets: 400,
+        short: 80,
+        medium: 20,
+        long_snapshot: true,
+    },
+    Scenario {
+        name: "write-heavy",
+        ops_per_client: 400_000,
+        gets: 40,
+        short: 10,
+        medium: 5,
+        long_snapshot: false,
+    },
+];
+
+const CLIENTS: u64 = 2;
+
+/// A client's operations, from its own seed. Client `c` writes only indices
+/// congruent to `c` modulo [`CLIENTS`], so the final state does not depend on
+/// how the clients interleave. One get in 8 is of an absent key.
+fn plan(scenario: &Scenario, client: u64) -> Vec<Op> {
+    let records = SCAN_GROUP * SCAN_GROUPS;
+    let mut rng = Rng::new(70 + client);
+    (0..scenario.ops_per_client)
+        .map(|_| {
+            let roll = rng.below(1000);
+            let index = rng.below(records);
+            if roll < scenario.gets {
+                if index % 8 == 7 {
+                    Op::Absent(index)
+                } else {
+                    Op::Get(index)
+                }
+            } else if roll < scenario.gets + scenario.short {
+                Op::Short(index)
+            } else if roll < scenario.gets + scenario.short + scenario.medium {
+                Op::Medium(index)
+            } else {
+                let index = index / CLIENTS * CLIENTS + client;
+                if rng.below(10) == 0 {
+                    Op::Delete(index)
+                } else {
+                    Op::Put(index, rng.next())
+                }
+            }
+        })
+        .collect()
+}
+
+/// A key between two keys of the scan layout, inside the dataset's range.
+fn absent_scan_key(index: u64) -> Vec<u8> {
+    let mut key = scan_key(index);
+    key[7] = 0x7F;
+    key
+}
+
+/// CPU seconds from a `/proc` stat file: user plus system, at 100 ticks a
+/// second; 0 where Linux does not report it.
+fn cpu_secs(path: &str) -> f64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|stat| {
+            let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+            let user: f64 = fields.get(11)?.parse().ok()?;
+            let system: f64 = fields.get(12)?.parse().ok()?;
+            Some((user + system) / 100.0)
+        })
+        .unwrap_or(0.0)
+}
+
+/// The process's current resident memory in MiB, where Linux reports it.
+fn rss_mib() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+            line.split_whitespace().nth(1)?.parse::<f64>().ok()
+        })
+        .map_or(0.0, |kib| kib / 1024.0)
+}
+
+/// What one client measured.
+#[derive(Default)]
+struct Client {
+    latency: [Latencies; 7],
+    /// Time to the first record (or to the end of an empty scan).
+    first: [Latencies; 7],
+    blocks: [u64; 7],
+    records: [u64; 7],
+    cpu: f64,
+}
+
+/// Drains `scan`, recording the time from `start` to its first record.
+fn drain(mut scan: Scan<'_>, start: Instant, first: &mut Latencies) -> u64 {
+    let mut records = 0;
+    while let Some(record) = scan.next_record().unwrap() {
+        if records == 0 {
+            first.0.push(start.elapsed().as_nanos() as u64);
+        }
+        black_box(record.value.len());
+        records += 1;
+    }
+    if records == 0 {
+        first.0.push(start.elapsed().as_nanos() as u64);
+    }
+    records
+}
+
+fn client(engine: &Engine, ops: &[Op], values: &Values) -> Client {
+    let mut out = Client::default();
+    let mut workspace = EngineWorkspace::new();
+    for &op in ops {
+        let before = workspace.blocks_loaded();
+        let start = Instant::now();
+        let (class, records) = match op {
+            Op::Get(index) => {
+                let key = scan_key(index);
+                let class = match value_seed(index) {
+                    None => 2,
+                    Some(seed) if seed != index => 1,
+                    Some(_) => 0,
+                };
+                let start = Instant::now();
+                let found = engine.get(&key, &mut workspace).unwrap();
+                black_box(found.map(|found| found.value.len()));
+                out.latency[class].0.push(start.elapsed().as_nanos() as u64);
+                (class, 0)
+            }
+            Op::Absent(index) => {
+                let key = absent_scan_key(index);
+                let start = Instant::now();
+                assert!(engine.get(&key, &mut workspace).unwrap().is_none());
+                out.latency[3].0.push(start.elapsed().as_nanos() as u64);
+                (3, 0)
+            }
+            Op::Short(index) => {
+                let prefix = scan_key(index);
+                let guard = engine.read();
+                let records = drain(
+                    guard.scan_prefix(&prefix[..6], &mut workspace),
+                    start,
+                    &mut out.first[4],
+                );
+                drop(guard);
+                out.latency[4].0.push(start.elapsed().as_nanos() as u64);
+                (4, records)
+            }
+            Op::Medium(index) => {
+                let prefix = scan_key(index);
+                let snapshot = engine.snapshot().unwrap();
+                let records = drain(
+                    snapshot.scan_prefix(&prefix[..4], &mut workspace),
+                    start,
+                    &mut out.first[5],
+                );
+                drop(snapshot);
+                out.latency[5].0.push(start.elapsed().as_nanos() as u64);
+                (5, records)
+            }
+            Op::Put(index, seed) => {
+                engine.put(&scan_key(index), values.get(seed)).unwrap();
+                out.latency[WRITE].0.push(start.elapsed().as_nanos() as u64);
+                (WRITE, 0)
+            }
+            Op::Delete(index) => {
+                engine.delete(&scan_key(index)).unwrap();
+                out.latency[WRITE].0.push(start.elapsed().as_nanos() as u64);
+                (WRITE, 0)
+            }
+        };
+        out.blocks[class] += workspace.blocks_loaded() - before;
+        out.records[class] += records;
+    }
+    out.cpu = cpu_secs("/proc/thread-self/stat");
+    out
+}
+
+/// Maxima of the engine's state, sampled while the clients run.
+#[derive(Default)]
+struct Peaks {
+    runs: usize,
+    overlap: usize,
+    run_bytes: usize,
+    memtables: usize,
+    retained: usize,
+}
+
+impl Peaks {
+    fn sample(&mut self, stats: &EngineStats) {
+        self.runs = self.runs.max(stats.runs);
+        self.overlap = self.overlap.max(stats.max_overlap);
+        self.run_bytes = self.run_bytes.max(stats.run_bytes + stats.filter_bytes);
+        let frozen = stats.frozen.map_or(0, |frozen| frozen.charged);
+        self.memtables = self.memtables.max(stats.active.charged + frozen);
+        self.retained = self.retained.max(stats.retained_bytes);
+    }
+}
+
+/// Every live record a view returns for `prefix`, checked against the model
+/// of value seeds.
+fn check_scan(
+    scan: Scan<'_>,
+    model: &BTreeMap<Vec<u8>, u64>,
+    prefix: &[u8],
+    values: &Values,
+) -> usize {
+    let mut expected = model
+        .range(prefix.to_vec()..)
+        .take_while(|(key, _)| key.starts_with(prefix));
+    let mut scan = scan;
+    let mut records = 0;
+    while let Some(record) = scan.next_record().unwrap() {
+        let (key, &seed) = expected.next().expect("extra record");
+        assert_eq!(record.key, key.as_slice());
+        assert_eq!(record.value, values.get(seed));
+        records += 1;
+    }
+    assert!(expected.next().is_none(), "missing record in {prefix:?}");
+    records
+}
+
+/// Read-heavy, balanced and write-heavy mixes from two clients beside
+/// background compaction, on one codec; see `docs/benchmarks.md`. Each
+/// codec runs in its own process, so that resident memory is its own.
+fn workloads(compression: Compression) {
+    const RECORDS: u64 = SCAN_GROUP * SCAN_GROUPS;
+    let values = Values::new();
+    let preload: BTreeMap<Vec<u8>, u64> = (0..RECORDS)
+        .filter_map(|index| Some((scan_key(index), value_seed(index)?)))
+        .collect();
+    let codec = format!("{compression:?}");
+    let (mut reads, mut writes, mut memory) = (Vec::new(), Vec::new(), Vec::new());
+    for scenario in &SCENARIOS {
+        let engine = Engine::new(EngineOptions {
+            background_compaction: Some(CompactionOptions::default()),
+            compression,
+            ..options(4 << 20)
+        });
+        // The starting state: every key in one run, then a seventh deleted
+        // and a fifth of the rest overwritten in newer runs.
+        for &index in &shuffled(RECORDS, 12) {
+            engine.put(&scan_key(index), values.get(index)).unwrap();
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+        consolidate(&engine);
+        for index in 0..RECORDS {
+            match value_seed(index) {
+                None => {
+                    engine.delete(&scan_key(index)).unwrap();
+                }
+                Some(seed) if seed != index => {
+                    engine.put(&scan_key(index), values.get(seed)).unwrap();
+                }
+                Some(_) => {}
+            }
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+        let initial = engine.stats();
+        let plans: Vec<Vec<Op>> = (0..CLIENTS).map(|c| plan(scenario, c)).collect();
+        let held = scenario.long_snapshot.then(|| engine.snapshot().unwrap());
+        let background = engine.background_status().unwrap();
+        let mut peaks = Peaks::default();
+        peaks.sample(&initial);
+        let running = std::sync::atomic::AtomicUsize::new(plans.len());
+
+        let cpu = cpu_secs("/proc/self/stat");
+        let start = Instant::now();
+        let clients: Vec<Client> = thread::scope(|scope| {
+            let handles: Vec<_> = plans
+                .iter()
+                .map(|ops| {
+                    let (engine, values, running) = (&engine, &values, &running);
+                    scope.spawn(move || {
+                        let out = client(engine, ops, values);
+                        running.fetch_sub(1, Ordering::Relaxed);
+                        out
+                    })
+                })
+                .collect();
+            while running.load(Ordering::Relaxed) > 0 {
+                peaks.sample(&engine.stats());
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let wall = start.elapsed().as_secs_f64();
+        let settling = Instant::now();
+        engine.wait_for_compaction().unwrap();
+        let settle = settling.elapsed().as_secs_f64();
+        let cpu = cpu_secs("/proc/self/stat") - cpu;
+        let client_cpu: f64 = clients.iter().map(|c| c.cpu).sum();
+        let stats = engine.stats();
+        peaks.sample(&stats);
+        let after = engine.background_status().unwrap();
+        assert_eq!(after.failures, 0, "{:?}", after.last_failure);
+
+        // Untimed: the final state, a held snapshot and prefix boundaries
+        // against the model.
+        let mut model = preload.clone();
+        for op in plans.iter().flatten() {
+            match *op {
+                Op::Put(index, seed) => {
+                    model.insert(scan_key(index), seed);
+                }
+                Op::Delete(index) => {
+                    model.remove(&scan_key(index));
+                }
+                _ => {}
+            }
+        }
+        let mut workspace = EngineWorkspace::new();
+        let guard = engine.read();
+        assert_eq!(
+            check_scan(guard.scan_prefix(&[], &mut workspace), &model, &[], &values),
+            model.len()
+        );
+        let mut rng = Rng::new(80);
+        for len in [2, 3, 4, 6, 8] {
+            for _ in 0..32 {
+                let prefix = scan_key(rng.below(RECORDS))[..len].to_vec();
+                check_scan(
+                    guard.scan_prefix(&prefix, &mut workspace),
+                    &model,
+                    &prefix,
+                    &values,
+                );
+            }
+        }
+        for prefix in [
+            &[0xFF, 0xFF][..],
+            &[0x00],
+            &[0x01, 0xFF],
+            &[0xFF, 0xFF, 0xFF],
+        ] {
+            check_scan(
+                guard.scan_prefix(prefix, &mut workspace),
+                &model,
+                prefix,
+                &values,
+            );
+        }
+        drop(guard);
+        if let Some(held) = &held {
+            check_scan(
+                held.scan_prefix(&[], &mut workspace),
+                &preload,
+                &[],
+                &values,
+            );
+        }
+
+        let merged: Vec<Latencies> = (0..CLASSES.len())
+            .map(|class| {
+                Latencies::merge(
+                    clients
+                        .iter()
+                        .map(|c| Latencies(c.latency[class].0.clone())),
+                )
+            })
+            .collect();
+        for (class, name) in CLASSES.iter().enumerate().take(WRITE) {
+            let latency = &merged[class];
+            let ops = latency.0.len();
+            if ops == 0 {
+                continue;
+            }
+            let blocks: u64 = clients.iter().map(|c| c.blocks[class]).sum();
+            let records: u64 = clients.iter().map(|c| c.records[class]).sum();
+            let (scan_columns, first) = if class >= 4 {
+                let first =
+                    Latencies::merge(clients.iter().map(|c| Latencies(c.first[class].0.clone())));
+                let total: u64 = latency.0.iter().sum();
+                let to_first: u64 = first.0.iter().sum();
+                let after = records.saturating_sub(ops as u64).max(1);
+                (
+                    format!(
+                        "{:.1} | {:.0}",
+                        records as f64 / ops as f64,
+                        (total - to_first) as f64 / after as f64
+                    ),
+                    format!("{:.2}", first.us(0.5)),
+                )
+            } else {
+                ("– | –".into(), "–".into())
+            };
+            reads.push(format!(
+                "| {} | {codec} | {name} | {ops} | {:.0} | {:.2} | {:.2} | {:.2} | {first} | {scan_columns} |",
+                scenario.name,
+                ops as f64 / wall / 1e3,
+                latency.us(0.5),
+                latency.us(0.99),
+                blocks as f64 / ops as f64,
+            ));
+        }
+        let written = &merged[WRITE];
+        writes.push(format!(
+            "| {} | {codec} | {wall:.2} | {:.0} | {:.1} | {:.1} | {:.0} | {} | {} | {:.1} → {:.1} | {settle:.2} | {} → {} (peak {}) | {} | {client_cpu:.1} | {:.1} |",
+            scenario.name,
+            written.0.len() as f64 / wall / 1e3,
+            written.us(0.5),
+            written.us(0.99),
+            written.max_us(),
+            stats.flushes - initial.flushes,
+            after.compactions - background.compactions,
+            mib(after.input_bytes - background.input_bytes),
+            mib(after.output_bytes - background.output_bytes),
+            initial.runs,
+            stats.runs,
+            peaks.runs,
+            peaks.overlap,
+            cpu - client_cpu,
+        ));
+        let logical: usize = model.len() * (8 + VALUE_LEN);
+        memory.push(format!(
+            "| {} | {codec} | {:.1} | {:.1} | {:.1} | {:.2} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} |",
+            scenario.name,
+            mib(logical as u64),
+            mib(stats.run_bytes as u64),
+            mib(stats.filter_bytes as u64),
+            logical as f64 / stats.run_bytes as f64,
+            mib(peaks.run_bytes as u64),
+            mib(peaks.memtables as u64),
+            mib(peaks.retained as u64),
+            rss_mib(),
+            peak_rss_mib(),
+        ));
+        drop(held);
+    }
+
+    table(
+        &format!(
+            "Mixed workloads, reads: {RECORDS} records of 8 + {VALUE_LEN} bytes, {CLIENTS} clients, 4 MiB memtable, background compaction"
+        ),
+        &[
+            "scenario",
+            "codec",
+            "operation",
+            "ops",
+            "k ops/s",
+            "p50 µs",
+            "p99 µs",
+            "blocks/op",
+            "first record p50 µs",
+            "records/scan",
+            "ns/record after first",
+        ],
+    );
+    reads.iter().for_each(|row| println!("{row}"));
+    table(
+        "Mixed workloads, writes and maintenance",
+        &[
+            "scenario",
+            "codec",
+            "wall s",
+            "writes k/s",
+            "write p50 µs",
+            "write p99 µs",
+            "write max µs",
+            "flushes",
+            "compactions",
+            "compacted MiB in → out",
+            "settle s",
+            "runs start → end",
+            "max overlap",
+            "client CPU s",
+            "other CPU s",
+        ],
+    );
+    writes.iter().for_each(|row| println!("{row}"));
+    table(
+        "Mixed workloads, memory",
+        &[
+            "scenario",
+            "codec",
+            "live logical MiB",
+            "run MiB",
+            "filter MiB",
+            "logical / run",
+            "peak runs + filters MiB",
+            "peak memtables MiB",
+            "peak retained MiB",
+            "RSS MiB",
+            "peak RSS MiB",
+        ],
+    );
+    memory.iter().for_each(|row| println!("{row}"));
+}
+
 /// Durable writes from several writers, which group commit batches into
 /// shared syncs.
 fn durable(base: &Path) {
@@ -1817,12 +2358,16 @@ fn main() {
         Some("snapshots") => snapshots(),
         Some("ingest") => ingest(),
         Some("mixed") => mixed(),
+        Some("workloads-zstd") => workloads(Compression::Zstd),
+        Some("workloads-lz4") => workloads(Compression::Lz4),
+        Some("workloads-none") => workloads(Compression::Uncompressed),
         Some("durable") => durable(&base),
         Some("recovery") => recovery(&base),
         _ => {
             eprintln!(
                 "usage: bench MODE [DIR], MODE one of memtable lookups scans readers density \
-                 maintenance snapshots ingest mixed durable recovery"
+                 maintenance snapshots ingest mixed workloads-zstd workloads-lz4 workloads-none \
+                 durable recovery"
             );
             std::process::exit(2);
         }

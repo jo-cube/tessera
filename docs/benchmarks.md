@@ -33,8 +33,25 @@ how far passes disagree.
 | `snapshots` | snapshots taken after a write; 1,000,000 overwrites with 0–16 live snapshots replaced in turn | snapshot cost, and what live snapshots cost writes and memory |
 | `ingest` | 1,000,000 writes by 1–4 writers over 400,000 keys, 4 MiB memtable, background compaction | sustained ingestion with automatic flushes, its latency tail and run shape |
 | `mixed` | 500,000 writes beside 1–3 readers doing gets and prefix scans | readers and writers sharing the engine |
+| `workloads-zstd`, `-lz4`, `-none` | read-heavy, balanced and write-heavy mixes from 2 clients over 491,520 records, background compaction; one codec per process | how the codec choice holds up with reads and writes together |
 | `durable` | 200,000 durable writes from 1, 4 and 8 writers | group commit: throughput, latency and writes per sync |
 | `recovery` | checkpoints of 500,000 records, recovery, and a reopen replaying 100,000 logged writes | checkpoint, recovery and replay rates |
+
+The `workloads-*` modes are not in the default suite; run them by name
+(`scripts/validate.sh bench workloads-zstd workloads-lz4 workloads-none`).
+
+Kinds of result in this file:
+
+- **Complete-engine, isolated:** the 5V read baseline and the 5W codec
+  comparison: one operation class at a time through the public API, no
+  concurrent writes.
+- **Complete-engine, mixed:** the 5X section: reads and writes together,
+  with automatic flushes and background compaction.
+- **Run layer only:** "Compressed and uncompressed runs" and the block-cache
+  simulation, which read runs without an engine.
+- **Historical:** everything under "Historical results", from earlier
+  harnesses; kept for the decisions it records, not comparable number for
+  number.
 
 Key filters are built as each run is written, so flush and compaction times
 include their construction; the reports give the filter's size and the
@@ -650,6 +667,166 @@ the runs that flushes, compactions and checkpoints build.
   structured values it holds 1.7–3.8× more data than the alternatives.
 - **Not done:** per-level or adaptive codecs, recompression, Zstandard
   levels, block caching and sequence-bound pruning.
+
+## Mixed read/write workloads (5X)
+
+*Complete engine, mixed.* Whether the isolated 5W differences hold when
+reads, writes, automatic flushes and background compaction share the two
+CPUs. Modes `workloads-zstd`, `workloads-lz4` and `workloads-none`, one
+process per codec so resident memory is its own; three passes in the
+bounded container with the codec order rotated (Z L N, N L Z, L Z N).
+Medians of the three; a cell is marked where a pass differed from the
+median by 10% or more.
+
+### Method
+
+- **Dataset:** the `scans` layout, 491,520 keys of 8 bytes with 100-byte
+  values (50.6 MiB logical). Loaded in random order, flushed and
+  consolidated, then a seventh of the keys deleted and a fifth of the
+  rest overwritten into newer runs, so the run starts with 9 runs and an
+  overlap of 2. Background compaction with default options, 4 MiB
+  memtable budget.
+- **Clients:** two threads, each with its own seeded list of operations,
+  generated before the clock starts; the lists are identical for every
+  codec. Writers write disjoint keys (one in ten writes is a delete), so
+  the final state is deterministic.
+- **Operations:** point gets (one in eight of an absent key between two
+  stored keys; the others reported by what the key was before the run:
+  present, overwritten or deleted), short scans (a 6-byte prefix, about 28
+  records, through a read guard) and medium scans (a 4-byte prefix, about
+  440 records, through a `Snapshot`, whose creation is included).
+- **Scenarios, per client:** read-heavy, 400,000 operations, 80% gets, 12%
+  short and 3% medium scans, 5% writes; balanced, 200,000, 40% gets, 8%
+  short, 2% medium, 50% writes, holding a snapshot of the starting state
+  throughout; write-heavy, 400,000, 4% gets, 1% short, 0.5% medium, 94.5%
+  writes.
+- **Measured:** each operation's latency, the time to a scan's first
+  record, blocks decoded per operation, the clients' CPU time and the
+  rest of the process's (background compaction and a 10 ms stats
+  sampler), peaks of the engine's own accounting sampled every 10 ms, and
+  resident memory.
+- **Checked, after the clock stops:** the final state against a model of
+  the plans (every live record, plus 160 random prefixes of 2–8 bytes and
+  the 0x00, 0xFF and past-the-end boundaries), the held snapshot against
+  the starting state, and that no compaction failed. All passed in every
+  pass and codec.
+
+### Reads while writing
+
+p50 / p99 in µs, Zstandard / LZ4 / uncompressed:
+
+| scenario | get, present | get, overwritten | get, absent | 28-record scan | 440-record snapshot scan |
+|---|---|---|---|---|---|
+| read-heavy | 8.7 / 2.6 / 1.2 — 36 / 24 / 11 | 18.3 / 5.2 / 1.8 — 45 / 27 / 12 | 0.6 / 0.6 / 0.5 — 27 / 21 / 7 | 28.5 / 9.4 / 4.3 — 55 / 32 / 16 | 95 / 51 / 41 — 159 / 86 / 68 |
+| balanced | 9.1 / 2.9 / 1.4 — 40 / 29 / 27 | 18.7 / 5.6 / 1.9 — 49 / 32 / 27 | 0.7 / 0.7 / 0.6 — 28 / 26 / 26 | 38.7 / 13.6 / 6.3 — 71 / 41 / 32 | 116 / 65 / 56 — 192 / 110 / 92 |
+| write-heavy | 11.7 / 4.1 / 1.8 — 36 / 12 / 9 | 18.7 / 5.9 / 2.3 — 38 / 14 / 10 | 0.6 / 0.6 / 0.5 — 11 / 5 / 8 | 48.6 / 17.4 / 8.6 — 165 (±342%) / 33 / 20 | 156 / 92 / 78 — 2,211 / 1,375 / 1,685 (±40–54%) |
+
+| scenario | gets k/s, Z / L / N | blocks per present get | scan: first record p50 µs, Z / L / N | scan ns/record after the first, short; medium |
+|---|---|---|---|---|
+| read-heavy | 61 / 163 / 291 | 1.02 | 25.8 / 6.8 / 2.1 | 171 / 107 / 91; 153 / 95 / 84 |
+| balanced | 33 / 73 / 121 | 1.17 | 32.9 / 9.5 / 2.9 | 289 / 175 / 138; 193 / 125 / 122 |
+| write-heavy | 12 / 21 / 27 | 1.61 | 43.3 / 12.5 / 4.1 | 946 / 281 / 199; 373 / 229 / 225 |
+
+- **The isolated ratios hold.** Present-key gets keep the 5W order and
+  close to its ratios (3.3× and 7× faster than Zstandard in read-heavy;
+  5W had 3.9× and 17× on a consolidated run). Uncompressed gets cost
+  1.2–1.8 µs here, not 0.5, because the memtable and two layers of runs
+  are searched and two clients share the CPUs; the cheaper the codec, the
+  more of a lookup is this fixed engine cost.
+- **Prefix scans gain most at the first record**: 11–12× from Zstandard to
+  uncompressed and 3.5–3.8× to LZ4, against 1.6–4.8× per record after it;
+  a whole 440-record scan is 2–2.3× (uncompressed) and 1.7–1.9× (LZ4)
+  faster.
+- **Writes raise read costs through overlap, not the codec.** From
+  read-heavy to write-heavy, blocks per present get rise from 1.02 to
+  1.61 and latency by 35–55% under every codec. Short scans after the
+  first record slow most under Zstandard (171 → 946 ns), since each
+  additional overlapping run adds a block decode.
+- **Tails:** gets' p99 sits at 21–40 µs in read-heavy and balanced under
+  every codec (preemption: two clients, compaction and the sampler on two
+  CPUs). In write-heavy, snapshot scans have a p99 of 1.4–2.2 ms under
+  every codec, varying by up to 54% between passes. Its cause was not
+  investigated; it does not depend on the codec.
+- Absent keys cost the same under every codec: the filters answer them.
+
+### Writes, flushes and compaction
+
+| scenario | codec | wall s | writes k/s | write p99 µs | write max ms | flushes | compactions, MiB in → out | client CPU s | other CPU s |
+|---|---|---|---|---|---|---|---|---|---|
+| read-heavy | Zstandard | 6.28 | 6 | 51 | 5.5 | 2 | 0 | 11.9 | 0 |
+| | LZ4 | 2.35 | 17 | 28 | 2.7 (±27%) | 2 | 0 | 4.3 | 0 |
+| | uncompressed | 1.32 | 30 | 23 | 2.4 (±46%) | 2 | 0 | 2.4 | 0 |
+| balanced | Zstandard | 2.89 | 69 | 62 | 9.3 (±23%) | 10 | 9, 18.9 → 17.8 | 4.5 | 0.2 |
+| | LZ4 | 1.31 | 153 | 40 | 4.3 | 10 | 9, 26.8 → 25.1 | 1.9 | 0.1 |
+| | uncompressed | 0.79 | 253 | 28 | 3.9 (±19%) | 10 | 9, 56.0 → 52.9 | 1.2 | 0.1 |
+| write-heavy | Zstandard | 1.66 | 454 | 6 (±31%) | 11.0 | 41 | 32, 120 → 94 | 2.0 | 1.2 |
+| | LZ4 | 0.90 | 844 | 11 | 5.9 | 41 | 31, 124 → 114 | 1.1 | 0.4 |
+| | uncompressed | 0.71 | 1,070 | 11 | 5.1 (±50%) | 41 | 33, 381 → 298 | 0.9 | 0.4 |
+
+- **Write throughput** (closed loop, so it also reflects the reads each
+  client does, which dominate read-heavy) is 1.9–2.8× higher with LZ4 and
+  2.4–5× uncompressed. In
+  write-heavy the difference is the flush, which runs inside the write
+  that fills the table: the slowest write, a flush, takes 11 ms under
+  Zstandard and 5–6 ms otherwise. Median writes cost 0.2–0.7 µs under
+  every codec.
+- **Compaction** did the same work (31–33 compactions, the same flushes)
+  and kept up under every codec: waiting for it after the clients
+  finished took at most 0.14 s. Its CPU (the "other" column, mostly the
+  background worker) was 1.2 s under Zstandard against 0.4 s, while
+  moving 3× the bytes uncompressed. No refusal or backpressure beyond the
+  flushes occurred: run limits were unbounded here.
+- **Same work, less CPU:** the read-heavy clients used 11.9, 4.3 and 2.4
+  CPU seconds for the same 800,000 operations.
+
+### Memory
+
+| scenario | codec | live logical MiB | peak runs + filters MiB | runs at the end, logical ÷ stored | peak memtables MiB | peak retained MiB | peak RSS MiB |
+|---|---|---|---|---|---|---|---|
+| read-heavy | Zstandard | 43.5 | 21.2 | 2.14 | 4.0 | 0 | 133 |
+| | LZ4 | | 31.0 | 1.44 | 4.0 | 0 | 141 |
+| | uncompressed | | 64.7 | 0.68 | 4.0 | 0 | 179 |
+| balanced | Zstandard | 44.1 | 25.1 | 1.85 | 4.0 | 4.7 (±55%) | 139 |
+| | LZ4 | | 36.3 | 1.26 | 4.0 | 5.0 | 154 |
+| | uncompressed | | 76.5 | 0.59 | 4.0 | 9.6 (±41%) | 227 |
+| write-heavy | Zstandard | 45.1 | 37.2 | 3.0 | 4.4 | 3.9 | 199 |
+| | LZ4 | | 52.0 | varies (±124%) | 4.0 | 6.3 (±38%) | 210 (±13%) |
+| | uncompressed | | 114.1 | 0.95 | 4.1 | 4.5 (±87%) | 358 |
+
+- Runs hold old versions and tombstones until compaction merges them, so
+  stored bytes exceed live logical bytes uncompressed (logical ÷ stored
+  below 1) and the end-of-run ratio depends on where compaction stopped;
+  the peaks are the steadier measure. The density order of 5W holds:
+  peak run memory is 1.4–1.5× (LZ4) and 3.0–3.1× (uncompressed) the
+  Zstandard figure on these 100-byte, roughly 3:1 compressible values.
+- Memtables stay within their 4 MiB budget under every codec, and the
+  snapshot held through the balanced run retained 5–10 MiB: compaction
+  replaced only the small update runs it pinned.
+- Peak process memory (which also holds the benchmark's model of the
+  starting state) follows the run peaks: 199, 210 and 358 MiB in
+  write-heavy, where compaction keeps its inputs until its outputs are
+  published.
+
+### Reading it
+
+- **Confirmed:** the 5W tradeoff holds with writes and compaction running.
+  Every read class and the writes are faster with a cheaper codec, by
+  ratios close to the isolated ones, and memory grows by the isolated
+  ratios. No measured scenario reverses the order: the fastest isolated
+  codec was also the fastest overall here, because the dataset fits and
+  compaction keeps up.
+- **Where the choice matters least:** absent keys and memtable hits; and
+  tails dominated by scheduling and flush stalls, which are the same under
+  every codec.
+- **Confidence:** medians of read latency, throughput and CPU varied by
+  under 10% between passes; differences of 2× and more are established.
+  Tails (p99 in write-heavy, max write latency), end-of-run stored size
+  and peak retained bytes depend on flush and compaction timing and vary
+  by up to ±54% (one cell ±342%); only their order of magnitude is
+  reliable. Two CPUs; nothing here measures more parallelism.
+- **Not measured:** a dataset near the run limits, where a less compact
+  codec would refuse flushes sooner; larger values, where Zstandard's
+  density advantage grows (5W: 3.8–4.2× on JSON-like and document data).
 
 ## Historical results
 

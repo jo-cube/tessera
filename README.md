@@ -77,6 +77,11 @@ and JSON-like data takes about 1.7× (LZ4) or 3.8× (uncompressed) the
 Zstandard memory. Blocks record their codec, so the setting can change
 between restarts: existing runs and checkpoints stay readable, and
 compaction rewrites runs with the current setting.
+Keep Zstandard when memory is the constraint or values are large and
+structured; choose LZ4 when reads that miss the memtable set your latency
+and about 1.2–1.7× the run memory is affordable; choose `Uncompressed` when
+the uncompressed dataset fits comfortably, which costs least for small
+binary records. The order held with writes and compaction running.
 
 ## Engine
 

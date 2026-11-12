@@ -9,7 +9,9 @@
 #   scripts/validate.sh bench [MODE…]      the benchmark suite, or some of its modes:
 #                                          memtable lookups scans readers density
 #                                          maintenance snapshots ingest mixed
-#                                          durable recovery
+#                                          durable recovery, and on request
+#                                          workloads-zstd workloads-lz4
+#                                          workloads-none
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #

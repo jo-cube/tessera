@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CheckpointError, CheckpointOptions, CompactionOptions, Compression, Damage, Engine,
-    EngineOptions, EngineWorkspace, MergeWorkspace, RecoveryError, SnapshotLimits,
+    CheckpointError, CheckpointOptions, CompactionError, CompactionOptions, Compression, Damage,
+    Engine, EngineOptions, EngineWorkspace, MergeWorkspace, RecoveryError, Snapshot,
+    SnapshotLimits,
 };
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -244,6 +245,70 @@ fn checkpoints_recover_under_any_compression() {
         run_bytes[0] < run_bytes[1] && run_bytes[1] < run_bytes[2],
         "{run_bytes:?}"
     );
+}
+
+/// After a switch to a less compact codec, a compaction that would grow the
+/// runs past `max_run_bytes` is refused and leaves the runs, their contents
+/// and a snapshot's view as they were; lifting the limit lets it through.
+#[test]
+fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
+    let scratch = Scratch::new("codec-switch-limit");
+    let with = |compression| EngineOptions {
+        target_run_len: 4096,
+        compression,
+        ..EngineOptions::default()
+    };
+    let engine = Engine::new(with(Compression::Zstd));
+    let mut model = Model::new();
+    for i in 0..3_000u32 {
+        let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
+        engine.put(&key, value.as_bytes()).unwrap();
+        model.insert(key, value.into_bytes());
+    }
+    engine.flush().unwrap();
+    engine
+        .checkpoint(&scratch.0, CheckpointOptions::default())
+        .unwrap();
+
+    // Recovered Zstandard runs under a newer uncompressed run of overwrites.
+    let recovered = Engine::recover(&scratch.0, with(Compression::Uncompressed)).unwrap();
+    for i in (0..3_000u32).step_by(5) {
+        let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
+        recovered.put(&key, value.as_bytes()).unwrap();
+        model.insert(key, value.into_bytes());
+    }
+    recovered.flush().unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    let before = recovered.stats();
+    assert!(before.max_overlap > 1, "{before:?}");
+    recovered.set_run_limits(usize::MAX, before.run_bytes + before.filter_bytes);
+    let options = CompactionOptions {
+        max_overlap: 1,
+        ..CompactionOptions::default()
+    };
+    let refused = recovered.compact(options, &mut MergeWorkspace::new());
+    assert!(
+        matches!(refused, Err(CompactionError::RunLimit(_))),
+        "{refused:?}"
+    );
+    assert_eq!(recovered.stats(), before);
+    assert_eq!(contents(&recovered, b""), model);
+    let snapshot_contents = |snapshot: &Snapshot| {
+        let mut workspace = EngineWorkspace::new();
+        let mut scan = snapshot.scan_prefix(b"", &mut workspace);
+        let mut seen = Model::new();
+        while let Some(record) = scan.next_record().unwrap() {
+            seen.insert(record.key.to_vec(), record.value.to_vec());
+        }
+        seen
+    };
+    assert_eq!(snapshot_contents(&snapshot), model);
+
+    recovered.set_run_limits(usize::MAX, usize::MAX);
+    compact_all(&recovered);
+    assert!(recovered.stats().run_bytes > before.run_bytes);
+    assert_eq!(contents(&recovered, b""), model);
+    assert_eq!(snapshot_contents(&snapshot), model);
 }
 
 #[test]
