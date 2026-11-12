@@ -258,6 +258,113 @@ fn checkpoints_recover_under_any_compression() {
     );
 }
 
+/// Like the codec, the block length decides only what new runs use: each
+/// block records its length, so runs of every length are read side by side
+/// and recover under any setting, and compactions and checkpoints rewrite
+/// what they write in the current one.
+#[test]
+fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
+    const LENGTHS: [usize; 3] = [16 << 10, 2 << 10, 256];
+    let with = |target_block_len| EngineOptions {
+        target_run_len: 1 << 20,
+        target_block_len,
+        ..EngineOptions::default()
+    };
+    // The decoded block one lookup leaves in a fresh workspace.
+    let block_of = |engine: &Engine, key: u32| {
+        let mut workspace = EngineWorkspace::new();
+        engine.get(&key.to_be_bytes(), &mut workspace).unwrap();
+        assert_eq!(workspace.blocks_loaded(), 1);
+        workspace.capacity()
+    };
+    // Records here are under 64 bytes, so a block passes its target by less.
+    let within = |block: usize, target: usize| block <= target + 64;
+    let mut blocks = Vec::new();
+    for written in LENGTHS {
+        let scratch = Scratch::new(&format!("block-length-{written}"));
+        let engine = Engine::new(with(written));
+        let mut model = Model::new();
+        for i in 0..3_000u32 {
+            let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
+            engine.put(&key, value.as_bytes()).unwrap();
+            model.insert(key, value.into_bytes());
+        }
+        engine.flush().unwrap();
+        compact_all(&engine);
+        let block = block_of(&engine, 4);
+        assert!(within(block, written), "{block} for {written}");
+        blocks.push(block);
+        engine
+            .checkpoint(&scratch.0, CheckpointOptions::default())
+            .unwrap();
+
+        for read in LENGTHS {
+            let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
+            assert_eq!(contents(&recovered, b""), model, "{written} as {read}");
+            // Recovered runs keep their blocks.
+            assert_eq!(block_of(&recovered, 4), block, "{written} as {read}");
+            // A newer run in the configured length beside them: overwrites,
+            // deletes, and keys only the older run holds.
+            let mut newer = model.clone();
+            for i in (0..3_000u32).step_by(7) {
+                let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
+                recovered.put(&key, value.as_bytes()).unwrap();
+                newer.insert(key, value.into_bytes());
+            }
+            for i in (1..3_000u32).step_by(11) {
+                recovered.delete(&i.to_be_bytes()).unwrap();
+                newer.remove(&i.to_be_bytes()[..]);
+            }
+            recovered.flush().unwrap();
+            assert!(recovered.stats().max_overlap > 1);
+            assert_eq!(contents(&recovered, b""), newer, "{written} as {read}");
+            assert_eq!(
+                get(&recovered, &7u32.to_be_bytes()),
+                Some(b"newer 7".to_vec())
+            );
+            assert_eq!(get(&recovered, &12u32.to_be_bytes()), None);
+            assert_eq!(block_of(&recovered, 4), block, "{written} as {read}");
+
+            // A checkpoint of the mixed runs writes every run in the current
+            // length, whatever the engine it is recovered into is set to.
+            let again = Scratch::new(&format!("block-length-{written}-{read}"));
+            recovered
+                .checkpoint(&again.0, CheckpointOptions::default())
+                .unwrap();
+            let reopened = Engine::recover(&again.0, with(written)).unwrap();
+            assert_eq!(contents(&reopened, b""), newer, "{written} as {read}");
+            assert!(within(block_of(&reopened, 4), read), "{written} as {read}");
+
+            // Compaction rewrites the merged runs in the configured length;
+            // a snapshot keeps reading the runs it replaced.
+            let snapshot = recovered.snapshot().unwrap();
+            compact_all(&recovered);
+            assert_eq!(recovered.stats().max_overlap, 1);
+            assert_eq!(contents(&recovered, b""), newer, "{written} as {read}");
+            assert!(within(block_of(&recovered, 4), read), "{written} as {read}");
+            let mut workspace = EngineWorkspace::new();
+            let mut scan = snapshot.scan_prefix(b"", &mut workspace);
+            let mut seen = Model::new();
+            while let Some(record) = scan.next_record().unwrap() {
+                seen.insert(record.key.to_vec(), record.value.to_vec());
+            }
+            assert_eq!(seen, newer, "snapshot, {written} as {read}");
+        }
+    }
+    assert!(blocks[0] > blocks[1] && blocks[1] > blocks[2], "{blocks:?}");
+
+    // Lengths above the largest the engine builds are treated as it: these
+    // records, about 100 KB, would otherwise be one block.
+    let engine = Engine::new(with(usize::MAX));
+    for i in 0..3_000u32 {
+        let value = format!("value {} of {i}", i % 10);
+        engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();
+    }
+    engine.flush().unwrap();
+    let block = block_of(&engine, 2_999);
+    assert!(within(block, 64 << 10) && block > 32 << 10, "{block}");
+}
+
 /// After a switch to a less compact codec, a compaction that would grow the
 /// runs past `max_run_bytes` is refused and leaves the runs, their contents
 /// and a snapshot's view as they were; lifting the limit lets it through.

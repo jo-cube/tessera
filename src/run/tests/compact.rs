@@ -4,7 +4,8 @@
 use crate::block::Value;
 use crate::run::{
     CONTEXT_ALLOWANCE, Codec, CompactError, CompactLimits, Compacted, ConflictingCopies,
-    MergeWorkspace, ReadError, ReadWorkspace, Run, RunBuilder, compact,
+    MAX_ENGINE_BLOCK_LEN, MergeWorkspace, ReadError, ReadWorkspace, Run, RunBuilder,
+    TARGET_BLOCK_LEN, compact,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -41,6 +42,7 @@ const UNLIMITED: CompactLimits = CompactLimits {
     max_output_bytes: usize::MAX,
     max_workspace_bytes: usize::MAX,
     codec: Codec::Zstd,
+    target_block_len: crate::run::TARGET_BLOCK_LEN,
 };
 
 fn merge(
@@ -212,28 +214,37 @@ fn limits_fail_the_merge_with_the_amount_needed() {
 }
 
 /// The workspace estimate allows a fixed amount per codec context; the real
-/// contexts, measured by Zstandard itself, must fit in it.
+/// contexts, measured by Zstandard itself, must fit in it at every block
+/// length the engine builds. A compression context grows with the block.
 #[test]
 fn measured_codec_contexts_fit_their_allowance() {
-    let input: Vec<(String, u64, Option<String>)> = (0..3_000)
-        .map(|i| (format!("key{i:05}"), i + 1, Some(format!("{:064}", i * 7))))
-        .collect();
-    let mut builder = RunBuilder::default();
-    for (key, seq, value) in &input {
-        let value = Value::Bytes(value.as_deref().unwrap().as_bytes());
-        builder.add(key.as_bytes(), *seq, value).unwrap();
-    }
-    assert!(builder.context_bytes() > 0);
-    assert!(
-        builder.context_bytes() <= CONTEXT_ALLOWANCE,
-        "{}",
-        builder.context_bytes()
-    );
-    let run = builder.finish();
+    for target in [256, TARGET_BLOCK_LEN, MAX_ENGINE_BLOCK_LEN] {
+        // Two blocks' worth, so that one block reaches the target.
+        let input: Vec<(String, String)> = (0..2 * target / 72 + 64)
+            .map(|i| (format!("key{i:07}"), format!("{:064}", i * 7)))
+            .collect();
+        let mut builder = RunBuilder::with_target_block_len(Codec::Zstd, target);
+        for (seq, (key, value)) in input.iter().enumerate() {
+            let value = Value::Bytes(value.as_bytes());
+            builder.add(key.as_bytes(), seq as u64 + 1, value).unwrap();
+        }
+        assert!(builder.context_bytes() > 0);
+        assert!(
+            builder.context_bytes() <= CONTEXT_ALLOWANCE,
+            "{} at {target}",
+            builder.context_bytes()
+        );
+        let run = builder.finish();
+        assert!(run.view().largest_block_len().unwrap() >= target - 64);
 
-    let views = [run.view()];
-    let mut workspace = MergeWorkspace::new();
-    compact(&views, |_| true, UNLIMITED, &mut workspace).unwrap();
-    assert!(workspace.context_bytes() > 0);
-    assert!(workspace.context_bytes() <= CONTEXT_ALLOWANCE);
+        let views = [run.view()];
+        let mut workspace = MergeWorkspace::new();
+        let limits = CompactLimits {
+            target_block_len: target,
+            ..UNLIMITED
+        };
+        compact(&views, |_| true, limits, &mut workspace).unwrap();
+        assert!(workspace.context_bytes() > 0);
+        assert!(workspace.context_bytes() <= CONTEXT_ALLOWANCE);
+    }
 }

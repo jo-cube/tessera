@@ -25,6 +25,10 @@
 //! keeps fixtures on tmpfs. Data comes from fixed seeds, so every run sees
 //! the same keys and values; timings vary with the machine, so compare
 //! configurations only within one environment and one pass of the suite.
+//!
+//! Two variables change the runs every mode builds: `BENCH_BLOCK_LEN`, the
+//! target block length in bytes, and `BENCH_COMPRESSION`, one of `zstd`,
+//! `lz4` and `none` (the `workloads-*` modes choose their own codec).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -120,6 +124,8 @@ fn shuffled(count: u64, seed: u64) -> Vec<u64> {
 fn options(memtable_budget: usize) -> EngineOptions {
     EngineOptions {
         memtable_budget,
+        target_block_len: block_len(),
+        compression: compression(),
         max_runs: usize::MAX,
         max_run_bytes: usize::MAX,
         snapshots: SnapshotLimits {
@@ -127,6 +133,24 @@ fn options(memtable_budget: usize) -> EngineOptions {
             max_retained_bytes: usize::MAX,
         },
         ..EngineOptions::default()
+    }
+}
+
+/// `BENCH_BLOCK_LEN` bytes, or the engine's default.
+fn block_len() -> usize {
+    std::env::var("BENCH_BLOCK_LEN").map_or(EngineOptions::default().target_block_len, |len| {
+        len.parse().expect("BENCH_BLOCK_LEN is a byte count")
+    })
+}
+
+/// `BENCH_COMPRESSION`, or the engine's default.
+fn compression() -> Compression {
+    match std::env::var("BENCH_COMPRESSION").as_deref() {
+        Err(_) => Compression::default(),
+        Ok("zstd") => Compression::Zstd,
+        Ok("lz4") => Compression::Lz4,
+        Ok("none") => Compression::Uncompressed,
+        Ok(other) => panic!("BENCH_COMPRESSION {other:?} is not zstd, lz4 or none"),
     }
 }
 
@@ -2397,6 +2421,11 @@ fn recovery(base: &Path) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let base = PathBuf::from(args.get(1).map_or("/tmp", String::as_str));
+    println!(
+        "Runs built with {:?} in {} B blocks.",
+        compression(),
+        block_len()
+    );
     let start = Instant::now();
     match args.first().map(String::as_str) {
         Some("memtable") => memtable(),

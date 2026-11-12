@@ -107,7 +107,9 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
-pub use compact::{CompactError, CompactLimits, CompactStats, Compacted, compact};
+pub use compact::{
+    CompactError, CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, compact,
+};
 pub(crate) use logical::latest_in;
 pub use logical::{
     ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError,

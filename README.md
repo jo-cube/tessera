@@ -83,6 +83,15 @@ and about 1.2–1.7× the run memory is affordable; choose `Uncompressed` when
 the uncompressed dataset fits comfortably, which costs least for small
 binary records. The order held with writes and compaction running.
 
+`EngineOptions::target_block_len` (16 KiB by default) sets the block length
+of new runs. Under Zstandard, 4 KiB blocks made lookups that reach a run
+about 2.4–2.8× faster through the engine; they cost about 4% more run
+memory on small binary records but about 24% more on JSON-like values, and
+scans of hundreds of records or more ran up to 1.7× slower (least on small
+records). Like the codec,
+the setting can change between restarts: runs and checkpoints of any block
+length stay readable.
+
 ## Engine
 
 `put` and `delete` return the write's sequence number. `get` returns a key's

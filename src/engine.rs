@@ -294,7 +294,8 @@ use crate::memtable::{
     FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, Run, RunView, compact, latest_in,
+    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_ENGINE_BLOCK_LEN, Run, RunView,
+    TARGET_BLOCK_LEN, compact, latest_in,
 };
 
 type SharedRun = Arc<Published>;
@@ -355,11 +356,29 @@ pub struct EngineOptions {
     /// How the runs this engine builds store their blocks. See
     /// [`Compression`].
     pub compression: Compression,
+    /// Bytes of records per block, before compression, in the runs that
+    /// flushes, compactions and checkpoints build: 16 KiB by default. Every
+    /// run read decodes one block, so smaller blocks make lookups and the
+    /// first record of a scan cheaper, and cost memory: each block compresses
+    /// on its own and adds an index entry and a frame header (see
+    /// `docs/benchmarks.md`). Blocks are cut at record boundaries, so a
+    /// record larger than this is a block of its own. Values above 64 KiB are
+    /// treated as 64 KiB, which keeps compression contexts within the
+    /// compaction workspace estimate. Any smaller value is valid, down to a
+    /// block per record, at about 20 bytes of index and frame header a
+    /// block.
+    ///
+    /// Each block records its own length, so an engine reads runs of every
+    /// block length whatever this is set to, as with [`Self::compression`]:
+    /// existing runs and checkpoints keep their blocks until compaction or a
+    /// checkpoint rewrites their records.
+    pub target_block_len: usize,
 }
 
 impl Default for EngineOptions {
     /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs, no
-    /// background compaction, the default snapshot limits, and Zstandard.
+    /// background compaction, the default snapshot limits, and Zstandard in
+    /// 16 KiB blocks.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -370,6 +389,7 @@ impl Default for EngineOptions {
             background_compaction: None,
             snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
+            target_block_len: TARGET_BLOCK_LEN,
         }
     }
 }
@@ -378,7 +398,8 @@ impl Default for EngineOptions {
 /// blocks: the trade between memory and the cost of reading a run.
 ///
 /// Every read of a run, a lookup or a scan's first record in it, decodes a
-/// 16 KiB block, so the codec sets most of a run read's cost; reading from
+/// block ([`EngineOptions::target_block_len`], 16 KiB by default), so the
+/// codec sets most of a run read's cost; reading from
 /// the memtables costs the same under all three. In the measurements in
 /// `docs/benchmarks.md`, a lookup in a run took about 8 µs
 /// with Zstandard, 2 µs with LZ4 and 0.5 µs uncompressed, and runs of
@@ -824,6 +845,8 @@ struct Core {
     target_run_len: usize,
     /// The codec of the runs this engine builds.
     codec: Codec,
+    /// The block length, before compression, of the runs this engine builds.
+    target_block_len: usize,
     snapshot_limits: SnapshotLimits,
     /// Cloned by every snapshot, so that its count is the live snapshots.
     snapshots: Arc<()>,
@@ -1016,6 +1039,7 @@ impl Core {
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
+            target_block_len: options.target_block_len.min(MAX_ENGINE_BLOCK_LEN),
             snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
             background: options.background_compaction.map(|_| worker::Signal::new()),
@@ -1524,7 +1548,12 @@ impl<'e> FlushJob<'e> {
     /// are merged as one, keeping each key's newest update.
     fn build(self) -> BuiltFlush<'e> {
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
-        let runs = flush_merged(&tables, self.engine.target_run_len, self.engine.codec);
+        let runs = flush_merged(
+            &tables,
+            self.engine.target_run_len,
+            self.engine.codec,
+            self.engine.target_block_len,
+        );
         BuiltFlush { job: self, runs }
     }
 
@@ -1909,6 +1938,7 @@ impl<'e> CompactionJob<'e> {
             max_output_bytes: self.options.max_output_bytes,
             max_workspace_bytes: self.options.max_workspace_bytes,
             codec: self.engine.codec,
+            target_block_len: self.engine.target_block_len,
         };
         let output = compact(&views, keep_tombstone, limits, workspace)?;
         #[cfg(test)]

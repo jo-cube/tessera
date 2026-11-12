@@ -31,12 +31,22 @@ pub struct CompactLimits {
     pub max_workspace_bytes: usize,
     /// How the output runs store their blocks.
     pub codec: Codec,
+    /// Bytes per output block before compression, as for
+    /// [`RunBuilder::with_target_block_len`].
+    pub target_block_len: usize,
 }
 
 /// Bytes allowed for one Zstandard context, compressing 16 KiB blocks at level
 /// 3 or decompressing them. Measured contexts are well below this; a test
 /// checks it.
 pub const CONTEXT_ALLOWANCE: usize = 1 << 20;
+
+/// The largest block length the engine builds. A Zstandard compression
+/// context grows with the block it compresses: at level 3 it measured
+/// 0.28 MB for 16 KiB blocks, 0.66 MB for 64 KiB and 1.3 MB from 256 KiB,
+/// so beyond this a context would outgrow [`CONTEXT_ALLOWANCE`] and the
+/// workspace estimate would understate it. A test checks it.
+pub const MAX_ENGINE_BLOCK_LEN: usize = 64 << 10;
 
 /// Returns an upper estimate of what compacting `inputs` needs beside its
 /// output: per input, a decoded copy of its largest block and a decompression
@@ -142,7 +152,7 @@ impl fmt::Display for CompactError {
 
 impl std::error::Error for CompactError {}
 
-/// Merges `inputs` into new runs with the default codec and block size, keeping
+/// Merges `inputs` into new runs with the limits' codec and block length, keeping
 /// only the newest version of each user key.
 ///
 /// - Older versions are dropped. This assumes no reader needs anything but the
@@ -263,7 +273,8 @@ impl Output {
 
     fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
         let builder = self.builder.get_or_insert_with(|| {
-            let mut builder = RunBuilder::new(self.limits.codec);
+            let mut builder =
+                RunBuilder::with_target_block_len(self.limits.codec, self.limits.target_block_len);
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder
         });

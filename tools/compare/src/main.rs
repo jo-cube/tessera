@@ -256,6 +256,11 @@ impl Tessera {
             max_runs: 256,
             background_compaction: Some(CompactionOptions::default()),
             compression,
+            // `BENCH_BLOCK_LEN` bytes, as in the engine's benchmark (5AC).
+            target_block_len: std::env::var("BENCH_BLOCK_LEN")
+                .map_or(EngineOptions::default().target_block_len, |len| {
+                    len.parse().expect("BENCH_BLOCK_LEN is a byte count")
+                }),
             ..EngineOptions::default()
         });
         Self {

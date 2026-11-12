@@ -60,6 +60,9 @@ Kinds of result in this file:
 - **Layout research, run layer:** the 5AB section, candidate run layouts
   built and read beside the production run in `src/run/tests/layouts.rs`;
   none is used by the engine.
+- **Engine option, paired:** the 5AC section, `target_block_len` at 16, 4
+  and 2 KiB through the benchmark suite and the 5Y harness's `tessera`
+  engine.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -1891,6 +1894,281 @@ JSON). For this milestone:
   milestone, not for a format change without one: the engine-level gain
   (more than one run, the memtable, mixed workloads), building and
   training on compaction, and the format questions above are untested.
+
+## Block length through the engine (5AC)
+
+*Engine measurements; the run format is unchanged.* 5AB found, at the run
+layer, that 4 KiB Zstandard blocks look up about 3× faster than 16 KiB
+blocks for 4% more memory on small records. This section measures block
+length alone (16, 4 and 2 KiB, Zstandard, with LZ4 at 16 and 4 KiB beside
+it) through the complete engine, before any dictionary.
+
+### The option
+
+- **Format:** none changed. Where a block is cut was already a builder
+  policy, not part of the format (`src/run/mod.rs`): each frame records
+  its decoded length, readers accept any length up to the block limit,
+  and compaction sizes its workspace from the largest block of its
+  inputs. `RunBuilder::with_target_block_len` already existed.
+- **`EngineOptions::target_block_len`** (default 16 KiB, so nothing
+  changes unless it is set) reaches every run the engine builds: memtable
+  flushes, compaction output and checkpoints, which rebuild their runs
+  from a snapshot scan. Existing runs keep their blocks until compaction
+  or a checkpoint rewrites their records; nothing is rewritten because
+  the setting changed. Values above 64 KiB are treated as 64 KiB: a
+  Zstandard compression context grows with its block (0.28 MB at 16 KiB,
+  0.66 MB at 64 KiB, 1.3 MB from 256 KiB, measured), and beyond 64 KiB it
+  would outgrow the 1 MiB per context that compaction's workspace
+  estimate allows. Smaller values down to a block per record are valid;
+  the run's index limits hold for any block length, since a run's input
+  bounds its record count.
+- **Tests:** `runs_of_any_block_length_recover_mix_and_are_rewritten`
+  (`tests/checkpoint.rs`) writes runs at 16 KiB, 2 KiB and 256 B and
+  recovers each checkpoint under every setting. It reads the recovered
+  runs beside newer runs of another length (overwrites, deletes, keys
+  only the old run holds), checks that recovered runs keep their blocks,
+  that a checkpoint of the mixed engine and a compaction rewrite in the
+  current length, and that a snapshot taken before the compaction still
+  reads what it saw. The randomized engine test against its model now
+  also draws block lengths of 64 B, 2 KiB and 16 KiB.
+- **Benchmarks:** `BENCH_BLOCK_LEN` and `BENCH_COMPRESSION` select the
+  block length and codec of every run `examples/bench.rs` builds;
+  `BENCH_BLOCK_LEN` does the same for the `tools/compare` harness's
+  `tessera` engine.
+
+### Method
+
+- **Engine benchmarks:** the 5V `lookups` and `scans` modes (500,000
+  records of 8 + 100 bytes in six storage shapes: memtable, consolidated,
+  9 overlapping runs, a run under a newer run, run + memtable, its
+  snapshot, and a 9-run history), and the `density` and `maintenance`
+  modes, for each of the five configurations.
+- **Real payloads:** the 5Y harness's `tessera` engine on `sensor:256`
+  (4.19M records, 8 + 14–32 bytes) and `json:64` (1.05M records, 8 +
+  about 545 bytes), with background compaction, in its overlapping and
+  consolidated states. RocksDB was not rerun.
+- **Pairing:** each matrix ran twice, the second pass in reverse order;
+  ranges below are the two passes. Every 4 and 2 KiB cell agreed within a
+  few percent. Some 16 KiB scan cells in the harness differed by up to
+  25% (16 KiB ran first in one pass); both values are given. Every scan
+  in `scans` and every full scan in the harness was checked against a
+  model.
+- **Memory:** only from `density` and the harness. The `lookups`, `scans`
+  and `maintenance` modes draw their 100-byte values from a pool of 64,
+  which large blocks find again: stored bytes are 0.31 of the payload at
+  16 KiB and 0.67 at 4 KiB, far more sensitive than any real payload.
+  Their latencies are comparable; their memory is not.
+
+### Point lookups
+
+Harness, consolidated state, p50 µs (p99), and throughput per thread:
+
+| dataset | block | present | overwritten | localized | deleted / missing | lookups/s, present |
+|---|---|---|---|---|---|---|
+| sensor | 16 KiB | 14.75–14.88 (19.2–19.3) | 14.75–14.83 | 13.3 | 0.13 | 67–68k |
+| | 4 KiB | 5.25 (5.9–6.4) | 5.25 | 4.63 | 0.13 | 188–189k |
+| | 2 KiB | 3.92 (4.3–4.6) | 3.88–3.92 | 3.46 | 0.13 | 255k |
+| JSON | 16 KiB | 13.75–14.42 (17.8–20.0) | 13.75–14.42 | 13.0–14.2 | 0.29–0.33 | 67–72k |
+| | 4 KiB | 5.79–5.88 (6.6–7.6) | 5.83–5.88 | 5.38–5.42 | 0.33 | 168–171k |
+| | 2 KiB | 4.46–4.58 (5.3–6.0) | 4.42–4.58 | 4.00–4.13 | 0.33 | 215–223k |
+
+With overlapping runs (sensor 5 runs, overlap 3; JSON 10–11 runs), present
+keys took 15.0–15.1, 5.29 and 3.96 µs on sensor and 13.8, 5.8–5.9 and
+4.5–4.6 µs on JSON; overwritten and deleted keys, found in the newer run
+alone (5Z's sequence-bound pruning), 17.5, 5.6 and 3.8 µs on sensor.
+
+`lookups` mode, p50 µs (the same in both passes within 0.1 µs unless a
+range is given):
+
+| shape, class | Zstd 16 KiB | 4 KiB | 2 KiB | LZ4 16 KiB | LZ4 4 KiB |
+|---|---|---|---|---|---|
+| consolidated, present random | 8.04 | 4.46–4.50 | 3.29 | 2.04–2.08 | 0.88–0.92 |
+| consolidated, hot 4,096-key range | 7.50 | 3.96 | 2.96 | 1.42 | 0.54 |
+| consolidated, overwritten | 8.08–8.12 | 4.46–4.50 | 3.25–3.29 | 2.00–2.08 | 0.88 |
+| 9 overlapping runs, present | 8.46–8.50 | 5.04–5.08 | 3.67–3.79 | 2.71 | 1.04–1.08 |
+| snapshot of run + memtable, present | 8.12–8.83 | 5.46–5.62 | 3.88–3.92 | 2.12–2.54 | 1.33 |
+| 9-run history, overwritten in 8 runs | 3.92–4.04 | 2.67–2.75 | 2.42 | 1.21–1.25 | 0.54–0.58 |
+| 9-run history, snapshot after 4 | 3.92–4.04 | 2.62–2.75 | 2.42 | 1.21 | 0.50 |
+
+- **Gain:** 4 KiB blocks make a run lookup 1.8× (100-byte values) to
+  2.8× (sensor) faster, 2 KiB blocks 2.4–3.8×, p99 alike; LZ4 at 4 KiB
+  9×. The engine keeps less of the run layer's gain (5AB: 2.9–3.0× at
+  4 KiB on sensor) because a lookup's fixed costs (memtables, run
+  selection, the filter, the index search) stay.
+- **Blocks decoded are unchanged:** 1.00 a present lookup on a
+  consolidated run, 1.01–1.07 with overlap, 1.00 for keys overwritten in 8
+  runs, in every configuration: pruning and filters do not depend on
+  block length. Bytes decompressed per lookup are therefore about one
+  block, roughly the target (derived, not counted). No lookup allocates.
+- **Unaffected:** memtable reads, filter-rejected keys (deleted keys
+  absent from a consolidated run, missing keys: 0.04–0.33 µs) and keys
+  beyond every run.
+
+### Prefix and ordered scans
+
+Harness, consolidated state; the seek is the time to the first record:
+
+| dataset | block | seek µs | 30 records µs | 480 µs | 1,920 µs | 15,360 ms | ns/record after seek | blocks: 30 / 480 / 1,920 | full scan M records/s |
+|---|---|---|---|---|---|---|---|---|---|
+| sensor | 16 KiB | 14.5–14.7 | 16.3–16.8 | 48–58 | 146–187 | 1.05–1.37 | 68–94 | 1.06 / 1.97 / 4.87 | 11.1–14.3 |
+| | 4 KiB | 5.3–5.4 | 6.7–6.8 | 42.4–42.5 | 150 | 1.17 | 76–79 | 1.24 / 4.77 / 16.1 | 12.9–13.0 |
+| | 2 KiB | 4.0 | 5.6 | 48.1–48.5 | 177 | 1.39–1.40 | 91–96 | 1.51 / 8.58 / 31.2 | 10.9–11.0 |
+| JSON | 16 KiB | 13.8–14.7 | 27.7–29.3 | 246–261 | 914–971 | 7.2–7.6 | 466–524 | 2.0 / 17.3 / 66 | 2.08–2.12 |
+| | 4 KiB | 6.0–6.2 | 26.7–27.0 | 344–345 | 1,357–1,368 | 10.7–10.8 | 699–744 | 5.0 / 66 / 262 | 1.41–1.42 |
+| | 2 KiB | 4.7–5.0 | 34.3–34.9 | 484–490 | 1,926–1,945 | 15.3–15.5 | 996–1,053 | 9.1 / 131 / 524 | 1.00 |
+
+`scans` mode (100-byte values; µs per scan):
+
+| shape, prefix | Zstd 16 KiB | 4 KiB | 2 KiB | LZ4 16 KiB | LZ4 4 KiB |
+|---|---|---|---|---|---|
+| consolidated, 32 keys | 11.0 | 8.8–9.3 | 8.5–8.7 | 3.8 | 2.4 |
+| consolidated, 512 keys | 48.7–49.2 | 70.1–73.0 | 87.6–87.7 | 25.1–25.5 | 23.2–23.7 |
+| consolidated, 2,048 keys | 169 | 269–284 | 337 | 93–96 | 89–91 |
+| consolidated, every key (ms) | 39.1–39.7 | 63.7–66.9 | 79.9–80.7 | 22.0–22.2 | 21.7 |
+| consolidated, no match inside the range | 7.6 | 4.4–4.6 | 3.0–3.1 | 1.5 | 0.6 |
+| 9 overlapping runs, 32 keys | 82.6–84.3 | 50.9–53.1 | 41.4–41.7 | 25.4–25.6 | 12.4–12.7 |
+| 9 overlapping runs, 512 keys | 165–167 | 166–177 | 185–186 | 85–86 | 72 |
+| 9 overlapping runs, no match inside the range | 71.4–72.2 | 37.2–38.9 | 28.5–28.7 | 15.1–15.3 | 4.9 |
+| run + newer run, 32 keys | 21.1–21.4 | 16.6–17.2 | 14.8–14.9 | 6.6–6.7 | 3.9–4.0 |
+| run + newer run, 512 keys | 75.6–76.2 | 109–114 | 129–130 | 45.6–46.5 | 34.7–34.8 |
+
+- **Seeks gain what lookups gain:** 2.2–2.8× at 4 KiB and 2.8–3.7× at
+  2 KiB on the real payloads (1.7–1.9× and 2.5× on the 100-byte values),
+  for each run the scan reads: a no-match prefix inside the key range of
+  9 overlapping runs takes 1.9× and 2.5× less.
+- **Iteration loses under Zstandard:** each block costs a fixed amount
+  to decode besides its bytes, so iteration slows as blocks shrink:
+  100-byte values from 93 ns a record at 16 KiB to 150–159 at 4 KiB and
+  about 190 at 2 KiB; JSON from about 490 to 700–740 and 1,000–1,050;
+  sensor, whose blocks hold many records, from 68–94 to 76–79 and
+  91–96. From the full scans, an extra Zstandard block costs about
+  2–3 µs beyond its bytes (derived: the difference in scan time over the
+  difference in blocks). LZ4 shows almost none: iteration is 48–55 ns a
+  record at both lengths.
+- **Crossover:** at 4 KiB, a scan gains while the seek dominates. On
+  sensor it is ahead up to about 500 records and level at 2,000; on JSON
+  level at 30 records and 1.35–1.5× slower beyond; full scans run 1.5×
+  slower on JSON and 1.65× on the 100-byte values, about level on sensor.
+  2 KiB is slower than 4 KiB on every scan longer than about 30 records.
+- **Workspace:** one decoded block per participating run: 16, 4 and
+  2 KiB for one run, 144, 36 and 18 KiB for nine; two allocations a scan
+  in every configuration. Block transitions follow records over block
+  capacity: 4× and 8× as many at 4 and 2 KiB.
+
+### Memory
+
+Consolidated, from `density` (one run, filters included) and the harness
+(the engine's charge, and resident memory after trimming):
+
+| payload | block | run MiB | vs 16 KiB | heap B/record in runs | resident MiB |
+|---|---|---|---|---|---|
+| sensor, 1.5M × 14–32 B (`density`) | 16 KiB | 33.8 | | 25 | |
+| | 4 KiB | 34.5 | +2.1% | 25 | |
+| | 2 KiB | 35.7 | +5.6% | 26 | |
+| | LZ4 4 KiB | 41.2 | +22% | 30 | |
+| JSON, 120k × ~150 B–1 KiB (`density`) | 16 KiB | 16.7 | | 147 | |
+| | 4 KiB | 20.8 | +25% | 183 | |
+| | 2 KiB | 25.3 | +52% | 223 | |
+| documents, 15k × 1–6 KiB (`density`) | 16 KiB | 8.6 | | 600 | |
+| | 4 KiB | 10.9 | +27% | 762 | |
+| | 2 KiB | 12.1 | +41% | 845 | |
+| sensor, 4.19M (harness) | 16 KiB | 87.1 + 4.7 filter | | | 115 |
+| | 4 KiB | 90.4 + 4.7 | +3.8% | | 118 |
+| | 2 KiB | 94.1 + 4.7 | +8.0% | | 126 |
+| JSON, 1.05M (harness) | 16 KiB | 138 + 1.2 filter | | | 159 |
+| | 4 KiB | 171 + 1.2 | +24% | | 197 |
+| | 2 KiB | 208 + 1.2 | +51% | | 238–243 |
+
+- **Where the bytes go:** almost all of the growth is compression lost to
+  smaller blocks; index and frame headers grow from 0.27% of a sensor
+  run at 16 KiB to about 1% at 4 KiB (5AB's run-layer accounting), and
+  filters do not change. Metadata per run (footer, key range) is fixed.
+- **Small records pay little; structured values pay a quarter.** Sensor
+  blocks hold many short, similar records, so a 4 KiB block still finds
+  most of what 16 KiB finds; JSON and documents lose the repetition
+  between records, which is what 5AB's dictionaries recover.
+
+### Construction
+
+| | 16 KiB | 4 KiB | 2 KiB |
+|---|---|---|---|
+| flush, 250k × 108 B (`maintenance`), ms | 78–79 | 145–150 | 170 |
+| compaction, 8 runs × 250k, ms | 412–414 | 826–828 | 990 |
+| sensor (harness), consolidation CPU s | 2.20–2.22 | 2.41–2.43 | 2.83 |
+| sensor, load CPU s | 3.03–3.11 | 3.10–3.14 | 3.31–3.37 |
+| JSON (harness), base consolidation CPU s | 3.39–3.40 | 4.31–4.38 | 6.80–8.16 |
+| JSON, final consolidation CPU s | 4.70–4.93 | 4.86–4.91 | 8.82–9.23 |
+| JSON, load CPU s | 2.95–3.00 | 3.82–3.85 | 4.77–4.84 |
+| peak resident MiB, sensor / JSON consolidation | 224–248 / 243–280 | 236–253 / 294–335 | 248–272 / 361–393 |
+
+- **Zstandard pays per block when compressing too:** flushes of the
+  100-byte values take 1.9× and 2.2× as long; on real payloads,
+  consolidation costs 9% (sensor) to 27% (JSON) more CPU at 4 KiB and 28%
+  to 2× more at 2 KiB. LZ4 flushes and compactions cost the same at both
+  lengths (45–47 and 227–237 ms).
+- **Peaks** grow with the stored size of what is built (5AA: output plus
+  slack), so by the memory growth above; workspace estimates shrink with
+  the block (9.4 to 9.2 MiB in `maintenance`, dominated by contexts).
+
+### Decision
+
+- **The option stays, the default stays 16 KiB.** Smaller blocks are a
+  real, reproducible engine-level gain for point reads and seeks
+  (2.4–2.8× at 4 KiB on the real payloads, 1.8× on the 100-byte values;
+  3.0–3.8× at 2 KiB), with no correctness or
+  maintenance cost: the format already allowed them, the change is one
+  option passed to three builders, and compatibility is tested. But the
+  memory cost depends on the payload: about 4% on small binary records,
+  24–27% on structured values, where long scans and compaction also slow
+  by up to 1.5× and 27%. A default has to suit both, and 16 KiB keeps
+  density and scans; 4 KiB is an explicit choice for point-read-heavy
+  workloads, best on small records.
+- **2 KiB is not worth recommending under Zstandard:** a further 1.3×
+  on lookups for a second step of memory, slower scans than 4 KiB beyond
+  30 records, and about twice the consolidation CPU of 16 KiB on JSON.
+- **The per-block cost of Zstandard limits small blocks** (about 2–3 µs a
+  block beyond its bytes, here). Where it comes from was not examined
+  (frame setup on each decode and encode is the likely candidate); it
+  bounds what any small-block layout, dictionaries included, can gain on
+  scans and construction.
+
+### Toward dictionaries
+
+From 5AB (run layer) and the measurements above; estimates where marked.
+
+- **Initial target: 4 KiB.** At the run layer dictionary blocks at 4 KiB
+  were 7% smaller than today's 16 KiB blocks on JSON and 4.3–4.6×
+  faster to look up; at 2 KiB only 1% smaller for 7.4–8.8×. Through the
+  engine, plain 2 KiB blocks bought 1.3× over 4 KiB on lookups while
+  costing more on scans (1.4× slower iteration on JSON) and up to 1.9×
+  the compaction CPU; a dictionary does not remove the per-block decode
+  and encode cost. 4 KiB gives most of the lookup gain at the lowest scan
+  and construction cost.
+- **What a dictionary would buy back:** 4 KiB blocks alone cost JSON 24%
+  and documents 27% more memory; dictionaries turned that into −7% and
+  +2.4% at the run layer. On sensor they cost memory (5AB: +7.9%), and
+  plain 4 KiB blocks already give 2.8× for 3.8%.
+- **Minimum run size (estimate):** a 64 KiB dictionary costs about
+  150 KiB a run held in memory (raw bytes in the run plus the 89 KiB
+  decoding form), 1% of a 15 MiB run; training wanted about 6.4 MiB of
+  samples. Runs of a few MiB or less, such as flushes of small memtables,
+  are poor candidates; the default run target is 64 MiB of input.
+- **Compaction only:** compaction writes the runs that hold the data and
+  could train on its own output; flushes would stay plain. Training cost
+  0.14–0.68 s a run (5AB), fixed by the sample size rather than the run;
+  peak memory adds the samples, the trainer's workspace and the encoding
+  dictionary (not measured).
+- **Ownership:** the dictionary belongs to its run: stored in it, covered
+  by its checksums, its decoding form held as long as the run and charged
+  to `run_bytes`; readers keep their own decoding contexts, as now.
+- **Which runs:** an engine-wide setting, as for the codec and block
+  length, is the simplest policy and needs no adaptive selection; sensor
+  shows the setting can lose, so it would be the application's choice.
+- **Coexistence:** as with codecs and block lengths, the frame's codec
+  byte would say how to decode it, so dictionary and plain runs could sit
+  in one engine and one checkpoint, and compaction would rewrite in the
+  current setting. This milestone's mixed-length test is the pattern for
+  testing it.
 
 ## Historical results
 

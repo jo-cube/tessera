@@ -720,7 +720,9 @@ fn write_runs(
     let mut builder: Option<RunBuilder> = None;
     let mut input = 0;
     while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
-        let open = builder.get_or_insert_with(|| RunBuilder::new(core.codec));
+        let open = builder.get_or_insert_with(|| {
+            RunBuilder::with_target_block_len(core.codec, core.target_block_len)
+        });
         // Keys and values came from runs and memtables that held them.
         open.add(record.key, record.seq, Value::Bytes(record.value))
             .expect("live records fit a run");

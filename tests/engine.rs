@@ -991,6 +991,7 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                 Compression::Lz4,
                 Compression::Uncompressed,
             ][rng.below(3)],
+            target_block_len: [64, 2 << 10, 16 << 10][rng.below(3)],
         });
         let mut model = Model::new();
         // Charged per key in the active table, and what frozen tables are
