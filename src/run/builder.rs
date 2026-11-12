@@ -48,6 +48,7 @@ pub struct RunBuilder {
     keys: Vec<u8>,
     min_key_len: usize,
     record_count: usize,
+    max_seq: u64,
     key_hashes: KeyHashes,
 }
 
@@ -78,6 +79,7 @@ impl RunBuilder {
             keys: Vec::new(),
             min_key_len: 0,
             record_count: 0,
+            max_seq: 0,
             key_hashes: KeyHashes::new(),
         }
     }
@@ -104,6 +106,7 @@ impl RunBuilder {
             self.min_key_len = user_key.len();
         }
         self.record_count += 1;
+        self.max_seq = self.max_seq.max(seq);
         self.key_hashes.add(user_key);
         Ok(())
     }
@@ -170,7 +173,7 @@ impl RunBuilder {
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         data.shrink_to_fit();
-        Run::from_builder(data, self.key_hashes.finish())
+        Run::from_builder(data, self.key_hashes.finish(), self.max_seq)
     }
 
     fn should_cut(&self, user_key: &[u8], value: Value<'_>) -> bool {

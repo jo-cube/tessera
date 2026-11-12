@@ -756,6 +756,56 @@ fn lookups() {
         }
     }
 
+    // A deep history: a consolidated load, then the same eighth of the keys
+    // overwritten in each of 8 flushes, so those keys have a version in 9
+    // runs. A snapshot taken after the fourth flush sees the fourth version.
+    {
+        let engine = Engine::new(options(1 << 30));
+        for index in shuffled(RECORDS, 50) {
+            engine.put(&point_key(index), values.get(index)).unwrap();
+        }
+        engine.flush().unwrap();
+        consolidate(&engine);
+        let mut snapshot = None;
+        for round in 1..=8 {
+            for index in (0..RECORDS).step_by(8) {
+                engine
+                    .put(&point_key(index), values.get(index + round))
+                    .unwrap();
+            }
+            engine.flush().unwrap();
+            if round == 4 {
+                snapshot = Some(engine.snapshot().unwrap());
+            }
+        }
+        let order = shuffled(RECORDS, 52);
+        let probes = |deep: bool, seed: u64| -> Probes {
+            order
+                .iter()
+                .filter(|&&index| (index % 8 == 0) == deep)
+                .take(PROBES)
+                .map(|&index| (point_key(index), Some(index + if deep { seed } else { 0 })))
+                .collect()
+        };
+        let mut fixture = Fixture {
+            engine,
+            snapshot: None,
+        };
+        let sources = fixture.sources();
+        for (class, probes) in [
+            ("overwritten in 8 runs", probes(true, 8)),
+            ("present, never updated", probes(false, 0)),
+        ] {
+            let row = measure_gets(&fixture, &probes, &values);
+            println!("| 9-run history | {sources} | {class} | {row} |");
+        }
+        fixture.snapshot = snapshot;
+        let row = measure_gets(&fixture, &probes(true, 4), &values);
+        println!(
+            "| 9-run history, snapshot after 4 | {sources} | overwritten in 4 of its runs | {row} |"
+        );
+    }
+
     // The same lookups on 31-byte keys with long shared prefixes.
     for shape in [Shape::Consolidated, Shape::Overlapping] {
         let fixture = Fixture::new(shape, RECORDS, shared_key, &values);

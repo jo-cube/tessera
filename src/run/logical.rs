@@ -153,7 +153,12 @@ impl<'a> RunSet<'a> {
     where
         'a: 'r,
     {
-        latest_in(self.runs.iter().map(|&run| (run, None)), key, workspace)
+        // Views carry no sequence bound, so none is skipped for one.
+        latest_in(
+            self.runs.iter().map(|&run| (run, None, u64::MAX)),
+            key,
+            workspace,
+        )
     }
 
     /// Returns a cursor before the first live key. Nothing is decoded until
@@ -168,14 +173,29 @@ impl<'a> RunSet<'a> {
 }
 
 /// Finds the latest value of `key` across `runs`, as [`RunSet::get`] does,
-/// skipping a run only where its filter, if any, proves the key absent.
+/// skipping a run only where its filter, if any, proves the key absent, or
+/// where its bound, the largest sequence number it holds, is below that of
+/// a version already found.
+///
+/// Such a run cannot change the result. Every version in it is older than
+/// the one found, so it cannot be newest; and a copy of the newest version
+/// shares its sequence number, so it can only be in a run whose bound is at
+/// least that one, which is still read and checked for a conflict. This
+/// holds for runs given in any order and with interleaved sequence ranges;
+/// visiting them in descending order of their bounds makes it prune most.
+/// A bound of `u64::MAX` never prunes.
+///
+/// A lookup checks the integrity only of the blocks it decodes, so damage in
+/// a skipped run, like damage outside the key's range, cannot fail it. Every
+/// record of a run is validated when the run is loaded, and compaction reads
+/// every record of its inputs.
 pub(crate) fn latest_in<'a, 'r, I>(
     runs: I,
     key: &[u8],
     workspace: &'r mut LogicalWorkspace,
 ) -> Result<Option<LiveValue<'r>>, ReadError>
 where
-    I: ExactSizeIterator<Item = (RunView<'a>, Option<&'a KeyFilter>)>,
+    I: ExactSizeIterator<Item = (RunView<'a>, Option<&'a KeyFilter>, u64)>,
     'a: 'r,
 {
     let reads = workspace.merge.reads(runs.len());
@@ -183,7 +203,10 @@ where
     let mut hash = None;
     // Held until every run is read: a later run may supersede both copies.
     let mut disagreement = None;
-    for (input, ((run, filter), read)) in runs.zip(reads).enumerate() {
+    for (input, ((run, filter, max_seq), read)) in runs.zip(reads).enumerate() {
+        if newest.is_some_and(|(_, seq, _)| max_seq < seq) {
+            continue;
+        }
         if excluded(run, filter, key, &mut hash)? {
             continue;
         }

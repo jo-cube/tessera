@@ -975,6 +975,7 @@ impl Loaded {
         {
             let mut state = core.write_state();
             state.runs.extend(published(self.runs));
+            state.order_runs();
             state.run_bytes = self.run_bytes;
             state.filter_bytes = self.filter_bytes;
         }

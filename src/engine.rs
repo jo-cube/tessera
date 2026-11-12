@@ -697,6 +697,12 @@ struct State {
     /// Shared so that a compaction can read its inputs without the lock while
     /// flushes publish beside them.
     runs: Vec<SharedRun>,
+    /// The same runs in the order lookups read them: largest sequence number
+    /// first, so that a version found early lets `latest_in` skip the runs
+    /// holding only older ones. Rebuilt by [`State::order_runs`] whenever
+    /// `runs` changes; `runs` keeps publication order, which compaction
+    /// selection uses to break ties.
+    lookup_order: Vec<SharedRun>,
     run_bytes: usize,
     filter_bytes: usize,
     max_runs: usize,
@@ -735,6 +741,14 @@ struct Retained {
 }
 
 impl State {
+    /// Rebuilds `lookup_order` from `runs`. Publication is rare and runs are
+    /// few, so this sorts a fresh copy rather than maintaining one.
+    fn order_runs(&mut self) {
+        self.lookup_order.clone_from(&self.runs);
+        self.lookup_order
+            .sort_by_key(|run| std::cmp::Reverse(run.run.max_seq()));
+    }
+
     /// `filter_bytes` is `Some` for a run.
     fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, filter_bytes: Option<usize>) {
         self.retired
@@ -983,6 +997,7 @@ impl Core {
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
                 frozen: Vec::new(),
                 runs: Vec::new(),
+                lookup_order: Vec::new(),
                 run_bytes: 0,
                 filter_bytes: 0,
                 max_runs: options.max_runs,
@@ -1185,10 +1200,11 @@ impl Core {
         // is released: the result is the state at the lock, and a writer or
         // publication waits only for the memtable lookup, not for decoding.
         runs.clear();
-        runs.extend(state.runs.iter().cloned());
+        runs.extend(state.lookup_order.iter().cloned());
         drop(state);
         let found = latest_in(
-            runs.iter().map(|run| (run.run.view(), run.run.filter())),
+            runs.iter()
+                .map(|run| (run.run.view(), run.run.filter(), run.run.max_seq())),
             key,
             logical,
         )
@@ -1245,7 +1261,7 @@ impl Core {
         tables.extend(state.frozen.iter().rev().cloned());
         Ok(Snapshot {
             tables,
-            runs: state.runs.clone(),
+            runs: state.lookup_order.clone(),
             last_seq: state.last_seq,
             _live: Arc::clone(&self.snapshots),
         })
@@ -1575,6 +1591,7 @@ impl BuiltFlush<'_> {
             "a flush's tables are the oldest frozen ones"
         );
         state.runs.extend(published(runs));
+        state.order_runs();
         state.run_bytes += report.run_bytes;
         state.filter_bytes += report.filter_bytes;
         state.refused = None;
@@ -1973,6 +1990,7 @@ impl BuiltCompaction<'_> {
         }
         state.runs.retain(|run| !is_input(run));
         state.runs.extend(published(output.runs));
+        state.order_runs();
         state.run_bytes = stored;
         state.filter_bytes = filters;
         state.refused = None;
@@ -2157,7 +2175,7 @@ fn lookup_state<'r>(
         .active
         .get(key)
         .or_else(|| state.frozen.iter().rev().find_map(|table| table.get(key)));
-    resolve(in_memory, &state.runs, key, logical)
+    resolve(in_memory, &state.lookup_order, key, logical)
 }
 
 /// Decides `key` from the newest table update, or else from the runs.
@@ -2174,7 +2192,8 @@ fn resolve<'r>(
         }) => Ok(Some(LiveValue { seq, value })),
         Some(_) => Ok(None),
         None => latest_in(
-            runs.iter().map(|run| (run.run.view(), run.run.filter())),
+            runs.iter()
+                .map(|run| (run.run.view(), run.run.filter(), run.run.max_seq())),
             key,
             logical,
         ),
@@ -2479,6 +2498,112 @@ mod tests {
             engine.put(b"a", value).unwrap();
             engine.put(b"z", value).unwrap();
             engine.flush().unwrap();
+        }
+    }
+
+    /// A lookup's value and the run blocks it decoded, through each read
+    /// path that reaches the runs.
+    fn read_counting(engine: &Engine, key: &[u8]) -> [(Option<Vec<u8>>, u64); 2] {
+        let mut workspace = EngineWorkspace::new();
+        let got = engine
+            .get(key, &mut workspace)
+            .unwrap()
+            .map(|v| v.value.to_vec());
+        let direct = (got, workspace.blocks_loaded());
+        let mut workspace = EngineWorkspace::new();
+        let guard = engine.read();
+        let got = guard
+            .get(key, &mut workspace)
+            .unwrap()
+            .map(|v| v.value.to_vec());
+        [direct, (got, workspace.blocks_loaded())]
+    }
+
+    #[test]
+    fn a_lookup_decodes_only_the_newest_run_holding_the_key() {
+        let engine = Engine::new(EngineOptions::default());
+        overlapping_runs(&engine);
+        engine.put(b"m", b"live").unwrap();
+        engine.delete(b"z").unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.stats().max_overlap, 4);
+        // "a" is in three runs, the newest decides; "z" is deleted in a
+        // fourth; "m" is in one.
+        for (key, expected) in [
+            (&b"a"[..], Some(&b"3"[..])),
+            (b"z", None),
+            (b"m", Some(b"live")),
+        ] {
+            for (value, blocks) in read_counting(&engine, key) {
+                assert_eq!(value.as_deref(), expected);
+                assert_eq!(blocks, 1, "{key:?}");
+            }
+        }
+        // A snapshot keeps the runs it saw, and still reads one block.
+        let snapshot = engine.snapshot().unwrap();
+        engine.put(b"a", b"4").unwrap();
+        engine.flush().unwrap();
+        let mut workspace = EngineWorkspace::new();
+        let seen = snapshot
+            .get(b"a", &mut workspace)
+            .unwrap()
+            .unwrap()
+            .value
+            .to_vec();
+        assert_eq!((seen, workspace.blocks_loaded()), (b"3".to_vec(), 1));
+        assert_eq!(value(&engine, b"a").as_deref(), Some(&b"4"[..]));
+    }
+
+    /// Compaction selects the smallest runs, not adjacent ones, so its output
+    /// can span a run it left: here the output holds the oldest and newest
+    /// versions of "k" and the oldest of "j", and the run left between them
+    /// holds the newest of "j".
+    #[test]
+    fn a_partial_compaction_leaves_interleaved_runs_that_read_correctly() {
+        let engine = Engine::new(EngineOptions::default());
+        engine.put(b"j", b"j1").unwrap();
+        engine.put(b"k", b"k1").unwrap();
+        engine.flush().unwrap();
+        engine.put(b"j", b"j2").unwrap();
+        engine.put(b"k", b"k2").unwrap();
+        for i in 0..200u32 {
+            engine.put(format!("x{i:04}").as_bytes(), &[7; 64]).unwrap();
+        }
+        engine.flush().unwrap();
+        engine.put(b"k", b"k3").unwrap();
+        engine.flush().unwrap();
+        let before = engine.snapshot().unwrap();
+
+        let report = engine
+            .compact(
+                CompactionOptions {
+                    max_overlap: 2,
+                    max_inputs: 2,
+                    ..CompactionOptions::default()
+                },
+                &mut MergeWorkspace::new(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((report.inputs, report.outputs), (2, 1));
+        assert_eq!(engine.stats().runs, 2);
+        // "k": the output decides alone. "j": the output's version is older
+        // than the run it spans, which is still read.
+        for (value, blocks) in read_counting(&engine, b"k") {
+            assert_eq!((value.as_deref(), blocks), (Some(&b"k3"[..]), 1));
+        }
+        for (value, blocks) in read_counting(&engine, b"j") {
+            assert_eq!((value.as_deref(), blocks), (Some(&b"j2"[..]), 2));
+        }
+        let mut workspace = EngineWorkspace::new();
+        for (key, expected) in [(&b"j"[..], &b"j2"[..]), (b"k", b"k3")] {
+            let seen = before
+                .get(key, &mut workspace)
+                .unwrap()
+                .unwrap()
+                .value
+                .to_vec();
+            assert_eq!(seen, expected);
         }
     }
 

@@ -52,6 +52,9 @@ Kinds of result in this file:
 - **Competitive baseline:** the 5Y section, Tessera against RocksDB on
   identical data and operations, from the separate harness in
   `tools/compare`; read-only phases, plus the cost of building them.
+- **Engine change, paired:** the 5Z section, sequence-bound lookups
+  measured against the 5Y commit with the same benchmark source, plus the
+  harness's memory-cycle mode.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -640,7 +643,8 @@ It is safe but narrow: it saves one decode only for keys with versions in
 more than one run (17.8 → about 11 µs for overwritten keys in 9 runs under
 Zstandard, 1.2 → 0.9 µs uncompressed, *extrapolated* from the
 present-key cells). Consolidated data, absent keys and memtable hits gain
-nothing, and consolidation removes the case entirely. Deferred.
+nothing, and consolidation removes the case entirely. Deferred here;
+implemented in 5Z (see "Historical read amplification (5Z)").
 
 ### Decision
 
@@ -888,6 +892,10 @@ or more.
   stored bytes, Tessera's input bytes, so Tessera has about four times
   as many, smaller runs; their compaction policies differ (below), and
   so does the overlapping state they leave.
+- **Tessera-only additions (5Z):** a `MissingHeld` row, the same missing
+  keys read through one held `ReadGuard`, and a `tessera-cycles` engine
+  name that runs the memory cycles of the 5Z section instead of the
+  comparison phases.
 
 ### Datasets and states
 
@@ -1115,7 +1123,7 @@ one, examined against the code (`lookup_state`, `latest_in`, `select`):
   about the 13–14 µs of a present key (sensor 33 → ~15 µs; LZ4 11.8 →
   ~6 µs), a factor of 2, and by more for keys in deeper histories. It does
   nothing for consolidated data, present keys in one run, or missing keys.
-- **The smallest plausible change** (not made): record each published
+- **The smallest plausible change** (made in 5Z): record each published
   run's largest sequence number, keep the run list ordered by it, and in
   `latest_in` stop once the next run's largest sequence number is below
   the version found. The separate cost that grows with the number of
@@ -1146,6 +1154,239 @@ one, examined against the code (`lookup_state`, `latest_in`, `select`):
   the same compressed blocks in a page cache achieve the same latency at
   equal or better density. Tessera's measurable advantages are in
   iteration, small records and ingestion, not in lookup latency per byte.
+
+## Historical read amplification (5Z)
+
+*Engine change, measured.* A lookup used to read every run whose key range
+and filter admitted the key; it now stops once no remaining run can hold a
+version newer than the one found. Measured with the `lookups` and `scans`
+modes, two passes each, paired against the 5Y commit built from the same
+benchmark source, and with the comparison harness at `json:64`.
+
+### Version resolution: the rules
+
+What a lookup must return, established from the code
+(`lookup_state`, `latest_in`, `RunSet`, `select`, `publish`, checkpoint
+recovery and log replay):
+
+- **Precedence:** the version with the highest sequence number wins; a
+  tombstone is a version like any other, so a newer tombstone hides older
+  values and a newer value revives a deleted key.
+- **Sources:** the active memtable, then frozen memtables newest first,
+  then the runs. Every memtable record is newer than every run record (a
+  flush publishes a frozen table's records as a run only after they leave
+  the memtables, and new writes take higher sequence numbers), so a
+  memtable hit ends the lookup before any run is read. This is unchanged.
+- **Run order is not chronological.** Flushes append; compaction removes
+  its inputs and appends its output, after runs newer than some inputs.
+  Selection takes the *smallest* runs covering the deepest key, ties by
+  `(bytes, position)`, so it can merge an old run with a newer one and
+  leave a middle-aged run outside, and sequence ranges then interleave.
+- **Duplicates:** the contract accepts any number of copies of a
+  `(key, seq)` pair if they agree and reports corruption if copies of the
+  *newest* version differ; older versions are not compared. Nothing in the
+  engine creates copies: flushes and compactions replace their sources
+  atomically, compaction itself rejects conflicting copies among its
+  inputs, log replay applies only records above the checkpoint's sequence
+  number, and recovery rejects runs whose largest sequence number exceeds
+  the manifest's or that overlap. The read-time check is therefore
+  defensive (it detects damage or a future bug), not a correctness
+  requirement of normal operation.
+- **Snapshots** pin their memtable view and run list at creation; every
+  record they hold is at or below their sequence number, so no read path
+  filters by a ceiling and the same rules apply unchanged.
+- **Why older runs were inspected:** without per-run sequence bounds, and
+  with runs not in recency order, a version found in one run could not
+  prove that a later run in the list held nothing newer.
+
+### The stopping rule
+
+Each run carries its largest sequence number, `max_seq`. Runs are visited
+in descending `max_seq`; a run is skipped when a version at sequence `S`
+has been found and the run's `max_seq < S`.
+
+*Proof.* Every record in a run has a sequence number at most the run's
+`max_seq`, by definition, since `max_seq` is computed from the records
+present (by the builder as it adds them, and by validation when a run is
+loaded). A skipped run therefore holds only versions below `S`: none can
+outrank the version found, and none is a copy of it. A copy of the
+deciding version has sequence `S`, so it lies in a run with
+`max_seq >= S`, which the rule still reads, and the conflict check at the
+newest version is exactly as before. A newer tombstone is found first and
+ends the search the same way. The rule is correct in *any* visiting order,
+interleaved ranges included; the descending order only maximizes how much
+it skips. With interleaved ranges it prunes less: a run whose maximum is
+high but which holds only an old copy of the key is still read.
+
+Cases checked against it: overlapping and interleaved ranges (key range
+and filter exclusion still apply first, unchanged), snapshots (they pin
+the ordered list they were created with), equal-sequence copies (read and
+compared), conflicting older copies (skipped, as they were already
+ignored), memtables (resolved before runs), compaction outputs (their
+`max_seq` is computed from the records they keep, whatever was dropped), newly flushed runs
+(their records are the newest in the run set), recovery (recomputed from
+the records), and empty or tombstone-only runs (an empty run has
+`max_seq` 0 and holds nothing to find; a tombstone-only run is ordered by
+its tombstones like any other).
+
+### Metadata
+
+- **What:** one `u64` per run, held beside the run in memory.
+- **Format:** none changed. Every record already persists its sequence
+  number, so the value is recoverable from existing runs and checkpoints:
+  the builder tracks it as records are added, and `Run::new` and
+  `Run::recover` compute it in the validation walk they already perform
+  over every record. Checkpoints written before this change load
+  unchanged.
+- **Cost:** 8 bytes per run; no extra pass at construction or recovery.
+- **Order:** the engine keeps a second list of the same runs sorted by
+  descending `max_seq`, rebuilt (one clone of the run pointers and a sort)
+  each time a flush, compaction or recovery publishes runs. The original
+  list keeps publication order, so compaction selection and its
+  tie-breaks are untouched. Snapshots and lookups use the sorted list;
+  lookups allocate nothing.
+- **Corruption:** unchanged. Loading a run (`Run::new`, checkpoint
+  recovery) still validates every block and record, recovery still rejects
+  runs above the manifest's sequence number and overlapping runs, and
+  compaction still reads every input record. A lookup was never a full
+  integrity check: it verifies only the blocks it decodes, and a pruned
+  run, like one whose range or filter excludes the key, is not read. Normal
+  lookup correctness rests on the invariants above; finding historical
+  damage is the job of load-time validation and compaction.
+- **Not changed:** compaction selection, run storage and its format,
+  scans (they merge every run, so the rule does not apply), the
+  memtable path, and corruption checks.
+
+### Results
+
+`lookups` mode, 500k records of 8 + 100 bytes under Zstandard, mean of
+two passes each, warm ns and p99 µs; the 5Y commit (baseline) and this
+change built from the same benchmark source and run back to back.
+Allocation is zero per lookup in every row, before and after.
+
+| shape | lookup | before ns | after ns | p99 µs before → after | blocks before → after |
+|---|---|---|---|---|---|
+| consolidated | present | 8,156 | 8,169 | 11.8 → 11.9 | 1.00 → 1.00 |
+| consolidated | absent | 108 | 107 | 0.12 → 0.12 | 0.01 → 0.01 |
+| run + newer run | overwritten | 16,759 | 8,370 | 22.1 → 11.4 | 2.00 → 1.00 |
+| run + newer run | deleted | 16,734 | 8,360 | 22.2 → 14.4 | 2.00 → 1.00 |
+| run + newer run | present | 9,772 | 8,183 | 17.9 → 14.2 | 1.21 → 1.01 |
+| 9 overlapping runs | overwritten | 17,900 | 8,424 | 26.6 → 11.5 | 2.06 → 1.00 |
+| 9 overlapping runs | deleted | 17,949 | 8,423 | 26.9 → 11.6 | 2.06 → 1.00 |
+| 9 overlapping runs | present | 10,983 | 8,905 | 25.5 → 17.4 | 1.27 → 1.03 |
+| 9 overlapping runs | absent | 875 | 882 | 9.3 → 9.3 | 0.07 → 0.07 |
+| 9-run history | overwritten in 8 runs | 40,726 | 3,956 | 48.7 → 4.6 | 9.00 → 1.00 |
+| 9-run history | never updated | 8,346 | 8,267 | 16.5 → 16.0 | 1.07 → 1.07 |
+| 9-run history, snapshot after 4 | overwritten in 4 of its runs | 24,309 | 3,887 | 30.6 → 4.2 | 5.00 → 1.00 |
+| run + memtable | overwritten (memtable hit) | 366 | 332 | 0.75 → 0.67 | 0 → 0 |
+
+- **Updated and deleted keys** decode one block instead of one per run
+  holding a version: half the latency with two versions, a tenth with
+  nine. A snapshot gains the same, against its own run list.
+- **Present keys among overlapping runs** gain 16–19%: a filter false
+  positive in an older run no longer costs a decode once the key is found.
+- **The deep-history key costs 4 µs, not 8,** because its newest version
+  sits in a small flush run (an eighth of the keys) whose blocks stay in
+  the CPU caches; the baseline's 40.7 µs for 9 blocks is that 4 µs eight
+  times plus the base run's 8 µs. The per-block cost is unchanged; only
+  the number of blocks fell.
+- **No regressions:** consolidated, absent, memtable and snapshot rows,
+  and every `scans` row (seeks, short to full scans, under 1, 2 and 9
+  runs), are within ±5% of the baseline, mostly faster by noise.
+
+**Comparison harness** (one pass, against the two 5Y passes, `json:64`
+and `json:256`, overlapping state): overwritten keys 27.5 → 13.3 µs and
+28.8 → 14.0 µs, deleted 27.5 → 13.3 and 29.3 → 13.9 µs, all at 1.00
+blocks, now matching RocksDB's 13–14 µs and one block. Localized lookups
+1.14 → 1.00 blocks. Present, missing and scan rows match 5Y within its
+spread; the large dataset's consolidated present and missing keys read
+3% and 6% slower in this single pass (15.25 against 14.83 µs, 1.17
+against 1.10 µs, where 5Y's own two passes differed by up to 34% on
+missing keys), which is not distinguishable from noise here. Memory is
+unchanged: 566.6 MiB allocated at 3.9M records before and after, 141.6
+MiB at 1M.
+
+**Metadata overhead:** 8 bytes per run for the sequence number plus 8
+for its pointer in the second list; about 600 bytes at 38 runs. The
+publication-time sort is of the run count, not the data.
+
+### Run-range lookups (investigation)
+
+A lookup that reaches the runs walks the run list: per run it compares
+the key with the run's range (re-reading the run's footer), and only a run
+whose range holds the key probes its filter. Missing keys cost 0.08 µs
+with 2 runs, 0.31 µs with 10 and 1.10–1.27 µs with 38, about 30 ns a run.
+
+- **Pointer copies are a small part:** `Engine::get` copies the run
+  pointers under the lock, so it can read without it; the same missing
+  lookups through one held read guard, which copies nothing per lookup,
+  cost 1.21 against 1.27 µs (consolidated) and 1.36 against 1.49 µs
+  (overlapping) at 38 runs. The remaining 1.1 µs is the range checks.
+- **Binary search** needs runs sorted by key and disjoint. Consolidated
+  runs are disjoint but kept in publication order (and now also in
+  sequence order), not key order; overlapping runs would need an
+  interval structure, or a sorted list of starts with a scan back over
+  the runs that may still cover the key.
+- **Range checks against filter probes:** a range check is two key
+  comparisons after parsing the footer; a filter probe is a hash and a few
+  cache misses, run only where the range holds the key. Ranges exclude 37
+  of 38 runs in consolidated state, so filters are probed once.
+- **What an index would buy:** at most about 1 µs on a missing key at 38
+  runs, nothing measurable on a key that decodes a 14 µs block, and
+  nothing at the 2–10 runs that background compaction normally leaves.
+  Keeping each run's parsed range beside it (32–64 bytes a run) would
+  likely remove most of the per-run cost without any index.
+
+Not implemented: the benefit is confined to missing keys in large run
+counts, and the cheaper step (caching parsed ranges) would come first.
+
+### Memory over repeated cycles
+
+`tessera-cycles` in the comparison harness: load 1M JSON records
+(`json:64`), consolidate, then six cycles that each overwrite a quarter of
+the keys, flush, settle and consolidate. A snapshot is taken in cycle 3
+and dropped in cycle 4. Memory is read after each cycle without trimming;
+`malloc_trim` runs once at the end. Run once with glibc's defaults and
+once with `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072`, which fixes
+the threshold above which allocations are mapped individually.
+
+| cycle | live runs + filters MiB | allocated MiB | resident, default | heap free, default | resident, fixed threshold | heap free, fixed threshold |
+|---|---|---|---|---|---|---|
+| 0 (consolidated) | 148.7 | 149.7 | 244 | 111 | 211 | 61 |
+| 1 | 148.8 | 149.9 | 247 | 106 | 212 | 62 |
+| 2 | 148.9 | 149.9 | 267 | 125 | 211 | 61 |
+| 3 (snapshot held) | 148.9 + 186 retained | 336.1 | 458 | 130 | 397 | 61 |
+| 4 (released) | 148.8 | 149.9 | 290 | 148 | 214 | 64 |
+| 5 | 149.2 | 150.3 | 301 | 158 | 214 | 63 |
+| 6 | 149.4 | 150.5 | 265 | 123 | 214 | 63 |
+| after `malloc_trim` | | | 170 | | 152 | |
+
+- **Live data is flat:** runs and filters stay at 149 MiB and the
+  allocator's live total at 150 MiB through every cycle; nothing leaks.
+- **Snapshot-retained memory** is exactly the superseded runs the
+  snapshot pins (186 MiB, `retained_bytes`) and is freed when it drops.
+- **Transient compaction memory:** the per-cycle peak is 325–360 MiB
+  under defaults and 285–291 MiB with the fixed threshold, against 150
+  MiB live: compaction holds its inputs and its output together.
+- **Allocator-retained memory is reused, not growing.** Under defaults,
+  glibc maps the first run buffers individually (147 MiB mapped), then
+  raises its threshold as they are freed, so later run buffers come from
+  the heap (83–116 MiB mapped). Freed heap memory is kept and reused:
+  free heap moves between 106 and 158 MiB and resident memory between 244
+  and 301 MiB with no upward trend (cycle 6 is lower than cycles 4 and 5).
+  With the fixed threshold every run buffer is mapped and returned on
+  free: resident memory is steady at 211–214 MiB and free heap at 61–64
+  MiB (memtable and small allocations), with identical cycle times
+  (4.4–6.3 s in both).
+- **Stable and peak:** resident memory is 1.6–2.0× the live data under
+  defaults and 1.4× with the fixed threshold; the peak with a snapshot
+  held is 412–485 MiB.
+
+No production change: the engine allocates through the global allocator
+and leaves the policy to the application. A deployment that wants stable
+resident memory can set the tunable (or a different global allocator)
+without code changes; the measurement supports that, not a custom
+allocator or trimming in the engine.
 
 ## Historical results
 

@@ -833,3 +833,124 @@ fn logical_reads_match_a_reference_model() {
         }
     }
 }
+
+// Sequence-bound pruning: lookups that skip runs whose largest sequence
+// number is below a version already found.
+
+/// Reads `key` from `runs` in the order given, each bounded by its largest
+/// sequence number, and returns the result and the blocks decoded.
+type Found = Result<Option<(u64, Vec<u8>)>, ReadError>;
+
+fn get_bounded(runs: &[Run<Vec<u8>>], key: &[u8]) -> (Found, u64) {
+    let mut workspace = LogicalWorkspace::new();
+    let found = crate::run::latest_in(
+        runs.iter()
+            .map(|run| (run.view(), run.filter(), run.max_seq())),
+        key,
+        &mut workspace,
+    )
+    .map(|found| found.map(|found| (found.seq, found.value.to_vec())));
+    (found, workspace.blocks_loaded())
+}
+
+#[test]
+fn runs_know_their_largest_sequence_number_however_they_were_made() {
+    let records = [put(b"a", 4, b"x"), del(b"b", 9), put(b"c", 2, b"y")];
+    let built = build(Codec::Zstd, &records, SMALL_BLOCK);
+    assert_eq!(built.max_seq(), 9);
+    assert_eq!(Run::new(built.as_bytes().to_vec()).unwrap().max_seq(), 9);
+    let (recovered, max_seq) = Run::recover(built.as_bytes().to_vec()).unwrap();
+    assert_eq!((recovered.max_seq(), max_seq), (9, 9));
+    // Tombstones count; a run of nothing has 0.
+    assert_eq!(
+        build(Codec::None, &[del(b"a", 5)], SMALL_BLOCK).max_seq(),
+        5
+    );
+    assert_eq!(RunBuilder::new(Codec::None).finish().max_seq(), 0);
+}
+
+#[test]
+fn a_found_version_skips_runs_holding_only_older_ones() {
+    let runs: Vec<_> = [30, 20, 10]
+        .map(|seq| build(Codec::Zstd, &[put(b"k", seq, b"v")], SMALL_BLOCK))
+        .into_iter()
+        .collect();
+    // Newest first, the older runs are not decoded; in any other order the
+    // result is the same and only the saving is lost.
+    assert_eq!(get_bounded(&runs, b"k"), (Ok(Some((30, b"v".to_vec()))), 1));
+    let reversed: Vec<_> = runs
+        .iter()
+        .rev()
+        .map(|run| Run::new(run.as_bytes().to_vec()).unwrap())
+        .collect();
+    assert_eq!(
+        get_bounded(&reversed, b"k").0,
+        Ok(Some((30, b"v".to_vec())))
+    );
+
+    // A newest tombstone ends the search the same way.
+    let deleted = [
+        build(Codec::Lz4, &[del(b"k", 20)], SMALL_BLOCK),
+        build(Codec::None, &[put(b"k", 10, b"old")], SMALL_BLOCK),
+    ];
+    assert_eq!(get_bounded(&deleted, b"k"), (Ok(None), 1));
+}
+
+#[test]
+fn interleaved_sequence_ranges_are_read_until_no_run_can_be_newer() {
+    // The first run holds the oldest version of "k" but the largest sequence
+    // number overall; the second holds the newest version. A lookup that
+    // stopped at its first version would return seq 1.
+    let runs = [
+        build(
+            Codec::Zstd,
+            &[put(b"k", 1, b"old"), put(b"z", 10, b"z")],
+            SMALL_BLOCK,
+        ),
+        build(Codec::Lz4, &[put(b"k", 5, b"new")], SMALL_BLOCK),
+        build(Codec::None, &[put(b"k", 3, b"mid")], SMALL_BLOCK),
+    ];
+    // The third run's bound, 3, is below 5, so it is not decoded.
+    assert_eq!(
+        get_bounded(&runs, b"k"),
+        (Ok(Some((5, b"new".to_vec()))), 2)
+    );
+}
+
+#[test]
+fn a_copy_of_the_newest_version_is_still_checked() {
+    // The second run's bound equals the version found, so it is read.
+    let conflicting = [
+        build(
+            Codec::Zstd,
+            &[put(b"k", 7, b"x"), put(b"z", 9, b"z")],
+            SMALL_BLOCK,
+        ),
+        build(Codec::Zstd, &[put(b"k", 7, b"y")], SMALL_BLOCK),
+    ];
+    let error = get_bounded(&conflicting, b"k").0.unwrap_err();
+    assert_eq!(conflict_of(error).seq, 7);
+    let identical = [
+        build(
+            Codec::Zstd,
+            &[put(b"k", 7, b"x"), put(b"z", 9, b"z")],
+            SMALL_BLOCK,
+        ),
+        build(Codec::Lz4, &[put(b"k", 7, b"x")], SMALL_BLOCK),
+    ];
+    assert_eq!(
+        get_bounded(&identical, b"k"),
+        (Ok(Some((7, b"x".to_vec()))), 2)
+    );
+    // Copies of an older version never decided a lookup, and runs holding
+    // only them are now skipped.
+    let older = [
+        build(Codec::Zstd, &[put(b"k", 8, b"new")], SMALL_BLOCK),
+        build(Codec::Zstd, &[put(b"k", 3, b"p")], SMALL_BLOCK),
+        build(Codec::Zstd, &[put(b"k", 3, b"q")], SMALL_BLOCK),
+    ];
+    assert_eq!(
+        get_bounded(&older, b"k"),
+        (Ok(Some((8, b"new".to_vec()))), 1)
+    );
+}

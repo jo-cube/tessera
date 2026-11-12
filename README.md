@@ -154,7 +154,11 @@ block's last key and its key range; a point lookup decodes at most one
 block. Runs the engine builds carry an in-memory Bloom filter (10 bits a
 key), so lookups of absent keys usually decode nothing; filters are rebuilt
 on recovery, not stored. Reads merge the memtables and overlapping runs into
-the latest state of each key.
+the latest state of each key. Each run's largest sequence number is derived
+from its records when it is built or loaded, so a point lookup visits runs
+in descending order of it and stops once no remaining run can hold a newer
+version: an updated or deleted key usually decodes one block however many
+older runs hold it.
 
 A **memtable** holds the latest update of each key in a copy-on-write B+
 tree under a memory budget, so snapshots are constant-time.

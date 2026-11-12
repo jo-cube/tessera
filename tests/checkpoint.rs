@@ -227,6 +227,17 @@ fn checkpoints_recover_under_any_compression() {
             newer.remove(&2u32.to_be_bytes()[..]);
             recovered.flush().unwrap();
             assert!(recovered.stats().runs > 1);
+            // The newer run decides overwritten and deleted keys alone: the
+            // recovered run holding the older version is not decoded.
+            for (key, expected) in [(4u32, newer.get(&4u32.to_be_bytes()[..])), (2, None)] {
+                let mut workspace = EngineWorkspace::new();
+                let found = recovered
+                    .get(&key.to_be_bytes(), &mut workspace)
+                    .unwrap()
+                    .map(|found| found.value.to_vec());
+                assert_eq!(found.as_ref(), expected, "{written:?} as {read:?}");
+                assert_eq!(workspace.blocks_loaded(), 1, "key {key}");
+            }
             let snapshot = recovered.snapshot().unwrap();
             // Compaction writes the merged runs with the configured codec;
             // the snapshot keeps reading the runs it replaced.

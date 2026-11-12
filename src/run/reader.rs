@@ -33,6 +33,10 @@ pub struct Run<B> {
     data: B,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
+    /// The largest sequence number of any record, 0 if there are none. Not
+    /// stored: every record carries its sequence number, so the builder and
+    /// validation derive it.
+    max_seq: u64,
 }
 
 const VALIDATED: &str = "run bytes were validated or built by this crate";
@@ -48,15 +52,26 @@ impl<B: AsRef<[u8]>> Run<B> {
         expect(dead_code, reason = "tested component API the engine does not use")
     )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        validate(data.as_ref())?;
-        Ok(Self { data, filter: None })
+        let max_seq = validate(data.as_ref())?;
+        Ok(Self {
+            data,
+            filter: None,
+            max_seq,
+        })
     }
 
-    pub(super) fn from_builder(data: B, filter: Option<KeyFilter>) -> Self {
+    pub(super) fn from_builder(data: B, filter: Option<KeyFilter>, max_seq: u64) -> Self {
         Self {
             data,
             filter: filter.map(Box::new),
+            max_seq,
         }
+    }
+
+    /// Returns the largest sequence number of any record in the run, or 0
+    /// if it has none. No record in the run is newer.
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
     }
 
     /// Returns the bytes of the run's key filter, held beside the stored
@@ -153,18 +168,16 @@ impl Run<Vec<u8>> {
     /// the run and its largest sequence number (0 if empty). For runs read
     /// back from storage.
     pub(crate) fn recover(data: Vec<u8>) -> Result<(Self, u64), CorruptRun> {
-        validate(&data)?;
+        let max_seq = validate(&data)?;
         let mut hashes = KeyHashes::new();
-        let mut max_seq = 0;
         {
             let mut workspace = ReadWorkspace::new();
             let mut cursor = RunView::open(&data)?.cursor(&mut workspace);
             while let Some(record) = cursor.next_record()? {
                 hashes.add(record.key);
-                max_seq = max_seq.max(record.seq);
             }
         }
-        Ok((Self::from_builder(data, hashes.finish()), max_seq))
+        Ok((Self::from_builder(data, hashes.finish(), max_seq), max_seq))
     }
 }
 
@@ -805,7 +818,8 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// the next starts and each must hold its header. The key area is tiled the
 /// same way, and matching every index key against its block completes the
 /// index checks.
-fn validate(bytes: &[u8]) -> Result<(), CorruptRun> {
+/// Returns the largest sequence number of the run's records.
+fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
     let view = RunView::open(bytes)?;
     let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
@@ -843,5 +857,5 @@ fn validate(bytes: &[u8]) -> Result<(), CorruptRun> {
             RunCorruption::RecordCountMismatch,
         ));
     }
-    Ok(())
+    Ok(walk.max_seq)
 }

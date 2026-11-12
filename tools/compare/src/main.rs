@@ -230,6 +230,11 @@ trait Store {
     fn report(&self) -> String;
     /// The decoded-block workspace a reader holds, where known.
     fn workspace_bytes(&self) -> Option<usize>;
+    /// Times gets of `keys` through one read held for all of them, where
+    /// the engine has such a read; the nanoseconds of each.
+    fn held_gets(&mut self, _keys: &[[u8; 8]]) -> Option<Vec<u64>> {
+        None
+    }
     /// The directory whose files hold the data, if any.
     fn dir(&self) -> Option<PathBuf>;
 }
@@ -338,6 +343,21 @@ impl Store for Tessera {
 
     fn workspace_bytes(&self) -> Option<usize> {
         Some(self.workspace.capacity())
+    }
+
+    /// Through a read guard, which copies no run pointers per lookup.
+    fn held_gets(&mut self, keys: &[[u8; 8]]) -> Option<Vec<u64>> {
+        let guard = self.engine.read();
+        Some(
+            keys.iter()
+                .map(|key| {
+                    let start = Instant::now();
+                    let found = guard.get(key, &mut self.workspace).unwrap();
+                    black_box(found.map(|found| found.value.len()));
+                    start.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        )
     }
 
     fn dir(&self) -> Option<PathBuf> {
@@ -797,6 +817,20 @@ fn timed_reads<S: Store>(store: &mut S, data: Dataset, state: &str, seed: u64) {
             round_p50[ROUNDS - 1],
         );
     }
+    // Missing keys through one held read, beside the per-get path above.
+    let mut rng = Rng::new(seed + 50);
+    let keys: Vec<[u8; 8]> = (0..GET_OPS)
+        .map(|_| get_key(data, Get::Missing, &mut rng).0)
+        .collect();
+    let _ = store.held_gets(&keys);
+    if let Some(mut samples) = store.held_gets(&keys) {
+        let (p50, p99, mean) = summary(&mut samples);
+        println!(
+            "get\t{state}\tMissingHeld\tops={}\tp50_ns={p50}\tp99_ns={p99}\tmean_ns={mean:.0}\tops_per_s={:.0}\tround_p50_ns={p50}-{p50}",
+            samples.len(),
+            1e9 / mean,
+        );
+    }
     for (at, class) in SCANS.into_iter().enumerate() {
         let mut rng = Rng::new(seed + 100 + at as u64);
         let (mut totals, mut firsts) = (Vec::new(), Vec::new());
@@ -974,6 +1008,71 @@ fn checked_reads<S: Store>(store: &mut S, data: Dataset, state: &str, seed: u64)
     );
 }
 
+// Memory over repeated cycles.
+
+/// Loads and consolidates, then repeats: overwrite a quarter of the records,
+/// flush, settle and consolidate, reporting memory after each cycle without
+/// trimming. A snapshot is held through cycle 3 and released in cycle 4.
+fn cycles(data: Dataset) {
+    let mut store = Tessera::new(Compression::Zstd);
+    let (sampler, thread) = Sampler::start(None);
+    let records = data.records();
+    let report = |store: &Tessera, cycle: u64, phase: Phase, sampler: &Sampler| {
+        let (anon, _, _) = resident();
+        // SAFETY: mallinfo2 has no preconditions.
+        let heap = unsafe { mallinfo2() };
+        let stats = store.engine.stats();
+        let (_, _, peak) = sampler.take();
+        println!(
+            "cycle\t{cycle}\twall_s={:.2}\tanon_mib={:.1}\tallocated_mib={:.1}\theap_free_mib={:.1}\tmmapped_mib={:.1}\tpeak_anon_mib={:.1}\truns={}\trun_mib={:.1}\tfilter_mib={:.1}\tretained_mib={:.1}",
+            phase.start.elapsed().as_secs_f64(),
+            anon as f64 / 1024.0,
+            mib((heap.uordblks + heap.hblkhd) as u64),
+            mib(heap.fordblks as u64),
+            mib(heap.hblkhd as u64),
+            mib(peak),
+            stats.runs,
+            mib(stats.run_bytes as u64),
+            mib(stats.filter_bytes as u64),
+            mib(stats.retained_bytes as u64),
+        );
+    };
+    let phase = Phase::start();
+    for j in 0..records {
+        let index = data.shuffled(j, 0x9E37_79B1);
+        store.put(&data.key(index), &value(data.payload, index, 0));
+    }
+    store.settle();
+    store.consolidate();
+    report(&store, 0, phase, &sampler);
+    let mut snapshot = None;
+    for cycle in 1..=6u64 {
+        let phase = Phase::start();
+        for j in 0..records {
+            let index = data.shuffled(j, 0x85EB_CA6B);
+            if index % 4 == cycle % 4 {
+                store.put(&data.key(index), &value(data.payload, index, cycle));
+            }
+        }
+        store.flush();
+        store.settle();
+        match cycle {
+            3 => snapshot = Some(store.engine.snapshot().unwrap()),
+            4 => snapshot = None,
+            _ => {}
+        }
+        store.consolidate();
+        report(&store, cycle, phase, &sampler);
+    }
+    drop(snapshot);
+    // SAFETY: as above.
+    unsafe { malloc_trim(0) };
+    let (anon, _, _) = resident();
+    println!("cycle\ttrimmed\tanon_mib={:.1}", anon as f64 / 1024.0);
+    sampler.stop.store(true, Relaxed);
+    thread.join().unwrap();
+}
+
 // The run.
 
 fn run<S: Store>(mut store: S, data: Dataset) {
@@ -1096,6 +1195,7 @@ fn main() {
     match engine.as_str() {
         "tessera" => run(Tessera::new(Compression::Zstd), data),
         "tessera-lz4" => run(Tessera::new(Compression::Lz4), data),
+        "tessera-cycles" => cycles(data),
         "rocksdb" => run(rocks(false, None), data),
         "rocksdb-lz4" => run(rocks(true, None), data),
         "rocksdb-tuned" => run(rocks(false, Some(64 << 20)), data),
