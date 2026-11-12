@@ -238,7 +238,7 @@ pub(crate) fn choose(
 }
 
 /// The decoded length of every block of `inputs`, from frame headers.
-fn decoded_len(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
+pub(super) fn decoded_len(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     let mut total = 0usize;
     for input in inputs {
         for block in 0..input.block_count() {
@@ -248,16 +248,16 @@ fn decoded_len(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     Ok(total)
 }
 
-struct Samples {
+pub(super) struct Samples {
     /// Training blocks, back to back, with their lengths.
-    train: Vec<u8>,
-    sizes: Vec<usize>,
-    held: Vec<u8>,
+    pub(super) train: Vec<u8>,
+    pub(super) sizes: Vec<usize>,
+    pub(super) held: Vec<u8>,
 }
 
 /// Takes whole decoded blocks evenly across `inputs`, together at most
 /// [`SAMPLE_BUDGET`] bytes.
-fn sample(inputs: &[RunView<'_>], decoded: usize) -> Result<Samples, CorruptRun> {
+pub(super) fn sample(inputs: &[RunView<'_>], decoded: usize) -> Result<Samples, CorruptRun> {
     // Every `step`-th block, counted across inputs, so that blocks of the
     // average length fill the budget.
     let blocks: usize = inputs.iter().map(|input| input.block_count()).sum();
@@ -311,7 +311,7 @@ pub(super) fn train(samples: &[u8], sizes: &[usize]) -> Option<Trained> {
 /// The saving of `trained` on the held-out blocks, cut into output-sized
 /// pieces, in percent of their plain compressed size; `None` if nothing was
 /// held out.
-fn estimate(trained: &Trained, held: &[u8], target_block_len: usize) -> Option<i32> {
+pub(super) fn estimate(trained: &Trained, held: &[u8], target_block_len: usize) -> Option<i32> {
     const ROOM: &str = "output has the codec's worst-case length";
 
     let piece_len = target_block_len.max(1);
@@ -332,4 +332,21 @@ fn estimate(trained: &Trained, held: &[u8], target_block_len: usize) -> Option<i
     // Within ±100 for any real compressor output; clamped to stay an i32.
     let saving = 100 - (with.saturating_mul(100) / plain).min(1_000) as i64;
     Some(saving as i32)
+}
+
+/// A dictionary that already exists, prepared for compressing: its bytes,
+/// and the prepared decoding form to share, or a new one. For the reuse
+/// experiment in the tests (5AG); compaction always trains its own.
+#[cfg(test)]
+pub(super) fn reuse(bytes: &[u8], prepared: Option<&Arc<RunDictionary>>) -> Option<Trained> {
+    let cdict = CDict::try_create(bytes, ZSTD_LEVEL)?;
+    let prepared = match prepared {
+        Some(prepared) => Arc::clone(prepared),
+        None => Arc::new(RunDictionary::prepare(bytes)?),
+    };
+    Some(Trained {
+        bytes: bytes.to_vec(),
+        cdict,
+        prepared,
+    })
 }

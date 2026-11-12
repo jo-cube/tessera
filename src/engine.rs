@@ -2400,6 +2400,28 @@ impl fmt::Debug for Scan<'_> {
     }
 }
 
+/// For the tests' dictionary measurements (5AG).
+#[cfg(test)]
+impl Engine {
+    /// The published runs that store a dictionary, the distinct prepared
+    /// dictionaries they hold, and the distinct dictionaries by content.
+    pub(crate) fn dictionary_counts(&self) -> (usize, usize, usize) {
+        let state = self.core.read_state();
+        let parts: Vec<_> = state
+            .runs
+            .iter()
+            .filter_map(|run| run.run.dictionary_parts())
+            .collect();
+        let mut prepared: Vec<_> = parts.iter().map(|(_, p)| Arc::as_ptr(p)).collect();
+        prepared.sort_unstable();
+        prepared.dedup();
+        let mut contents: Vec<&[u8]> = parts.iter().map(|(bytes, _)| *bytes).collect();
+        contents.sort_unstable();
+        contents.dedup();
+        (parts.len(), prepared.len(), contents.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

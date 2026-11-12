@@ -109,6 +109,14 @@ impl<B: AsRef<[u8]>> Run<B> {
         self.dictionary.as_deref().map_or(0, RunDictionary::bytes)
     }
 
+    /// The run's stored dictionary and its prepared form, for the tests'
+    /// dictionary experiments.
+    #[cfg(test)]
+    pub(crate) fn dictionary_parts(&self) -> Option<(&[u8], &Arc<RunDictionary>)> {
+        let stored = self.view().stored_dictionary?;
+        Some((stored.bytes, self.dictionary.as_ref()?))
+    }
+
     /// Returns whether the run stores a dictionary.
     #[cfg_attr(
         not(test),

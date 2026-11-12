@@ -72,6 +72,11 @@ Kinds of result in this file:
 - **Engine feature, paired:** the 5AE section, `Compression::ZstdDictionary`
   against 16 and 4 KiB plain Zstandard through the 5Y harness, with direct
   run-layer and engine lookup checks.
+- **Competitive reassessment and reuse research:** the 5AG section,
+  dictionary runs against RocksDB at matched block size, with and without
+  RocksDB's own dictionaries, on JSON and document data, a mixed
+  read/write workload, and a run-layer study of dictionary reuse; the
+  engine is unchanged.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -2902,6 +2907,346 @@ in-place use of several dictionaries, not a defect; the rest depends on
 the binary and memory placement and is not explained. Narrowing the
 measured part would need fewer distinct dictionaries, which this
 milestone does not add.
+
+## Dictionary runs against RocksDB, and dictionary reuse (5AG)
+
+*Competitive reassessment and run-layer research; no engine change.*
+Is `Compression::ZstdDictionary` competitive with RocksDB configured the
+same way, including RocksDB's own dictionaries, and is reusing a
+dictionary across compactions worth building? Labels: **M** measured,
+**D** derived, **A** assumed.
+
+### Setup
+
+- **Harness and environment:** the 5Y harness and container (2 CPUs, 3 GiB,
+  no swap, `/tmp` a 1.5 GiB tmpfs), RocksDB 7.8.3 from Debian (November
+  2022) with the system Zstandard 1.5.4, Tessera's vendored Zstandard 1.5.7,
+  the same release binary for every run. Tessera runs with default
+  background compaction and `max_runs` 256 at the block length given.
+- **RocksDB setups (new in `tools/compare/src/rocks.rs`):**
+  - `rocksdb`: 5Y's matched setup, 16 KiB blocks, Zstandard level 3, no
+    block cache.
+  - `rocksdb-4k`: the same at 4 KiB blocks.
+  - `rocksdb-4k-dict`: plus Zstandard dictionaries of 16 KiB trained per
+    SST file from up to 1.6 MiB of samples (`max_dict_bytes`,
+    `zstd_max_train_bytes`), set for both the general and the bottommost
+    compression, so every level uses one. The sizes are Tessera's.
+    Measured to work: 4 KiB data blocks of `doc:4` take 23.86 MB with it
+    and 30.46 MB without (−22%), and non-bottommost files shrink too
+    (33.38 → 26.10 MiB of SSTs in the overlapping state).
+  - `rocksdb-tuned-4k-dict`: plus 5Y's tuning (a 64 MiB LRU block cache,
+    mmap reads, dynamic level sizes).
+- **Tessera setups:** `tessera` at 16 KiB (the default) and 4 KiB, and
+  `tessera-dict` (`Compression::ZstdDictionary`) at 4 KiB.
+- **Datasets:** `json:64` (1,048,576 JSON profiles, 553 MiB logical, the 5Y
+  generator) and `doc:16` (262,144 of 5AD's order documents: nested JSON
+  with 10–60 line items, about 1.9 KiB on average, 481 MiB logical), plus
+  `sensor:64` once, to check the fallback. Histories are identical across
+  engines: the same keys and values in the same order, the same overwrites
+  and deletes, the same reads and scans.
+- **Memory:** *resident* is the process's anonymous memory after a
+  malloc trim (glibc keeps freed pages otherwise) plus the engine's files
+  on the tmpfs, which are RAM; RocksDB's SSTs therefore count in full.
+  *Peak* is the highest anonymous-plus-tmpfs total sampled during the
+  run, which includes compaction's transient files and buffers.
+- **Runs:** two passes, the second in reverse order, then the sensor
+  check and the mixed workload, one bounded container each. All 38
+  runs exited 0 with no OOM kill, and every checked read and full scan
+  verified (`verified=all`). Commands are those of 5Y, with
+  `BENCH_BLOCK_LEN` set and `TESSERA_IMAGE=tessera-compare:rocksdb-7.8.3
+  TESSERA_TMPFS_SIZE=1536m`.
+
+**The machine slowed halfway through.** From the middle of pass 2
+onward, every configuration ran about 2× slower in wall and CPU time
+alike (Tessera's 1M-record load 1.82 → 3.4–3.5 s, the same binary
+and data), and it stayed slow after a Colima restart. Raw CPU, warm
+memory bandwidth and host memory were normal; the cause was not found.
+Pass 1 matches 5AF (plain 4 KiB: 5.92 against 5.88–5.92 µs), so it is
+the normal state. Therefore:
+
+- **Latency and throughput** below come from pass 1 and the three
+  pass-2 runs before the slowdown (the RocksDB 4 KiB JSON setups,
+  within 3% of pass 1). One pass for the rest, so no spread is given.
+- **Sizes and memory** do not depend on speed and come from both
+  passes.
+- **The mixed workload** ran entirely in the slow state. It compares
+  setups with each other, not with the tables above.
+
+### Density and memory
+
+Consolidated state (one sorted base, no overlap), MiB:
+
+| dataset | setup | runs or SSTs | resident (process + tmpfs) | of which tmpfs | peak during run |
+|---|---|---|---|---|---|
+| JSON | Tessera 16 KiB | 138.17 | 158.7–159.4 | – | 295–296 |
+| JSON | Tessera 4 KiB | 171.15 | 197.0 | – | 336 |
+| JSON | Tessera 4 KiB + dictionary | 124.38 | 129.2–161.2 | – | 302 |
+| JSON | RocksDB 16 KiB | 135.22 | 142.2–142.3 | 135.3 | 399–412 |
+| JSON | RocksDB 4 KiB | 168.41 | 176.7–178.7 | 168.5 | 432–478 |
+| JSON | RocksDB 4 KiB + dictionary | 120.99 | 132.1–134.2 | 121.1 | 500–575 |
+| JSON | RocksDB tuned 4 KiB + dictionary | 120.99 | 137.2–140.2 | 121.1 | 506–562 |
+| doc | Tessera 16 KiB | 99.09 | 114.8 | – | 299–300 |
+| doc | Tessera 4 KiB | 124.05 | 127.3 | – | 341 |
+| doc | Tessera 4 KiB + dictionary | 95.29 | 112.4 | – | 331–332 |
+| doc | RocksDB 16 KiB | 98.15 | 105.2–106.0 | 98.2 | 326 |
+| doc | RocksDB 4 KiB | 117.47 | 125.4–126.5 | 117.6 | 345–350 |
+| doc | RocksDB 4 KiB + dictionary | 92.25 | 110.1 | 92.3 | 523–527 |
+| doc | RocksDB tuned 4 KiB + dictionary | 92.25 | 109.1–113.6 | 92.3 | 526–527 |
+
+- **Density is level (M).** With dictionaries, RocksDB's SSTs are 2.7%
+  (JSON) and 3.2% (doc) smaller than Tessera's runs; without them, 1.6% and
+  5.3% (4 KiB) and 2.1% and 0.9% (16 KiB). Dictionaries save 27–28% (JSON)
+  and 21–23% (doc) at 4 KiB in both engines.
+- **Stable memory favours RocksDB slightly.** Resident totals are within
+  0–20% of each other, mostly from allocator state: Tessera's dictionary
+  JSON process held 161.2 MiB in pass 1 against 127.9 MiB allocated
+  (33 MiB retained by glibc after the trim) and 129.2 MiB in pass 2. On
+  allocated bytes (D, process allocated plus tmpfs), the two dictionary
+  setups are 127.9 against 126.5 MiB on JSON and 97.8 against 96.1 on doc.
+- **Peak memory favours Tessera (M).** RocksDB's peaks are 1.6–1.9×
+  Tessera's with dictionaries (500–575 against 302 MiB on JSON, 523–527
+  against 331 on doc). The likely cause (A, not traced) is compaction
+  outputs on the tmpfs beside their inputs until the inputs are deleted.
+  Sensor: both Tessera setups 22.26 MiB of runs, compactions declined the
+  dictionary (`NotBeneficial`), so the fallback is exact.
+
+### Point lookups
+
+Consolidated state, p50 µs (p99), uniform keys unless noted. Each run
+does 90,000 timed gets per kind.
+
+| dataset | setup | present | overwritten | missing | localized |
+|---|---|---|---|---|---|
+| JSON | Tessera 16 KiB | 13.88 (18.4) | 13.88 (18.2) | 0.33 (0.6) | 13.08 (17.7) |
+| JSON | Tessera 4 KiB | 5.92 (7.4) | 5.92 (7.4) | 0.38 (0.6) | 5.50 (7.0) |
+| JSON | Tessera 4 KiB + dictionary | **4.83** (7.3) | 4.83 (7.0) | 0.38 (0.6) | 5.50 (7.0) |
+| JSON | RocksDB 16 KiB | 13.83 (18.4) | 13.83 (18.3) | 0.21 (4.5) | 12.92 (17.2) |
+| JSON | RocksDB 4 KiB | 6.67–6.83 (8.5–10.1) | 6.67–6.75 (8.4–8.7) | 0.21 (0.4–0.5) | 6.08–6.12 (7.9–8.4) |
+| JSON | RocksDB 4 KiB + dictionary | 8.33–9.21 (12.3–13.4) | 8.33–9.08 (12.9–13.5) | 0.21 (0.6–0.7) | 7.75–8.54 (11.8–12.4) |
+| JSON | RocksDB tuned 4 KiB + dictionary | 8.54–8.71 (12.5–14.1) | 8.50–8.58 (11.6–12.9) | 0.21 (0.6–0.7) | **0.79–0.83** (9.3–9.4) |
+| doc | Tessera 16 KiB | 13.42 (29.9) | 13.04 (17.1) | 0.29 (0.4) | 12.42 (19.7) |
+| doc | Tessera 4 KiB | 5.50 (6.5) | 5.42 (6.5) | 0.29 (0.8) | 4.96 (6.5) |
+| doc | Tessera 4 KiB + dictionary | **4.46** (6.5) | 4.62 (7.0) | 0.29 (0.5) | 4.67 (6.6) |
+| doc | RocksDB 16 KiB | 14.50 (19.4) | 14.37 (19.0) | 0.21 (0.3) | 13.50 (17.9) |
+| doc | RocksDB 4 KiB | 7.04 (9.1) | 7.08 (10.5) | 0.21 (0.3) | 6.58 (9.8) |
+| doc | RocksDB 4 KiB + dictionary | 9.54 (13.1) | 9.46 (13.2) | 0.21 (0.3) | 8.92 (12.8) |
+| doc | RocksDB tuned 4 KiB + dictionary | 8.71 (12.9) | 1.12 (10.4) | 0.21 (0.3) | **0.75** (10.1) |
+
+- **At equal block size and equal density, Tessera's dictionary lookups are
+  1.7–2.1× faster than RocksDB's (M):** 4.83 against 8.33–9.21 µs on JSON,
+  4.46 against 9.54 on doc. A dictionary makes RocksDB's lookups 22–36%
+  *slower* than its plain 4 KiB blocks and Tessera's 18–19% *faster*.
+  Tessera decodes with a dictionary prepared once per run; that RocksDB
+  7.8.3 without a block cache reloads its dictionary per block read is
+  assumed (A), not traced.
+- Plain 4 KiB: Tessera 5.92 against 6.67–6.83 (JSON), 5.50 against 7.04
+  (doc), 1.1–1.3×. At 16 KiB the engines are level (13.8–13.9 µs on
+  JSON; Tessera 7% faster on doc).
+- **Missing and deleted keys** are faster in RocksDB: 0.21 against
+  0.29–0.38 µs, both answered by filters (0.01 blocks per get).
+  Overlapping-state deleted keys cost a block in both.
+- **RocksDB's cache wins localized reads**, as 5Y found: 0.75–0.83 µs
+  against Tessera's 4.67–5.50, from 64 MiB of decoded blocks. Uniform reads
+  over a larger working set gain nothing from it (8.5–8.7 µs). Its doc
+  overwritten keys (1.12 µs) also hit the cache; why those keys, one in
+  sixteen, are cached and the JSON ones (8.5 µs) are not was not
+  investigated.
+- **Overlapping state (M):** Tessera dictionary 4.88 µs present (p99
+  10.2) on JSON, RocksDB 4 KiB dictionary 8.38–9.21 (16.0–17.1), plain
+  RocksDB 4 KiB 6.79–6.88; doc 4.71 against 10.17. The ordering is the
+  same as consolidated.
+- **Allocations:** a warm Tessera lookup makes no Rust heap allocation
+  and decodes one block for a present key (M,
+  `tests/lookup_allocations.rs`); blocks per get are 1.00 present and
+  0.01 missing in both engines here (M, harness counters). RocksDB's
+  allocations were not measured.
+
+### Prefix scans
+
+Consolidated state, p50 µs (time to first record in brackets) for
+prefixes matching about 30 and 480 records, throughput for longer ones:
+
+| dataset | setup | no match | short ~30 | medium ~480 | long ~1,900, M rec/s | ~15,000, M rec/s | full, M rec/s |
+|---|---|---|---|---|---|---|---|
+| JSON | Tessera 16 KiB | 14.0 | 28.0 (14.1) | 238.7 (14.3) | 2.08 | 2.12 | 2.01 |
+| JSON | Tessera 4 KiB | 5.8 | 27.1 (6.2) | 346.7 (6.7) | 1.40 | 1.41 | 1.41 |
+| JSON | Tessera 4 KiB + dictionary | 4.3 | **20.0** (4.9) | 241.1 (5.4) | 1.85 | 1.77 | 1.92 |
+| JSON | RocksDB 16 KiB | 13.8 | 29.5 (14.1) | 267.9 (14.5) | 1.86 | 1.91 | 1.91 |
+| JSON | RocksDB 4 KiB | 6.6–6.7 | 32.8–32.9 (7.2) | 424.6–425.7 (7.7) | 1.14–1.15 | 1.14–1.16 | 1.14–1.15 |
+| JSON | RocksDB 4 KiB + dictionary | 8.3–8.5 | 41.0–42.7 (8.8–9.0) | 542.2–562.1 (9.3–9.8) | 0.87–0.90 | 0.86–0.91 | 0.89–0.91 |
+| JSON | RocksDB tuned 4 KiB + dictionary | 1.2 | 41.4–41.9 (9.0–9.1) | 538.1–539.5 (9.4) | 0.94–0.97 | 1.25–1.27 | 0.93–0.94 |
+| doc | Tessera 16 KiB | 12.8 | 62.3 (13.6) | 722.7 (13.8) | 0.68 | 0.68 | 0.67 |
+| doc | Tessera 4 KiB | 5.2 | 71.7 (5.8) | 1067.0 (6.5) | 0.45 | 0.45 | 0.45 |
+| doc | Tessera 4 KiB + dictionary | 4.4 | **53.8** (4.9) | 797.7 (5.3) | 0.61 | 0.64 | 0.62 |
+| doc | RocksDB 16 KiB | 13.8 | 68.5 (14.6) | 819.2 (15.0) | 0.59 | 0.60 | 0.59 |
+| doc | RocksDB 4 KiB | 6.7 | 83.4 (8.2) | 1214.8 (8.4) | 0.40 | 0.39 | 0.39 |
+| doc | RocksDB 4 KiB + dictionary | 9.9 | 118.8 (11.2) | 1677.9 (11.0) | 0.28 | 0.29 | 0.29 |
+| doc | RocksDB tuned 4 KiB + dictionary | 1.1 | 102.3 (9.7) | 1569.7 (10.5) | 0.34 | 0.45 | 0.32 |
+
+- **Short scans and time to first record favour Tessera's dictionary runs
+  everywhere (M):** 20.0 µs against 27.1–42.7 for every other setup on JSON,
+  53.8 against 62.3–118.8 on doc; first record 4.9 µs against 5.8–14.6.
+- **Long scans (no regression hidden):** at 4 KiB Tessera's dictionary
+  runs stream 1.77–1.92 M rec/s on JSON, 2.0–2.2× RocksDB's dictionary
+  setup, but **4–17% below Tessera's own 16 KiB default** (2.01–2.12),
+  and on doc 0.61–0.64 against 16 KiB's 0.67–0.68 (6–10% below). Against
+  RocksDB 16 KiB, long scans are within ±7% (JSON 1.77–1.92 against
+  1.86–1.91; doc 0.61–0.64 against 0.59–0.60). Medium scans are about
+  equal to Tessera 16 KiB on JSON (241 against 239 µs) and 10% slower on
+  doc (798 against 723).
+- No-match prefixes: Tessera's dictionary 4.3–4.4 µs against RocksDB
+  tuned 1.1–1.2 (cached index and filter blocks) and 6.6–9.9 otherwise.
+- Overlapping state: the same order. JSON short scans 30.4 µs (Tessera
+  dictionary) against 37.3–56.1; long scans 1.55–1.62 M rec/s against
+  RocksDB 16 KiB's 1.58–1.67 and Tessera 16 KiB's 1.74–1.83.
+
+### Mixed read/write workload
+
+`BENCH_MIXED=48` on `json:64`, from the consolidated load: 48 rounds of
+16,384 overwrites (786,432 in all, 75% of the keys) with background
+flushes and compaction running. Each write is followed by seven uniform
+gets, one localized get and one short prefix scan, all timed, every
+value checked. A full scan then verifies the final state. **These runs
+were all in the slow state (see Setup): compare rows with each other,
+not with the tables above.**
+
+| setup | get p50/p99 µs | localized get | short scan | put p50/p99 µs | writes/s (wall) | background CPU s | runs or files after | resident after MiB | peak MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| Tessera 16 KiB | 28.71/56.3 | 28.00/54.5 | 116.0/213.4 | 1.88/5.9 | 2,692 | 4.42 | 14 runs | 363.5 | 485.5 |
+| Tessera 4 KiB | 13.58/26.1 | 12.62/24.4 | 96.6/143.9 | 1.96/5.7 | 4,465 | 5.26 | 14 runs | 412.2 | 533.9 |
+| Tessera 4 KiB + dictionary | **10.17**/21.4 | 9.21/20.1 | **69.9**/113.3 | 1.83/5.1 | **5,871** | 4.09 | 14 runs | 347.7 | 477.1 |
+| RocksDB 16 KiB | 31.96/62.6 | 30.62/59.8 | 118.3/241.1 | 4.58/20.2 | 2,492 | 8.73 | 5 files | 306.3 | 476.8 |
+| RocksDB 4 KiB + dictionary | 24.46/44.4 | 22.96/42.1 | 151.9/237.8 | 4.75/14.7 | 2,750 | 10.46 | 4 files | 291.8 | 631.2 |
+| RocksDB tuned 4 KiB + dictionary | 22.21/40.6 | **6.88**/29.1 | 130.0/223.0 | 4.92/16.7 | 3,204 | 10.96 | 4 files | 365.6 (64 cache) | 709.0 |
+
+- **Reads (M):** Tessera's dictionary runs serve uniform gets 2.2–2.4×
+  faster than the dictionary RocksDB setups and short scans 1.9–2.2×;
+  only the tuned RocksDB's cache wins localized gets. Wall time is mostly
+  reads, so the write rate follows the read cost: Tessera dictionary
+  5,871 writes/s against 2,750–3,204.
+- **Writes:** Tessera's puts are 2.3–2.7× cheaper at p50 (1.8–2.0 against
+  4.6–4.9 µs, RocksDB without its WAL) and its background CPU is about
+  half (4.1–5.3 against 8.7–11.0 s).
+- **Memory after the workload favours RocksDB:** Tessera keeps 14 runs (207
+  MiB of runs plus a 63 MiB memtable for the dictionary setup) because its
+  default compaction is lazy, against RocksDB's 4–5 files. Resident 347.7
+  MiB (14–19% more) against 291.8 (RocksDB dictionary, uncached) and 306.3
+  (RocksDB 16 KiB). Peaks favour Tessera: 477 against 631–709 MiB.
+- **Dictionaries during the workload** (run-layer replay of the same
+  writes, `mixed_dictionary_counts`, M): after consolidation 9 runs carry
+  5 distinct dictionaries. New data arrives as plain flushed runs (16
+  runs by round 48, 9 with dictionaries, 253 MiB of runs), and background
+  compaction stays at 2 until the workload stops; settling then compacts
+  to 15 runs, 14 with dictionaries, 6 distinct. The density benefit is
+  therefore mostly in the base, and the number of distinct dictionaries
+  stays near the 5AF curve's low end (4.0 µs at 5).
+
+### Dictionary reuse (run layer, M)
+
+`dictionary_reuse_costs` in `src/run/tests/dictionary.rs`: eight key-range
+partitions of 24,000 JSON profiles (about 29 MiB plain at 4 KiB) start with
+one shared dictionary. Six generations each overwrite 30% of the keys and
+rewrite pairs of adjacent partitions with their flushes, the pairing
+shifted every other generation, so that 24 rewrites meet inputs of
+different dictionaries as partitioned compactions do. All strategies see
+the same samples and held-out blocks; each output run stores its own copy
+of its dictionary. Production compaction is unchanged; the experiment
+uses test-only hooks.
+
+- `fresh`: train per rewrite (production);
+- `first`: reuse the first input's dictionary, sharing its prepared form;
+- `best`: reuse the input dictionary that saves most on the held-out
+  blocks if it saves at least 10%, otherwise train; shared prepared form;
+- `best-copy`: as `best`, prepared afresh per rewrite.
+
+Stable values (content varies, structure fixed), after six generations:
+
+| strategy | runs MiB (plain 29.31) | saving vs plain | held-out saving | distinct prepared / contents | lookup p50/p99 µs | walk M rec/s | decision time, 24 rewrites |
+|---|---|---|---|---|---|---|---|
+| fresh | 22.77 | 22.3% | 24.0% | 5 / 5 | 3.58–3.83 / 4.2–7.7 | 2.25–2.38 | 1.12–1.24 s |
+| first | 22.95 | 21.7% | 23.0% | 1 / 1 | 3.17–3.42 / 3.8–6.1 | 2.26–2.39 | 0.026–0.027 s |
+| best | 22.95 | 21.7% | 23.0% | 1 / 1 | 3.13–3.42 / 3.6–4.5 | 2.20–2.39 | 0.069–0.073 s |
+| best-copy | 22.95 | 21.7% | 23.0% | 5 / 1 | 3.54–3.92 / 4.2–5.3 | 2.25–2.38 | 0.070–0.075 s |
+
+Evolving values (a field added, renamed, nested, vocabulary changed, a
+field dropped, generations 1–5), saving against plain 4 KiB per generation:
+
+| strategy | gen 1 | gen 2 | gen 3 | gen 4 | gen 5 | gen 6 | final distinct prepared | lookup p50 µs | trained by `best` |
+|---|---|---|---|---|---|---|---|---|---|
+| fresh | 21.6% | 21.8% | 21.8% | 15.0% | 27.7% | 27.7% | 5 | 3.54–3.67 | – |
+| first | 21.5% | 20.3% | 18.6% | 9.0% | 5.5% | 3.1% | 1 | 2.79–3.00 | – |
+| best | 21.5% | 20.3% | 18.6% | 9.0% | 27.7% | 27.0% | 4 | 3.50 | 4 rewrites, at gen 5 |
+| best-copy | as `best` | | | | | | 5 | 3.58 | as `best` |
+
+(Two runs of the experiment; ranges are the runs. Generation 4 is low for
+every strategy because half the values still use the old vocabulary.)
+
+- **Latency comes only from sharing the prepared form across rewrites.**
+  Reusing the content but preparing it per rewrite (`best-copy`) is as slow
+  as training (3.5–3.9 µs). Shared reuse saves 0.4–0.6 µs (12–15%) per
+  lookup here, consistent with the 5AF dictionary-count curve.
+- **Density costs:** 0.6 points on stable values, and under structural
+  change reuse decays without bound (3.1% saving left after six
+  generations against 27.7% fresh). The 10%-guarded `best` recovers, but
+  only after its estimate falls below the threshold: it carried a stale
+  dictionary through generation 4 (9.0% against 15.0%).
+- **Training CPU avoided:** about 45 ms per rewrite (1.2 s over 24); the
+  guarded estimate of each candidate still costs 3 ms.
+- **Ownership:** the latency gain requires a prepared dictionary shared by
+  runs of different rewrites, which outlives the rewrite that made it and
+  must be found from the inputs: the cross-run reference this design
+  avoided. Content-only reuse keeps runs self-contained but gains nothing.
+
+**Recommendation: keep independent per-rewrite dictionaries.** Reuse buys
+at most 12–15% on lookups that already beat both baselines, needs shared
+cross-rewrite ownership, and risks density on changing data.
+
+### Reproduction
+
+```sh
+# Comparison: one engine, dataset and block length per bounded run.
+TESSERA_IMAGE=tessera-compare:rocksdb-7.8.3 TESSERA_TMPFS_SIZE=1536m scripts/validate.sh exec 1500 \
+  env BENCH_BLOCK_LEN=4096 /cache/compare-target/release/tessera-compare rocksdb-4k-dict doc:16 /tmp
+# Mixed workload.
+TESSERA_IMAGE=tessera-compare:rocksdb-7.8.3 TESSERA_TMPFS_SIZE=1536m scripts/validate.sh exec 1500 \
+  env BENCH_BLOCK_LEN=4096 BENCH_MIXED=48 /cache/compare-target/release/tessera-compare tessera-dict json:64 /tmp
+# Run-layer studies (ignored tests).
+scripts/validate.sh exec 900 sh -c 'cargo test --locked --release --lib \
+  run::tests::dictionary::dictionary_reuse_costs -- --ignored --nocapture'
+scripts/validate.sh exec 900 sh -c 'MIXED_ROUNDS=48 cargo test --locked --release --lib \
+  run::tests::dictionary::mixed_dictionary_counts -- --ignored --nocapture'
+```
+
+A comparison run takes about a minute; a mixed run took 2–5 minutes
+per setup in the slowed state.
+
+### Assessment
+
+- **Where Tessera now leads (M):** at the density of RocksDB with
+  dictionaries (within 3%), Tessera's dictionary runs give 1.7–2.1× faster
+  uniform lookups, 1.3–2.2× faster short scans and 1.5–3.0× faster time to
+  first record than every RocksDB setup, 2.0–2.2× faster long scans than
+  RocksDB at 4 KiB with dictionaries, 2.3–2.7× cheaper puts, about half the
+  background CPU and 0.5–0.6× the peak memory. In the mixed workload,
+  measured only in the slowed state, its reads were 2.2–2.4× faster than
+  RocksDB's dictionary setups (relative, not replicated at normal speed).
+- **Where it does not:** localized reads against a block cache (6–7× slower:
+  4.7–5.5 against 0.75–0.83 µs), filtered misses (0.3–0.4 against 0.2 µs),
+  stable memory after sustained writes (lazy compaction keeps 14 runs and
+  14–19% more resident memory than RocksDB), and long scans against
+  Tessera's own 16 KiB default (4–12% slower).
+- **Limits:** one RocksDB version (7.8.3, 2022) from a distribution
+  package, so newer releases' dictionary and cache work is not
+  represented; two dataset families at 64 and 16 groups; one CPU-bound
+  container with two CPUs; latency from one clean pass for most setups;
+  the mixed workload in a slowed machine state; RocksDB's dictionary
+  sizes set to Tessera's, not tuned for RocksDB.
+
+**Decision:** keep `Compression::ZstdDictionary` opt-in and unchanged,
+and do not build dictionary reuse. The advantage is real at equal
+density and block size, but it is a latency advantage on uniform reads
+and scans, not a density one, and the mixed workload shows lazy
+compaction leaving new data plain and memory above RocksDB's.
 
 ## Historical results
 

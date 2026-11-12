@@ -6,7 +6,10 @@
 //! ```
 //!
 //! ENGINE is `tessera`, `tessera-lz4`, `rocksdb`, `rocksdb-lz4` or
-//! `rocksdb-tuned`. DATASET is `json:GROUPS` or `sensor:GROUPS`, with a
+//! `rocksdb-tuned`, or one of 5AG's 4 KiB RocksDB setups: `rocksdb-4k`,
+//! `rocksdb-4k-dict` (Zstandard dictionaries) and `rocksdb-tuned-4k-dict`.
+//! DATASET is `json:GROUPS`, `doc:GROUPS` (5AD's order documents) or
+//! `sensor:GROUPS`, with a
 //! power of two of at most 256 groups of 16,384 records. DIR is where
 //! RocksDB keeps its files, a tmpfs. One engine per process, so resident
 //! memory is its own.
@@ -29,6 +32,8 @@
 //! test does; `BENCH_SKIP_UPDATES` reads the consolidated load without the
 //! updates; `BENCH_READS=present` times only present-key lookups, three
 //! times; `BENCH_THREAD` runs everything on a spawned thread.
+//! `BENCH_MIXED=ROUNDS` (5AG) replaces the update and read phases with a
+//! mixed read/write workload after the first consolidation.
 
 mod rocks;
 
@@ -82,6 +87,9 @@ enum Payload {
     Json,
     /// A sensor reading of 14 to 32 bytes, mostly binary.
     Sensor,
+    /// An order document of about 0.5 to 4 KiB, as the run layer's 5AD
+    /// `document` with a version in its seed (5AG).
+    Document,
 }
 
 /// The value of record `index` at `version`.
@@ -105,6 +113,24 @@ fn value(payload: Payload, index: u64, version: u64) -> Vec<u8> {
                 rng.below(24),
                 rng.below(60),
                 words(&mut rng, bio_words),
+            )
+            .into_bytes()
+        }
+        Payload::Document => {
+            let mut rng = Rng::new(3_000 + seed);
+            let items = 10 + rng.below(51);
+            let lines: Vec<String> = (0..items)
+                .map(|_| {
+                    let (sku, qty, note) = (rng.below(50_000), 1 + rng.below(9), rng.below(6));
+                    format!(
+                        r#"{{"sku":"SKU-{sku:06}","qty":{qty},"note":"{}"}}"#,
+                        words(&mut rng, note)
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"order":{index},"status":"paid","items":[{}]}}"#,
+                lines.join(",")
             )
             .into_bytes()
         }
@@ -136,6 +162,7 @@ impl Dataset {
         let payload = match payload {
             "json" => Payload::Json,
             "sensor" => Payload::Sensor,
+            "doc" => Payload::Document,
             other => panic!("unknown payload {other}"),
         };
         let groups: u64 = groups.parse().expect("GROUPS is a number");
@@ -319,7 +346,11 @@ impl Store for Tessera {
             ));
         }
         self.settle();
-        println!("consolidation\tcompactions={}\t{}", built.len(), built.join(" "));
+        println!(
+            "consolidation\tcompactions={}\t{}",
+            built.len(),
+            built.join(" ")
+        );
     }
 
     fn get<T>(&mut self, key: &[u8], found: impl FnOnce(Option<&[u8]>) -> T) -> T {
@@ -1255,6 +1286,111 @@ fn direct(mut store: Tessera, data: Dataset) {
     timed_reads(&mut store, data, "consolidated", 20_000);
 }
 
+/// A read-heavy mixed workload from the consolidated load (5AG):
+/// `BENCH_MIXED` rounds of 16,384 overwrites with a new version each, with
+/// background flushes and compaction running. Each write is followed by
+/// seven uniform gets, one localized get and one short prefix scan, each
+/// timed; every get's value is checked, and the final state is checked by
+/// a full ordered scan.
+fn mixed<S: Store>(
+    store: &mut S,
+    data: Dataset,
+    rounds: u64,
+    sampler: &Sampler,
+    dir: Option<&Path>,
+) {
+    // Versions 2 up to 255, one byte per record.
+    assert!(rounds <= 254, "BENCH_MIXED is at most 254 rounds");
+    let records = data.records();
+    let mut versions = vec![0u8; records as usize];
+    let mut rng = Rng::new(30_000);
+    let (mut puts, mut gets, mut hot, mut scans) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut scanned = 0u64;
+    let cpu = (
+        cpu_secs("/proc/self/stat"),
+        cpu_secs("/proc/thread-self/stat"),
+    );
+    let wall = Instant::now();
+    let get = |store: &mut S, versions: &[u8], index: u64, into: &mut Vec<u64>| {
+        let expected = value(data.payload, index, u64::from(versions[index as usize]));
+        let key = data.key(index);
+        let start = Instant::now();
+        let same = store.get(&key, |value| value == Some(expected.as_slice()));
+        into.push(start.elapsed().as_nanos() as u64);
+        assert!(same, "mixed: wrong value for {key:02x?}");
+    };
+    for round in 0..rounds {
+        let phase = Phase::start();
+        let version = 2 + round;
+        for j in 0..GROUP {
+            let index = data.shuffled(round * GROUP + j, 0x2545_F491);
+            let value = value(data.payload, index, version);
+            let start = Instant::now();
+            store.put(&data.key(index), &value);
+            puts.push(start.elapsed().as_nanos() as u64);
+            versions[index as usize] = version as u8;
+            for _ in 0..7 {
+                get(store, &versions, rng.below(records), &mut gets);
+            }
+            let hot_index = if rng.below(10) < 9 {
+                records / 2 + rng.below(records / 100)
+            } else {
+                rng.below(records)
+            };
+            get(store, &versions, hot_index, &mut hot);
+            let prefix = data.key(rng.below(records))[..6].to_vec();
+            let start = Instant::now();
+            store.scan(&prefix, |key, value| {
+                black_box((key.len(), value.len()));
+                scanned += 1;
+            });
+            scans.push(start.elapsed().as_nanos() as u64);
+        }
+        phase.end(&format!("mixed-{round}"), sampler, dir, "");
+    }
+    let elapsed = wall.elapsed().as_secs_f64();
+    let (process, main) = (
+        cpu_secs("/proc/self/stat") - cpu.0,
+        cpu_secs("/proc/thread-self/stat") - cpu.1,
+    );
+    let writes = puts.len();
+    let put_ns: u64 = puts.iter().sum();
+    for (name, samples) in [
+        ("put", &mut puts),
+        ("get", &mut gets),
+        ("hot-get", &mut hot),
+        ("short-scan", &mut scans),
+    ] {
+        let (p50, p99, mean) = summary(samples);
+        println!(
+            "mixed\t{name}\tops={}\tp50_ns={p50}\tp99_ns={p99}\tmean_ns={mean:.0}",
+            samples.len()
+        );
+    }
+    println!(
+        "mixed\ttotal\trounds={rounds}\twrites={writes}\twall_s={elapsed:.2}\twrites_per_put_s={:.0}\twrites_per_wall_s={:.0}\tcpu_s={process:.2}\tmain_cpu_s={main:.2}\tbackground_cpu_s={:.2}\tscan_records_per_op={:.1}",
+        writes as f64 / (put_ns as f64 / 1e9),
+        writes as f64 / elapsed,
+        process - main,
+        scanned as f64 / scans.len() as f64,
+    );
+    store.settle();
+    memory(store, "mixed");
+
+    // The final state, record by record.
+    let mut index = 0u64;
+    store.scan(&[], |key, stored| {
+        let want = value(data.payload, index, u64::from(versions[index as usize]));
+        assert!(
+            key == data.key(index) && stored == want.as_slice(),
+            "mixed: {key:02x?}"
+        );
+        index += 1;
+    });
+    assert_eq!(index, records, "mixed: the full scan ended early");
+    println!("full\tmixed\trecords={index}\tverified=all");
+}
+
 fn run<S: Store>(mut store: S, data: Dataset) {
     let dir = store.dir();
     let (sampler, thread) = Sampler::start(dir.clone());
@@ -1294,6 +1430,14 @@ fn run<S: Store>(mut store: S, data: Dataset) {
     store.consolidate();
     phase.end("consolidate-base", &sampler, dir, "");
 
+    if let Ok(rounds) = std::env::var("BENCH_MIXED") {
+        let rounds = rounds.parse().expect("BENCH_MIXED is a number of rounds");
+        memory(&store, "consolidated");
+        mixed(&mut store, data, rounds, &sampler, dir);
+        sampler.stop.store(true, Relaxed);
+        thread.join().unwrap();
+        return;
+    }
     // `BENCH_SKIP_UPDATES` reads the consolidated load instead (5AF
     // diagnostics): the same records, versions aside, without the updates'
     // history.
@@ -1403,12 +1547,18 @@ fn main() {
 }
 
 fn select(engine: &str, data: Dataset, dir: &Path) {
-    let rocks = |lz4, tuned_cache| {
+    let rocks = |config: rocks::Config| {
         std::fs::create_dir_all(dir).unwrap();
         Rocks {
-            db: rocks::Db::open(dir, rocks::Config { lz4, tuned_cache }),
+            db: rocks::Db::open(dir, config),
             dir: dir.to_path_buf(),
         }
+    };
+    let config = |lz4, block_size, dictionary, tuned_cache| rocks::Config {
+        lz4,
+        block_size,
+        dictionary,
+        tuned_cache,
     };
     match engine {
         "tessera" => run(Tessera::new(Compression::Zstd), data),
@@ -1421,9 +1571,13 @@ fn select(engine: &str, data: Dataset, dir: &Path) {
         "tessera-compactions" => compactions(data, Compression::Zstd),
         "tessera-compactions-lz4" => compactions(data, Compression::Lz4),
         "tessera-compactions-dict" => compactions(data, Compression::ZstdDictionary),
-        "rocksdb" => run(rocks(false, None), data),
-        "rocksdb-lz4" => run(rocks(true, None), data),
-        "rocksdb-tuned" => run(rocks(false, Some(64 << 20)), data),
+        "rocksdb" => run(rocks(config(false, 16 << 10, false, None)), data),
+        "rocksdb-lz4" => run(rocks(config(true, 16 << 10, false, None)), data),
+        "rocksdb-tuned" => run(rocks(config(false, 16 << 10, false, Some(64 << 20))), data),
+        // 5AG: block-size- and dictionary-matched to Tessera's 4 KiB runs.
+        "rocksdb-4k" => run(rocks(config(false, 4 << 10, false, None)), data),
+        "rocksdb-4k-dict" => run(rocks(config(false, 4 << 10, true, None)), data),
+        "rocksdb-tuned-4k-dict" => run(rocks(config(false, 4 << 10, true, Some(64 << 20))), data),
         other => panic!("unknown engine {other}"),
     }
 }

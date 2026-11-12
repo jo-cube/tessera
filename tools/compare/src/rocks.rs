@@ -27,6 +27,21 @@ unsafe extern "C" {
         strategy: c_int,
         max_dict_bytes: c_int,
     );
+    fn rocksdb_options_set_compression_options_zstd_max_train_bytes(o: H, v: c_int);
+    fn rocksdb_options_set_bottommost_compression(o: H, v: c_int);
+    fn rocksdb_options_set_bottommost_compression_options(
+        o: H,
+        window_bits: c_int,
+        level: c_int,
+        strategy: c_int,
+        max_dict_bytes: c_int,
+        enabled: u8,
+    );
+    fn rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes(
+        o: H,
+        v: c_int,
+        enabled: u8,
+    );
     fn rocksdb_options_set_write_buffer_size(o: H, v: usize);
     fn rocksdb_options_set_max_write_buffer_number(o: H, v: c_int);
     fn rocksdb_options_set_max_background_jobs(o: H, v: c_int);
@@ -123,6 +138,11 @@ fn check(err: *mut c_char, what: &str) {
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub lz4: bool,
+    /// Bytes per data block before compression: 16 KiB, as 5Y, or 4 KiB.
+    pub block_size: usize,
+    /// Zstandard dictionaries of 16 KiB trained per SST file from up to
+    /// 1.6 MiB of samples, the sizes Tessera uses, at every level.
+    pub dictionary: bool,
     /// An LRU cache of decompressed blocks of this many bytes, mmap reads
     /// and dynamic level sizes; `None` for the architecture-matched setup.
     pub tuned_cache: Option<usize>,
@@ -147,15 +167,33 @@ impl Db {
             rocksdb_options_set_create_if_missing(options, 1);
             let codec = if config.lz4 { LZ4 } else { ZSTD };
             rocksdb_options_set_compression(options, codec);
-            // Zstandard level 3, as Tessera; no dictionary.
-            rocksdb_options_set_compression_options(options, -14, 3, 0, 0);
+            // Zstandard level 3, as Tessera, with or without a dictionary.
+            let dict_bytes: c_int = if config.dictionary { 16 << 10 } else { 0 };
+            let train_bytes: c_int = if config.dictionary {
+                100 * (16 << 10)
+            } else {
+                0
+            };
+            rocksdb_options_set_compression_options(options, -14, 3, 0, dict_bytes);
+            rocksdb_options_set_compression_options_zstd_max_train_bytes(options, train_bytes);
+            if config.dictionary {
+                rocksdb_options_set_bottommost_compression(options, codec);
+                rocksdb_options_set_bottommost_compression_options(
+                    options, -14, 3, 0, dict_bytes, 1,
+                );
+                rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes(
+                    options,
+                    train_bytes,
+                    1,
+                );
+            }
             rocksdb_options_set_write_buffer_size(options, 64 << 20);
             rocksdb_options_set_max_write_buffer_number(options, 2);
             rocksdb_options_set_max_background_jobs(options, 2);
             rocksdb_options_set_target_file_size_base(options, 64 << 20);
 
             let table = rocksdb_block_based_options_create();
-            rocksdb_block_based_options_set_block_size(table, 16 << 10);
+            rocksdb_block_based_options_set_block_size(table, config.block_size);
             // Ownership passes to the table options.
             rocksdb_block_based_options_set_filter_policy(
                 table,

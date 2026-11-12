@@ -851,3 +851,355 @@ fn training_peak_memory() {
         DICTIONARY_WORKSPACE as f64 / f64::from(1 << 20),
     );
 }
+
+/// A JSON profile at `generation`. With `evolve`, its structure changes as
+/// generations pass: a field added (1), one renamed with new values (2), a
+/// nested object added (3), another vocabulary (4), and a field dropped
+/// and a date turned into a number (5). Without, only the content varies.
+fn generation_value(index: u64, generation: u64, evolve: bool) -> Vec<u8> {
+    const WORDS: [&str; 16] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+    ];
+    const OTHER: [&str; 16] = [
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "labore",
+        "magna",
+        "aliqua",
+        "veniam",
+    ];
+    let mut rng = super::costs::Rng::new(5_000 + index + (generation << 40));
+    let g = if evolve { generation } else { 0 };
+    let words = if g >= 4 { &OTHER } else { &WORDS };
+    let pick = |rng: &mut super::costs::Rng| words[rng.below(16) as usize];
+    let (first, last) = (pick(&mut rng), pick(&mut rng));
+    let mut out = format!(r#"{{"id":{index},"name":"{first} {last}""#);
+    if g < 5 {
+        out += &format!(r#","email":"{first}.{last}@example.com""#);
+    }
+    out += &format!(
+        r#","active":{},"score":{}"#,
+        rng.below(2) == 0,
+        rng.below(100_000)
+    );
+    if g >= 2 {
+        out += &format!(
+            r#","tier":"{}""#,
+            ["basic", "plus", "max"][rng.below(3) as usize]
+        );
+    } else {
+        out += &format!(
+            r#","plan":"{}""#,
+            ["free", "pro", "team"][rng.below(3) as usize]
+        );
+    }
+    if g >= 1 {
+        out += &format!(r#","region":"{}""#, pick(&mut rng));
+    }
+    if g >= 3 {
+        out += &format!(
+            r#","prefs":{{"lang":"{}","theme":"{}"}}"#,
+            ["en", "fr", "de"][rng.below(3) as usize],
+            ["dark", "light"][rng.below(2) as usize]
+        );
+    }
+    let (month, day) = (1 + rng.below(12), 1 + rng.below(28));
+    if g >= 5 {
+        out += &format!(r#","created":{}"#, 1_767_225_600 + rng.below(31_536_000));
+    } else {
+        out += &format!(r#","created":"2026-{month:02}-{day:02}""#);
+    }
+    let bio: Vec<&str> = (0..20 + rng.below(100)).map(|_| pick(&mut rng)).collect();
+    out += &format!(r#","bio":"{}"}}"#, bio.join(" "));
+    out.into_bytes()
+}
+
+/// Whether reusing an input run's dictionary would beat training one per
+/// rewrite (5AG; compaction always trains). Eight key-range partitions of
+/// JSON profiles start with one shared dictionary. Each of six generations
+/// overwrites 30% of the keys with new values, flushed per partition, and
+/// then rewrites pairs of adjacent partitions with their flushes, the
+/// pairing shifted by one every other generation, so that rewrites meet
+/// inputs of different dictionaries as partitioned compactions do. Every
+/// strategy sees the same held-out samples:
+///
+/// - `fresh`: train a dictionary per rewrite, as compaction does;
+/// - `first`: reuse the first input's dictionary and its prepared form;
+/// - `best`: reuse whichever input dictionary saves most on the samples,
+///   sharing its prepared form across rewrites, if it saves at least the
+///   10% compaction requires; otherwise train one;
+/// - `best-copy`: the same choice, prepared afresh per rewrite, so that no
+///   prepared form outlives the rewrite that made it.
+///
+/// Run on values whose structure stays the same and on values whose
+/// structure changes each generation.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn dictionary_reuse_costs() {
+    use std::time::{Duration, Instant};
+
+    const PARTS: usize = 8;
+    const PER: u64 = 24_000;
+    const GENERATIONS: u64 = 6;
+    const STRATEGIES: [&str; 4] = ["fresh", "first", "best", "best-copy"];
+    let key = |index: u64| (index * 2 + 1).to_be_bytes().to_vec();
+    let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
+
+    for evolve in [false, true] {
+        let mut model: Vec<Vec<Owned>> = (0..PARTS as u64)
+            .map(|p| {
+                (p * PER..(p + 1) * PER)
+                    .map(|i| (key(i), i + 1, Some(generation_value(i, 0, evolve))))
+                    .collect()
+            })
+            .collect();
+        let first_dictionary = {
+            let plains: Vec<Run<Vec<u8>>> = model.iter().map(|r| plain(r, SMALL_BLOCK)).collect();
+            let views: Vec<RunView<'_>> = plains.iter().map(Run::view).collect();
+            let decoded = dictionary::decoded_len(&views).unwrap();
+            let samples = dictionary::sample(&views, decoded).unwrap();
+            Arc::new(dictionary::train(&samples.train, &samples.sizes).unwrap())
+        };
+        let mut sets: Vec<Vec<Run<Vec<u8>>>> = STRATEGIES
+            .iter()
+            .map(|_| {
+                model
+                    .iter()
+                    .map(|r| with_dictionary(r, &first_dictionary))
+                    .collect()
+            })
+            .collect();
+        drop(first_dictionary);
+        let mut decision = [Duration::ZERO; 4];
+        println!(
+            "| values | generation | strategy | runs MiB | plain 4 KiB MiB | saving vs plain | held-out saving, mean | distinct prepared / contents | trained (best) |"
+        );
+        for generation in 1..=GENERATIONS {
+            let mut rng = super::costs::Rng::new(70 + generation);
+            let flushes: Vec<Vec<Owned>> = model
+                .iter_mut()
+                .map(|records| {
+                    let mut flushed = Vec::new();
+                    for record in records.iter_mut() {
+                        if rng.below(10) < 3 {
+                            let index = u64::from_be_bytes(record.0[..8].try_into().unwrap()) / 2;
+                            record.1 = (generation << 32) | index;
+                            record.2 = Some(generation_value(index, generation, evolve));
+                            flushed.push(record.clone());
+                        }
+                    }
+                    flushed
+                })
+                .collect();
+            let flush_runs: Vec<Run<Vec<u8>>> =
+                flushes.iter().map(|r| plain(r, SMALL_BLOCK)).collect();
+            let units: Vec<Vec<usize>> = if generation % 2 == 1 {
+                (0..PARTS / 2).map(|u| vec![2 * u, 2 * u + 1]).collect()
+            } else {
+                let mut units = vec![vec![0]];
+                units.extend((0..PARTS / 2 - 1).map(|u| vec![2 * u + 1, 2 * u + 2]));
+                units.push(vec![PARTS - 1]);
+                units
+            };
+            let plain_total: usize = model
+                .iter()
+                .map(|r| plain(r, SMALL_BLOCK).as_bytes().len())
+                .sum();
+            for (s, strategy) in STRATEGIES.iter().enumerate() {
+                let mut savings = Vec::new();
+                let mut trained = 0;
+                for unit in &units {
+                    let views: Vec<RunView<'_>> = unit
+                        .iter()
+                        .map(|&p| sets[s][p].view())
+                        .chain(unit.iter().map(|&p| flush_runs[p].view()))
+                        .collect();
+                    let decoded = dictionary::decoded_len(&views).unwrap();
+                    let samples = dictionary::sample(&views, decoded).unwrap();
+                    let start = Instant::now();
+                    let reuse = |p: usize, share: bool| {
+                        let (bytes, prepared) = sets[s][p].dictionary_parts().unwrap();
+                        Arc::new(dictionary::reuse(bytes, share.then_some(prepared)).unwrap())
+                    };
+                    let chosen = match *strategy {
+                        "fresh" => {
+                            Arc::new(dictionary::train(&samples.train, &samples.sizes).unwrap())
+                        }
+                        "first" => reuse(unit[0], true),
+                        _ => {
+                            // The input dictionary saving most on the samples,
+                            // if it saves enough; otherwise a new one.
+                            let (saving, best) = unit
+                                .iter()
+                                .map(|&p| {
+                                    let candidate = reuse(p, true);
+                                    let saving = dictionary::estimate(
+                                        &candidate,
+                                        &samples.held,
+                                        SMALL_BLOCK,
+                                    );
+                                    (saving.unwrap(), p)
+                                })
+                                .max()
+                                .unwrap();
+                            if saving >= dictionary::MIN_SAVING_PERCENT as i32 {
+                                reuse(best, *strategy == "best")
+                            } else {
+                                trained += 1;
+                                Arc::new(dictionary::train(&samples.train, &samples.sizes).unwrap())
+                            }
+                        }
+                    };
+                    let saving = dictionary::estimate(&chosen, &samples.held, SMALL_BLOCK).unwrap();
+                    decision[s] += start.elapsed();
+                    savings.push(saving);
+                    drop(views);
+                    for &p in unit {
+                        sets[s][p] = with_dictionary(&model[p], &chosen);
+                    }
+                }
+                let total: usize = sets[s].iter().map(|run| run.as_bytes().len()).sum();
+                let parts: Vec<_> = sets[s].iter().filter_map(Run::dictionary_parts).collect();
+                let mut prepared: Vec<_> = parts.iter().map(|(_, p)| Arc::as_ptr(p)).collect();
+                prepared.sort_unstable();
+                prepared.dedup();
+                let mut contents: Vec<&[u8]> = parts.iter().map(|(b, _)| *b).collect();
+                contents.sort_unstable();
+                contents.dedup();
+                println!(
+                    "| {} | {generation} | {strategy} | {:.2} | {:.2} | {:.1}% | {:.1}% | {} / {} | {trained} |",
+                    if evolve { "evolving" } else { "stable" },
+                    mib(total),
+                    mib(plain_total),
+                    100.0 - 100.0 * total as f64 / plain_total as f64,
+                    savings.iter().sum::<i32>() as f64 / savings.len() as f64,
+                    prepared.len(),
+                    contents.len(),
+                );
+            }
+        }
+
+        // Reads of the final runs: random lookups as the harness draws them,
+        // then every record in key order.
+        for (s, strategy) in STRATEGIES.iter().enumerate() {
+            let runs = &sets[s];
+            let mut workspace = ReadWorkspace::new();
+            let mut rng = super::costs::Rng::new(20_000);
+            let mut samples = Vec::with_capacity(90_000);
+            for round in 0..4 {
+                for _ in 0..if round == 0 { 7_500 } else { 30_000 } {
+                    let index = rng.below(PARTS as u64 * PER);
+                    let (k, run) = (key(index), &runs[(index / PER) as usize]);
+                    let start = Instant::now();
+                    std::hint::black_box(run.get(&k, &mut workspace).unwrap());
+                    if round > 0 {
+                        samples.push(start.elapsed().as_nanos() as u64);
+                    }
+                }
+            }
+            samples.sort_unstable();
+            let start = Instant::now();
+            let mut records = 0u64;
+            for run in runs {
+                let mut cursor = run.view().cursor(&mut workspace);
+                while let Some(record) = cursor.next_record().unwrap() {
+                    std::hint::black_box(record.key);
+                    records += 1;
+                }
+            }
+            let walk = start.elapsed();
+            println!(
+                "| {} | reads | {strategy} | lookup p50 {} ns | p99 {} ns | walk {:.2} M rec/s | decisions {:.3} s |",
+                if evolve { "evolving" } else { "stable" },
+                samples[samples.len() / 2],
+                samples[samples.len() * 99 / 100],
+                records as f64 / walk.as_secs_f64() / 1e6,
+                decision[s].as_secs_f64(),
+            );
+        }
+    }
+}
+
+/// The write sequence of the comparison harness's mixed workload
+/// (`BENCH_MIXED` in `tools/compare`, 5AG) on `json:LOOKUP_GROUPS` (64 by
+/// default) with background compaction, without its reads: what runs and
+/// dictionaries it leaves after each round, which the harness cannot see.
+/// The load, consolidation and overwrites match the harness's; the timing
+/// of background compactions does not.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn mixed_dictionary_counts() {
+    use crate::engine::{CompactionOptions, Compression, Engine, EngineOptions};
+
+    const GROUP: u64 = 16_384;
+    let groups = std::env::var("LOOKUP_GROUPS").map_or(64, |g| g.parse().unwrap());
+    let rounds = std::env::var("MIXED_ROUNDS").map_or(16, |r| r.parse().unwrap());
+    let records = groups * GROUP;
+    let shuffled = |j: u64, multiplier: u64| {
+        (j.wrapping_mul(multiplier).wrapping_add(0x7F4A_7C15)) & (records - 1)
+    };
+    let engine = Engine::new(EngineOptions {
+        max_runs: 256,
+        background_compaction: Some(CompactionOptions::default()),
+        compression: Compression::ZstdDictionary,
+        target_block_len: SMALL_BLOCK,
+        ..EngineOptions::default()
+    });
+    for j in 0..records {
+        let index = shuffled(j, 0x9E37_79B1);
+        engine
+            .put(&compare::key(groups, index), &compare::json(index, 0))
+            .unwrap();
+    }
+    engine.flush().unwrap();
+    engine.wait_for_compaction().unwrap();
+    let options = CompactionOptions {
+        max_overlap: 1,
+        max_inputs: usize::MAX,
+        max_input_bytes: usize::MAX,
+        max_output_bytes: usize::MAX,
+        ..CompactionOptions::default()
+    };
+    let mut merge = MergeWorkspace::new();
+    while engine.compact(options, &mut merge).unwrap().is_some() {}
+    engine.wait_for_compaction().unwrap();
+    let report = |label: &str| {
+        let (with, prepared, contents) = engine.dictionary_counts();
+        let status = engine.background_status().unwrap();
+        let stats = engine.stats();
+        println!(
+            "| {label} | runs {} | with a dictionary {with} | distinct prepared {prepared} | distinct contents {contents} | background compactions {} | {:.2} MiB + {:.2} |",
+            stats.runs,
+            status.compactions,
+            stats.run_bytes as f64 / f64::from(1 << 20),
+            stats.held_bytes as f64 / f64::from(1 << 20),
+        );
+    };
+    report("consolidated");
+    for round in 0..rounds {
+        for j in 0..GROUP {
+            let index = shuffled(round * GROUP + j, 0x2545_F491);
+            engine
+                .put(
+                    &compare::key(groups, index),
+                    &compare::json(index, 2 + round),
+                )
+                .unwrap();
+        }
+        report(&format!("round {round}"));
+    }
+    engine.flush().unwrap();
+    engine.wait_for_compaction().unwrap();
+    report("settled");
+}
