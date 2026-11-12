@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CompactionError, CompactionOptions, ENTRY_OVERHEAD, Engine, EngineOptions, EngineStats,
-    EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, ReadGuard, SnapshotLimits,
-    UpdateError, WriteError,
+    CompactionError, CompactionOptions, Compression, ENTRY_OVERHEAD, Engine, EngineOptions,
+    EngineStats, EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, ReadGuard,
+    SnapshotLimits, UpdateError, WriteError,
 };
 
 type Live = (Vec<u8>, u64, Vec<u8>);
@@ -986,6 +986,11 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
             last_seq: 0,
             background_compaction: None,
             snapshots: SnapshotLimits::default(),
+            compression: [
+                Compression::Zstd,
+                Compression::Lz4,
+                Compression::Uncompressed,
+            ][rng.below(3)],
         });
         let mut model = Model::new();
         // Charged per key in the active table, and what frozen tables are

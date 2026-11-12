@@ -70,6 +70,14 @@ engine.durable_checkpoint(Default::default())?;
 writes. Writes never need the caller to flush or retry for room; see
 **Flushing** under [Engine](#engine).
 
+`EngineOptions::compression` chooses how runs store their blocks:
+`Compression::Zstd` (the default, densest), `Lz4`, or `Uncompressed`. A
+lookup that reaches a run costs about 8 µs, 2 µs or 0.5 µs respectively,
+and JSON-like data takes about 1.7× (LZ4) or 3.8× (uncompressed) the
+Zstandard memory. Blocks record their codec, so the setting can change
+between restarts: existing runs and checkpoints stay readable, and
+compaction rewrites runs with the current setting.
+
 ## Engine
 
 `put` and `delete` return the write's sequence number. `get` returns a key's
@@ -243,7 +251,9 @@ writes run at about 1.2–1.7 million a second from 1–4 writers. One durable
 writer on the VM's virtual disk manages about 6,000–8,000 writes a second
 (one sync each, p50 about 125 µs); group commit reaches about 30,000–36,000
 with 8 writers, with about 0.2 syncs a write. Recovery replays the log at
-about 270–290 MiB a second. Writes that flush for themselves measured level
+about 270–290 MiB a second. A point lookup that reaches a run is dominated
+by decoding one 16 KiB block (about 8 µs under Zstandard; see
+`EngineOptions::compression`). Writes that flush for themselves measured level
 with caller-driven flushing, and several writers share one flush per full
 table. Methods, workloads and full results are in
 [`docs/benchmarks.md`](docs/benchmarks.md).

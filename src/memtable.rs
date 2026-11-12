@@ -63,7 +63,7 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
-use crate::run::{RECORD_INPUT_OVERHEAD, Run, RunBuilder};
+use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder};
 
 #[cfg(test)]
 mod tests;
@@ -927,7 +927,17 @@ impl FrozenMemtable {
     }
 
     /// Returns an iterator that builds this table's runs one at a time, with
-    /// the default codec and block size.
+    /// the default codec and block size, as [`Self::flush_with`] does.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
+    pub fn flush(&self, target_run_len: usize) -> Flush<'_> {
+        self.flush_with(target_run_len, Codec::default())
+    }
+
+    /// Returns an iterator that builds this table's runs one at a time, with
+    /// `codec` and the default block size.
     ///
     /// A run ends once its records reach `target_run_len` bytes of input,
     /// reduced to [`MAX_TARGET_RUN_LEN`] if larger, so runs hold disjoint key
@@ -936,10 +946,11 @@ impl FrozenMemtable {
     /// The table is only borrowed. A caller that cannot use a run can drop the
     /// iterator and flush again, which produces identical runs. The table and
     /// the runs built so far coexist until the caller drops the table.
-    pub fn flush(&self, target_run_len: usize) -> Flush<'_> {
+    pub fn flush_with(&self, target_run_len: usize, codec: Codec) -> Flush<'_> {
         Flush {
             records: self.iter(),
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
+            codec,
         }
     }
 }
@@ -953,11 +964,15 @@ fn input_len(record: &Record<'_>) -> usize {
 }
 
 /// Builds runs from several frozen tables as if they were one, splitting
-/// them as [`FrozenMemtable::flush`] does. `tables` is ordered oldest first,
-/// and where tables share a key the newest update is the one written.
-pub(crate) fn flush_merged(tables: &[&FrozenMemtable], target_run_len: usize) -> Vec<Run<Vec<u8>>> {
+/// them as [`FrozenMemtable::flush_with`] does. `tables` is ordered oldest
+/// first, and where tables share a key the newest update is the one written.
+pub(crate) fn flush_merged(
+    tables: &[&FrozenMemtable],
+    target_run_len: usize,
+    codec: Codec,
+) -> Vec<Run<Vec<u8>>> {
     if let [table] = tables {
-        return table.flush(target_run_len).collect();
+        return table.flush_with(target_run_len, codec).collect();
     }
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
     let mut heads: Vec<_> = tables.iter().map(|table| table.iter().peekable()).collect();
@@ -980,7 +995,7 @@ pub(crate) fn flush_merged(tables: &[&FrozenMemtable], target_run_len: usize) ->
             head.next_if(|other| other.key == key);
         }
         builder
-            .get_or_insert_with(RunBuilder::default)
+            .get_or_insert_with(|| RunBuilder::new(codec))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
         input += input_len(&record);
@@ -1050,6 +1065,7 @@ impl fmt::Debug for Records<'_> {
 pub struct Flush<'a> {
     records: Records<'a>,
     target: usize,
+    codec: Codec,
 }
 
 impl Iterator for Flush<'_> {
@@ -1057,7 +1073,7 @@ impl Iterator for Flush<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut record = self.records.next()?;
-        let mut builder = RunBuilder::default();
+        let mut builder = RunBuilder::new(self.codec);
         let mut input = 0;
         loop {
             builder

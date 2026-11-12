@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CheckpointError, CheckpointOptions, CompactionOptions, Damage, Engine, EngineOptions,
-    EngineWorkspace, MergeWorkspace, RecoveryError, SnapshotLimits,
+    CheckpointError, CheckpointOptions, CompactionOptions, Compression, Damage, Engine,
+    EngineOptions, EngineWorkspace, MergeWorkspace, RecoveryError, SnapshotLimits,
 };
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -167,6 +167,83 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
     let again = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
     assert_eq!(contents(&again, b""), contents(&recovered, b""));
     assert_eq!(get(&again, &4u32.to_be_bytes()), None);
+}
+
+/// Each block records its codec, so the configured compression decides only
+/// what new runs use: a checkpoint written under one setting recovers under
+/// any other, and compaction rewrites what it merges.
+#[test]
+fn checkpoints_recover_under_any_compression() {
+    const ALL: [Compression; 3] = [
+        Compression::Zstd,
+        Compression::Lz4,
+        Compression::Uncompressed,
+    ];
+    let with = |compression| EngineOptions {
+        target_run_len: 4096,
+        compression,
+        ..EngineOptions::default()
+    };
+    let mut run_bytes = Vec::new();
+    for written in ALL {
+        let scratch = Scratch::new(&format!("compression-{written:?}"));
+        let engine = Engine::new(with(written));
+        let mut model = Model::new();
+        for i in 0..3_000u32 {
+            let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
+            engine.put(&key, value.as_bytes()).unwrap();
+            model.insert(key, value.into_bytes());
+        }
+        engine.flush().unwrap();
+        for i in (0..3_000u32).step_by(3) {
+            engine.delete(&i.to_be_bytes()).unwrap();
+            model.remove(&i.to_be_bytes()[..]);
+        }
+        engine.flush().unwrap();
+        assert_eq!(contents(&engine, b""), model);
+        run_bytes.push(engine.stats().run_bytes);
+        engine
+            .checkpoint(&scratch.0, CheckpointOptions::default())
+            .unwrap();
+
+        for read in ALL {
+            let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
+            assert_eq!(contents(&recovered, b""), model, "{written:?} as {read:?}");
+            assert_eq!(
+                get(&recovered, &4u32.to_be_bytes()),
+                model.get(&4u32.to_be_bytes()[..]).cloned()
+            );
+            assert_eq!(get(&recovered, &3u32.to_be_bytes()), None);
+            // A newer run in the configured codec beside the recovered ones:
+            // overwrites, a delete and a key a delete had hidden.
+            let mut newer = model.clone();
+            for i in [1u32, 3, 4, 2_999] {
+                let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
+                recovered.put(&key, value.as_bytes()).unwrap();
+                newer.insert(key, value.into_bytes());
+            }
+            recovered.delete(&2u32.to_be_bytes()).unwrap();
+            newer.remove(&2u32.to_be_bytes()[..]);
+            recovered.flush().unwrap();
+            assert!(recovered.stats().runs > 1);
+            let snapshot = recovered.snapshot().unwrap();
+            // Compaction writes the merged runs with the configured codec;
+            // the snapshot keeps reading the runs it replaced.
+            compact_all(&recovered);
+            assert_eq!(contents(&recovered, b""), newer, "{written:?} as {read:?}");
+            let mut workspace = EngineWorkspace::new();
+            let mut scan = snapshot.scan_prefix(b"", &mut workspace);
+            let mut seen = Model::new();
+            while let Some(record) = scan.next_record().unwrap() {
+                seen.insert(record.key.to_vec(), record.value.to_vec());
+            }
+            assert_eq!(seen, newer, "snapshot, {written:?} as {read:?}");
+        }
+    }
+    assert!(
+        run_bytes[0] < run_bytes[1] && run_bytes[1] < run_bytes[2],
+        "{run_bytes:?}"
+    );
 }
 
 #[test]

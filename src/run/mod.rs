@@ -106,6 +106,7 @@ use std::fmt;
 use crate::block::Corruption;
 
 pub use builder::RunBuilder;
+pub use codec::Codec;
 pub use compact::{CompactError, CompactLimits, CompactStats, Compacted, compact};
 pub(crate) use logical::latest_in;
 pub use logical::{
@@ -115,8 +116,6 @@ pub use merge::{MergeCursor, MergeWorkspace};
 pub use reader::{Run, RunView};
 
 // Used beyond this module only by its tests.
-#[cfg(test)]
-pub use codec::Codec;
 #[cfg(test)]
 pub use compact::CONTEXT_ALLOWANCE;
 #[cfg(test)]

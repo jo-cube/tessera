@@ -6,8 +6,8 @@ use crate::block::{Record, Value};
 
 use super::logical::conflict;
 use super::{
-    CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD, ReadError,
-    Run, RunBuilder, RunView,
+    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
+    ReadError, Run, RunBuilder, RunView,
 };
 
 const BUILDABLE: &str = "merged records are ordered, within the limits, and fit in one run";
@@ -29,6 +29,8 @@ pub struct CompactLimits {
     /// hashes, and an output run whose distinct keys need more is built
     /// without a filter.
     pub max_workspace_bytes: usize,
+    /// How the output runs store their blocks.
+    pub codec: Codec,
 }
 
 /// Bytes allowed for one Zstandard context, compressing 16 KiB blocks at level
@@ -261,7 +263,7 @@ impl Output {
 
     fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
         let builder = self.builder.get_or_insert_with(|| {
-            let mut builder = RunBuilder::default();
+            let mut builder = RunBuilder::new(self.limits.codec);
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder
         });

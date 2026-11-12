@@ -439,8 +439,7 @@ overhead, but not allocator fragmentation or RSS.
 
 ### Compressed and uncompressed runs
 
-The engine always writes Zstandard level 3, so this comes from the run
-layer directly: `cargo test --release --lib run::tests::costs -- --ignored
+This comes from the run layer directly (5W below measures the engine): `cargo test --release --lib run::tests::costs -- --ignored
 --nocapture` builds one run per payload and codec (smaller, simplified
 versions of the `density` payloads, with 10-byte keys) and reads it
 without an engine, so it shows block costs, not the engine's read path.
@@ -492,7 +491,165 @@ or the index, is what separates run lookups from memory lookups.
   at the newest run holding a key, halving the cost of overwritten keys in
   overlapping runs; and a choice of codec (LZ4, or none for hot data)
   would trade density for 2–3× (LZ4) or 20–60× (none) cheaper decodes. Each is a design decision
-  beyond this baseline.
+  beyond this baseline. 5W, below, measured all three and added the codec
+  choice.
+
+## Compression and read latency (5W)
+
+Zstandard level 3, LZ4 and uncompressed runs through the whole engine, on
+the identical datasets of the 5V modes. Every run block already records its
+codec, so the comparison needed no format change: one pass of `lookups`,
+`scans`, `density`, `maintenance`, `snapshots` and `recovery` per codec, in
+one session, with the engine's codec switched at build time (the same
+setting `EngineOptions::compression` now exposes). One pass each, so read
+single-digit percentage differences as noise; the differences below are
+2× and more. Lookups took 86.7 / 25.6 / 11.7 s of the `lookups` mode's
+wall time (Zstandard / LZ4 / none); container peaks stayed under 360 MiB.
+
+### What each codec costs and saves
+
+Medians of the same cells as the 5V tables. *Measured*, one pass:
+
+| | Zstandard (default) | LZ4 | uncompressed |
+|---|---|---|---|
+| lookup, consolidated, present key: warm ns / p99 µs | 8,112 / 11.6 | 2,105 / 2.7 | 474 / 0.8 |
+| lookup, 9 overlapping runs, present | 10,939 / 25.3 | 3,432 / 7.7 | 886 / 1.8 |
+| lookup, 9 overlapping runs, overwritten (2 blocks) | 17,817 / 26.5 | 5,052 / 8.3 | 1,209 / 2.1 |
+| lookup, absent key inside run ranges, 9 runs: ns / p99 µs | 865 / 9.3 | 434 / 3.3 | 275 / 0.9 |
+| lookup, hot 4,096-key range, consolidated | 7,563 | 1,391 | 314 |
+| scan seek, consolidated / 9 runs (µs) | 8.4 / 77.6 | 2.3 / 21.9 | 0.6 / 4.4 |
+| 32-key scan, consolidated / 9 runs (µs) | 11.0 / 83.0 | 3.8 / 25.8 | 1.8 / 7.8 |
+| ns per record after the seek, consolidated / 9 runs | 94 / 206 | 53 / 148 | 42 / 130 |
+| 16,384-key scan, consolidated (µs) | 1,345 | 760 | 589 |
+| no match inside the key range, consolidated (µs) | 7.6 | 1.5 | 0.4 |
+| heap in runs, sensor / JSON / documents (MiB) | 35.6 / 16.9 / 8.6 | 42.2 / 28.9 / 13.7 | 46.2 / 63.5 / 35.9 |
+| logical ÷ run bytes, same payloads | 1.48 / 3.80 / 4.19 | 1.24 / 2.21 / 2.63 | 1.13 / 1.00 / 1.00 |
+| flush of 250,000 × 108 B: ms (MB/s), stored ÷ payload | 77.9 (346), 0.31 | 43.0 (627), 0.47 | 37.1 (727), 1.00 |
+| compaction of 8 runs: ms, output MiB | 414, 28.1 | 231, 41.7 | 213, 89.2 |
+| checkpoint of 500,000: ms, MiB | 150, 15.9 | 70, 24.0 | 59, 51.5 |
+| recover / durable open replaying 100,000 (ms) | 70 / 101 | 33 / 63 | 33 / 63 |
+
+For comparison, the memtable answers the same lookups in 0.69 µs and a
+`BTreeMap` in 0.38 µs, holding the three payloads in 134.7 / 121.3 / 72.3
+MiB of heap.
+
+- **Point lookups:** the run-layer advantage survives the engine almost
+  whole. An uncompressed run lookup costs 0.47 µs against 0.2–0.5 µs in the
+  run alone, close to the memtable; LZ4 is 3.5–4× and uncompressed 13–17×
+  cheaper than Zstandard wherever a block is decoded, including the p99.
+  Blocks per lookup, allocations (none) and filter behaviour are unchanged:
+  the codec changes the price of a block, not how many are read. Absent
+  keys barely change, except the false-positive tail with many runs.
+  Locality starts to pay once decoding is cheap: hot and ascending lookups
+  are 1.5× faster than random with LZ4 and uncompressed, not at all with
+  Zstandard.
+- **Scans:** a cheaper codec helps the seek and short scans 3–20×, long
+  scans 1.6–2.3× (ns a record falls 94 → 53 → 42), since iteration also
+  pays for merging and copying. Overlap costs the same share under every
+  codec. Snapshot reads and memtable scans are unchanged.
+- **Memory:** the codec matters most for structured values: JSON-like
+  runs are 1.7× (LZ4) and 3.8× (uncompressed) the Zstandard size. Small
+  binary records save only 23% under Zstandard, at 27× the lookup cost of
+  uncompressed. Even uncompressed, runs hold 1.9–2.9× less heap than a
+  `BTreeMap`. Indexes (15–30 KiB per 11–22 MiB) and filters (10 bits a key)
+  do not depend on the codec. Read workspaces and snapshot retention do
+  not change either; a decoded block is still at most one 16 KiB buffer per
+  run cursor, and uncompressed blocks need none.
+- **Writes and persistence:** Zstandard is the slowest to build: flushes
+  and compactions take 1.8–2.1× as long as LZ4, which is within 15% of
+  uncompressed. Snapshot-heavy overwrites run 25–45% faster with LZ4 for
+  the same reason. Rewrite amplification (versions dropped) is identical.
+  Checkpoints re-encode every live record with the configured codec, so
+  their size follows the run sizes (1.5× and 3.2× of Zstandard here) and
+  so does the disk they write; recovery is 2× faster with either cheaper
+  codec.
+
+### Decoded-block cache (simulation only)
+
+`cargo test --release --lib run::tests::costs::block_cache -- --ignored
+--nocapture` replays the blocks that 200,000 reads would decode from one
+consolidated Zstandard run through an LRU, charging each cached block the
+run's largest decoded block plus 64 bytes. Hot keys in the Zipf traces are
+scattered across the key space; the hot window in the second trace is
+contiguous. *Measured* hit rates, one pass:
+
+| payload | trace | blocks/op | 1 MiB | 4 MiB | 16 MiB | 64 MiB | all blocks decoded |
+|---|---|---|---|---|---|---|---|
+| sensor readings (600,000) | uniform gets | 1.00 | 6% | 24% | 96% | 99% | 16.7 MiB |
+| | 90% of gets in 1% of keys, contiguous | 1.00 | 91% | 92% | 99% | 99% | |
+| | Zipf gets, scattered | 1.00 | 25% | 48% | 98% | 99% | |
+| | Zipf 32-key scans | 1.05 | 24% | 48% | 98% | 99% | |
+| JSON profiles (50,000) | uniform gets | 1.00 | 4% | 18% | 71% | 99% | 22.5 MiB |
+| | 90% of gets in 1% of keys, contiguous | 1.00 | 90% | 92% | 97% | 99% | |
+| | Zipf gets, scattered | 1.00 | 30% | 51% | 88% | 99% | |
+| | Zipf 32-key scans | 1.89 | 25% | 47% | 86% | 100% | |
+
+*Extrapolated:* a hit spares one decode, about 7.5 µs under Zstandard, so
+a 4 MiB cache under scattered Zipf traffic would save about 3.6 µs of an
+8 µs lookup. The same budget held as uncompressed runs serves every read
+at the uncompressed price: a cache pays only where the hot set is small
+and contiguous, or where most of the data must stay compressed. It would
+also need shared decoded blocks across readers, synchronization on each
+read and its own memory accounting. Not implemented; this agrees with the
+earlier simulation under "Decoded-block caching".
+
+### Sequence-bound pruning (review only)
+
+A lookup reads every run its filter and key range do not exclude, keeps the
+highest sequence number and checks for conflicting copies of it. Recording
+each run's largest sequence number (known to the builder, and recomputable
+when `Run::new` validates a loaded run, so no format change) and visiting
+runs in descending order of it would let the lookup stop as soon as no
+remaining run can hold a newer version.
+
+- **Precedence and tombstones:** safe. A tombstone is a version like any
+  other; skipping runs whose newest record is older than a found version
+  cannot hide a newer one.
+- **Overlapping ranges:** unaffected; key ranges and filters still exclude
+  first.
+- **Conflict detection:** another copy of the decisive sequence number can
+  only be in a run whose largest sequence number is at least that one, so
+  the check at the deciding version is kept. Conflicting copies of older
+  versions would go unnoticed, but today's lookups already ignore them.
+- **Snapshots and compaction:** snapshots hold immutable run lists; a
+  compaction output carries the largest sequence number of its inputs.
+  The run list is not in recency order (compaction outputs are appended
+  after newer flushes), so the order would be computed per published list.
+
+It is safe but narrow: it saves one decode only for keys with versions in
+more than one run (17.8 → about 11 µs for overwritten keys in 9 runs under
+Zstandard, 1.2 → 0.9 µs uncompressed, *extrapolated* from the
+present-key cells). Consolidated data, absent keys and memtable hits gain
+nothing, and consolidation removes the case entirely. Deferred.
+
+### Decision
+
+The codec is now a setting: `EngineOptions::compression`, one of
+`Compression::Zstd` (the default), `Lz4` or `Uncompressed`. It applies to
+the runs that flushes, compactions and checkpoints build.
+
+- **Why:** a material, reproducible difference (4–17× point lookups,
+  3–20× seeks and short scans, 2× flush, compaction, checkpoint and
+  recovery throughput) in exchange for memory, which is the trade an
+  application should choose. The integration is one value threaded to the
+  three run builders.
+- **Format and compatibility:** none changed. Each block frame already
+  records its codec and checksum, and readers accept all three, so runs of
+  different codecs coexist, checkpoints and logs recover under any setting
+  (tested in `tests/checkpoint.rs`), and compaction rewrites what it merges
+  with the configured codec. No per-run or per-checkpoint setting is
+  stored, so there is nothing to keep consistent.
+- **Validation:** unchanged for compressed blocks. Uncompressed blocks are
+  read in place, so their checksums are verified when a run is loaded
+  from a checkpoint, not on each read; runs live only in memory, so
+  this leaves no window for on-disk corruption to reach a read.
+- **Limits:** `max_run_bytes` and checkpoint `max_bytes` count stored
+  bytes, so less compression reaches them sooner; nothing else in memory
+  admission depends on the codec.
+- **Default:** Zstandard stays. Density is the engine's purpose, and for
+  structured values it holds 1.7–3.8× more data than the alternatives.
+- **Not done:** per-level or adaptive codecs, recompression, Zstandard
+  levels, block caching and sequence-bound pruning.
 
 ## Historical results
 

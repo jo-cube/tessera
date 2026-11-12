@@ -1,12 +1,13 @@
-//! What compression costs and saves, per codec, on the payloads of the
-//! benchmark's `density` mode. A measurement rather than a test: the engine
-//! always uses the default codec, so this is the only place the others can be
-//! compared. Run it in release:
+//! Measurements rather than tests, on the payloads of the benchmark's
+//! `density` mode: what each codec costs and saves within one run, and how
+//! often a decoded-block cache, which the engine does not have, would spare a
+//! decode. Run them in release:
 //!
 //! ```text
 //! cargo test --release --lib run::tests::costs -- --ignored --nocapture
 //! ```
 
+use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -158,6 +159,171 @@ fn codec_size_and_read_costs() {
                 median(gets),
                 blocks as f64 / probes.len() as f64,
                 median(scans),
+            );
+        }
+    }
+}
+
+/// A least-recently-used set of decoded blocks, counted in bytes.
+struct Lru {
+    budget: usize,
+    block_bytes: usize,
+    clock: u64,
+    stamps: HashMap<usize, u64>,
+    order: BTreeMap<u64, usize>,
+    hits: u64,
+    misses: u64,
+}
+
+impl Lru {
+    fn new(budget: usize, block_bytes: usize) -> Self {
+        Self {
+            budget,
+            block_bytes,
+            clock: 0,
+            stamps: HashMap::new(),
+            order: BTreeMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn touch(&mut self, block: usize) {
+        self.clock += 1;
+        if let Some(stamp) = self.stamps.insert(block, self.clock) {
+            self.order.remove(&stamp);
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+            if self.stamps.len() * self.block_bytes > self.budget {
+                let (_, evicted) = self.order.pop_first().unwrap();
+                self.stamps.remove(&evicted);
+            }
+        }
+        self.order.insert(self.clock, block);
+    }
+}
+
+/// Zipf(1) ranks over `count` items, drawn by inverting the cumulative sum.
+fn zipf(count: usize) -> impl FnMut(&mut Rng) -> usize {
+    let mut total = 0.0;
+    let cumulative: Vec<f64> = (1..=count)
+        .map(|rank| {
+            total += 1.0 / rank as f64;
+            total
+        })
+        .collect();
+    move |rng: &mut Rng| {
+        let target = rng.below(1 << 52) as f64 / (1u64 << 52) as f64 * total;
+        cumulative
+            .partition_point(|&sum| sum < target)
+            .min(count - 1)
+    }
+}
+
+/// How often a decoded-block cache of a given size would have spared a
+/// decode: an LRU simulation over the blocks that reads touch, without a
+/// cache in the engine. Each cached block is charged the run's largest
+/// decoded block plus a small entry overhead.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn block_cache_hit_rates() {
+    const OPS: usize = 200_000;
+    const ENTRY_OVERHEAD: usize = 64;
+    type Payload = fn(u64) -> Vec<u8>;
+    let payloads: [(&str, u64, Payload); 2] = [
+        ("sensor readings", 600_000, small),
+        ("JSON profiles", 50_000, json),
+    ];
+    println!(
+        "\n| payload | trace | blocks/op | 1 MiB | 4 MiB | 16 MiB | 64 MiB | decoded run MiB |"
+    );
+    println!("|{}", "---|".repeat(8));
+    for (name, count, value) in payloads {
+        let keys: Vec<Vec<u8>> = (0..count)
+            .map(|index| format!("k/{index:08}").into_bytes())
+            .collect();
+        let mut builder = RunBuilder::new(Codec::Zstd);
+        for (index, key) in keys.iter().enumerate() {
+            builder
+                .add(key, 1, Value::Bytes(&value(index as u64)))
+                .unwrap();
+        }
+        let run: Run<Vec<u8>> = builder.finish();
+        let view = run.view();
+        let block_bytes = view.largest_block_len().unwrap() + ENTRY_OVERHEAD;
+        let decoded = run.block_count() * block_bytes;
+        let block = |key: &[u8]| view.locate(key).unwrap().unwrap();
+        let count = count as usize;
+
+        // Popularity follows key order within the hot window, and a random
+        // permutation of keys under Zipf, so popular keys share few blocks
+        // only by chance.
+        let mut rng = Rng::new(11);
+        let mut permutation: Vec<usize> = (0..count).collect();
+        for at in (1..count).rev() {
+            permutation.swap(at, rng.below(at as u64 + 1) as usize);
+        }
+        let mut rank = zipf(count);
+        let window = count / 100;
+        let traces: [(&str, Vec<Vec<usize>>); 4] = [
+            (
+                "uniform gets",
+                (0..OPS)
+                    .map(|_| vec![block(&keys[rng.below(count as u64) as usize])])
+                    .collect(),
+            ),
+            (
+                "90% of gets in 1% of keys",
+                (0..OPS)
+                    .map(|_| {
+                        let at = if rng.below(10) < 9 {
+                            count / 2 + rng.below(window as u64) as usize
+                        } else {
+                            rng.below(count as u64) as usize
+                        };
+                        vec![block(&keys[at])]
+                    })
+                    .collect(),
+            ),
+            (
+                "Zipf gets, scattered",
+                (0..OPS)
+                    .map(|_| vec![block(&keys[permutation[rank(&mut rng)]])])
+                    .collect(),
+            ),
+            (
+                "Zipf 32-key scans",
+                (0..OPS)
+                    .map(|_| {
+                        let first = permutation[rank(&mut rng)].min(count - 32);
+                        (block(&keys[first])..=block(&keys[first + 31])).collect()
+                    })
+                    .collect(),
+            ),
+        ];
+        for (trace_name, trace) in traces {
+            let touches: usize = trace.iter().map(Vec::len).sum();
+            let rates: Vec<String> = [1usize, 4, 16, 64]
+                .into_iter()
+                .map(|mib| {
+                    let mut lru = Lru::new(mib << 20, block_bytes);
+                    for blocks in &trace {
+                        for &at in blocks {
+                            lru.touch(at);
+                        }
+                    }
+                    format!(
+                        "{:.0}%",
+                        100.0 * lru.hits as f64 / (lru.hits + lru.misses) as f64
+                    )
+                })
+                .collect();
+            println!(
+                "| {name} | {trace_name} | {:.2} | {} | {:.1} |",
+                touches as f64 / OPS as f64,
+                rates.join(" | "),
+                decoded as f64 / f64::from(1 << 20),
             );
         }
     }

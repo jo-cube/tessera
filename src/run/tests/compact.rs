@@ -3,8 +3,8 @@
 
 use crate::block::Value;
 use crate::run::{
-    CONTEXT_ALLOWANCE, CompactError, CompactLimits, Compacted, ConflictingCopies, MergeWorkspace,
-    ReadError, ReadWorkspace, Run, RunBuilder, compact,
+    CONTEXT_ALLOWANCE, Codec, CompactError, CompactLimits, Compacted, ConflictingCopies,
+    MergeWorkspace, ReadError, ReadWorkspace, Run, RunBuilder, compact,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -40,6 +40,7 @@ const UNLIMITED: CompactLimits = CompactLimits {
     target_run_len: usize::MAX,
     max_output_bytes: usize::MAX,
     max_workspace_bytes: usize::MAX,
+    codec: Codec::Zstd,
 };
 
 fn merge(
