@@ -425,9 +425,11 @@ impl Default for EngineOptions {
 /// On JSON-like values through the engine (`docs/benchmarks.md`), 4 KiB
 /// blocks with a dictionary held 10% less run memory than 16 KiB plain
 /// blocks and 27% less than 4 KiB plain blocks, and lookups that reached a
-/// run took 4.0–5.2 µs, against 13.8 µs at 16 KiB and 5.9–6.0 µs at 4 KiB
-/// plain. On small repetitive records they gained nothing, and the check
-/// below leaves those plain.
+/// run took 3.9–5.7 µs, against 13.8 µs at 16 KiB and 5.9–6.0 µs at 4 KiB
+/// plain. Within that range a lookup is slower the more distinct
+/// dictionaries the runs use (each compaction trains its own) and the less
+/// of their tables is in cache. On small repetitive records they gained
+/// nothing, and the check below leaves those plain.
 ///
 /// Only runs that are rewritten get a dictionary. Runs that no compaction
 /// merges, such as the disjoint runs of keys written in ascending order,
@@ -443,10 +445,10 @@ impl Default for EngineOptions {
 ///   plain Zstandard at the same block length. Otherwise the output is plain.
 ///   Rewrites of less than about 6.4 MiB decoded are not sampled at all.
 ///   This is decided before any output is built and is never retried.
-/// - A compaction reserves about 21 MiB for training beside the merge,
-///   which [`CompactionOptions::max_workspace_bytes`] must admit; a
-///   compaction whose limit leaves less room builds plain output rather than
-///   failing.
+/// - A compaction reserves about 21 MiB for training beside the merge
+///   (about 13 MiB was measured), which
+///   [`CompactionOptions::max_workspace_bytes`] must admit; a compaction
+///   whose limit leaves less room builds plain output rather than failing.
 ///   A checkpoint applies no such limit. Each dictionary run stores its
 ///   16 KiB dictionary and holds a prepared form of about 43 KiB beside it,
 ///   which counts towards [`EngineOptions::max_run_bytes`] like a key

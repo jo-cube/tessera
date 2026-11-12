@@ -94,13 +94,16 @@ length stay readable.
 
 `Compression::ZstdDictionary` (opt-in) pairs with 4 KiB blocks: compactions
 and checkpoints train a 16 KiB Zstandard dictionary from samples of the runs
-they rewrite and use it for every run they build, when a held-out sample shows
-it saving at least 10%. On JSON-like values this held 10% less run memory than
-the 16 KiB default and 27% less than plain 4 KiB blocks, with lookups that
-reach a run at 4.0–5.2 µs (13.8 µs at 16 KiB, 5.9 µs at 4 KiB plain). Small
-binary records gain nothing and are left plain. Flushes, and runs no
-compaction merges, stay plain until a checkpoint. Dictionary runs use a newer
-run format, which older builds reject.
+they rewrite and use it for every run they build, when a held-out sample
+shows it saving at least 10%. On JSON-like values this held 10% less run
+memory than the 16 KiB default and 27% less than plain 4 KiB blocks, with
+lookups that reach a run at 3.9–5.7 µs (13.8 µs at 16 KiB, 5.9 µs at 4 KiB
+plain). The range is real: each compaction trains its own dictionary, and a
+lookup is slower the more distinct dictionaries the runs use and the less
+of their tables is in cache. Small binary records gain nothing and are left
+plain. Flushes, and runs no compaction merges, stay plain until a
+checkpoint. Dictionary runs use a newer run format, which older builds
+reject.
 
 ## Engine
 

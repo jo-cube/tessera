@@ -526,10 +526,12 @@ fn lookup_costs() {
     }
 }
 
-/// The same lookups through the engine: records loaded in shuffled order,
-/// flushed and consolidated by compaction (with the background worker
-/// during the load if `LOOKUP_BACKGROUND` is set), at 4 KiB blocks with and
-/// without dictionaries.
+/// Lookups through the engine on the comparison harness's records: loaded
+/// in shuffled order, flushed and consolidated by compaction (with the
+/// background worker during the load if `LOOKUP_BACKGROUND` is set), at
+/// 4 KiB blocks with and without dictionaries. Keys are drawn as the
+/// harness's present-key lookups are: records neither overwritten nor
+/// deleted, a warm-up round of 7,500 and three rounds of 30,000 fresh keys.
 #[test]
 #[ignore = "a measurement: run in release with --ignored --nocapture"]
 fn engine_lookup_costs() {
@@ -538,18 +540,47 @@ fn engine_lookup_costs() {
     use crate::engine::{CompactionOptions, Compression, Engine, EngineOptions, EngineWorkspace};
 
     let groups = std::env::var("LOOKUP_GROUPS").map_or(8, |g| g.parse().unwrap());
-    let records: Vec<Owned> = json_records(groups)
-        .into_iter()
-        .filter(|record| record.2.is_some())
-        .collect();
-    let mut rng = super::costs::Rng::new(7);
-    let keys: Vec<&[u8]> = (0..20_000)
-        .map(|_| {
-            records[rng.below(records.len() as u64) as usize]
-                .0
-                .as_slice()
-        })
-        .collect();
+    let all = json_records(groups);
+    let present = |rng: &mut super::costs::Rng| loop {
+        let index = rng.below(all.len() as u64);
+        if !matches!(index % 16, 0 | 8) {
+            break all[index as usize].0.as_slice();
+        }
+    };
+    let records: Vec<&Owned> = all.iter().filter(|record| record.2.is_some()).collect();
+    // Memory, then lookups timed as the harness times them.
+    let timed = |engine: &Engine| {
+        let mut workspace = EngineWorkspace::new();
+        let mut rng = super::costs::Rng::new(20_000);
+        let mut samples = Vec::with_capacity(90_000);
+        let mut blocks = 0;
+        for round in 0..4 {
+            let keys: Vec<&[u8]> = (0..if round == 0 { 7_500 } else { 30_000 })
+                .map(|_| present(&mut rng))
+                .collect();
+            let before = workspace.blocks_loaded();
+            for key in keys {
+                let start = Instant::now();
+                std::hint::black_box(engine.get(key, &mut workspace).unwrap());
+                if round > 0 {
+                    samples.push(start.elapsed().as_nanos() as u64);
+                }
+            }
+            if round > 0 {
+                blocks += workspace.blocks_loaded() - before;
+            }
+        }
+        samples.sort_unstable();
+        let stats = engine.stats();
+        format!(
+            "{:.2} MiB + {:.2} | p50 {} ns | p99 {} ns | blocks/lookup {:.3}",
+            stats.run_bytes as f64 / f64::from(1 << 20),
+            stats.held_bytes as f64 / f64::from(1 << 20),
+            samples[samples.len() / 2],
+            samples[samples.len() * 99 / 100],
+            blocks as f64 / samples.len() as f64,
+        )
+    };
     let background = std::env::var("LOOKUP_BACKGROUND").is_ok();
     for compression in [Compression::Zstd, Compression::ZstdDictionary] {
         let engine = Engine::new(EngineOptions {
@@ -586,25 +617,237 @@ fn engine_lookup_costs() {
         while let Some(report) = engine.compact(options, &mut merge).unwrap() {
             choices.push(report.stats.dictionary);
         }
-        let mut workspace = EngineWorkspace::new();
-        let mut samples = Vec::with_capacity(keys.len());
-        for _ in 0..2 {
-            samples.clear();
-            for key in &keys {
+        println!(
+            "| engine {compression:?} | runs {} | {choices:?} | {} |",
+            engine.stats().runs,
+            timed(&engine),
+        );
+
+        // A checkpoint of the consolidated state, which trains its own
+        // dictionary from the runs, and recovery from it.
+        let dir = std::env::temp_dir().join(format!("tessera-lookup-costs-{compression:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let start = Instant::now();
+        let report = engine
+            .checkpoint(&dir, crate::engine::CheckpointOptions::default())
+            .unwrap();
+        let checkpoint = start.elapsed();
+        drop(engine);
+        let start = Instant::now();
+        let recovered = Engine::recover(
+            &dir,
+            EngineOptions {
+                target_block_len: SMALL_BLOCK,
+                compression,
+                max_runs: usize::MAX,
+                max_run_bytes: usize::MAX,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let recovery = start.elapsed();
+        println!(
+            "| checkpoint {compression:?} | {:.2} s | {:?} | {} runs, {:.2} MiB | recovery {:.2} s | {} |",
+            checkpoint.as_secs_f64(),
+            report.dictionary,
+            report.runs,
+            report.bytes as f64 / f64::from(1 << 20),
+            recovery.as_secs_f64(),
+            timed(&recovered),
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Lookups over ten runs of the same records, split by key range, compressed
+/// with 1, 2, 5 or 10 distinct dictionaries (each trained on samples of the
+/// runs that use it), against plain 4 KiB runs: what the number of distinct
+/// dictionaries a lookup may meet costs, with nothing else changed. Keys as
+/// in [`engine_lookup_costs`]; `LOOKUP_GROUPS` groups, 8 by default.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn dictionary_count_costs() {
+    use std::time::Instant;
+
+    const RUNS: usize = 10;
+    let groups = std::env::var("LOOKUP_GROUPS").map_or(8, |g| g.parse().unwrap());
+    let all = json_records(groups);
+    let records: Vec<Owned> = all
+        .iter()
+        .filter(|record| record.2.is_some())
+        .cloned()
+        .collect();
+    let chunk = records.len().div_ceil(RUNS);
+    let chunks: Vec<&[Owned]> = records.chunks(chunk).collect();
+    let present = |rng: &mut super::costs::Rng| loop {
+        let index = rng.below(all.len() as u64);
+        if !matches!(index % 16, 0 | 8) {
+            break all[index as usize].0.as_slice();
+        }
+    };
+    for distinct in [0, 1, 2, 5, 10] {
+        // Dictionary `d` serves runs `d * RUNS / distinct ..`, trained on every
+        // eighth of their records, about the compaction's sample budget.
+        let dictionaries: Vec<Arc<Trained>> = (0..distinct)
+            .map(|d| {
+                let sample: Vec<Owned> = chunks[d * RUNS / distinct..(d + 1) * RUNS / distinct]
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().step_by(8 * RUNS / distinct))
+                    .cloned()
+                    .collect();
+                train_on(&plain(&sample, SMALL_BLOCK))
+            })
+            .collect();
+        let runs: Vec<Run<Vec<u8>>> = chunks
+            .iter()
+            .enumerate()
+            .map(|(at, chunk)| match distinct {
+                0 => plain(chunk, SMALL_BLOCK),
+                _ => with_dictionary(chunk, &dictionaries[at * distinct / RUNS]),
+            })
+            .collect();
+        drop(dictionaries);
+        let mut workspace = ReadWorkspace::new();
+        let mut rng = super::costs::Rng::new(20_000);
+        let mut samples = Vec::with_capacity(90_000);
+        for round in 0..4 {
+            let keys: Vec<&[u8]> = (0..if round == 0 { 7_500 } else { 30_000 })
+                .map(|_| present(&mut rng))
+                .collect();
+            for key in keys {
                 let start = Instant::now();
-                std::hint::black_box(engine.get(key, &mut workspace).unwrap());
-                samples.push(start.elapsed().as_nanos() as u64);
+                let run = runs
+                    .iter()
+                    .find(|run| run.key_range().unwrap().unwrap().max >= key)
+                    .unwrap();
+                std::hint::black_box(run.get(key, &mut workspace).unwrap());
+                if round > 0 {
+                    samples.push(start.elapsed().as_nanos() as u64);
+                }
             }
         }
         samples.sort_unstable();
-        let stats = engine.stats();
+        // The decoding stage alone: checksum, dictionary check and
+        // decompression of a block chosen uniformly from all runs.
+        let views: Vec<RunView<'_>> = runs.iter().map(Run::view).collect();
+        let blocks: Vec<(usize, usize)> = views
+            .iter()
+            .enumerate()
+            .flat_map(|(at, view)| (0..view.block_count()).map(move |block| (at, block)))
+            .collect();
+        let mut decodes = Vec::with_capacity(90_000);
+        for round in 0..4 {
+            for _ in 0..if round == 0 { 7_500 } else { 30_000 } {
+                let (at, block) = blocks[rng.below(blocks.len() as u64) as usize];
+                let start = Instant::now();
+                let frame = views[at].frame(block).unwrap();
+                std::hint::black_box(workspace.load(&frame, views[at].dictionary()).unwrap());
+                if round > 0 {
+                    decodes.push(start.elapsed().as_nanos() as u64);
+                }
+            }
+        }
+        decodes.sort_unstable();
+        let stored: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
+        let held: usize = runs.iter().map(Run::held_bytes).sum();
         println!(
-            "| engine {compression:?} | runs {} | {choices:?} | {:.2} MiB + {:.2} | p50 {} ns | p99 {} ns |",
-            stats.runs,
-            stats.run_bytes as f64 / f64::from(1 << 20),
-            stats.held_bytes as f64 / f64::from(1 << 20),
+            "| {distinct} distinct dictionaries | {:.2} MiB + {:.2} | p50 {} ns | p99 {} ns | decode p50 {} ns | p99 {} ns |",
+            stored as f64 / f64::from(1 << 20),
+            held as f64 / f64::from(1 << 20),
             samples[samples.len() / 2],
             samples[samples.len() * 99 / 100],
+            decodes[decodes.len() / 2],
+            decodes[decodes.len() * 99 / 100],
         );
     }
+}
+
+/// The peak resident memory that training adds, native allocations
+/// included, which the safe API cannot report: Linux's high-water mark,
+/// reset just before, around one [`dictionary::choose`] on compaction inputs
+/// of the comparison dataset (`LOOKUP_GROUPS` groups, 8 by default) and
+/// around [`dictionary::train`] alone on a full sample budget. Against
+/// [`DICTIONARY_WORKSPACE`], the reservation charged for it.
+///
+/// Freed memory that the allocator keeps would hide new allocations, so the
+/// measured code runs on a new thread, and should run with
+/// `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536`, which maps every large
+/// allocation afresh and unmaps it when freed.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn training_peak_memory() {
+    fn kib(field: &str) -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|line| line.starts_with(field)).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+    // The most resident memory seen above the start while `run` runs, read
+    // by a thread every 200 µs, and the kernel's high-water mark.
+    // `run` goes on a new thread, which glibc gives a fresh arena, so that
+    // the free memory of this thread's arena cannot serve it.
+    fn peak_above(run: impl FnOnce() + Send) -> usize {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = kib("VmRSS:");
+        let (done, most) = (AtomicBool::new(false), AtomicUsize::new(before));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    most.fetch_max(kib("VmRSS:"), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            });
+            scope.spawn(run).join().unwrap();
+            done.store(true, Ordering::Relaxed);
+        });
+        (most.into_inner().max(kib("VmHWM:")) - before) << 10
+    }
+
+    let groups = std::env::var("LOOKUP_GROUPS").map_or(8, |g| g.parse().unwrap());
+    let records = json_records(groups);
+    let inputs = inputs(&records, 2);
+    let views: Vec<RunView<'_>> = inputs.iter().map(Run::view).collect();
+    let mut outcome = None;
+    let choose = peak_above(|| {
+        let choice = dictionary::choose(&views, SMALL_BLOCK, usize::MAX).unwrap();
+        outcome = Some(choice.outcome);
+    });
+
+    // Training alone, on whole decoded blocks up to the budget.
+    let mut workspace = ReadWorkspace::new();
+    let (mut samples, mut sizes) = (Vec::new(), Vec::new());
+    'fill: for view in &views {
+        for block in 0..view.block_count() {
+            let frame = view.frame(block).unwrap();
+            let decoded = workspace.load(&frame, None).unwrap();
+            if samples.len() + decoded.len() > dictionary::SAMPLE_BUDGET {
+                break 'fill;
+            }
+            samples.extend_from_slice(decoded);
+            sizes.push(decoded.len());
+        }
+    }
+    let train = peak_above(|| {
+        std::hint::black_box(dictionary::train(&samples, &sizes).unwrap());
+    });
+    // The method's control: 4 MiB allocated and written, held 20 ms.
+    let control = peak_above(|| {
+        let held = std::hint::black_box(vec![1u8; 4 << 20]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+    });
+    println!(
+        "control: 4 MiB written shows {:.2} MiB ({:?})",
+        control as f64 / f64::from(1 << 20),
+        std::env::var("GLIBC_TUNABLES"),
+    );
+    println!(
+        "| choose {outcome:?} | peak above {:.2} MiB | train alone on {:.2} MiB | peak above {:.2} MiB | reserved {:.2} MiB |",
+        choose as f64 / f64::from(1 << 20),
+        samples.len() as f64 / f64::from(1 << 20),
+        train as f64 / f64::from(1 << 20),
+        DICTIONARY_WORKSPACE as f64 / f64::from(1 << 20),
+    );
 }

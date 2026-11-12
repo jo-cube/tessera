@@ -66,6 +66,9 @@ Kinds of result in this file:
 - **Dictionary research, run layer:** the 5AD section, per-run Zstandard
   dictionaries at 4 KiB blocks in the research layout, with a format and
   compaction design; the engine is unchanged.
+- **Diagnosis and review:** the 5AF section, which explains the 5AE
+  harness's dictionary lookup cost with controlled run-layer and engine
+  measurements and remeasures the three layouts.
 - **Engine feature, paired:** the 5AE section, `Compression::ZstdDictionary`
   against 16 and 4 KiB plain Zstandard through the 5Y harness, with direct
   run-layer and engine lookup checks.
@@ -2723,6 +2726,182 @@ two-input compactions:
   each compaction's runs have their own dictionary, which costs lookups a
   little as their number grows; documents were not measured through the
   engine.
+
+## Dictionary runs reviewed, and their lookup cost explained (5AF)
+
+*Review, diagnosis and focused measurements; no format or policy change.*
+5AE's `Compression::ZstdDictionary` was reviewed and kept. This section
+records the review's outcomes, explains the gap between the harness's
+5.2 µs and the direct test's 4.0 µs per dictionary lookup, and remeasures
+the three layouts. Labels: **M** measured, **D** derived, **A** assumed.
+
+### Review outcomes
+
+- **Statistics renamed.** The engine's `filter_bytes` fields counted
+  prepared dictionaries too, so they are now `held_bytes`
+  (`EngineStats::held_bytes`, `retained_held_bytes`,
+  `FlushReport::held_bytes`, `CompactionReport::input_held_bytes` and
+  `output_held_bytes`), matching `Run::held_bytes`; `Run::filter_bytes`
+  still means the filter alone.
+- **Accounting rule (D):** each run charges its prepared dictionary in full.
+  The runs of one rewrite share one, so the charge overstates by about
+  43 KiB per extra run: 0.42 MiB on 124 MiB of runs here (0.3%), far below
+  any limit's granularity, so it causes no meaningful false refusal. A
+  recovered run prepares its own copy, which the charge then describes
+  exactly. Snapshot retention charges what a run charged when published.
+- **Checkpoints keep training.** A checkpoint trains from the snapshot's
+  runs before writing any file, so a failure leaves the previous checkpoint
+  committed and the WAL boundary unchanged; there is no new setting, and
+  its transient memory is now documented in the checkpoint's resources.
+  Without it, a restart turns dictionary runs into plain ones that
+  compaction may never rewrite.
+- Verified unchanged: version 3 bytes; footer selection by the last 8
+  bytes; length bound before slicing, checksum then preparation before any
+  frame; frames' dictionary IDs; recovery validating every run before any
+  is readable; immutable, shared prepared dictionaries; sequence-bound
+  pruning (`max_seq` is derived from records as before); atomic publication
+  on compaction and checkpoint failure; the default codec.
+
+### Resources (M)
+
+Peak resident memory above the start, native allocations included (Linux's
+high-water mark and a 200 µs sampler, on a thread with a fresh glibc arena
+and `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536`; control: a written
+4 MiB buffer reads 4.00 MiB), `training_peak_memory`:
+
+| measured | peak above, MiB |
+|---|---|
+| `train` alone, on 1.56 MiB of samples (samples not counted) | 10.84–10.91 |
+| whole decision (`choose`: sampling, training, estimate), JSON | 12.66 |
+| reserved (`DICTIONARY_WORKSPACE`) | 21.12 |
+
+The reservation is 1.7× the measured peak. The trainer measured 10.9 MiB
+against its 16 MiB allowance, consistent with the 12 MiB derived from the
+source (D). This is one workload's peak, not a proven bound: the trainer's
+tables are fixed-size, so it is not expected to vary much with the data (A).
+
+Checkpoint and recovery, `json:64` consolidated (direct test, M):
+
+| layout | checkpoint s | runs, MiB written | recovery s | lookups after recovery p50 µs |
+|---|---|---|---|---|
+| Zstd 4 KiB | 2.55 | 9, 171.09 | 1.38 | 6.00 |
+| 4 KiB + dictionary | 1.78 (training about 0.05) | 9, 123.75 | 0.79 | 4.04 (3.92 before) |
+
+### The lookup gap (M)
+
+Plain 4 KiB lookups took 5.8–6.0 µs in every configuration below; only
+dictionary lookups moved. Present-key lookups, `json:64`, 10 runs at 4 KiB,
+one block decoded per lookup:
+
+| binary | how the runs were built | dictionary p50 µs |
+|---|---|---|
+| lib test (`engine_lookup_costs`) | live records shuffled, consolidated in 5 compactions | 3.92–3.96 |
+| harness | the same procedure (`tessera-dict-direct`) | 4.63–4.67 |
+| harness, on a spawned thread | the same | 4.29–4.42 |
+| harness | its load, consolidated, no updates | 4.96–5.63 (5.58–5.75 on a spawned thread) |
+| harness | its full history, consolidated in 9 two-output compactions | 5.25–5.42 |
+
+- **Not the harness's earlier phases.** Without the update history the
+  harness was as slow (4.96–5.63 µs); key sets and timing were made
+  identical (the same xorshift keys, warm-up and rounds) without changing
+  the direct result.
+- **The number of distinct dictionaries (M)** over the same ten runs
+  (`dictionary_count_costs`):
+
+  | distinct dictionaries | lookup p50 µs | decoding alone p50 µs |
+  |---|---|---|
+  | none (plain) | 5.88 | 5.29 |
+  | 1 | 3.38–3.58 | 2.96 |
+  | 2 | 3.75–3.92 | 3.29 |
+  | 5 | 4.00–4.04 | 3.42 |
+  | 10 | 4.08–4.25 | 3.63 |
+
+  All of the difference is in decoding; the rest of a lookup costs 0.6 µs
+  whatever the layout. Zstandard reads a prepared dictionary's entropy
+  tables and content in place (D: `ZSTD_copyDDictParameters` points the
+  context at them), so each lookup reads tables and content from a 43 KiB
+  structure that is only warm if the same dictionary was used recently, where plain blocks carry their
+  own tables into the context's fixed workspace.
+- **Placement (M, partly):** the same runs cost 0.7 µs more in the harness
+  binary than in the test binary, and 0.3 µs of that goes when the work
+  runs on a spawned thread, as tests do, whose allocations glibc serves
+  from another arena. The rest was not isolated.
+- **Unexplained (M):** in the same harness binary, runs built by the
+  harness's own load cost 0.6–1.0 µs more than runs built by the direct
+  procedure (5.25–5.71 against 4.63–4.67 µs). The harness's runs come from
+  about 9 compactions rather than 5, which the curve above puts at 0.1–0.2
+  µs; the rest is not explained, and memory placement is a plausible but
+  untested cause (A).
+- **Conclusion.** No defect was found. The measured part of the gap is
+  intrinsic to the design (one dictionary per rewrite, used in place) and
+  depends on the workload (how many compactions made the live runs); a
+  further part depends on the binary and how memory was placed, and is
+  only partly explained. Plain decoding has no such sensitivity. Expect 3.9–5.7 µs per dictionary lookup at 4 KiB,
+  against 5.9–6.0 µs plain. Only fewer distinct dictionaries would narrow
+  it, which is out of this milestone's scope.
+
+Reproduce: `engine_lookup_costs`, `dictionary_count_costs` and
+`training_peak_memory` in `src/run/tests/dictionary.rs` (release,
+`--ignored --nocapture`, `LOOKUP_GROUPS=64`, and `LOOKUP_BACKGROUND=1` for
+the first); the harness rows with `tessera-dict-direct` and the
+`BENCH_SKIP_UPDATES`, `BENCH_READS=present` and `BENCH_THREAD` switches
+described in `tools/compare/src/main.rs`, at `BENCH_BLOCK_LEN=4096`.
+
+### Paired remeasurement (M)
+
+The 5Y harness's default sequence, consolidated state, two passes in
+opposite orders (ranges are the passes); every full scan verified.
+"Beside" is filters plus prepared dictionaries; "resident" is trimmed
+anonymous memory. Blocks decoded per operation come from the harness's
+counted reads.
+
+| dataset | layout | runs MiB | beside MiB | resident MiB | present p50/p99 µs | overwritten p50 µs | short scan, first record µs | 30 records µs | 480 records µs | long scan M rec/s | full scan M rec/s | blocks per get / short scan |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| JSON | Zstd 16 KiB | 138.17 | 1.17 | 159.4 | 13.88 / 18.0–19.5 | 13.88 | 14.04–14.08 | 27.9 | 238–239 | 2.09–2.10 | 2.11–2.12 | 1.00 / 2.00 |
+| JSON | Zstd 4 KiB | 171.15 | 1.17 | 197.1 | 5.88–5.92 / 7.8 | 5.92 | 6.17 | 26.9–27.0 | 344 | 1.41 | 1.42 | 1.00 / 5.03 |
+| JSON | 4 KiB + dictionary | 124.38 | 1.59 | 131.1–156.4 | 5.46–5.71 / 7.2–7.4 | 5.54–5.62 | 5.54–5.62 | 23.0–24.0 | 288–303 | 1.66–1.67 | 1.67–1.69 | 1.00 / 5.04 |
+| sensor | Zstd 4 KiB | 90.41 | 4.69 | 118.1–118.2 | 5.29 / 6.2–6.4 | 5.25–5.29 | 5.42 | 6.8 | 43 | 12.54–12.57 | 12.79 | 1.00 / 1.24 |
+| sensor | 4 KiB + dictionary | 90.41 | 4.69 | 118.5 | 5.25 / 6.1–6.2 | 5.25 | 5.38–5.42 | 6.8 | 43 | 12.48–12.54 | 12.82 | 1.00 / 1.24 |
+
+Peak anonymous memory over the whole run: JSON 287.6–291.9 MiB (16 KiB),
+336.3 (4 KiB), 302.3 (dictionary); sensor 252.0–253.7 for both.
+
+- Density is as 5AE measured: 10.0% below 16 KiB, 27.3% below plain 4 KiB.
+- Harness lookups were 5.46–5.71 µs, against 5.21–5.25 in 5AE: inside the
+  range above, and the reason the harness is a poor instrument for this
+  path's latency. Through the same harness, plain 4 KiB was 5.88–5.92 µs
+  in both milestones.
+- Sensor compactions all declined (`NotBeneficial`): sizes identical to
+  plain 4 KiB, reads equal within noise.
+- **Allocations (M for the Rust heap, D for Zstandard):** a warm lookup
+  makes no Rust heap allocation and decodes exactly one block for a present
+  key, plain or dictionary (`tests/lookup_allocations.rs`). Zstandard
+  allocates nothing to decode with a prepared dictionary and an existing
+  context (D, from the 1.5.7 source).
+
+Compaction cost, `json:64` shuffled into 11 plain runs, then 12 two-input
+compactions (`tessera-compactions`, 4 KiB):
+
+| layout | stored input MiB | wall s | stored MB/s | training s | estimate MiB | peak heap above, max MiB | peak resident above, max MiB |
+|---|---|---|---|---|---|---|---|
+| Zstd 4 KiB | 387.6 | 5.62 | 72.3 | – | 3.0 | 54.4 | 54.6 |
+| 4 KiB + dictionary | 296.0 | 4.45 | 69.7 | 0.549 | 24.1 | 34.4 | 29.2 |
+
+Every compaction used its dictionary (28–29% held-out saving); training is
+0.045 s each, 12% of these compactions' time.
+
+### Decision
+
+Keep `Compression::ZstdDictionary` as committed (`def13e1`), opt-in, with
+checkpoint training. The density advantage is stable and large (10% below
+the default, 27% below plain 4 KiB on JSON); lookups are 2.4–3.5× faster
+than the default and 1.04–1.5× faster than plain 4 KiB, the low end where
+the live runs come from many compactions. The remaining lookup cost is
+partly understood, which is enough to stop: the measured part is the
+in-place use of several dictionaries, not a defect; the rest depends on
+the binary and memory placement and is not explained. Narrowing the
+measured part would need fewer distinct dictionaries, which this
+milestone does not add.
 
 ## Historical results
 

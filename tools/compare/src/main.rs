@@ -20,6 +20,15 @@
 //! the generator, which holds no copy of the data, followed by a full
 //! ordered scan checked record by record. Output is tab-separated lines for
 //! a summary script.
+//!
+//! Further engines: `tessera-dict` (`Compression::ZstdDictionary`),
+//! `tessera-compactions[-lz4|-dict]` (compaction cost) and
+//! `tessera-cycles[-16m]` (update cycles). `BENCH_BLOCK_LEN` sets Tessera's
+//! block length. Diagnostics of dictionary lookup cost (5AF), all opt-in:
+//! `tessera-direct` and `tessera-dict-direct` load as the direct engine
+//! test does; `BENCH_SKIP_UPDATES` reads the consolidated load without the
+//! updates; `BENCH_READS=present` times only present-key lookups, three
+//! times; `BENCH_THREAD` runs everything on a spawned thread.
 
 mod rocks;
 
@@ -298,13 +307,19 @@ impl Store for Tessera {
             ..CompactionOptions::default()
         };
         let mut workspace = MergeWorkspace::new();
-        while self
-            .engine
-            .compact(options, &mut workspace)
-            .unwrap()
-            .is_some()
-        {}
+        // Each compaction's outputs and dictionary choice: the runs of one
+        // compaction share one dictionary (5AF diagnostics).
+        let mut built = Vec::new();
+        while let Some(report) = self.engine.compact(options, &mut workspace).unwrap() {
+            built.push(format!(
+                "{}x{:?}/{:.2}s",
+                report.outputs,
+                report.stats.dictionary,
+                report.stats.dictionary_time.as_secs_f64()
+            ));
+        }
         self.settle();
+        println!("consolidation\tcompactions={}\t{}", built.len(), built.join(" "));
     }
 
     fn get<T>(&mut self, key: &[u8], found: impl FnOnce(Option<&[u8]>) -> T) -> T {
@@ -805,8 +820,19 @@ fn summary(samples: &mut [u64]) -> (u64, u64, f64) {
     (percentile(samples, 0.5), percentile(samples, 0.99), mean)
 }
 
+/// Whether `BENCH_READS=present` limits the timed reads to the consolidated
+/// state's present-key lookups, repeated (5AF diagnostics).
+fn present_only() -> bool {
+    std::env::var("BENCH_READS").is_ok_and(|reads| reads == "present")
+}
+
 fn timed_reads<S: Store>(store: &mut S, data: Dataset, state: &str, seed: u64) {
-    for (at, class) in GETS.into_iter().enumerate() {
+    let gets: &[Get] = if present_only() {
+        &[Get::Present, Get::Present, Get::Present]
+    } else {
+        &GETS
+    };
+    for (at, &class) in gets.iter().enumerate() {
         let mut rng = Rng::new(seed + at as u64);
         let mut latencies = Vec::with_capacity(GET_OPS * ROUNDS);
         let mut round_p50 = Vec::new();
@@ -836,6 +862,9 @@ fn timed_reads<S: Store>(store: &mut S, data: Dataset, state: &str, seed: u64) {
             round_p50[0],
             round_p50[ROUNDS - 1],
         );
+    }
+    if present_only() {
+        return;
     }
     // Missing keys through one held read, beside the per-get path above.
     let mut rng = Rng::new(seed + 50);
@@ -1202,6 +1231,30 @@ fn cycles(data: Dataset, memtable_budget: Option<usize>) {
 
 // The run.
 
+/// The direct engine test's procedure (`engine_lookup_costs` in
+/// `src/run/tests/dictionary.rs`) in this binary, for 5AF: the final live
+/// records loaded in that test's shuffled order, flushed, settled and
+/// consolidated, then this harness's consolidated reads.
+fn direct(mut store: Tessera, data: Dataset) {
+    let records = data.records();
+    let live: Vec<u64> = (0..records)
+        .filter(|index| version(*index, true).is_some())
+        .collect();
+    let mut order: Vec<usize> = (0..live.len()).collect();
+    let mut shuffle = Rng::new(11);
+    for at in (1..order.len()).rev() {
+        order.swap(at, shuffle.below(at as u64 + 1) as usize);
+    }
+    for &at in &order {
+        let index = live[at];
+        let value = value(data.payload, index, version(index, true).unwrap());
+        store.put(&data.key(index), &value);
+    }
+    store.consolidate();
+    memory(&store, "consolidated");
+    timed_reads(&mut store, data, "consolidated", 20_000);
+}
+
 fn run<S: Store>(mut store: S, data: Dataset) {
     let dir = store.dir();
     let (sampler, thread) = Sampler::start(dir.clone());
@@ -1240,6 +1293,21 @@ fn run<S: Store>(mut store: S, data: Dataset) {
     let phase = Phase::start();
     store.consolidate();
     phase.end("consolidate-base", &sampler, dir, "");
+
+    // `BENCH_SKIP_UPDATES` reads the consolidated load instead (5AF
+    // diagnostics): the same records, versions aside, without the updates'
+    // history.
+    let skip_updates = std::env::var("BENCH_SKIP_UPDATES").is_ok();
+    if skip_updates {
+        memory(&store, "consolidated");
+        let phase = Phase::start();
+        timed_reads(&mut store, data, "consolidated", 20_000);
+        phase.end("reads-consolidated", &sampler, dir, "");
+        memory(&store, "final");
+        sampler.stop.store(true, Relaxed);
+        thread.join().unwrap();
+        return;
+    }
 
     // Updates: one record in 16 overwritten, another deleted.
     let mut phase = Phase::start();
@@ -1281,6 +1349,9 @@ fn run<S: Store>(mut store: S, data: Dataset) {
     phase.end("update-settle", &sampler, dir, "");
 
     for (state, seed) in [("overlapping", 10_000), ("consolidated", 20_000)] {
+        if present_only() && state == "overlapping" {
+            continue;
+        }
         if state == "consolidated" {
             let phase = Phase::start();
             store.consolidate();
@@ -1293,7 +1364,9 @@ fn run<S: Store>(mut store: S, data: Dataset) {
         let phase = Phase::start();
         timed_reads(&mut store, data, state, seed);
         phase.end(&format!("reads-{state}"), &sampler, dir, "");
-        checked_reads(&mut store, data, state, seed);
+        if !present_only() {
+            checked_reads(&mut store, data, state, seed);
+        }
     }
     memory(&store, "final");
 
@@ -1315,17 +1388,34 @@ fn main() {
         data.payload,
         data.records()
     );
+    // `BENCH_THREAD` runs everything on a spawned thread, as the test
+    // harness runs a test, whose allocations glibc serves from another arena
+    // (5AF diagnostics).
+    if std::env::var("BENCH_THREAD").is_ok() {
+        let (engine, dir) = (engine.clone(), dir.clone());
+        std::thread::spawn(move || select(&engine, data, &dir))
+            .join()
+            .unwrap();
+    } else {
+        select(engine, data, &dir);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn select(engine: &str, data: Dataset, dir: &Path) {
     let rocks = |lz4, tuned_cache| {
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir).unwrap();
         Rocks {
-            db: rocks::Db::open(&dir, rocks::Config { lz4, tuned_cache }),
-            dir: dir.clone(),
+            db: rocks::Db::open(dir, rocks::Config { lz4, tuned_cache }),
+            dir: dir.to_path_buf(),
         }
     };
-    match engine.as_str() {
+    match engine {
         "tessera" => run(Tessera::new(Compression::Zstd), data),
         "tessera-lz4" => run(Tessera::new(Compression::Lz4), data),
         "tessera-dict" => run(Tessera::new(Compression::ZstdDictionary), data),
+        "tessera-direct" => direct(Tessera::new(Compression::Zstd), data),
+        "tessera-dict-direct" => direct(Tessera::new(Compression::ZstdDictionary), data),
         "tessera-cycles" => cycles(data, None),
         "tessera-cycles-16m" => cycles(data, Some(16 << 20)),
         "tessera-compactions" => compactions(data, Compression::Zstd),
@@ -1336,5 +1426,4 @@ fn main() {
         "rocksdb-tuned" => run(rocks(false, Some(64 << 20)), data),
         other => panic!("unknown engine {other}"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
