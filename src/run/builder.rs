@@ -1,13 +1,16 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::block::{BlockBuilder, BuildError, MAX_KEY_LEN, Value};
 
 use super::codec::{Codec, Compressor};
+use super::dictionary::Trained;
 use super::filter::KeyHashes;
 use super::frame;
 use super::reader::Run;
 use super::{
-    FOOTER_LEN, FORMAT_VERSION, MAGIC, MAX_TARGET_BLOCK_LEN, TABLE_ENTRY_LEN, TARGET_BLOCK_LEN,
+    DICTIONARY_FOOTER_LEN, DICTIONARY_VERSION, FOOTER_LEN, FORMAT_VERSION, MAGIC,
+    MAX_TARGET_BLOCK_LEN, TABLE_ENTRY_LEN, TARGET_BLOCK_LEN,
 };
 
 /// Encodes records, supplied in internal-key order, into an immutable [`Run`].
@@ -68,10 +71,26 @@ impl RunBuilder {
 
     /// Creates a builder aiming for blocks of `target` bytes before
     /// compression, reduced to [`MAX_TARGET_BLOCK_LEN`] if larger.
+    ///
+    /// # Panics
+    ///
+    /// If `codec` is [`Codec::ZstdDictionary`], which needs
+    /// [`with_dictionary`](Self::with_dictionary).
     pub fn with_target_block_len(codec: Codec, target: usize) -> Self {
+        Self::with_compressor(Compressor::new(codec), target)
+    }
+
+    /// Creates a builder like [`with_target_block_len`](Self::with_target_block_len)
+    /// whose blocks are Zstandard frames compressed with `dictionary`. The run
+    /// stores a copy of the dictionary and is written in version 4.
+    pub(crate) fn with_dictionary(dictionary: Arc<Trained>, target: usize) -> Self {
+        Self::with_compressor(Compressor::with_dictionary(dictionary), target)
+    }
+
+    fn with_compressor(compressor: Compressor, target: usize) -> Self {
         Self {
             target: target.min(MAX_TARGET_BLOCK_LEN),
-            compressor: Compressor::new(codec),
+            compressor,
             block: BlockBuilder::new(),
             uncompressed: Vec::new(),
             frames: Vec::new(),
@@ -132,7 +151,11 @@ impl RunBuilder {
     /// Returns the length the run would have if finished now, not counting
     /// the open block.
     pub fn stored_len(&self) -> usize {
-        self.frames.len() + self.table.len() + self.keys.len() + FOOTER_LEN
+        let (dictionary, footer) = match self.compressor.dictionary() {
+            Some(dictionary) => (dictionary.bytes().len(), DICTIONARY_FOOTER_LEN),
+            None => (0, FOOTER_LEN),
+        };
+        self.frames.len() + dictionary + self.table.len() + self.keys.len() + footer
     }
 
     /// Builds the run without a filter if its distinct keys would need more
@@ -152,16 +175,24 @@ impl RunBuilder {
     }
 
     /// Writes the index and footer and returns the finished run, which is
-    /// valid by construction and is not walked again.
+    /// valid by construction and is not walked again. A dictionary run also
+    /// stores its dictionary and prepares its own decoding form of it.
     pub fn finish(mut self) -> Run<Vec<u8>> {
         if !self.block.is_empty() {
             self.cut_block();
         }
 
         let block_count = self.table.len() / TABLE_ENTRY_LEN;
-        let index_offset = self.frames.len();
+        let dictionary = self.compressor.dictionary().map(Trained::bytes);
+        let dictionary_len = dictionary.map_or(0, <[u8]>::len);
+        let index_offset = self.frames.len() + dictionary_len;
         let mut data = self.frames;
-        data.reserve_exact(self.table.len() + self.keys.len() + FOOTER_LEN);
+        data.reserve_exact(
+            dictionary_len + self.table.len() + self.keys.len() + DICTIONARY_FOOTER_LEN,
+        );
+        if let Some(dictionary) = dictionary {
+            data.extend_from_slice(dictionary);
+        }
         data.extend_from_slice(&self.table);
         data.extend_from_slice(&self.keys);
         data.extend_from_slice(&(index_offset as u64).to_le_bytes());
@@ -170,10 +201,23 @@ impl RunBuilder {
         data.extend_from_slice(&(block_count as u32).to_le_bytes());
         // A key is at most MAX_KEY_LEN.
         data.extend_from_slice(&(self.min_key_len as u32).to_le_bytes());
-        data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let prepared = match dictionary {
+            None => {
+                data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+                None
+            }
+            Some(dictionary) => {
+                // A trained dictionary is at most DICTIONARY_LEN.
+                data.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
+                data.extend_from_slice(&crc32fast::hash(dictionary).to_le_bytes());
+                data.extend_from_slice(&DICTIONARY_VERSION.to_le_bytes());
+                let trained = self.compressor.dictionary().expect("a dictionary run");
+                Some(Arc::clone(trained.prepared()))
+            }
+        };
         data.extend_from_slice(&MAGIC.to_le_bytes());
         data.shrink_to_fit();
-        Run::from_builder(data, self.key_hashes.finish(), self.max_seq)
+        Run::from_builder(data, self.key_hashes.finish(), self.max_seq, prepared)
     }
 
     fn should_cut(&self, user_key: &[u8], value: Value<'_>) -> bool {

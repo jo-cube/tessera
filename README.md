@@ -92,6 +92,16 @@ records). Like the codec,
 the setting can change between restarts: runs and checkpoints of any block
 length stay readable.
 
+`Compression::ZstdDictionary` (opt-in) pairs with 4 KiB blocks: compactions
+and checkpoints train a 16 KiB Zstandard dictionary from samples of the runs
+they rewrite and use it for every run they build, when a held-out sample shows
+it saving at least 10%. On JSON-like values this held 10% less run memory than
+the 16 KiB default and 27% less than plain 4 KiB blocks, with lookups that
+reach a run at 4.0–5.2 µs (13.8 µs at 16 KiB, 5.9 µs at 4 KiB plain). Small
+binary records gain nothing and are left plain. Flushes, and runs no
+compaction merges, stay plain until a checkpoint. Dictionary runs use a newer
+run format, which older builds reject.
+
 ## Engine
 
 `put` and `delete` return the write's sequence number. `get` returns a key's
@@ -160,8 +170,11 @@ sequence number descending, with prefix-compressed keys and a restart point
 every 16 records. A **run** is a self-contained sequence of independently
 compressed blocks (uncompressed, LZ4 or Zstandard) with a sparse index of each
 block's last key and its key range; a point lookup decodes at most one
-block. Runs the engine builds carry an in-memory Bloom filter (10 bits a
-key), so lookups of absent keys usually decode nothing; filters are rebuilt
+block. A run that compaction or a checkpoint built under
+`Compression::ZstdDictionary` also stores one 16 KiB Zstandard dictionary
+that all its blocks share (format version 4; other runs stay version 3),
+and holds it prepared for decoding beside its bytes. Runs the engine builds
+carry an in-memory Bloom filter (10 bits a key), so lookups of absent keys usually decode nothing; filters are rebuilt
 on recovery, not stored. Reads merge the memtables and overlapping runs into
 the latest state of each key. Each run's largest sequence number is derived
 from its records when it is built or loaded, so a point lookup visits runs
@@ -256,8 +269,8 @@ not been tested. After a failed sync, check the device before reopening.
   threads. Checkpoints and the log need a filesystem with the guarantees under
   [Durability](#durability), and use advisory file locks (`File::try_lock`).
 - Zstandard is C code: `zstd-safe` builds the bundled libzstd 1.5.7
-  (`vendored`), so building needs a C compiler but no system library. LZ4
-  and CRC-32 are pure Rust. `Cargo.lock` pins every dependency; build with
+  (`vendored`, with its dictionary trainer), so building needs a C compiler
+  but no system library. LZ4 and CRC-32 are pure Rust. `Cargo.lock` pins every dependency; build with
   `--locked`.
 - `unsafe` is forbidden in the crate itself.
 

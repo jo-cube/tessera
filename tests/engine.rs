@@ -321,8 +321,8 @@ fn flushed_size() -> usize {
     let engine = engine();
     engine.put(b"a", b"v").unwrap();
     let report = engine.flush().unwrap();
-    assert!(report.filter_bytes > 0);
-    report.run_bytes + report.filter_bytes
+    assert!(report.held_bytes > 0);
+    report.run_bytes + report.held_bytes
 }
 
 #[test]
@@ -990,7 +990,8 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                 Compression::Zstd,
                 Compression::Lz4,
                 Compression::Uncompressed,
-            ][rng.below(3)],
+                Compression::ZstdDictionary,
+            ][rng.below(4)],
             target_block_len: [64, 2 << 10, 16 << 10][rng.below(3)],
         });
         let mut model = Model::new();

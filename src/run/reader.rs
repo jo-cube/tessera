@@ -1,13 +1,15 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
+use super::dictionary::{MAX_DICTIONARY_LEN, RunDictionary};
 use super::filter::{self as key_filter, KeyFilter, KeyHashes};
 use super::frame::{self, Frame};
 use super::{
-    CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, TABLE_ENTRY_LEN, read_u32,
-    read_u64,
+    CorruptRun, DICTIONARY_FOOTER_LEN, DICTIONARY_VERSION, FOOTER_LEN, FORMAT_VERSION, MAGIC,
+    RunCorruption, TABLE_ENTRY_LEN, read_u32, read_u64,
 };
 
 /// A valid run over any byte storage, such as `Vec<u8>`, `Arc<[u8]>` or
@@ -37,6 +39,9 @@ pub struct Run<B> {
     /// stored: every record carries its sequence number, so the builder and
     /// validation derive it.
     max_seq: u64,
+    /// The prepared form of the dictionary the run stores, if it stores one,
+    /// shared by every reader. Built once, after the dictionary is validated.
+    dictionary: Option<Arc<RunDictionary>>,
 }
 
 const VALIDATED: &str = "run bytes were validated or built by this crate";
@@ -52,19 +57,26 @@ impl<B: AsRef<[u8]>> Run<B> {
         expect(dead_code, reason = "tested component API the engine does not use")
     )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        let max_seq = validate(data.as_ref())?;
+        let (max_seq, dictionary) = validate(data.as_ref())?;
         Ok(Self {
             data,
             filter: None,
             max_seq,
+            dictionary: dictionary.map(Arc::new),
         })
     }
 
-    pub(super) fn from_builder(data: B, filter: Option<KeyFilter>, max_seq: u64) -> Self {
+    pub(super) fn from_builder(
+        data: B,
+        filter: Option<KeyFilter>,
+        max_seq: u64,
+        dictionary: Option<Arc<RunDictionary>>,
+    ) -> Self {
         Self {
             data,
             filter: filter.map(Box::new),
             max_seq,
+            dictionary,
         }
     }
 
@@ -87,6 +99,30 @@ impl<B: AsRef<[u8]>> Run<B> {
 
     pub(crate) fn filter(&self) -> Option<&KeyFilter> {
         self.filter.as_deref()
+    }
+
+    /// Returns the bytes of the run's prepared dictionary, held beside the
+    /// stored bytes (which include the dictionary itself), or 0 without one.
+    /// The runs one compaction builds share a single prepared form, and each
+    /// counts it in full: an overstatement, never an understatement.
+    pub fn dictionary_bytes(&self) -> usize {
+        self.dictionary.as_deref().map_or(0, RunDictionary::bytes)
+    }
+
+    /// Returns whether the run stores a dictionary.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tested component API the engine does not use")
+    )]
+    pub fn has_dictionary(&self) -> bool {
+        self.dictionary.is_some()
+    }
+
+    /// Returns everything the run holds beside its stored bytes: its key
+    /// filter and its prepared dictionary. What memory limits charge besides
+    /// [`as_bytes`](Self::as_bytes).
+    pub fn held_bytes(&self) -> usize {
+        self.filter_bytes() + self.dictionary_bytes()
     }
 
     /// Returns the number of stored records, counting every version.
@@ -153,7 +189,9 @@ impl<B: AsRef<[u8]>> Run<B> {
 
     /// Returns a view of this run's bytes.
     pub fn view(&self) -> RunView<'_> {
-        RunView::open(self.data.as_ref()).expect(VALIDATED)
+        RunView::open(self.data.as_ref())
+            .expect(VALIDATED)
+            .with_dictionary(self.dictionary.as_deref())
     }
 
     /// Returns the run's serialized bytes.
@@ -168,16 +206,19 @@ impl Run<Vec<u8>> {
     /// the run and its largest sequence number (0 if empty). For runs read
     /// back from storage.
     pub(crate) fn recover(data: Vec<u8>) -> Result<(Self, u64), CorruptRun> {
-        let max_seq = validate(&data)?;
+        let (max_seq, dictionary) = validate(&data)?;
+        let dictionary = dictionary.map(Arc::new);
         let mut hashes = KeyHashes::new();
         {
             let mut workspace = ReadWorkspace::new();
-            let mut cursor = RunView::open(&data)?.cursor(&mut workspace);
+            let view = RunView::open(&data)?.with_dictionary(dictionary.as_deref());
+            let mut cursor = view.cursor(&mut workspace);
             while let Some(record) = cursor.next_record()? {
                 hashes.add(record.key);
             }
         }
-        Ok((Self::from_builder(data, hashes.finish(), max_seq), max_seq))
+        let run = Self::from_builder(data, hashes.finish(), max_seq, dictionary);
+        Ok((run, max_seq))
     }
 }
 
@@ -256,12 +297,23 @@ impl ReadWorkspace {
     }
 
     /// Returns a frame's block, decoding and verifying it if it is compressed.
-    fn load<'r>(&'r mut self, frame: &Frame<'r>) -> Result<&'r [u8], CorruptRun> {
+    /// A frame compressed with a dictionary must name `dictionary`, its run's.
+    pub(super) fn load<'r>(
+        &'r mut self,
+        frame: &Frame<'r>,
+        dictionary: Option<&RunDictionary>,
+    ) -> Result<&'r [u8], CorruptRun> {
         self.blocks_loaded += 1;
         if frame.codec == Codec::None {
             return Ok(frame.stored);
         }
         frame.verify_checksum()?;
+        if frame.codec == Codec::ZstdDictionary {
+            let dictionary = dictionary.ok_or(frame.error(RunCorruption::MissingDictionary))?;
+            if zstd_safe::get_dict_id_from_frame(frame.stored) != Some(dictionary.id()) {
+                return Err(frame.error(RunCorruption::DictionaryMismatch));
+            }
+        }
 
         // Both checks precede sizing the buffer from a declared length.
         let len = frame.decoded_len;
@@ -274,9 +326,12 @@ impl ReadWorkspace {
             self.scratch.reserve_exact(len - self.scratch.len());
             self.scratch.resize(len, 0);
         }
-        let written =
-            self.decompressor
-                .decompress(frame.codec, frame.stored, &mut self.scratch[..len]);
+        let written = self.decompressor.decompress(
+            frame.codec,
+            frame.stored,
+            &mut self.scratch[..len],
+            dictionary,
+        );
         if written != Some(len) {
             return Err(frame.error(RunCorruption::CorruptPayload));
         }
@@ -545,7 +600,7 @@ impl<'a> RunCursor<'a> {
     fn load_block(&mut self, index: usize) -> Result<LoadedBlock<'a>, CorruptRun> {
         self.loaded = None;
         let frame = self.view.frame(index)?;
-        let bytes = self.workspace.load(&frame)?;
+        let bytes = self.workspace.load(&frame, self.view.dictionary)?;
         let entries_len = BlockView::open(bytes)
             .map_err(|error| frame.block_error(error))?
             .entries_len();
@@ -575,6 +630,10 @@ impl<'a> RunCursor<'a> {
 /// [`RunBuilder`](super::RunBuilder), or accepted once by [`Run::new`], and
 /// unchanged since. A checksum can show bytes are unchanged. It cannot show
 /// that whoever wrote them produced a valid run.
+///
+/// A view of a run that stores a dictionary reads its dictionary frames only
+/// once the prepared dictionary is attached, as [`Run::view`] does; until
+/// then they fail with [`RunCorruption::MissingDictionary`].
 #[derive(Clone, Copy, Debug)]
 pub struct RunView<'a> {
     frames: &'a [u8],
@@ -582,22 +641,49 @@ pub struct RunView<'a> {
     keys: &'a [u8],
     min_key: &'a [u8],
     record_count: usize,
+    /// The dictionary region of a version 4 run, unchecked.
+    stored_dictionary: Option<StoredDictionary<'a>>,
+    /// Its prepared form, attached by the run that owns it.
+    dictionary: Option<&'a RunDictionary>,
+}
+
+/// A version 4 run's dictionary as its bytes and footer declare it.
+#[derive(Clone, Copy, Debug)]
+struct StoredDictionary<'a> {
+    offset: usize,
+    bytes: &'a [u8],
+    checksum: u32,
 }
 
 impl<'a> RunView<'a> {
     /// Checks the footer and the ends of the index and returns a view of
     /// `bytes`. The cost does not depend on the run's length.
+    ///
+    /// The last 8 bytes, the version and magic, decide the footer's length,
+    /// and nothing before them is read until both are known.
     pub fn open(bytes: &'a [u8]) -> Result<Self, CorruptRun> {
-        let Some((body, footer)) = bytes.split_last_chunk::<FOOTER_LEN>() else {
+        let Some((_, short_footer)) = bytes.split_last_chunk::<FOOTER_LEN>() else {
             return Err(corrupt(0, RunCorruption::Truncated));
         };
+        let short_offset = bytes.len() - FOOTER_LEN;
+        if read_u32(short_footer, 28) != MAGIC {
+            return Err(corrupt(short_offset, RunCorruption::InvalidMagic));
+        }
+        // The fields both footers share, then version 4's dictionary fields.
+        let (body, footer, dictionary): (_, &[u8; FOOTER_LEN], _) = match read_u32(short_footer, 24)
+        {
+            FORMAT_VERSION => (&bytes[..short_offset], short_footer, None),
+            DICTIONARY_VERSION => {
+                let Some((body, footer)) = bytes.split_last_chunk::<DICTIONARY_FOOTER_LEN>() else {
+                    return Err(corrupt(0, RunCorruption::Truncated));
+                };
+                let (shared, _) = footer.split_first_chunk::<FOOTER_LEN>().expect("longer");
+                let fields = (read_u32(footer, 24) as usize, read_u32(footer, 28));
+                (body, shared, Some(fields))
+            }
+            _ => return Err(corrupt(short_offset, RunCorruption::UnsupportedVersion)),
+        };
         let footer_offset = body.len();
-        if read_u32(footer, 28) != MAGIC {
-            return Err(corrupt(footer_offset, RunCorruption::InvalidMagic));
-        }
-        if read_u32(footer, 24) != FORMAT_VERSION {
-            return Err(corrupt(footer_offset, RunCorruption::UnsupportedVersion));
-        }
 
         let invalid_footer = corrupt(footer_offset, RunCorruption::InvalidFooter);
         let record_count = usize::try_from(read_u64(footer, 8)).map_err(|_| invalid_footer)?;
@@ -605,6 +691,22 @@ impl<'a> RunView<'a> {
             .ok()
             .and_then(|index_offset| body.split_at_checked(index_offset))
             .ok_or(invalid_footer)?;
+        let (frames, stored_dictionary) = match dictionary {
+            None => (frames, None),
+            Some((len, checksum)) => {
+                if len == 0 || len > MAX_DICTIONARY_LEN {
+                    return Err(corrupt(footer_offset, RunCorruption::InvalidDictionary));
+                }
+                let offset = frames.len().checked_sub(len).ok_or(invalid_footer)?;
+                let (frames, bytes) = frames.split_at(offset);
+                let stored = StoredDictionary {
+                    offset,
+                    bytes,
+                    checksum,
+                };
+                (frames, Some(stored))
+            }
+        };
         let (table, keys) = (read_u32(footer, 16) as usize)
             .checked_mul(TABLE_ENTRY_LEN)
             .and_then(|table_len| index.split_at_checked(table_len))
@@ -621,6 +723,8 @@ impl<'a> RunView<'a> {
             keys,
             min_key,
             record_count,
+            stored_dictionary,
+            dictionary: None,
         };
         match (table.first(), table.last()) {
             (Some(&first), Some(&last)) => {
@@ -640,16 +744,22 @@ impl<'a> RunView<'a> {
         Ok(view)
     }
 
+    /// Attaches the prepared form of this run's dictionary, which reads of its
+    /// dictionary frames need.
+    pub(super) fn with_dictionary(self, dictionary: Option<&'a RunDictionary>) -> Self {
+        Self { dictionary, ..self }
+    }
+
+    pub(super) fn dictionary(self) -> Option<&'a RunDictionary> {
+        self.dictionary
+    }
+
     /// Returns the number of stored records, as declared by the footer.
     pub fn len(self) -> usize {
         self.record_count
     }
 
     /// Returns the number of blocks.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
     pub fn block_count(self) -> usize {
         self.table.len()
     }
@@ -734,7 +844,7 @@ impl<'a> RunView<'a> {
             return Ok(None);
         };
         let frame = self.frame(block)?;
-        let bytes = workspace.load(&frame)?;
+        let bytes = workspace.load(&frame, self.dictionary)?;
         BlockView::open(bytes)
             .and_then(|view| view.get(target))
             .map_err(|error| frame.block_error(error))
@@ -770,7 +880,7 @@ impl<'a> RunView<'a> {
 
     /// Finds a frame and checks its header. `block` must be below the block
     /// count.
-    fn frame(self, block: usize) -> Result<Frame<'a>, CorruptRun> {
+    pub(super) fn frame(self, block: usize) -> Result<Frame<'a>, CorruptRun> {
         let start = frame_offset(self.table[block]);
         let end = self
             .table
@@ -784,16 +894,24 @@ impl<'a> RunView<'a> {
         Frame::parse(start, header, stored)
     }
 
+    /// The offset of the table, after the frames and any dictionary.
+    fn table_offset(self) -> usize {
+        self.frames.len()
+            + self
+                .stored_dictionary
+                .map_or(0, |stored| stored.bytes.len())
+    }
+
     fn invalid_key_range(self) -> CorruptRun {
         corrupt(
-            self.frames.len() + size_of_val(self.table),
+            self.table_offset() + size_of_val(self.table),
             RunCorruption::InvalidKeyRange,
         )
     }
 
     fn invalid_index(self, block: usize) -> CorruptRun {
         corrupt(
-            self.frames.len() + block * TABLE_ENTRY_LEN,
+            self.table_offset() + block * TABLE_ENTRY_LEN,
             RunCorruption::InvalidIndex,
         )
     }
@@ -818,9 +936,24 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// the next starts and each must hold its header. The key area is tiled the
 /// same way, and matching every index key against its block completes the
 /// index checks.
-/// Returns the largest sequence number of the run's records.
-fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
+///
+/// A stored dictionary is checked first, against its checksum and then by
+/// preparing it, within [`MAX_DICTIONARY_LEN`]; every frame is then decoded
+/// with it. Returns the largest sequence number of the run's records and the
+/// prepared dictionary.
+fn validate(bytes: &[u8]) -> Result<(u64, Option<RunDictionary>), CorruptRun> {
     let view = RunView::open(bytes)?;
+    let dictionary = match view.stored_dictionary {
+        None => None,
+        Some(stored) => {
+            if crc32fast::hash(stored.bytes) != stored.checksum {
+                return Err(corrupt(stored.offset, RunCorruption::ChecksumMismatch));
+            }
+            let prepared = RunDictionary::prepare(stored.bytes);
+            Some(prepared.ok_or(corrupt(stored.offset, RunCorruption::InvalidDictionary))?)
+        }
+    };
+    let view = view.with_dictionary(dictionary.as_ref());
     let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
     for block in 0..view.table.len() {
@@ -829,7 +962,7 @@ fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
         if frame.codec == Codec::None {
             frame.verify_checksum()?;
         }
-        let decoded = workspace.load(&frame)?;
+        let decoded = workspace.load(&frame, view.dictionary)?;
 
         let records_before = walk.record_count;
         walk.validate_block(decoded)
@@ -857,5 +990,5 @@ fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
             RunCorruption::RecordCountMismatch,
         ));
     }
-    Ok(walk.max_seq)
+    Ok((walk.max_seq, dictionary))
 }

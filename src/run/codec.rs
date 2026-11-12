@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use lz4_flex::block as lz4;
 use zstd_safe::{CCtx, DCtx};
+
+use super::dictionary::{RunDictionary, Trained};
 
 /// How a run's blocks are stored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -12,9 +16,13 @@ pub enum Codec {
     /// provisional default codec for runs.
     #[default]
     Zstd,
+    /// A Zstandard frame at level 3 compressed with its run's dictionary. Only
+    /// a run that stores a dictionary has such frames; see
+    /// [`RunBuilder::with_dictionary`](super::RunBuilder::with_dictionary).
+    ZstdDictionary,
 }
 
-const ZSTD_LEVEL: i32 = 3;
+pub(super) const ZSTD_LEVEL: i32 = 3;
 
 /// No valid LZ4 block decodes to more than this many bytes per stored byte.
 ///
@@ -31,6 +39,7 @@ impl Codec {
             Self::None => 0,
             Self::Lz4 => 1,
             Self::Zstd => 2,
+            Self::ZstdDictionary => 3,
         }
     }
 
@@ -39,6 +48,7 @@ impl Codec {
             0 => Some(Self::None),
             1 => Some(Self::Lz4),
             2 => Some(Self::Zstd),
+            3 => Some(Self::ZstdDictionary),
             _ => None,
         }
     }
@@ -48,14 +58,37 @@ impl Codec {
 pub(super) struct Compressor {
     codec: Codec,
     zstd: Option<CCtx<'static>>,
+    /// Present exactly when the codec is [`Codec::ZstdDictionary`].
+    dictionary: Option<Arc<Trained>>,
 }
 
 impl Compressor {
+    /// A compressor for `codec`, which must not be [`Codec::ZstdDictionary`]:
+    /// see [`with_dictionary`](Self::with_dictionary).
     pub(super) fn new(codec: Codec) -> Self {
+        assert_ne!(
+            codec,
+            Codec::ZstdDictionary,
+            "a dictionary codec needs a dictionary"
+        );
         Self {
             codec,
             zstd: (codec == Codec::Zstd).then(CCtx::create),
+            dictionary: None,
         }
+    }
+
+    /// A compressor of Zstandard frames that use `dictionary`.
+    pub(super) fn with_dictionary(dictionary: Arc<Trained>) -> Self {
+        Self {
+            codec: Codec::ZstdDictionary,
+            zstd: Some(CCtx::create()),
+            dictionary: Some(dictionary),
+        }
+    }
+
+    pub(super) fn dictionary(&self) -> Option<&Trained> {
+        self.dictionary.as_deref()
     }
 
     pub(super) fn codec(&self) -> Codec {
@@ -84,13 +117,16 @@ impl Compressor {
         let bound = match self.codec {
             Codec::None => block.len(),
             Codec::Lz4 => lz4::get_maximum_output_size(block.len()),
-            Codec::Zstd => zstd_safe::compress_bound(block.len()),
+            Codec::Zstd | Codec::ZstdDictionary => zstd_safe::compress_bound(block.len()),
         };
         out.resize(start + bound, 0);
         let output = &mut out[start..];
-        let written = match (self.codec, &mut self.zstd) {
-            (Codec::Lz4, _) => lz4::compress_into(block, output).expect(ROOM),
-            (Codec::Zstd, Some(zstd)) => zstd.compress(output, block, ZSTD_LEVEL).expect(ROOM),
+        let written = match (self.codec, &mut self.zstd, &self.dictionary) {
+            (Codec::Lz4, ..) => lz4::compress_into(block, output).expect(ROOM),
+            (Codec::Zstd, Some(zstd), _) => zstd.compress(output, block, ZSTD_LEVEL).expect(ROOM),
+            (Codec::ZstdDictionary, Some(zstd), Some(dictionary)) => zstd
+                .compress_using_cdict(output, block, dictionary.cdict())
+                .expect(ROOM),
             _ => {
                 output.copy_from_slice(block);
                 block.len()
@@ -107,7 +143,7 @@ pub(super) fn plausible_decoded_len(codec: Codec, stored: &[u8], decoded_len: us
     match codec {
         Codec::None => stored.len() == decoded_len,
         Codec::Lz4 => decoded_len <= stored.len().saturating_mul(LZ4_MAX_RATIO),
-        Codec::Zstd => matches!(
+        Codec::Zstd | Codec::ZstdDictionary => matches!(
             zstd_safe::get_frame_content_size(stored),
             Ok(Some(size)) if size == decoded_len as u64
         ),
@@ -130,20 +166,27 @@ impl Decompressor {
 
     /// Decompresses `stored` into `output`, which bounds what can be written,
     /// and returns the decoded length. `None` means the bytes are corrupt.
+    /// A [`Codec::ZstdDictionary`] frame needs its run's `dictionary`, which
+    /// the caller has matched to the frame.
     pub(super) fn decompress(
         &mut self,
         codec: Codec,
         stored: &[u8],
         output: &mut [u8],
+        dictionary: Option<&RunDictionary>,
     ) -> Option<usize> {
-        match codec {
-            Codec::None => None,
-            Codec::Lz4 => lz4::decompress_into(stored, output).ok(),
-            Codec::Zstd => self
-                .zstd
+        let zstd = &mut self.zstd;
+        match (codec, dictionary) {
+            (Codec::Lz4, _) => lz4::decompress_into(stored, output).ok(),
+            (Codec::Zstd, _) => zstd
                 .get_or_insert_with(DCtx::create)
                 .decompress(output, stored)
                 .ok(),
+            (Codec::ZstdDictionary, Some(dictionary)) => zstd
+                .get_or_insert_with(DCtx::create)
+                .decompress_using_ddict(output, stored, dictionary.ddict())
+                .ok(),
+            (Codec::None | Codec::ZstdDictionary, _) => None,
         }
     }
 }

@@ -1396,7 +1396,7 @@ fn density() {
             mib(charged as u64),
             mib(memtable_heap as u64),
             mib(stats.run_bytes as u64),
-            mib(stats.filter_bytes as u64),
+            mib(stats.held_bytes as u64),
             mib(runs_heap as u64),
             logical as f64 / stats.run_bytes as f64,
             runs_heap as f64 / count as f64,
@@ -1441,7 +1441,7 @@ fn maintenance() {
         RECORDS as f64 * payload / secs / 1e6,
         report.run_bytes as f64 / (RECORDS as f64 * payload),
         report.runs,
-        report.filter_bytes as f64 * 8.0 / RECORDS as f64,
+        report.held_bytes as f64 * 8.0 / RECORDS as f64,
         report.filter_build_bytes >> 10,
     );
 
@@ -1985,7 +1985,7 @@ impl Peaks {
     fn sample(&mut self, stats: &EngineStats) {
         self.runs = self.runs.max(stats.runs);
         self.overlap = self.overlap.max(stats.max_overlap);
-        self.run_bytes = self.run_bytes.max(stats.run_bytes + stats.filter_bytes);
+        self.run_bytes = self.run_bytes.max(stats.run_bytes + stats.held_bytes);
         let frozen = stats.frozen.map_or(0, |frozen| frozen.charged);
         self.memtables = self.memtables.max(stats.active.charged + frozen);
         self.retained = self.retained.max(stats.retained_bytes);
@@ -2214,7 +2214,7 @@ fn workloads(compression: Compression) {
             scenario.name,
             mib(logical as u64),
             mib(stats.run_bytes as u64),
-            mib(stats.filter_bytes as u64),
+            mib(stats.held_bytes as u64),
             logical as f64 / stats.run_bytes as f64,
             mib(peaks.run_bytes as u64),
             mib(peaks.memtables as u64),

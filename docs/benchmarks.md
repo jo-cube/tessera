@@ -66,6 +66,9 @@ Kinds of result in this file:
 - **Dictionary research, run layer:** the 5AD section, per-run Zstandard
   dictionaries at 4 KiB blocks in the research layout, with a format and
   compaction design; the engine is unchanged.
+- **Engine feature, paired:** the 5AE section, `Compression::ZstdDictionary`
+  against 16 and 4 KiB plain Zstandard through the 5Y harness, with direct
+  run-layer and engine lookup checks.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -2544,6 +2547,182 @@ codec 3   := a Zstandard frame that declares its content size and was
   value structure is stable within the inputs. Data whose structure
   drifts quickly was not tested. Zstandard version, hardware and other
   datasets may move the 10% threshold.
+
+## Dictionary-compressed runs through the engine (5AE)
+
+*Engine measurements, and a format change.* `Compression::ZstdDictionary`
+(opt-in; the default is unchanged) makes compactions and checkpoints
+compress the runs they build with a 16 KiB Zstandard dictionary trained
+for the rewrite, when a held-out sample shows it saving at least 10%.
+Flushes stay plain. The design is the 5AD one, with the changes below.
+Labels: **M** measured, **D** derived, **A** assumed.
+
+### What was built
+
+- **Option:** one `Compression` variant. It does not change
+  `target_block_len` (set it to 4 KiB, as measured); a dictionary works at
+  any block length, and the 10% check is against plain Zstandard at the
+  same length.
+- **Format:** runs without a dictionary are still version 3, byte for byte.
+  A dictionary run is version 4: codec 3 frames, the dictionary between the
+  frames and the table, and a 40-byte footer with its length (1 B to
+  64 KiB) and CRC-32. The last 8 bytes (version, magic) select the footer.
+  Validation checks the length bound from the footer, then the checksum,
+  the magic and ID, and prepares the dictionary, before any frame; each
+  codec 3 frame must then name its ID. New `RunCorruption` kinds:
+  `InvalidDictionary`, `MissingDictionary`, `DictionaryMismatch`.
+- **Training** (`src/run/dictionary.rs`): from frame headers, rewrites
+  under 6.4 MiB decoded are not sampled. Otherwise whole decoded blocks are
+  taken evenly across the inputs up to 1.6 MiB; one in eight is held out,
+  the rest train once (`ZDICT_trainFromBuffer`). The held-out blocks, cut
+  to the block length, are compressed with and without it. All of this
+  happens after the workspace check and before the merge, on the
+  compaction's own thread outside the state lock, and is never retried.
+- **Fallbacks:** too small, no workspace room, training failure, or under
+  10% saving all build plain output; `CompactStats::dictionary` says which.
+  A workspace limit without room for training builds plain rather than
+  failing. The output limit is unchanged: a compaction that exceeds it
+  fails and publishes nothing, as before.
+- **Checkpoints also train**, from the snapshot's runs (not its memtables).
+  A checkpoint rebuilds every run from a scan, so without this a restart
+  would recover plain runs that, being disjoint, compaction might not
+  rewrite for a long time.
+- **Ownership:** the runs one rewrite builds each store the dictionary
+  bytes and share one prepared decoding dictionary (`Arc`), freed with the
+  last of them; a recovered run prepares its own. Readers share it; each
+  keeps its own decoding context. No registry or pool.
+- **Accounting:** the prepared dictionary counts with the key filter
+  (`Run::held_bytes`, reported in the `held_bytes` fields of the engine's
+  statistics and reports, formerly `filter_bytes`, and limited by
+  `max_run_bytes`); runs sharing one each count it in full, an
+  overstatement. Training adds `DICTIONARY_WORKSPACE` (21.2 MiB: two
+  1.6 MiB sample buffers, a 16 MiB trainer allowance, two codec contexts)
+  to the workspace estimate. The trainer's allowance is derived from the
+  zstd 1.5.7 source (about 12 MiB of tables); it cannot be measured
+  through the safe API (A).
+
+### Method
+
+The 5Y harness's `tessera` engine on `json:64` (1.05M records, about 545 B
+values, 518 MiB logical) and `sensor:256` (4.19M records), with background
+compaction, consolidated. New harness engines: `tessera-dict`, and
+`tessera-compactions-dict` for compaction cost. Two passes, the second in
+reverse order; ranges are the passes. Pass 1 ran before the prepared
+dictionary was shared between a rewrite's runs; harness lookups were the
+same within 1% after the change. Every full scan was verified against the
+model. Documents are not in the harness and were not measured through the
+engine. Run-layer and direct engine checks: the ignored tests
+`lookup_costs` and `engine_lookup_costs` in `src/run/tests/dictionary.rs`
+(release, 48–64 groups of the same dataset).
+
+### Results (M)
+
+Consolidated state, harness:
+
+| dataset | layout | runs MiB | beside MiB | resident MiB | present p50/p99 µs | overwritten p50 µs | first record µs | 30 keys µs | 480 keys µs | 1,920 keys µs | full scan M rec/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| JSON | Zstd 16 KiB | 138.2 | 1.17 | 159.5 | 13.75–13.87 / 17.8 | 13.75–13.91 | 13.7–13.9 | 27.7–28.0 | 237–239 | 912–919 | 2.11–2.13 |
+| JSON | Zstd 4 KiB | 171.2 | 1.17 | 197.0 | 5.88–5.92 / 7.0 | 5.92 | 5.79 | 26.9–27.3 | 345 | 1,359–1,365 | 1.41–1.42 |
+| JSON | 4 KiB + dictionary | 124.4 | 1.59 | 129.5–137.0 | 5.21–5.25 / 7.1–7.4 | 5.12–5.21 | 4.83–5.29 | 20.7–22.3 | 258–289 | 1,047–1,159 | 1.74–1.93 |
+| sensor | Zstd 16 KiB | 87.1 | 4.69 | 115.1 | 14.58–14.80 / 19.1–19.6 | 14.59–14.62 | 14.6–15.0 | 16.2–16.3 | 48 | 148 | 14.2 |
+| sensor | Zstd 4 KiB | 90.4 | 4.69 | 118.1 | 5.25 / 6.3–6.5 | 5.25 | 5.3–5.5 | 6.8–6.9 | 43 | 151–152 | 12.6–12.8 |
+| sensor | 4 KiB + dictionary | 90.4 | 4.69 | 118.5 | 5.25 / 6.4–9.3 | 5.25 | 5.3–5.4 | 6.8 | 43 | 151–153 | 12.8 |
+
+"Beside" is key filters plus prepared dictionaries; "resident" is trimmed
+anonymous memory. Peak anonymous memory over the whole run: JSON 287.6–295.9
+MiB (16 KiB), 336.3 (4 KiB), 302.3–314.1 (dictionary); sensor 253–256 for all.
+
+- **Density holds through the engine.** JSON runs with dictionaries are
+  10.0% smaller than 16 KiB and 27.3% smaller than 4 KiB plain; resident
+  memory 14–19% below 16 KiB. The 10 runs hold 0.42 MiB of prepared
+  dictionaries, 43 KiB each, as the docs state.
+- **The sensor fallback works.** Every sensor compaction reported
+  `NotBeneficial`; sizes are identical to plain 4 KiB and reads equal
+  within noise. Nothing was lost by enabling the option.
+- **Scans improve over plain 4 KiB** (short 1.2–1.3×, medium 1.2–1.3×,
+  full scan 1.2–1.4×) but remain slower than 16 KiB beyond about 30 keys
+  (medium 1.1–1.2×, long 1.15–1.26×, full scan 1.1–1.2×).
+- **Lookups: a smaller gain than the run layer measured, and not fully
+  explained.** In the harness, dictionary lookups took 5.21–5.25 µs against
+  5.88–5.92 µs plain at 4 KiB (1.13×) and 13.8 µs at 16 KiB (2.6×). Measured
+  directly, on the same dataset and the production paths:
+
+  | path (64 groups unless noted) | plain 4 KiB p50 µs | dictionary p50 µs |
+  |---|---|---|
+  | one run (48 groups) | 5.83 | 3.58 |
+  | 7 runs of one compaction, one or per-run workspaces (48 groups) | 5.88–5.92 | 3.63 |
+  | engine, shuffled load, one consolidating compaction (48 groups) | 5.75 | 3.58 |
+  | engine, shuffled load with background compaction (48 groups) | 5.83 | 3.92 |
+  | engine, the same at 64 groups (10 runs, 5 compactions) | 6.04 | 4.04 |
+
+  So through `Engine::get` the gain is 1.5× over plain 4 KiB (M). Two causes
+  were found and one fixed: runs built by one compaction now share one
+  prepared dictionary (9 runs with separate copies: 3.92 µs; shared:
+  3.33 µs, at 8 groups); runs from different compactions keep separate
+  dictionaries, which costs about 0.35–0.45 µs a lookup, consistent with
+  each dictionary's decoding tables having to be in cache (D). The
+  harness's remaining 1.2 µs is not explained: per-run workspaces, the
+  memory sampler thread and a second libzstd (the binary resolves Zstandard
+  statically) were ruled out (M); an interaction with the harness's
+  preceding phases is untested (A).
+- **No lookup allocates (D).** The prepared dictionary is built once per
+  run; a lookup uses the reader's existing context and buffer, and the
+  dictionary check reads the frame header. Not separately measured.
+
+Compaction cost, `json:64` loaded shuffled into 11 plain runs, then 12
+two-input compactions:
+
+| layout | stored input MiB | output MiB | wall s | stored MiB/s | training s | estimate MiB | peak heap above, max MiB | peak resident above, max MiB |
+|---|---|---|---|---|---|---|---|---|
+| Zstd 16 KiB | 331.4 | 331.3 | 4.13 | 80.2 | – | 3.1 | 50.5 | 47.3 |
+| Zstd 4 KiB | 387.6 | 387.2 | 5.62 | 69.0 | – | 3.0 | 54.4 | 55.1 |
+| 4 KiB + dictionary | 296.0 | 269.3 | 4.40 | 67.3 | 0.552 | 24.1 | 34.4 | 29.5 |
+
+- **Training is 0.045–0.049 s per compaction** (12% of these compactions'
+  time) and saves 28–29% (held-out) every time. Per stored byte the
+  compaction runs at the speed of plain 4 KiB (M).
+- **No unaccounted transient (M):** peaks above the starting heap, which
+  include the growing output, stayed below plain 4 KiB's; the 24.1 MiB
+  estimate (3 MiB merge + 21.1 MiB training) covers the training phase
+  (A: the trainer's own peak is not isolated).
+
+### Correctness
+
+- `src/run/tests/dictionary.rs`: round trips (gets, tombstones, absent
+  keys, prefix scans, full walks) through built, validated and recovered
+  runs; independent, ID-carrying frames; deterministic encoding; damaged,
+  garbage and unpreparable dictionaries; out-of-bound and incomplete
+  dictionary regions refused from the footer; short and unknown-version
+  footers; missing and mismatched dictionaries; a detached view; compaction
+  using a dictionary (same records as plain, smaller output, dictionary
+  inputs re-sampled); and every fallback (sensor, small input, workspace).
+- `tests/checkpoint.rs`: dictionary compaction through the engine, a
+  refused compaction publishing nothing, a snapshot reading dictionary runs
+  a later compaction replaced, a checkpoint writing version 4 runs, and
+  recovery under all four settings beside newer plain runs (overwrites,
+  deletes, keys only in the older run), then compaction in the current
+  setting; and the sensor fallback through the engine.
+- The randomized engine model test draws `ZstdDictionary` too (its inputs
+  are below the training floor, so it checks the plumbing).
+- Format tests: codec 3 in a version 3 run is `MissingDictionary`; codec 4
+  is unsupported; version 5 is unsupported.
+
+### Decision
+
+- **Retain, as an opt-in for structured values (D).** Through the engine it
+  is the best density measured for JSON-like values (10% below the 16 KiB
+  default, 27% below plain 4 KiB) with lookups 2.6–3.4× faster than the
+  default and 1.13–1.5× faster than plain 4 KiB, scans better than plain
+  4 KiB, and compaction at the same speed per stored byte. It declines on
+  sensor data at no cost.
+- **Weaker than 5AD predicted on lookups.** The run layer's 1.6–1.9× over
+  plain 4 KiB shrinks to 1.5× through the engine and 1.13× in the harness.
+  The density case stands on its own; the latency case is modest and its
+  harness gap is open.
+- **Limitations:** runs no compaction merges stay plain until a checkpoint;
+  each compaction's runs have their own dictionary, which costs lookups a
+  little as their number grows; documents were not measured through the
+  engine.
 
 ## Historical results
 

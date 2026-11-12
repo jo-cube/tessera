@@ -280,8 +280,8 @@ pub use worker::{BackgroundError, BackgroundStatus};
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub use crate::run::{
-    CompactError, CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue,
-    MergeWorkspace, ReadError, RunCorruption,
+    CompactError, CompactStats, ConflictingCopies, CorruptRun, DictionaryChoice, LiveRecord,
+    LiveValue, MergeWorkspace, ReadError, RunCorruption,
 };
 
 use std::fmt;
@@ -294,8 +294,9 @@ use crate::memtable::{
     FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_ENGINE_BLOCK_LEN, Run, RunView,
-    TARGET_BLOCK_LEN, compact, latest_in,
+    Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
+    MAX_ENGINE_BLOCK_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, Run, RunView, TARGET_BLOCK_LEN,
+    compact, latest_in,
 };
 
 type SharedRun = Arc<Published>;
@@ -339,8 +340,8 @@ pub struct EngineOptions {
     pub target_run_len: usize,
     /// The most runs that may be published.
     pub max_runs: usize,
-    /// The most bytes of published runs: their stored bytes and their key
-    /// filters together.
+    /// The most bytes of published runs: their stored bytes, key filters
+    /// and prepared dictionaries together.
     pub max_run_bytes: usize,
     /// The sequence number a new engine continues after: the first write
     /// uses the next. [`Engine::new`] and [`Engine::create`] use it;
@@ -413,6 +414,51 @@ impl Default for EngineOptions {
 /// reaches them sooner: after a switch to a less compact setting, a
 /// compaction whose rewritten output would exceed `max_run_bytes` is
 /// refused with [`CompactionError::RunLimit`] and changes nothing.
+///
+/// # Dictionaries
+///
+/// [`Self::ZstdDictionary`] is Zstandard whose rewrites train a
+/// dictionary for their output. Small blocks compress poorly alone, and a
+/// dictionary learned from the data restores most of what they lose, so it
+/// is meant to pair with small blocks: it was measured with
+/// [`EngineOptions::target_block_len`] at 4 KiB, which is not set for you.
+/// On JSON-like values through the engine (`docs/benchmarks.md`), 4 KiB
+/// blocks with a dictionary held 10% less run memory than 16 KiB plain
+/// blocks and 27% less than 4 KiB plain blocks, and lookups that reached a
+/// run took 4.0–5.2 µs, against 13.8 µs at 16 KiB and 5.9–6.0 µs at 4 KiB
+/// plain. On small repetitive records they gained nothing, and the check
+/// below leaves those plain.
+///
+/// Only runs that are rewritten get a dictionary. Runs that no compaction
+/// merges, such as the disjoint runs of keys written in ascending order,
+/// stay plain until a checkpoint rewrites them.
+///
+/// - Flushes and the memtable's records are always plain Zstandard: there is
+///   no rewrite to learn from.
+/// - A compaction, and a checkpoint, first sample decoded blocks of the runs
+///   they rewrite (about 1.6 MiB, read evenly across them) and train one
+///   16 KiB dictionary, outside the engine's state lock. One block in eight
+///   is held back, and the dictionary is used for every run the rewrite
+///   builds only if it compresses those blocks at least 10% smaller than
+///   plain Zstandard at the same block length. Otherwise the output is plain.
+///   Rewrites of less than about 6.4 MiB decoded are not sampled at all.
+///   This is decided before any output is built and is never retried.
+/// - A compaction reserves about 21 MiB for training beside the merge,
+///   which [`CompactionOptions::max_workspace_bytes`] must admit; a
+///   compaction whose limit leaves less room builds plain output rather than
+///   failing.
+///   A checkpoint applies no such limit. Each dictionary run stores its
+///   16 KiB dictionary and holds a prepared form of about 43 KiB beside it,
+///   which counts towards [`EngineOptions::max_run_bytes`] like a key
+///   filter: the runs of one rewrite share it but each counts it in full,
+///   and a recovered run prepares its own. Training takes roughly 0.05 s
+///   per rewrite.
+/// - [`CompactStats::dictionary`] and [`CheckpointReport::dictionary`] report
+///   each choice.
+///
+/// A dictionary run is written in a newer run format, which builds before it
+/// cannot read; plain runs are unchanged, and runs of every kind recover and
+/// mix whatever this is set to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
@@ -426,17 +472,25 @@ pub enum Compression {
     /// block's checksum is then verified only when its run is loaded from a
     /// checkpoint, not on every read.
     Uncompressed,
+    /// Zstandard, and compactions and checkpoints compress the runs they
+    /// build with a dictionary trained for them when that saves enough. See
+    /// [Dictionaries](Self#dictionaries).
+    ZstdDictionary,
 }
 
 impl Compression {
     fn codec(self) -> Codec {
         match self {
-            Self::Zstd => Codec::Zstd,
+            Self::Zstd | Self::ZstdDictionary => Codec::Zstd,
             Self::Lz4 => Codec::Lz4,
             Self::Uncompressed => Codec::None,
         }
     }
 }
+
+// The documentation above states these.
+const _: () = assert!(DICTIONARY_LEN == 16 << 10 && MIN_SAVING_PERCENT == 10);
+const _: () = assert!(MIN_DICTIONARY_INPUT == 6_553_600 && DICTIONARY_WORKSPACE <= 22 << 20);
 
 /// Admission limits for [`Engine::snapshot`]. A snapshot that would exceed
 /// one is refused with a [`SnapshotError`]; none is ever weakened.
@@ -657,8 +711,9 @@ pub struct FlushReport {
     pub runs: usize,
     /// Stored bytes published.
     pub run_bytes: usize,
-    /// Bytes of the published runs' key filters.
-    pub filter_bytes: usize,
+    /// Bytes the published runs hold beside their stored bytes: their key
+    /// filters. A flush builds no dictionary.
+    pub held_bytes: usize,
     /// The most bytes one run's filter construction held for key hashes,
     /// freed when that run was finished.
     pub filter_build_bytes: usize,
@@ -679,9 +734,12 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
-    /// Bytes of the published runs' key filters, held beside `run_bytes`;
-    /// [`EngineOptions::max_run_bytes`] limits the two together.
-    pub filter_bytes: usize,
+    /// Bytes the published runs hold in memory beside `run_bytes`: their key
+    /// filters and any prepared dictionaries. [`EngineOptions::max_run_bytes`]
+    /// limits the two together. The runs one rewrite builds share a prepared
+    /// dictionary and each counts it in full, so this can overstate the
+    /// memory held by one dictionary (about 43 KiB) per such run.
+    pub held_bytes: usize,
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes.
     pub max_overlap: usize,
@@ -698,8 +756,9 @@ pub struct EngineStats {
     /// The part of `retained_bytes` that is runs: stored bytes of runs that
     /// compaction replaced and snapshots still hold.
     pub retained_run_bytes: usize,
-    /// The part of `retained_bytes` that is those runs' filters.
-    pub retained_filter_bytes: usize,
+    /// The part of `retained_bytes` that is those runs' filters and prepared
+    /// dictionaries.
+    pub retained_held_bytes: usize,
     /// Flushes published since the engine started, whether a write or the
     /// caller started them.
     pub flushes: u64,
@@ -725,7 +784,7 @@ struct State {
     /// selection uses to break ties.
     lookup_order: Vec<SharedRun>,
     run_bytes: usize,
-    filter_bytes: usize,
+    held_bytes: usize,
     max_runs: usize,
     max_run_bytes: usize,
     /// Sources removed from the state, kept track of until no snapshot holds
@@ -748,8 +807,8 @@ struct State {
 struct Retired {
     source: Weak<dyn Send + Sync>,
     bytes: usize,
-    /// For a run, its filter's bytes.
-    filter_bytes: Option<usize>,
+    /// For a run, its filter and prepared dictionary bytes.
+    held_bytes: Option<usize>,
 }
 
 /// What snapshots alone keep.
@@ -758,7 +817,7 @@ struct Retained {
     sources: usize,
     bytes: usize,
     run_bytes: usize,
-    filter_bytes: usize,
+    held_bytes: usize,
 }
 
 impl State {
@@ -770,15 +829,15 @@ impl State {
             .sort_by_key(|run| std::cmp::Reverse(run.run.max_seq()));
     }
 
-    /// `filter_bytes` is `Some` for a run.
-    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, filter_bytes: Option<usize>) {
+    /// `held_bytes` is `Some` for a run.
+    fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, held_bytes: Option<usize>) {
         self.retired
             .retain(|retired| retired.source.strong_count() > 0);
         if source.strong_count() > 0 {
             self.retired.push(Retired {
                 source,
                 bytes,
-                filter_bytes,
+                held_bytes,
             });
         }
     }
@@ -800,11 +859,11 @@ impl State {
                     sources: 0,
                     bytes: pinned,
                     run_bytes: 0,
-                    filter_bytes: 0,
+                    held_bytes: 0,
                 },
                 |sum, retired| {
-                    let filter = retired.filter_bytes.unwrap_or(0);
-                    let run = if retired.filter_bytes.is_some() {
+                    let filter = retired.held_bytes.unwrap_or(0);
+                    let run = if retired.held_bytes.is_some() {
                         retired.bytes
                     } else {
                         0
@@ -813,7 +872,7 @@ impl State {
                         sources: sum.sources + 1,
                         bytes: sum.bytes + retired.bytes + filter,
                         run_bytes: sum.run_bytes + run,
-                        filter_bytes: sum.filter_bytes + filter,
+                        held_bytes: sum.held_bytes + filter,
                     }
                 },
             )
@@ -845,6 +904,8 @@ struct Core {
     target_run_len: usize,
     /// The codec of the runs this engine builds.
     codec: Codec,
+    /// Whether compactions and checkpoints may train dictionaries.
+    dictionary: bool,
     /// The block length, before compression, of the runs this engine builds.
     target_block_len: usize,
     snapshot_limits: SnapshotLimits,
@@ -1022,7 +1083,7 @@ impl Core {
                 runs: Vec::new(),
                 lookup_order: Vec::new(),
                 run_bytes: 0,
-                filter_bytes: 0,
+                held_bytes: 0,
                 max_runs: options.max_runs,
                 max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
@@ -1039,6 +1100,7 @@ impl Core {
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
+            dictionary: options.compression == Compression::ZstdDictionary,
             target_block_len: options.target_block_len.min(MAX_ENGINE_BLOCK_LEN),
             snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
@@ -1423,13 +1485,13 @@ impl Core {
             frozen_tables: state.frozen.len(),
             runs: state.runs.len(),
             run_bytes: state.run_bytes,
-            filter_bytes: state.filter_bytes,
+            held_bytes: state.held_bytes,
             max_overlap: deepest_overlap(&state.runs),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
             retained_bytes: retained.bytes,
             retained_run_bytes: retained.run_bytes,
-            retained_filter_bytes: retained.filter_bytes,
+            retained_held_bytes: retained.held_bytes,
             flushes: state.flushes,
             flushed_bytes: state.flushed_bytes,
         }
@@ -1590,13 +1652,12 @@ impl BuiltFlush<'_> {
             records: job.records(),
             runs: runs.len(),
             run_bytes: runs.iter().map(|run| run.as_bytes().len()).sum(),
-            filter_bytes: runs.iter().map(Run::filter_bytes).sum(),
+            held_bytes: runs.iter().map(Run::held_bytes).sum(),
             filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
         let mut state = job.engine.write_state();
         let total_runs = state.runs.len() + report.runs;
-        let total_bytes =
-            state.run_bytes + state.filter_bytes + report.run_bytes + report.filter_bytes;
+        let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
         if total_runs > state.max_runs || total_bytes > state.max_run_bytes {
             let error = FlushError {
                 runs: total_runs,
@@ -1622,7 +1683,7 @@ impl BuiltFlush<'_> {
         state.runs.extend(published(runs));
         state.order_runs();
         state.run_bytes += report.run_bytes;
-        state.filter_bytes += report.filter_bytes;
+        state.held_bytes += report.held_bytes;
         state.refused = None;
         state.flushes += 1;
         state.flushed_bytes += report.run_bytes as u64;
@@ -1760,14 +1821,14 @@ pub struct CompactionReport {
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
-    /// Their filters' bytes.
-    pub input_filter_bytes: usize,
+    /// What they held beside that: filters and prepared dictionaries.
+    pub input_held_bytes: usize,
     /// Runs published in their place.
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
-    /// Their filters' bytes.
-    pub output_filter_bytes: usize,
+    /// What they hold beside that: filters and prepared dictionaries.
+    pub output_held_bytes: usize,
     /// The most bytes one output's filter construction held for key hashes,
     /// freed when that run was finished.
     pub filter_build_bytes: usize,
@@ -1939,6 +2000,7 @@ impl<'e> CompactionJob<'e> {
             max_workspace_bytes: self.options.max_workspace_bytes,
             codec: self.engine.codec,
             target_block_len: self.engine.target_block_len,
+            dictionary: self.engine.dictionary,
         };
         let output = compact(&views, keep_tombstone, limits, workspace)?;
         #[cfg(test)]
@@ -1983,10 +2045,10 @@ impl BuiltCompaction<'_> {
         let report = CompactionReport {
             inputs: job.inputs.len(),
             input_bytes: job.input_bytes,
-            input_filter_bytes: job.inputs.iter().map(|run| run.run.filter_bytes()).sum(),
+            input_held_bytes: job.inputs.iter().map(|run| run.run.held_bytes()).sum(),
             outputs: output.runs.len(),
             output_bytes: output.output_bytes,
-            output_filter_bytes: output.filter_bytes,
+            output_held_bytes: output.held_bytes,
             filter_build_bytes: output
                 .runs
                 .iter()
@@ -2005,9 +2067,8 @@ impl BuiltCompaction<'_> {
         }
         let total_runs = state.runs.len() - report.inputs + report.outputs;
         let stored = state.run_bytes - report.input_bytes + report.output_bytes;
-        let filters = state.filter_bytes - report.input_filter_bytes + report.output_filter_bytes;
-        let (total_bytes, published_bytes) =
-            (stored + filters, state.run_bytes + state.filter_bytes);
+        let filters = state.held_bytes - report.input_held_bytes + report.output_held_bytes;
+        let (total_bytes, published_bytes) = (stored + filters, state.run_bytes + state.held_bytes);
         // Shrinking is always allowed, so that compaction can make room even
         // when the limits were lowered below what is published.
         let grows_runs = total_runs > state.max_runs.max(state.runs.len());
@@ -2024,10 +2085,10 @@ impl BuiltCompaction<'_> {
         state.runs.extend(published(output.runs));
         state.order_runs();
         state.run_bytes = stored;
-        state.filter_bytes = filters;
+        state.held_bytes = filters;
         state.refused = None;
         for input in &job.inputs {
-            let (bytes, filter) = (input.run.as_bytes().len(), input.run.filter_bytes());
+            let (bytes, filter) = (input.run.as_bytes().len(), input.run.held_bytes());
             state.retire(
                 Arc::downgrade(input) as Weak<dyn Send + Sync>,
                 bytes,
@@ -2721,7 +2782,7 @@ mod tests {
                 .unwrap()
         };
         let mut built = begin().build(&mut MergeWorkspace::new()).unwrap();
-        built.output.output_bytes = stats.run_bytes + stats.filter_bytes + 1;
+        built.output.output_bytes = stats.run_bytes + stats.held_bytes + 1;
         assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
         assert_eq!(engine.stats(), stats);
 

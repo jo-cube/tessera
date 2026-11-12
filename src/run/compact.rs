@@ -1,9 +1,12 @@
 //! Merging runs into fewer runs that hold only what can still be read.
 
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::block::{Record, Value};
 
+use super::dictionary::{self, DictionaryChoice, Trained};
 use super::logical::conflict;
 use super::{
     Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
@@ -34,6 +37,10 @@ pub struct CompactLimits {
     /// Bytes per output block before compression, as for
     /// [`RunBuilder::with_target_block_len`].
     pub target_block_len: usize,
+    /// Whether the output may be compressed with a dictionary trained for it,
+    /// as [`dictionary::choose`] decides before the merge starts. Only with
+    /// [`Codec::Zstd`]; otherwise ignored.
+    pub dictionary: bool,
 }
 
 /// Bytes allowed for one Zstandard context, compressing 16 KiB blocks at level
@@ -80,6 +87,11 @@ pub struct CompactStats {
     pub copies_collapsed: usize,
     /// Newest versions that were tombstones and were not kept.
     pub tombstones_dropped: usize,
+    /// Whether the output was compressed with a dictionary, and why not.
+    pub dictionary: DictionaryChoice,
+    /// Time spent deciding: sampling, training and estimating. Zero unless
+    /// dictionaries were enabled.
+    pub dictionary_time: Duration,
 }
 
 /// The runs a compaction built.
@@ -89,9 +101,12 @@ pub struct Compacted {
     pub runs: Vec<Run<Vec<u8>>>,
     /// Their total stored length.
     pub output_bytes: usize,
-    /// The total bytes of their key filters.
-    pub filter_bytes: usize,
-    /// The estimate from [`workspace_bytes`] that was checked.
+    /// The total bytes they hold beside that, [`Run::held_bytes`]: key filters
+    /// and prepared dictionaries.
+    pub held_bytes: usize,
+    /// The estimate from [`workspace_bytes`] that was checked, plus
+    /// [`DICTIONARY_WORKSPACE`](dictionary::DICTIONARY_WORKSPACE) if a
+    /// dictionary was trained.
     pub workspace_bytes: usize,
     /// What was read and written.
     pub stats: CompactStats,
@@ -171,6 +186,13 @@ impl std::error::Error for CompactError {}
 /// estimate leaves of the workspace limit. Both limits are checked as
 /// described on [`CompactLimits`], and on any error the partial output is
 /// dropped.
+///
+/// With [`CompactLimits::dictionary`], whether every output run uses one
+/// trained dictionary is decided once, after the workspace check and before
+/// the merge, and is never revisited: a run that would not benefit, or a
+/// workspace limit without room for [`DICTIONARY_WORKSPACE`](dictionary::DICTIONARY_WORKSPACE)
+/// beside the merge, gets plain Zstandard. Each output run stores its own
+/// copy of the dictionary.
 pub fn compact<'a>(
     inputs: &[RunView<'a>],
     mut keep_tombstone: impl FnMut(&[u8]) -> bool,
@@ -184,9 +206,20 @@ pub fn compact<'a>(
             max_workspace_bytes: limits.max_workspace_bytes,
         });
     }
+    let choice = if limits.dictionary && limits.codec == Codec::Zstd {
+        let room = limits.max_workspace_bytes - needed;
+        dictionary::choose(inputs, limits.target_block_len, room)?
+    } else {
+        dictionary::Choice::default()
+    };
+    let needed = needed + choice.workspace_bytes;
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
-    let mut output = Output::new(limits, limits.max_workspace_bytes - needed);
-    let mut stats = CompactStats::default();
+    let mut output = Output::new(limits, limits.max_workspace_bytes - needed, choice.trained);
+    let mut stats = CompactStats {
+        dictionary: choice.outcome,
+        dictionary_time: choice.time,
+        ..CompactStats::default()
+    };
     let mut key = Vec::new();
     let mut has_key = false;
 
@@ -216,8 +249,8 @@ pub fn compact<'a>(
     output.finish_run()?;
     Ok(Compacted {
         runs: output.runs,
-        output_bytes: output.bytes - output.filter_bytes,
-        filter_bytes: output.filter_bytes,
+        output_bytes: output.bytes - output.held_bytes,
+        held_bytes: output.held_bytes,
         workspace_bytes: needed,
         stats,
     })
@@ -247,34 +280,40 @@ struct Output {
     limits: CompactLimits,
     /// The most bytes the open builder may hold for key hashes.
     hash_bytes: usize,
+    /// The dictionary every output run is compressed with, if any.
+    dictionary: Option<Arc<Trained>>,
     builder: Option<RunBuilder>,
     input: usize,
     runs: Vec<Run<Vec<u8>>>,
     /// Stored and filter bytes of the finished runs.
     bytes: usize,
-    filter_bytes: usize,
+    held_bytes: usize,
 }
 
 impl Output {
-    fn new(limits: CompactLimits, hash_bytes: usize) -> Self {
+    fn new(limits: CompactLimits, hash_bytes: usize, dictionary: Option<Arc<Trained>>) -> Self {
         Self {
             limits: CompactLimits {
                 target_run_len: limits.target_run_len.min(MAX_TARGET_RUN_LEN),
                 ..limits
             },
             hash_bytes,
+            dictionary,
             builder: None,
             input: 0,
             runs: Vec::new(),
             bytes: 0,
-            filter_bytes: 0,
+            held_bytes: 0,
         }
     }
 
     fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
         let builder = self.builder.get_or_insert_with(|| {
-            let mut builder =
-                RunBuilder::with_target_block_len(self.limits.codec, self.limits.target_block_len);
+            let target = self.limits.target_block_len;
+            let mut builder = match &self.dictionary {
+                Some(dictionary) => RunBuilder::with_dictionary(Arc::clone(dictionary), target),
+                None => RunBuilder::with_target_block_len(self.limits.codec, target),
+            };
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder
         });
@@ -310,8 +349,8 @@ impl Output {
         };
         let run = builder.finish();
         self.input = 0;
-        self.filter_bytes += run.filter_bytes();
-        self.bytes += run.as_bytes().len() + run.filter_bytes();
+        self.held_bytes += run.held_bytes();
+        self.bytes += run.as_bytes().len() + run.held_bytes();
         self.check(self.bytes)?;
         self.runs.push(run);
         Ok(())

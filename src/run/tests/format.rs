@@ -167,6 +167,7 @@ fn codec_byte(codec: Codec) -> u8 {
         Codec::None => 0,
         Codec::Lz4 => 1,
         Codec::Zstd => 2,
+        Codec::ZstdDictionary => 3,
     }
 }
 
@@ -184,6 +185,7 @@ fn compress(codec: Codec, block: &[u8]) -> Vec<u8> {
             zstd_safe::compress(&mut out, block, 3).unwrap();
             out
         }
+        Codec::ZstdDictionary => unreachable!("needs a dictionary: see tests::dictionary"),
     }
 }
 
@@ -997,11 +999,12 @@ fn runs_work_over_shared_and_borrowed_storage() {
     }
 }
 
-/// Beside its storage a run holds one pointer, to the key filter its builder
-/// made, if any, and its largest sequence number.
+/// Beside its storage a run holds two pointers, to the key filter its
+/// builder made and to its prepared dictionary, if any, and its largest
+/// sequence number.
 #[test]
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
-    let extra = size_of::<usize>() + size_of::<u64>();
+    let extra = 2 * size_of::<usize>() + size_of::<u64>();
     assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>() + extra);
     assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>() + extra);
 }
@@ -1171,7 +1174,7 @@ fn malformed_structures_are_rejected() {
     let cases: &[(&str, Mutation, RunCorruption)] = &[
         ("magic", |b, l| b[l.footer + 31] ^= 1, InvalidMagic),
         ("version 2", |b, l| put_u32(b, l.footer + 24, 2), UnsupportedVersion),
-        ("version 4", |b, l| put_u32(b, l.footer + 24, 4), UnsupportedVersion),
+        ("version 5", |b, l| put_u32(b, l.footer + 24, 5), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),
         ("block count too large", |b, l| put_u32(b, l.footer + 16, u32::MAX), InvalidFooter),
@@ -1216,8 +1219,13 @@ type HeaderMutation = fn(&mut Vec<u8>);
 fn invalid_frame_headers_are_rejected_behind_a_valid_checksum() {
     use RunCorruption::*;
 
-    let cases: [(&str, HeaderMutation, [RunCorruption; 3]); 5] = [
-        ("unknown codec", |b| b[0] = 3, [UnsupportedCodec; 3]),
+    let cases: [(&str, HeaderMutation, [RunCorruption; 3]); 6] = [
+        ("unknown codec", |b| b[0] = 4, [UnsupportedCodec; 3]),
+        (
+            "dictionary codec in a run without one",
+            |b| b[0] = 3,
+            [MissingDictionary; 3],
+        ),
         ("reserved", |b| b[2] = 1, [InvalidFrame; 3]),
         (
             "decoded length over the limit",

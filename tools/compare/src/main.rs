@@ -338,7 +338,7 @@ impl Store for Tessera {
             stats.runs,
             stats.max_overlap,
             mib(stats.run_bytes as u64),
-            mib(stats.filter_bytes as u64),
+            mib(stats.held_bytes as u64),
             mib(memtables as u64),
             mib(stats.retained_bytes as u64),
             stats.flushes,
@@ -1040,6 +1040,10 @@ fn compactions(data: Dataset, compression: Compression) {
         max_runs: 256,
         background_compaction: None,
         compression,
+        target_block_len: std::env::var("BENCH_BLOCK_LEN")
+            .map_or(EngineOptions::default().target_block_len, |len| {
+                len.parse().expect("BENCH_BLOCK_LEN is a byte count")
+            }),
         ..EngineOptions::default()
     });
     let records = data.records();
@@ -1101,11 +1105,11 @@ fn compactions(data: Dataset, compression: Compression) {
         let freed = allocated();
         let delta = |a: u64, b: u64| (a as f64 - b as f64) / f64::from(1 << 20);
         println!(
-            "compaction\t{at}\tinputs={}\tinput_mib={:.1}\toutput_mib={:.1}\tfilters_mib={:.1}\tfilter_build_mib={:.1}\tworkspace_estimate_mib={:.1}\tpeak_alloc_above_mib={:.1}\tpeak_anon_above_mib={:.1}\tafter_alloc_change_mib={:.1}\tafter_anon_change_mib={:.1}\tretained_mib={:.1}\tafter_snapshot_drop_alloc_change_mib={:.1}\twall_s={:.2}",
+            "compaction\t{at}\tinputs={}\tinput_mib={:.1}\toutput_mib={:.1}\tfilters_mib={:.1}\tfilter_build_mib={:.1}\tworkspace_estimate_mib={:.1}\tpeak_alloc_above_mib={:.1}\tpeak_anon_above_mib={:.1}\tafter_alloc_change_mib={:.1}\tafter_anon_change_mib={:.1}\tretained_mib={:.1}\tafter_snapshot_drop_alloc_change_mib={:.1}\twall_s={:.2}\tdictionary={:?}\tdictionary_s={:.3}",
             report.inputs,
             mib(report.input_bytes as u64),
             mib(report.output_bytes as u64),
-            mib(report.output_filter_bytes as u64),
+            mib(report.output_held_bytes as u64),
             mib(report.filter_build_bytes as u64),
             mib(report.workspace_bytes as u64),
             delta(peak_alloc.load(Relaxed), alloc_before),
@@ -1115,6 +1119,8 @@ fn compactions(data: Dataset, compression: Compression) {
             mib(retained as u64),
             delta(freed, alloc_before),
             wall.as_secs_f64(),
+            report.stats.dictionary,
+            report.stats.dictionary_time.as_secs_f64(),
         );
     }
     stop.store(true, Relaxed);
@@ -1154,7 +1160,7 @@ fn cycles(data: Dataset, memtable_budget: Option<usize>) {
             mib(peak),
             stats.runs,
             mib(stats.run_bytes as u64),
-            mib(stats.filter_bytes as u64),
+            mib(stats.held_bytes as u64),
             mib(stats.retained_bytes as u64),
         );
     };
@@ -1319,10 +1325,12 @@ fn main() {
     match engine.as_str() {
         "tessera" => run(Tessera::new(Compression::Zstd), data),
         "tessera-lz4" => run(Tessera::new(Compression::Lz4), data),
+        "tessera-dict" => run(Tessera::new(Compression::ZstdDictionary), data),
         "tessera-cycles" => cycles(data, None),
         "tessera-cycles-16m" => cycles(data, Some(16 << 20)),
         "tessera-compactions" => compactions(data, Compression::Zstd),
         "tessera-compactions-lz4" => compactions(data, Compression::Lz4),
+        "tessera-compactions-dict" => compactions(data, Compression::ZstdDictionary),
         "rocksdb" => run(rocks(false, None), data),
         "rocksdb-lz4" => run(rocks(true, None), data),
         "rocksdb-tuned" => run(rocks(false, Some(64 << 20)), data),

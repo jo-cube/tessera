@@ -150,7 +150,7 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     }
     let flushed = engine.flush().unwrap();
     assert!(flushed.runs > 1);
-    assert!(flushed.filter_bytes > 0 && flushed.filter_build_bytes > 0);
+    assert!(flushed.held_bytes > 0 && flushed.filter_build_bytes > 0);
     // Newer tombstones and values over the same range.
     for i in (0..1_000).step_by(3) {
         engine.delete(&key(i)).unwrap();
@@ -162,10 +162,7 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     }
     let second = engine.flush().unwrap();
     let stats = engine.stats();
-    assert_eq!(
-        stats.filter_bytes,
-        flushed.filter_bytes + second.filter_bytes
-    );
+    assert_eq!(stats.held_bytes, flushed.held_bytes + second.held_bytes);
 
     let snapshot = engine.snapshot().unwrap();
     let mut workspace = MergeWorkspace::new();
@@ -177,24 +174,21 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
         ..options(0)
     };
     while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
-        assert!(report.outputs == 0 || report.output_filter_bytes > 0);
+        assert!(report.outputs == 0 || report.output_held_bytes > 0);
         inputs.0 += report.input_bytes;
-        inputs.1 += report.input_filter_bytes;
+        inputs.1 += report.input_held_bytes;
     }
     let compacted = engine.stats();
     assert!(compacted.runs > 1, "the output was split");
-    assert!(compacted.filter_bytes > 0 && inputs.1 > 0);
+    assert!(compacted.held_bytes > 0 && inputs.1 > 0);
     // Every run published when the snapshot was taken overlapped another, so
     // all were replaced; the snapshot keeps exactly those, filters included.
     // Intermediate runs no snapshot saw were freed.
     assert_eq!(
-        (
-            compacted.retained_run_bytes,
-            compacted.retained_filter_bytes
-        ),
-        (stats.run_bytes, stats.filter_bytes)
+        (compacted.retained_run_bytes, compacted.retained_held_bytes),
+        (stats.run_bytes, stats.held_bytes)
     );
-    assert!(inputs.1 > stats.filter_bytes);
+    assert!(inputs.1 > stats.held_bytes);
     // Every key, deleted ones included, reads as the model says, from the
     // compacted runs and from the snapshot's replaced ones.
     let mut read = EngineWorkspace::new();
@@ -207,7 +201,7 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     drop(snapshot);
     let released = engine.stats();
     assert_eq!(
-        (released.retained_run_bytes, released.retained_filter_bytes),
+        (released.retained_run_bytes, released.retained_held_bytes),
         (0, 0)
     );
 }

@@ -101,7 +101,13 @@
 //! [`SnapshotLimits`](super::SnapshotLimits) as retained bytes, like any
 //! snapshot's. Beside them it holds one run being built (input up to the
 //! engine's `target_run_len`), one decoded block per run it reads, and no
-//! copy of the database. On disk it needs the new checkpoint beside the
+//! copy of the database. With
+//! [`Compression::ZstdDictionary`](super::Compression::ZstdDictionary) it
+//! first samples the snapshot's runs and trains a dictionary, as a compaction
+//! does, before writing any file: about 21 MiB while training, and the
+//! trained dictionary until the last run is written.
+//! No limit is applied to that, as none is to the rest of a checkpoint's
+//! memory. On disk it needs the new checkpoint beside the
 //! previous one until the previous is removed, and
 //! [`CheckpointOptions::max_bytes`] bounds the new one.
 //!
@@ -123,7 +129,8 @@ use crc32fast::Hasher;
 
 use crate::block::Value;
 use crate::run::{
-    CorruptRun, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD, ReadError, Run, RunBuilder,
+    CorruptRun, DICTIONARY_WORKSPACE, DictionaryChoice, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD,
+    ReadError, Run, RunBuilder, RunView, choose_dictionary,
 };
 
 use super::{
@@ -179,6 +186,9 @@ pub struct CheckpointReport {
     pub bytes: u64,
     /// The largest run, the most run bytes held in memory at once.
     pub largest_run_bytes: usize,
+    /// Whether its runs were compressed with a dictionary, and why not; see
+    /// [`Compression::ZstdDictionary`](super::Compression::ZstdDictionary).
+    pub dictionary: DictionaryChoice,
     /// Older checkpoint directories removed: the previous one and leftovers
     /// of interrupted attempts.
     pub reclaimed: usize,
@@ -671,10 +681,15 @@ struct Written {
     manifest: Manifest,
     bytes: u64,
     largest_run_bytes: usize,
+    dictionary: DictionaryChoice,
 }
 
 /// Streams the snapshot's live keys into run files in `path`, then writes
 /// the manifest, syncing each file and the directory.
+///
+/// With dictionaries enabled, one is first chosen from samples of the
+/// snapshot's runs, as for a compaction, with the training workspace
+/// allowed in full; the memtables' records are not sampled.
 fn write_runs(
     core: &Core,
     snapshot: &super::Snapshot,
@@ -692,6 +707,16 @@ fn write_runs(
         },
         bytes: 0,
         largest_run_bytes: 0,
+        dictionary: DictionaryChoice::Off,
+    };
+    let trained = if core.dictionary {
+        let views: Vec<RunView<'_>> = snapshot.runs.iter().map(|run| run.run.view()).collect();
+        let choice = choose_dictionary(&views, core.target_block_len, DICTIONARY_WORKSPACE)
+            .map_err(|error| CheckpointError::Read(ReadError::Corrupt(error)))?;
+        written.dictionary = choice.outcome;
+        choice.trained
+    } else {
+        None
     };
     let emit = |run: Run<Vec<u8>>, written: &mut Written| -> Result<(), Failure> {
         let bytes = run.as_bytes();
@@ -720,8 +745,11 @@ fn write_runs(
     let mut builder: Option<RunBuilder> = None;
     let mut input = 0;
     while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
-        let open = builder.get_or_insert_with(|| {
-            RunBuilder::with_target_block_len(core.codec, core.target_block_len)
+        let open = builder.get_or_insert_with(|| match &trained {
+            Some(trained) => {
+                RunBuilder::with_dictionary(Arc::clone(trained), core.target_block_len)
+            }
+            None => RunBuilder::with_target_block_len(core.codec, core.target_block_len),
         });
         // Keys and values came from runs and memtables that held them.
         open.add(record.key, record.seq, Value::Bytes(record.value))
@@ -881,6 +909,7 @@ impl Engine {
             manifest,
             bytes,
             largest_run_bytes,
+            dictionary,
         } = written;
         Ok(CheckpointReport {
             generation,
@@ -889,6 +918,7 @@ impl Engine {
             runs: manifest.runs.len(),
             bytes,
             largest_run_bytes,
+            dictionary,
             reclaimed,
             unreclaimed,
             pruned_segments: 0,
@@ -966,7 +996,7 @@ pub(super) struct Loaded {
     pub(super) ceiling: u64,
     runs: Vec<Run<Vec<u8>>>,
     run_bytes: usize,
-    filter_bytes: usize,
+    held_bytes: usize,
 }
 
 impl Loaded {
@@ -979,7 +1009,7 @@ impl Loaded {
             state.runs.extend(published(self.runs));
             state.order_runs();
             state.run_bytes = self.run_bytes;
-            state.filter_bytes = self.filter_bytes;
+            state.held_bytes = self.held_bytes;
         }
         core
     }
@@ -1182,12 +1212,12 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
             ));
         }
         let run_bytes: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
-        let filter_bytes: usize = runs.iter().map(Run::filter_bytes).sum();
-        if runs.len() > options.max_runs || run_bytes + filter_bytes > options.max_run_bytes {
+        let held_bytes: usize = runs.iter().map(Run::held_bytes).sum();
+        if runs.len() > options.max_runs || run_bytes + held_bytes > options.max_run_bytes {
             return Err(RecoveryError::RunLimit(FlushError {
                 runs: runs.len(),
                 max_runs: options.max_runs,
-                run_bytes: run_bytes + filter_bytes,
+                run_bytes: run_bytes + held_bytes,
                 max_run_bytes: options.max_run_bytes,
             }));
         }
@@ -1197,7 +1227,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
             ceiling: manifest.last_seq,
             runs,
             run_bytes,
-            filter_bytes,
+            held_bytes,
         })
     }
 }

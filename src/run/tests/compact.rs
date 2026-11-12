@@ -43,6 +43,7 @@ const UNLIMITED: CompactLimits = CompactLimits {
     max_workspace_bytes: usize::MAX,
     codec: Codec::Zstd,
     target_block_len: crate::run::TARGET_BLOCK_LEN,
+    dictionary: false,
 };
 
 fn merge(
@@ -155,8 +156,8 @@ fn limits_fail_the_merge_with_the_amount_needed() {
     let full = merge(&[&older, &newer], |_| true, UNLIMITED).unwrap();
 
     // Output counts the stored bytes and the filters together.
-    let output = full.output_bytes + full.filter_bytes;
-    assert!(full.filter_bytes > 0);
+    let output = full.output_bytes + full.held_bytes;
+    assert!(full.held_bytes > 0);
     let error = merge(
         &[&older, &newer],
         |_| true,
@@ -203,7 +204,7 @@ fn limits_fail_the_merge_with_the_amount_needed() {
             ..UNLIMITED
         };
         let out = merge(&[&older, &newer], |_| true, limits).unwrap();
-        assert_eq!(out.filter_bytes > 0, filtered, "{spare}");
+        assert_eq!(out.held_bytes > 0, filtered, "{spare}");
         assert_eq!(merged(&out), merged(&full));
         let key = b"a".as_slice();
         assert_eq!(

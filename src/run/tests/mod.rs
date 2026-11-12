@@ -3,6 +3,7 @@
 
 mod compact;
 mod costs;
+mod dictionary;
 mod format;
 mod layouts;
 mod logical;
