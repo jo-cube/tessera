@@ -63,6 +63,9 @@ Kinds of result in this file:
 - **Engine option, paired:** the 5AC section, `target_block_len` at 16, 4
   and 2 KiB through the benchmark suite and the 5Y harness's `tessera`
   engine.
+- **Dictionary research, run layer:** the 5AD section, per-run Zstandard
+  dictionaries at 4 KiB blocks in the research layout, with a format and
+  compaction design; the engine is unchanged.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -2169,6 +2172,378 @@ From 5AB (run layer) and the measurements above; estimates where marked.
   in one engine and one checkpoint, and compaction would rewrite in the
   current setting. This milestone's mixed-length test is the pattern for
   testing it.
+
+## Dictionary-compressed runs (5AD, design and prototype)
+
+Whether a Zstandard dictionary per run lets 4 KiB blocks keep the density
+of today's 16 KiB blocks, and what it would take in Tessera's format,
+compaction and recovery. **Nothing here changes the engine or the run
+format.** The prototype is the research `Blocks` layout from 5AB, which
+uses the production block format behind the same kind of sparse index, with
+each frame checksummed and verified on decode. It is extended in
+`src/run/tests/layouts.rs`:
+
+```text
+cargo test --release --lib run::tests::layouts -- --ignored --nocapture
+```
+
+`decode_costs` breaks down a single block read, and `dictionary_runs`
+builds and reads the candidates. Both ran twice on the bounded container
+(2 CPUs, 3 GiB, tmpfs). Sizes matched between the passes. Timings in pass
+2 were 3–10% higher overall, and every ordering below held in both;
+pass 1 is shown. The datasets are the 5AB ones: sensor (small records,
+128 groups), JSON (about 512 B values, 16 groups) and documents (about
+2 KiB values, 4 groups).
+
+The labels **M**, **D** and **A** mark figures as measured, derived from
+measurements, or assumed but not verified.
+
+### Where a block read goes
+
+Per 4 KiB block, the median of five rounds over the whole run (M):
+
+| cost (ns) | sensor | JSON | documents |
+|---|---|---|---|
+| CRC-32 | 120 | 44 | 32 |
+| header parse | 4 | 5 | 4 |
+| Zstd decompress (reused context) | 4,427 | 4,869 | 4,730 |
+| the same with a fresh context | 4,456 | 4,913 | 4,697 |
+| copy decoded block | 68 | 67 | 63 |
+| block open | 2 | 2 | 2 |
+| in-block lookup | 161 | 142 | 53 |
+| production `Run::get`, end to end | 4,880 | 5,208 | 4,868 |
+| LZ4 decompress | 829 | 1,188 | 992 |
+
+- **Decompression is nearly all of it (M).** `Run::get` costs decompression
+  plus 0.2–0.5 µs. CRC, header, open and copy add up to 0.1–0.2 µs.
+- **The per-frame cost is Zstandard's own (D).** Across 1–16 KiB blocks,
+  decompression fits roughly 1.2–2 µs per frame plus 0.63–0.78 µs per
+  decoded KB. Starting from a fresh decompression context instead of a
+  reused one adds 0–300 ns, and a context is 96 KB. The fixed part is the
+  entropy-table setup each frame carries. Tessera does no avoidable setup:
+  the workspace already reuses its context and buffer. A decoder cache or
+  pool would save at most 0.3 µs, so none is proposed.
+- **A prepared dictionary removes most of the fixed cost (M).** With a
+  64 KiB dictionary, a 4 KiB JSON block decodes in 2.50 µs and a document
+  block in 2.54 µs, against 4.87 and 4.73 µs plain. The frames' tables come
+  from the dictionary. On sensor it only reaches 3.87 µs, against 4.43 µs.
+- **Only a prepared dictionary is usable (M).** Passing the raw dictionary
+  bytes per call costs 6.1–7.3 µs a block, slower than no dictionary,
+  because Zstandard prepares it on every frame. Preparing a decoding
+  dictionary (`DDict`) takes 4.2–4.4 µs, or 3.6–3.7 µs by reference. It is
+  a per-run cost, paid once.
+- **Compression (M).** A 4 KiB block compressed with a prepared encoding
+  dictionary (`CDict`) takes 8.8 µs on JSON instead of 12.7 µs, and 6.9 µs
+  on documents instead of 9.6 µs, but 23.6 µs on sensor instead of 18.0 µs.
+  A `CDict` at level 3 is 474 KB.
+
+### Prototype results
+
+Each row encodes the same records. "vs 16 KiB" compares total memory,
+which counts payload, keys, index, framing, Bloom filter, the raw
+dictionary and the dictionary's decoding form, against production Zstd at
+16 KiB. Reads, at 64 MiB of input only:
+
+- p50 and p99 cover present keys;
+- seeks;
+- 32- and 512-key scans from a seek;
+- a full scan.
+
+All of these are M.
+
+| dataset | layout | total MiB | vs 16 KiB | p50 µs | p99 µs | seek µs | 32 keys µs | 512 keys µs | full scan ns/rec |
+|---|---|---|---|---|---|---|---|---|---|
+| sensor | Zstd 16 KiB | 32.52 | – | 14.96 | 19.21 | 14.90 | 16.4 | 37.9 | 46 |
+| sensor | Zstd 4 KiB | 33.68 | +3.6% | 5.17 | 6.04 | 5.08 | 6.8 | 32.6 | 52 |
+| sensor | LZ4 4 KiB | 39.71 | +22.1% | 1.33 | 1.75 | 1.31 | 2.1 | 14.2 | 26 |
+| sensor | 4 KiB + 64 KiB dict | 34.53 | +6.2% | 4.38 | 5.42 | 4.48 | 6.0 | 28.0 | 47 |
+| sensor | 4 KiB + 16 KiB dict | 34.23 | +5.2% | 3.92 | 4.79 | 3.84 | 5.2 | 25.4 | 43 |
+| JSON | Zstd 16 KiB | 16.78 | – | 13.29 | 17.17 | 13.31 | 26.9 | 231.4 | 428 |
+| JSON | Zstd 4 KiB | 20.72 | +23.5% | 5.38 | 6.38 | 5.45 | 26.5 | 338.1 | 648 |
+| JSON | LZ4 4 KiB | 31.77 | +89.4% | 1.58 | 1.96 | 1.58 | 7.1 | 89.0 | 173 |
+| JSON | 4 KiB + 64 KiB dict | 15.26 | −9.0% | 2.83 | 3.38 | 2.82 | 13.7 | 174.8 | 342 |
+| JSON | 4 KiB + 16 KiB dict | 15.17 | −9.6% | 3.00 | 3.50 | 2.98 | 14.6 | 188.4 | 362 |
+| documents | Zstd 16 KiB | 11.99 | – | 12.08 | 15.83 | 12.07 | 54.4 | 686.6 | 1,321 |
+| documents | Zstd 4 KiB | 14.73 | +22.8% | 4.83 | 5.88 | 4.94 | 69.9 | 1,038.7 | 2,016 |
+| documents | LZ4 4 KiB | 24.29 | +102.6% | 1.33 | 1.83 | 1.33 | 16.4 | 241.2 | 472 |
+| documents | 4 KiB + 64 KiB dict | 12.19 | +1.7% | 2.79 | 3.67 | 2.86 | 39.4 | 583.0 | 1,138 |
+| documents | 4 KiB + 16 KiB dict | 12.08 | +0.8% | 2.92 | 3.88 | 2.96 | 41.2 | 612.5 | 1,198 |
+
+Size against input (M; "vs 16 KiB" for each dictionary size):
+
+| dataset | input MiB | Zstd 4 KiB | 64 KiB dict | 16 KiB dict |
+|---|---|---|---|---|
+| sensor | 4 | +3.6% | +11.0% | +6.9% |
+| sensor | 16 | +3.6% | +7.2% | +5.6% |
+| JSON | 4 | +23.3% | +2.6% | −5.6% |
+| JSON | 16 | +23.4% | −6.7% | −8.6% |
+| documents | 4 | +23.0% | +19.2% | +7.4% |
+| documents | 16 | +22.8% | +4.9% | +1.9% |
+
+- **On structured data, dictionaries beat 16 KiB blocks in both
+  dimensions (M).** JSON at 4 KiB with a dictionary is 9–10% smaller than
+  today's default, with present-key lookups 4.4–4.7× faster and p99 5×
+  lower. It scans faster too: 32 keys 1.8–2.0×, 512 keys 1.2–1.3×, a full
+  scan 1.2×. Documents match 16 KiB density within 0.8–1.7%, with lookups
+  4.1–4.3× faster and scans 1.1–1.4× faster. Against plain 4 KiB blocks,
+  the dictionary saves 26% on JSON and 18% on documents, and halves lookup
+  time.
+- **Scans gain because frames get cheaper (D).** The frames keep the same
+  number of records but decode in about half the time, so the 5AC scan
+  regression at 4 KiB disappears on JSON and documents.
+- **On sensor, a dictionary is the wrong tool (M).** Records are small and
+  repetitive inside a block, so plain 4 KiB blocks already cost only 3.6%.
+  A dictionary saves under 2% of payload and adds its own size. Lookups get
+  1.2–1.3× faster than plain 4 KiB, but sensor is 1.6–2.6 points larger.
+- **Prefer a 16 KiB dictionary (M).** At 64 MiB it costs up to 6% in lookup
+  time against 64 KiB (sensor is faster) and is the same size or smaller. Below that it is
+  much smaller: JSON −5.6% against +2.6% at 4 MiB, documents +7.4% against
+  +19.2%. It trains 3.5–4.7× faster on a quarter of the samples (below).
+- **LZ4 at 4 KiB is a different point (M):** 2–3.5× faster than any Zstd
+  layout, at 22–103% more memory. Dictionaries do not compete with it on
+  latency.
+
+### Training
+
+Sampling, training and building per run, at 64 MiB of input (M):
+
+| dataset | dictionary | samples MiB | sample ms | train s | train peak MiB | build s | build MB/s | estimated saving (actual) |
+|---|---|---|---|---|---|---|---|---|
+| sensor | Zstd 16 KiB, none | – | – | – | – | 0.23 | 287 | – |
+| sensor | 64 KiB, inputs | 7.1 | 8 | 0.28 | 0 | 0.30 | 220 | 1% (2%) |
+| sensor | 16 KiB, inputs | 1.6 | 2 | 0.06 | 0 | 0.30 | 221 | 0% (2%) |
+| JSON | Zstd 16 KiB, none | – | – | – | – | 0.15 | 440 | – |
+| JSON | Zstd 4 KiB, none | – | – | – | – | 0.22 | 312 | – |
+| JSON | 64 KiB, inputs | 6.9 | 6 | 0.20 | 13 | 0.16 | 422 | 28% (28%) |
+| JSON | 16 KiB, inputs | 1.6 | 2 | 0.05 | 0 | 0.14 | 465 | 28% (28%) |
+| JSON | 64 KiB, output blocks | 6.2 | 4 | 0.20 | 4 | 0.15 | 436 | 29% (28%) |
+| JSON | 64 KiB, values | 6.8 | 2 | 0.22 | 1 | 0.15 | 440 | 56% (25%) |
+| documents | Zstd 16 KiB, none | – | – | – | – | 0.11 | 587 | – |
+| documents | Zstd 4 KiB, none | – | – | – | – | 0.16 | 412 | – |
+| documents | 64 KiB, inputs | 6.4 | 5 | 0.14 | 0 | 0.12 | 546 | 19% (18%) |
+| documents | 16 KiB, inputs | 1.6 | 1 | 0.04 | 0 | 0.11 | 594 | 19% (19%) |
+
+"Estimated saving" is the held-out estimate described below. "Actual" is
+the measured payload saving against plain Zstd 4 KiB on the same records.
+"Train peak" is resident memory added while training: a lower bound,
+because freed heap is reused first.
+
+- **Samples come from the inputs, already in blocks (M).** `input_samples`
+  takes whole decoded blocks evenly from the input runs, up to a byte
+  budget, which is 100× the dictionary size. It reads each frame's decoded
+  length from its header and decodes only the frames it takes, so sampling
+  costs 1–8 ms. Nothing beyond the samples is materialized.
+- **Input blocks train as well as output blocks (M).** JSON: 15.26 against
+  15.15 MiB; documents: 12.19 against 12.10. Values alone train worse
+  (JSON 15.76 MiB), and estimate their own saving badly (56% predicted,
+  25% actual): a dictionary must be trained on what it will compress.
+- **A held-out estimate predicts the saving (M).** One block in eight of
+  the samples is held out. Compressing the held-out blocks with and
+  without the trained dictionary predicted the actual saving within
+  1–3 points for every dataset and size, at every input size measured
+  (4, 16 and 64 MiB). It costs one extra compression of the held-out
+  eighth, about 0.2–0.9 MiB.
+- **Training cost is fixed by the sample budget, not the run (M).** For a
+  16 KiB dictionary it is 0.04–0.07 s on 1.6–2.7 MiB of samples. For
+  64 KiB it is 0.09–0.45 s. At the default 64 MiB run target, a 16 KiB
+  dictionary adds about a third of the build time (D: 0.05 s against
+  0.14 s). The build itself is as fast as at 16 KiB, because compressing
+  with a dictionary is cheaper per block, except on sensor.
+- **Building and training peak memory (M, lower bounds):** 0–20 MiB above
+  the build. The samples (1.6 MiB for a 16 KiB dictionary) and a 474 KB
+  `CDict` are held during the merge (D).
+- **A size threshold is not needed for a 16 KiB dictionary (M).** The
+  15 MiB hypothesis came from the 64 KiB dictionary's fixed cost of about
+  150 KiB a run. With 16 KiB, both JSON and documents gain over plain 4 KiB
+  at every size measured, down to 4 MiB of input. The fixed cost is about
+  16 KiB raw plus a decoding form estimated at about 43 KiB (D). A floor,
+  such as 1 MiB of input, only avoids training on trivial runs (A).
+- **The fallback is a threshold on the held-out saving (D).** If the
+  estimated saving against plain Zstd at the same block length is below
+  10%, the run is built plain. That separates the datasets with a wide
+  margin: sensor shows 0–1%, documents 19%, JSON 28%. There is no
+  adaptive policy: one check per output run, with the same result for the
+  same inputs.
+
+### Ownership and memory
+
+- **Serialized:** the raw dictionary bytes as Zstandard's trainer emits
+  them, including its magic and ID, at most a fixed bound inside the run
+  (format below). No other dictionary state is persisted.
+- **Prepared:** one `DDict` per run, built when the run is constructed or
+  recovered, after validation, and held next to the Bloom filter in the
+  `Run`. It is boxed, so a plain run pays one pointer. `DDict` is
+  `Send + Sync` and is only read while decoding, so every reader of the
+  run shares it through `&Run`. Each reader keeps its own decompression
+  context in its `ReadWorkspace`, as now, and needs no pool.
+- **By copy, not by reference (M).** A `DDict` that copies its dictionary
+  is 90.7 KiB for 64 KiB of dictionary, against 26.7 KiB by reference. A
+  by-reference `DDict` would borrow from the run's own bytes, which makes
+  the run self-referential. That cannot be written under the crate's
+  `#![forbid(unsafe_code)]`, so the copy (about the dictionary's size
+  again) is the price. With a 16 KiB dictionary that is about 16 KiB a run
+  (D).
+- **Charged:** the decoding form is counted in the run's resident bytes,
+  with the filter, so `run_bytes`, retained-snapshot accounting and the
+  memory limits see it. The prototype's totals already include it.
+- **Lifetime:** the dictionary lives exactly as long as its run. Snapshots
+  pin runs, so a snapshot keeps the dictionaries of the runs it reads.
+  When compaction replaces a run and the last pin drops, its dictionary is
+  freed with it. There is no registry, no sharing across runs and no
+  reference tracking. A dictionary is never needed beyond its own run's
+  frames.
+- **Encoding side:** the `CDict` (474 KB at level 3) and the samples exist
+  only while one compaction builds one output run, in the merge's
+  workspace. They are not kept.
+
+### Compaction
+
+- **Flushes stay plain.** A flush has no input runs to sample, and its
+  output is replaced by the next compaction anyway.
+- **One pass from the inputs (recommended).** Before merging:
+  1. sample decoded blocks from the selected input runs;
+  2. train;
+  3. evaluate on the held-out eighth;
+  4. then merge once, building every output run with that dictionary or
+     plain, depending on the threshold.
+
+  The sampling decodes about 1.6 MiB and takes milliseconds.
+- **Two passes from the output (not recommended).** Build the output plain,
+  sample its blocks and rebuild it with the dictionary. It trains no better
+  (M: within 0.7%), doubles the compression work, and holds a full plain
+  copy of the output during the rebuild, which the output limit would have
+  to count.
+- **Where it runs.** The selected runs are already pinned, so training runs
+  on the compaction worker outside the state lock, like the merge.
+  Publication is the existing atomic replacement of inputs by outputs. A
+  training failure, or any error, leaves the inputs and every snapshot
+  untouched, exactly as a merge failure does now. A training error can
+  instead fall back to building plain (D).
+- **Inside the existing limits.** The workspace estimate would add the
+  sample budget, the trainer's workspace (about the samples' size; the
+  prototype's lower bound is 0–20 MiB), the `CDict` and the held-out
+  compression. Exceeding `max_workspace_bytes` would build plain rather
+  than fail. The output estimate would add one dictionary and decoding
+  form per output run. No new worker, scheduler or selection change is
+  needed.
+- **One dictionary per compaction, one copy per output run (D).** All
+  outputs of one merge come from the same inputs, so they can share the
+  trained bytes. Each output run still stores and prepares its own copy,
+  which keeps every run self-contained.
+
+### Format sketch (not implemented)
+
+A run with a dictionary would be version 4. Plain runs stay version 3,
+byte for byte. A build that knows only version 3 rejects version 4 with
+`UnsupportedVersion`, a safe failure.
+
+```text
+run       := frame* dictionary table key_area footer
+dictionary := dict_bytes                      dict_len bytes, before the table
+
+footer v4 := index_offset:u64 record_count:u64 block_count:u32
+             min_key_len:u32 dict_len:u32 dict_checksum:u32
+             version:u32 magic:u32            40 bytes
+
+codec 3   := a Zstandard frame that declares its content size and was
+             compressed with this run's dictionary
+```
+
+- **Version detection:** the version stays the last field but one, so a
+  reader learns the footer length before parsing anything else.
+- **Location and length:** the dictionary ends at `index_offset` and starts
+  at `index_offset - dict_len`. The last frame's stored length is implied
+  by the dictionary's start instead of `index_offset`. `dict_len` is at
+  most `MAX_DICTIONARY_LEN` (64 KiB; 16 KiB is the recommended size), so
+  recovery allocates at most that plus its decoding form before anything
+  is trusted. A version 4 run with `dict_len` 0 is invalid: it would be
+  version 3.
+- **Explicit codec:** codec 3 is its own value. A frame says whether it
+  needs the dictionary, and the reader never infers it from the run's
+  version or from a dictionary being present. Codecs 0–2 stay valid in a
+  version 4 run, so a run's frames may mix codec 2 and 3, as codecs 0–2
+  may be mixed now.
+- **Per-block reference:** Zstandard writes the dictionary's 32-bit ID into
+  every frame. The reader checks that the frame's ID equals the run's
+  dictionary ID before decoding, as a second check against frames copied
+  between runs.
+- **Checksums:** `dict_checksum` is the CRC-32 of the dictionary bytes.
+  Frame checksums are unchanged. The footer is not covered now and stays
+  uncovered; its fields are cross-checked against the regions, as now.
+- **Errors:** new `RunCorruption` kinds:
+  - `InvalidDictionary`: bad length, checksum, magic or ID, or Zstandard
+    refuses to prepare it;
+  - `MissingDictionary`: codec 3 in a version 3 run;
+  - `DictionaryMismatch`: the frame names another ID.
+
+  A codec 3 frame that fails to decode is `CorruptPayload`, as now.
+- **Compatibility and mixed runs:** version 3 and 4 runs coexist in one
+  engine and one checkpoint, as runs of mixed block lengths do since 5AC.
+  Compaction rewrites runs in whatever the current setting is. There is
+  no migration: old runs remain version 3 until they are compacted.
+
+### Recovery, reads and corruption
+
+- **`Run::new` and recovery:** validation reads the footer, checks
+  `dict_len` against its bound, verifies `dict_checksum`, checks the
+  dictionary's magic and nonzero ID, and prepares the `DDict`. Only then
+  does it validate the frames as now, decoding every one with that
+  dictionary and checking each frame's ID. The `Run` is constructed only
+  after all of this succeeds, so no reader can see a run whose dictionary
+  has not been validated. Recovery memory is one decoded block, as now,
+  plus the dictionary's decoding form.
+- **Checkpoints and manifests:** a checkpoint stores whole runs, so the
+  dictionary travels inside its run. The manifest needs no new field.
+  Loading a checkpoint validates every run in full, which includes the
+  above.
+- **WAL replay:** unchanged. It refills the memtable, and flushes stay
+  plain.
+- **Pruning:** key ranges, Bloom filters and `max_seq` are derived and
+  stored exactly as now. Sequence-bound pruning and sequence semantics do
+  not change.
+- **Snapshots:** they pin runs, and so their dictionaries. A view never
+  changes.
+- **Concurrent reads:** readers share the run's `DDict` by shared
+  reference; nothing in the read path is mutable beyond each reader's own
+  workspace.
+- **Corruption while reading:** a frame's CRC is verified before decoding,
+  as now. Damage to the dictionary after validation, which takes memory
+  corruption, makes frames fail to decode or fail their own checks. That
+  is reported as `CorruptPayload`, without a panic, through the same
+  checked path.
+
+### Correctness checks added
+
+- `layouts_agree_with_the_production_run` now also checks a dictionary
+  trained by `input_samples` from three runs with 1 KiB blocks, read
+  through 256 B dictionary blocks, against the production run: gets,
+  seeks, scans and versions.
+- `dictionary_frames_name_their_dictionary_and_need_it`: dictionary frames
+  carry the dictionary's ID. Decoding one without the dictionary, or with
+  another, is an error, never wrong bytes. The right `DDict` decodes it.
+- The engine is unchanged. The full bounded suite passes (below).
+
+### Decision
+
+- **Integration is justified, for structured values, as an explicit
+  option (D).** On JSON and documents, a 16 KiB dictionary at 4 KiB blocks
+  matches or beats today's density while making lookups 4–4.5× faster and
+  scans faster. Plain 4 KiB blocks cannot do that: 5AC measured +24–27%
+  memory. The cost is bounded and per run: a format version with one new
+  codec and one region; training of about 0.05 s per compaction output; a
+  few MiB of workspace; and about 60 KiB resident per run (D).
+- **It is not a general default (M).** On small repetitive records
+  (sensor), plain 4 KiB blocks are already dense. The held-out estimate
+  (at most 1%) is below the 10% threshold, so a run would be built plain;
+  the prototype measured the estimate but did not implement the fallback. Whether a workload gains depends on how much
+  structure its values repeat across blocks.
+- **Not shown here (A).** The prototype is the run layer. In 5AC, run-layer
+  and engine lookups at 4 KiB agreed within a few percent, but these runs
+  have not been read through the engine, its run sets or its memory
+  accounting. One dictionary per compaction assumes that the inputs'
+  value structure is stable within the inputs. Data whose structure
+  drifts quickly was not tested. Zstandard version, hardware and other
+  datasets may move the 10% threshold.
 
 ## Historical results
 

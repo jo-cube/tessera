@@ -14,7 +14,12 @@
 //! Both keep sequence numbers, tombstones, version order, the run's Bloom
 //! filter and a CRC-32 over every compressed frame, verified on each
 //! decode, as the production run does. `layouts_agree_with_the_production_run`
-//! checks them against the production run; `layout_tradeoffs` measures them:
+//! checks them against the production run; `layout_tradeoffs` measures them.
+//!
+//! Research (5AD): `decode_costs` breaks a block read into its parts, and
+//! `dictionary_runs` builds [`Blocks`] at 4 KiB with a dictionary trained on
+//! samples of the input runs' blocks, beside production Zstandard and LZ4
+//! runs, recording training, construction and read costs:
 //!
 //! ```text
 //! cargo test --release --lib run::tests::layouts -- --ignored --nocapture
@@ -854,6 +859,52 @@ fn layouts_agree_with_the_production_run() {
         let (built, _) = spec.build(&records);
         with_layout!(&built, layout => check(layout, &records, &probes, &prefixes));
     }
+
+    // 5AD: a dictionary trained on decoded blocks of overlapping inputs, as
+    // a compaction would train it before merging them.
+    let inputs: Vec<Blocks> = (0..3)
+        .map(|part| {
+            let part: Vec<Owned> = records.iter().skip(part).step_by(3).cloned().collect();
+            Blocks::build(&part, Pack::Zstd, 1 << 10, None)
+        })
+        .collect();
+    let (samples, sizes) = input_samples(&inputs, 64 << 10);
+    assert!(sizes.len() > 8, "{} samples", sizes.len());
+    let dictionary = train_on(4 << 10, &samples, &sizes);
+    let layout = Blocks::build(&records, Pack::Zstd, 256, Some(&dictionary));
+    check(&layout, &records, &probes, &prefixes);
+}
+
+/// A dictionary frame names its dictionary, and decodes with that one only:
+/// without it, or with another, Zstandard refuses the frame rather than
+/// produce other bytes. A format would still record the codec explicitly;
+/// the identifier is a second check.
+#[test]
+fn dictionary_frames_name_their_dictionary_and_need_it() {
+    let records = tricky_records();
+    let samples: Vec<&[u8]> = records.iter().filter_map(|r| r.2.as_deref()).collect();
+    let dictionary = train(4 << 10, samples.iter().step_by(2).copied());
+    let other = train(4 << 10, samples.iter().skip(1).step_by(2).copied());
+    let id = zstd_safe::get_dict_id(&dictionary).unwrap();
+    assert_ne!(Some(id), zstd_safe::get_dict_id(&other));
+
+    let layout = Blocks::build(&records, Pack::Zstd, 1 << 10, Some(&dictionary));
+    let (mut dctx, mut buf) = (DCtx::create(), Vec::with_capacity(8 << 10));
+    for at in 0..layout.index.len() {
+        let stored = layout.stored(at);
+        assert_eq!(zstd_safe::get_dict_id_from_frame(stored), Some(id));
+        buf.clear();
+        assert!(dctx.decompress(&mut buf, stored).is_err());
+        buf.clear();
+        let wrong = DDict::create(&other);
+        assert!(
+            dctx.decompress_using_ddict(&mut buf, stored, &wrong)
+                .is_err()
+        );
+        buf.clear();
+        let right = layout.ddict.as_ref().unwrap();
+        assert!(dctx.decompress_using_ddict(&mut buf, stored, right).is_ok());
+    }
 }
 
 // Measurements.
@@ -885,11 +936,7 @@ fn status_kib(field: &str) -> u64 {
 
 /// Mean ns per get over three timed rounds (median and spread), and the
 /// p99 of one round timed per get.
-fn time_gets<L: Layout>(
-    layout: &L,
-    workspace: &mut Workspace,
-    keys: &[Vec<u8>],
-) -> (f64, f64, f64) {
+fn time_gets<L: Layout>(layout: &L, workspace: &mut Workspace, keys: &[Vec<u8>]) -> TimedGets {
     let get = |workspace: &mut Workspace, key: &[u8]| {
         layout.get(key, workspace, |version| {
             black_box(version.map(|version| match version.value {
@@ -920,7 +967,21 @@ fn time_gets<L: Layout>(
         .collect();
     each.sort_unstable();
     let p99 = each[each.len() * 99 / 100] as f64;
-    (median(rounds.clone()), spread(&rounds), p99)
+    TimedGets {
+        mean: median(rounds.clone()),
+        spread: spread(&rounds),
+        p50: each[each.len() / 2] as f64,
+        p99,
+    }
+}
+
+/// Lookup timings: the median of three rounds' mean, the spread of those
+/// rounds, and percentiles of one round timed per lookup.
+struct TimedGets {
+    mean: f64,
+    spread: f64,
+    p50: f64,
+    p99: f64,
 }
 
 /// Mean µs to the first record and for the whole scan, over `prefixes`,
@@ -1058,9 +1119,10 @@ fn layout_tradeoffs() {
                 assert_eq!(at, records.len());
                 spot_check(layout, records, &probes, check_prefixes);
 
-                let (present_ns, present_spread, p99) = time_gets(layout, &mut workspace, &present);
-                let (deleted_ns, ..) = time_gets(layout, &mut workspace, &deleted);
-                let (missing_ns, ..) = time_gets(layout, &mut workspace, &missing);
+                let TimedGets { mean: present_ns, spread: present_spread, p99, .. } =
+                    time_gets(layout, &mut workspace, &present);
+                let deleted_ns = time_gets(layout, &mut workspace, &deleted).mean;
+                let missing_ns = time_gets(layout, &mut workspace, &missing).mean;
                 let (seek, short_us, short_spread) = time_scans(layout, &mut workspace, &short);
                 let (_, medium_us, _) = time_scans(layout, &mut workspace, &medium);
                 let full: Vec<f64> = (0..2)
@@ -1129,5 +1191,543 @@ fn spot_check<L: Layout>(layout: &L, records: &[Owned], probes: &[Vec<u8>], pref
             at += 1;
         });
         assert!(at > start && !records.get(at).is_some_and(|r| r.0.starts_with(prefix)));
+    }
+}
+
+// 5AD: where a block's decode time goes, and dictionary runs trained the way
+// a compaction could train them.
+
+/// The 5AD datasets, smaller than the 5AB ones: each holds at least 64 MiB
+/// of input, which is all the 5AD measurements read.
+fn research_datasets() -> impl Iterator<Item = Dataset> {
+    type Payload = fn(u64, u64) -> Vec<u8>;
+    let specs: [(&'static str, u64, Payload); 3] = [
+        ("sensor", 128, compare::sensor),
+        ("JSON", 16, compare::json),
+        ("documents", 4, |index, version| {
+            document(index + (version << 32))
+        }),
+    ];
+    specs.into_iter().map(|(name, groups, value)| Dataset {
+        name,
+        records: compare::history(groups, value)
+            .map(|(key, seq, value)| (key.to_vec(), seq, value))
+            .collect(),
+    })
+}
+
+/// The first records of `records` holding about `bytes` of input, counted
+/// as a flush or compaction counts it (key, value and 16 bytes a record).
+fn first_bytes(records: &[Owned], bytes: usize) -> &[Owned] {
+    let mut total = 0;
+    let count = records
+        .iter()
+        .take_while(|(key, _, value)| {
+            let more = total < bytes;
+            total += key.len() + value.as_ref().map_or(0, Vec::len) + 16;
+            more
+        })
+        .count();
+    &records[..count]
+}
+
+/// Mean ns per item of `f` over `items`, the median of five rounds.
+fn ns_each<T>(items: &[T], mut f: impl FnMut(&T)) -> f64 {
+    let rounds = (0..5)
+        .map(|_| {
+            let start = Instant::now();
+            items.iter().for_each(&mut f);
+            start.elapsed().as_nanos() as f64 / items.len() as f64
+        })
+        .collect();
+    median(rounds)
+}
+
+impl Blocks {
+    /// The stored bytes of frame `at`, after its header.
+    fn stored(&self, at: usize) -> &[u8] {
+        &self.frames[self.offsets[at] as usize + HEADER..self.offsets[at + 1] as usize]
+    }
+
+    /// About `count` frames, spread evenly over the run.
+    fn picks(&self, count: usize) -> Vec<usize> {
+        (0..self.index.len())
+            .step_by((self.index.len() / count).max(1))
+            .collect()
+    }
+}
+
+/// Training samples taken the way a compaction could take them before it
+/// merges: whole decoded blocks of its input runs, spread evenly across them,
+/// about `budget` bytes in all.
+fn input_samples(inputs: &[Blocks], budget: usize) -> (Vec<u8>, Vec<usize>) {
+    let blocks: usize = inputs.iter().map(|input| input.index.len()).sum();
+    // Each frame header records its decoded length.
+    let decoded: usize = inputs
+        .iter()
+        .flat_map(|input| {
+            input.offsets[..input.index.len()].iter().map(|&offset| {
+                let at = offset as usize + 4;
+                u32::from_le_bytes(input.frames[at..at + 4].try_into().unwrap()) as usize
+            })
+        })
+        .sum::<usize>()
+        .max(1);
+    let step = (decoded / budget.max(1)).max(1).min(blocks.max(1));
+    let (mut dctx, mut buf) = (DCtx::create(), Vec::new());
+    let (mut samples, mut sizes) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for input in inputs {
+        while at < input.index.len() {
+            let frame = &input.frames[input.offsets[at] as usize..input.offsets[at + 1] as usize];
+            let block = unframe(Pack::Zstd, None, frame, &mut dctx, &mut buf);
+            samples.extend_from_slice(block);
+            sizes.push(block.len());
+            at += step;
+        }
+        at -= input.index.len();
+    }
+    (samples, sizes)
+}
+
+/// Raw blocks of the output itself, every `every`-th, cut as the builder
+/// cuts them: what a second pass over the merge could sample.
+fn output_samples(records: &[Owned], target: usize, every: usize) -> (Vec<u8>, Vec<usize>) {
+    let (mut block, mut raw) = (BlockBuilder::new(), Vec::new());
+    let (mut samples, mut sizes, mut count) = (Vec::new(), Vec::new(), 0);
+    let mut cut = |block: &mut BlockBuilder| {
+        raw.clear();
+        block.flush_into(&mut raw);
+        if count % every == 0 {
+            samples.extend_from_slice(&raw);
+            sizes.push(raw.len());
+        }
+        count += 1;
+    };
+    for (key, seq, value) in records {
+        if ends_block(&block, key, value, target) {
+            cut(&mut block);
+        }
+        block.add(key, *seq, value_of(value)).unwrap();
+    }
+    if !block.is_empty() {
+        cut(&mut block);
+    }
+    (samples, sizes)
+}
+
+fn train_on(size: usize, samples: &[u8], sizes: &[usize]) -> Vec<u8> {
+    let mut dictionary = Vec::with_capacity(size);
+    zstd_safe::train_from_buffer(&mut dictionary, samples, sizes).unwrap();
+    dictionary
+}
+
+/// Resident memory added while `f` runs, above the level before it: a lower
+/// bound, since freed heap is reused first.
+fn peak_during<T>(f: impl FnOnce() -> T) -> (T, f64) {
+    let rss = status_kib("VmRSS:");
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    let out = f();
+    let peak = status_kib("VmHWM:").saturating_sub(rss);
+    (out, peak as f64 / 1024.0)
+}
+
+/// Where a Zstandard block's decode time goes, by block length: each step of
+/// the production read path timed alone on the same frames, with LZ4 and a
+/// plain copy for reference, and at 4 KiB the dictionary paths.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn decode_costs() {
+    println!(
+        "\n| dataset | block | records/block | decoded B | stored B | CRC ns | header ns | decompress ns | fresh context ns | copy ns | open ns | walk ns | lookup in block ns | production get ns | LZ4 decompress ns | compress ns |"
+    );
+    println!("|{}", "---|".repeat(16));
+    let mut dictionary_rows = Vec::new();
+    for dataset in research_datasets() {
+        let records = first_bytes(&dataset.records, 64 << 20);
+        for target in [1 << 10, 2 << 10, 4 << 10, 8 << 10, 16 << 10] {
+            let blocks = Blocks::build(records, Pack::Zstd, target, None);
+            let lz4 = Blocks::build(records, Pack::Lz4, target, None);
+            let picks = blocks.picks(2_000);
+            let (mut dctx, mut buf) = (DCtx::create(), Vec::with_capacity(4 * target + (64 << 10)));
+            let decoded: Vec<Vec<u8>> = picks
+                .iter()
+                .map(|&at| {
+                    buf.clear();
+                    dctx.decompress(&mut buf, blocks.stored(at)).unwrap();
+                    buf.clone()
+                })
+                .collect();
+            let keys: Vec<&[u8]> = picks.iter().map(|&at| blocks.index.key(at)).collect();
+            let at: Vec<usize> = (0..picks.len()).collect();
+            let mean = |f: &dyn Fn(usize) -> usize| {
+                at.iter().map(|&i| f(i)).sum::<usize>() as f64 / at.len() as f64
+            };
+            let records_per_block = mean(&|i| {
+                let view = BlockView::open(&decoded[i]).unwrap();
+                let (mut position, mut count) = (BlockPosition::new(), 0);
+                while position.next_record(view).unwrap().is_some() {
+                    count += 1;
+                }
+                count
+            });
+
+            let crc = ns_each(&picks, |&at| {
+                black_box(crc32fast::hash(blocks.stored(at)));
+            });
+            let header = ns_each(&picks, |&at| {
+                black_box(zstd_safe::get_frame_content_size(blocks.stored(at)).unwrap());
+            });
+            let decompress = ns_each(&picks, |&at| {
+                buf.clear();
+                dctx.decompress(&mut buf, blocks.stored(at)).unwrap();
+            });
+            let fresh = ns_each(&picks, |&at| {
+                let mut dctx = DCtx::create();
+                buf.clear();
+                dctx.decompress(&mut buf, blocks.stored(at)).unwrap();
+            });
+            let copy = ns_each(&at, |&i| {
+                buf.clear();
+                buf.extend_from_slice(&decoded[i]);
+                black_box(&buf);
+            });
+            let open = ns_each(&at, |&i| {
+                black_box(BlockView::open(&decoded[i]).unwrap());
+            });
+            let walk = ns_each(&at, |&i| {
+                let view = BlockView::open(&decoded[i]).unwrap();
+                let mut position = BlockPosition::new();
+                while let Some(record) = position.next_record(view).unwrap() {
+                    black_box(record);
+                }
+            });
+            let lookup = ns_each(&at, |&i| {
+                let view = BlockView::open(&decoded[i]).unwrap();
+                black_box(view.get(keys[i]).unwrap());
+            });
+            let mut builder = RunBuilder::with_target_block_len(Codec::Zstd, target);
+            for (key, seq, value) in records {
+                builder.add(key, *seq, value_of(value)).unwrap();
+            }
+            let run = builder.finish();
+            let mut read = ReadWorkspace::new();
+            let production = ns_each(&keys, |key| {
+                black_box(Run::get(&run, key, &mut read).unwrap());
+            });
+            let lz4_decode = ns_each(&lz4.picks(2_000), |&at| {
+                let frame = &lz4.frames[lz4.offsets[at] as usize..lz4.offsets[at + 1] as usize];
+                let len = u32::from_le_bytes(frame[4..HEADER].try_into().unwrap()) as usize;
+                buf.resize(len, 0);
+                lz4_flex::block::decompress_into(&frame[HEADER..], &mut buf).unwrap();
+            });
+            let mut cctx = CCtx::create();
+            let mut out = Vec::with_capacity(zstd_safe::compress_bound(4 * target + (64 << 10)));
+            let compress = ns_each(&at, |&i| {
+                out.clear();
+                cctx.compress(&mut out, &decoded[i], LEVEL).unwrap();
+            });
+            println!(
+                "| {} | {} KiB | {records_per_block:.0} | {:.0} | {:.0} | {crc:.0} | {header:.0} | {decompress:.0} | {fresh:.0} | {copy:.0} | {open:.0} | {walk:.0} | {lookup:.0} | {production:.0} | {lz4_decode:.0} | {compress:.0} |",
+                dataset.name,
+                target >> 10,
+                mean(&|i| decoded[i].len()),
+                mean(&|i| blocks.stored(picks[i]).len()),
+            );
+
+            if target == 4 << 10 {
+                // A dictionary trained on the inputs a compaction would merge.
+                let inputs: Vec<Blocks> = (0..4)
+                    .map(|part| {
+                        let part: Vec<Owned> =
+                            records.iter().skip(part).step_by(4).cloned().collect();
+                        Blocks::build(&part, Pack::Zstd, 16 << 10, None)
+                    })
+                    .collect();
+                let (samples, sizes) = input_samples(&inputs, 100 * (64 << 10));
+                let dictionary = train_on(64 << 10, &samples, &sizes);
+                let with = Blocks::build(records, Pack::Zstd, target, Some(&dictionary));
+                let ddict = with.ddict.as_ref().unwrap();
+                let by_reference = DDict::create_by_reference(&dictionary);
+                let picks = with.picks(2_000);
+                let using_ddict = ns_each(&picks, |&at| {
+                    buf.clear();
+                    dctx.decompress_using_ddict(&mut buf, with.stored(at), ddict)
+                        .unwrap();
+                });
+                let using_reference = ns_each(&picks, |&at| {
+                    buf.clear();
+                    dctx.decompress_using_ddict(&mut buf, with.stored(at), &by_reference)
+                        .unwrap();
+                });
+                let using_raw = ns_each(&picks, |&at| {
+                    buf.clear();
+                    dctx.decompress_using_dict(&mut buf, with.stored(at), &dictionary)
+                        .unwrap();
+                });
+                let prepare = ns_each(&[(); 20], |()| {
+                    black_box(DDict::create(&dictionary));
+                });
+                let prepare_reference = ns_each(&[(); 20], |()| {
+                    black_box(DDict::create_by_reference(&dictionary));
+                });
+                let cdict = CDict::create(&dictionary, LEVEL);
+                let compress_dict = ns_each(&at, |&i| {
+                    out.clear();
+                    cctx.compress_using_cdict(&mut out, &decoded[i], &cdict)
+                        .unwrap();
+                });
+                let stored = picks.iter().map(|&at| with.stored(at).len()).sum::<usize>() as f64
+                    / picks.len() as f64;
+                dictionary_rows.push(format!(
+                    "| {} | {} | {stored:.0} | {decompress:.0} | {using_ddict:.0} | {using_reference:.0} | {using_raw:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {compress_dict:.0} | {} | {} |",
+                    dataset.name,
+                    dictionary.len(),
+                    prepare / 1e3,
+                    prepare_reference / 1e3,
+                    ddict.sizeof() as f64 / 1024.0,
+                    by_reference.sizeof() as f64 / 1024.0,
+                    compress,
+                    dctx.sizeof(),
+                    cdict.sizeof(),
+                ));
+            }
+        }
+    }
+    println!(
+        "\n| dataset (4 KiB blocks) | dictionary B | stored B | plain decompress ns | with DDict ns | with DDict by reference ns | with raw dictionary ns | prepare DDict µs | prepare by reference µs | DDict KiB | by reference KiB | plain compress ns | compress with CDict ns | DCtx B | CDict B |"
+    );
+    println!("|{}", "---|".repeat(15));
+    for row in dictionary_rows {
+        println!("{row}");
+    }
+}
+
+/// Dictionary runs at 4 KiB blocks beside production runs of the same
+/// records, at three run sizes, with the dictionary trained three ways:
+/// on decoded blocks of the inputs a compaction would merge (one pass), on
+/// the output's own raw blocks (a second pass), and on values (5AB).
+/// Memory counts everything a persisted dictionary run would hold: blocks,
+/// headers, index, filter, the raw dictionary stored in the run and its
+/// decoding form.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn dictionary_runs() {
+    const DICTIONARY: usize = 64 << 10;
+    const BUDGET: usize = 100 * DICTIONARY;
+    println!(
+        "\n| dataset | input MiB | layout | total MiB | vs 16 KiB | blocks | samples MiB | sample s | train s | train peak MiB | build s | build MB/s | build peak MiB | estimated saving | present p50 µs | p99 µs | seek µs | 32 keys µs | 512 keys µs | full scan ns/record |"
+    );
+    println!("|{}", "---|".repeat(20));
+    let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
+    for dataset in research_datasets() {
+        for input_mib in [4, 16, 64] {
+            let records = first_bytes(&dataset.records, input_mib << 20);
+            let input_bytes: usize = records
+                .iter()
+                .map(|(key, _, value)| key.len() + value.as_ref().map_or(0, Vec::len) + 16)
+                .sum();
+            let reads = input_mib == 64;
+            let mut rng = Rng::new(7);
+            let count = records.len() as u64;
+            let present: Vec<Vec<u8>> = std::iter::repeat_with(|| rng.below(count) as usize)
+                .filter(|&at| records[at].2.is_some())
+                .take(30_000)
+                .map(|at| records[at].0.clone())
+                .collect();
+            let short: Vec<Vec<u8>> = (0..2_000)
+                .map(|_| records[rng.below(count) as usize].0[..6].to_vec())
+                .collect();
+            let medium: Vec<Vec<u8>> = (0..200)
+                .map(|_| records[rng.below(count) as usize].0[..4].to_vec())
+                .collect();
+            // The inputs a compaction would merge: four overlapping runs.
+            let inputs: Vec<Blocks> = (0..4)
+                .map(|part| {
+                    let part: Vec<Owned> = records.iter().skip(part).step_by(4).cloned().collect();
+                    Blocks::build(&part, Pack::Zstd, 16 << 10, None)
+                })
+                .collect();
+
+            let mut base = None;
+            let mut plain_payload = None;
+            enum Source {
+                Inputs(usize),
+                Output,
+                Values,
+            }
+            let layouts: Vec<(String, Option<Source>, Spec)> = vec![
+                (
+                    "production, Zstd 16 KiB".into(),
+                    None,
+                    Spec::Run(Codec::Zstd, 16 << 10),
+                ),
+                (
+                    "production, Zstd 4 KiB".into(),
+                    None,
+                    Spec::Run(Codec::Zstd, 4 << 10),
+                ),
+                (
+                    "production, LZ4 4 KiB".into(),
+                    None,
+                    Spec::Run(Codec::Lz4, 4 << 10),
+                ),
+                (
+                    "4 KiB + 64 KiB dict from inputs".into(),
+                    Some(Source::Inputs(DICTIONARY)),
+                    Spec::Blocks(Pack::Zstd, 4 << 10, None),
+                ),
+                (
+                    "4 KiB + 16 KiB dict from inputs".into(),
+                    Some(Source::Inputs(16 << 10)),
+                    Spec::Blocks(Pack::Zstd, 4 << 10, None),
+                ),
+                (
+                    "4 KiB + 64 KiB dict from output blocks".into(),
+                    Some(Source::Output),
+                    Spec::Blocks(Pack::Zstd, 4 << 10, None),
+                ),
+                (
+                    "4 KiB + 64 KiB dict from values".into(),
+                    Some(Source::Values),
+                    Spec::Blocks(Pack::Zstd, 4 << 10, None),
+                ),
+            ];
+            for (name, source, spec) in layouts {
+                if matches!(source, Some(Source::Output | Source::Values)) && !reads {
+                    continue;
+                }
+                // Samples and training, timed apart from the build.
+                let start = Instant::now();
+                let ((dictionary, samples_len, sample_s, train_s, estimate), train_peak) =
+                    peak_during(|| match &source {
+                        None => (None, 0, 0.0, 0.0, None),
+                        Some(source) => {
+                            let size = match source {
+                                Source::Inputs(size) => *size,
+                                _ => DICTIONARY,
+                            };
+                            let (samples, sizes) = match source {
+                                Source::Inputs(_) => input_samples(&inputs, 100 * size),
+                                Source::Output => {
+                                    let blocks = input_bytes.div_ceil(4 << 10);
+                                    output_samples(
+                                        records,
+                                        4 << 10,
+                                        (blocks * 4096 / BUDGET).max(1),
+                                    )
+                                }
+                                Source::Values => {
+                                    let (mut samples, mut sizes) = (Vec::new(), Vec::new());
+                                    for value in sampled(records, BUDGET, |(key, _, value)| {
+                                        value.as_deref().or(Some(key.as_slice()))
+                                    }) {
+                                        samples.extend_from_slice(value);
+                                        sizes.push(value.len());
+                                    }
+                                    (samples, sizes)
+                                }
+                            };
+                            let sample_s = start.elapsed().as_secs_f64();
+                            // Held out: every eighth sample, in 4 KiB pieces.
+                            let (mut train, mut train_sizes, mut held) =
+                                (Vec::new(), Vec::new(), Vec::new());
+                            let mut at = 0;
+                            for (i, &len) in sizes.iter().enumerate() {
+                                let sample = &samples[at..at + len];
+                                at += len;
+                                if i % 8 == 7 {
+                                    held.extend(sample.chunks(4 << 10).map(<[u8]>::to_vec));
+                                } else {
+                                    train.extend_from_slice(sample);
+                                    train_sizes.push(len);
+                                }
+                            }
+                            let trained = Instant::now();
+                            let full = train_on(size, &samples, &sizes);
+                            let train_s = trained.elapsed().as_secs_f64();
+                            let trial = train_on(size, &train, &train_sizes);
+                            // A builder would train once; the trial dictionary
+                            // only estimates the saving on unseen blocks.
+                            let cdict = CDict::create(&trial, LEVEL);
+                            let mut cctx = CCtx::create();
+                            let (mut plain, mut with) = (0, 0);
+                            let mut out = Vec::new();
+                            for piece in &held {
+                                out.clear();
+                                out.reserve(zstd_safe::compress_bound(piece.len()));
+                                plain += cctx.compress(&mut out, piece, LEVEL).unwrap();
+                                out.clear();
+                                with += cctx.compress_using_cdict(&mut out, piece, &cdict).unwrap();
+                            }
+                            let estimate = (plain > 0).then(|| 1.0 - with as f64 / plain as f64);
+                            (Some(full), samples.len(), sample_s, train_s, estimate)
+                        }
+                    });
+                let start = Instant::now();
+                let (built, build_peak) = peak_during(|| match spec {
+                    Spec::Blocks(pack, target, _) => {
+                        Built::Blocks(Blocks::build(records, pack, target, dictionary.as_deref()))
+                    }
+                    spec => spec.build(records).0,
+                });
+                let build_s = start.elapsed().as_secs_f64();
+                let row = with_layout!(&built, layout => {
+                    let bytes = layout.bytes();
+                    let total = bytes.total() + dictionary.as_ref().map_or(0, Vec::len);
+                    let base = *base.get_or_insert(total);
+                    let blocks = match &built {
+                        Built::Run(run) => run.block_count(),
+                        Built::Blocks(blocks) => blocks.index.len(),
+                        Built::Split(split) => split.index.len(),
+                    };
+                    if name == "production, Zstd 4 KiB" {
+                        plain_payload = Some(bytes.payload);
+                    }
+                    let actual = match (&dictionary, plain_payload) {
+                        (Some(_), Some(plain)) => {
+                            format!(" (actual {:.0}%)", 100.0 * (1.0 - bytes.payload as f64 / plain as f64))
+                        }
+                        _ => String::new(),
+                    };
+                    let estimate = estimate.map_or("–".into(), |e| format!("{:.0}%{actual}", 100.0 * e));
+                    let read_cells = if reads {
+                        spot_check(layout, records, &present[..200], &short[..20]);
+                        let mut workspace = Workspace::new();
+                        let gets = time_gets(layout, &mut workspace, &present);
+                        let (seek, short_us, _) = time_scans(layout, &mut workspace, &short);
+                        let (_, medium_us, _) = time_scans(layout, &mut workspace, &medium);
+                        let full: Vec<f64> = (0..2)
+                            .map(|_| {
+                                let start = Instant::now();
+                                let mut seen = 0usize;
+                                layout.scan(&[], &mut workspace, |record| {
+                                    black_box(record);
+                                    seen += 1;
+                                });
+                                assert_eq!(seen, records.len());
+                                start.elapsed().as_nanos() as f64 / seen as f64
+                            })
+                            .collect();
+                        format!(
+                            "{:.2} | {:.2} | {seek:.2} | {short_us:.2} | {medium_us:.1} | {:.0}",
+                            gets.p50 / 1e3,
+                            gets.p99 / 1e3,
+                            median(full)
+                        )
+                    } else {
+                        "– | – | – | – | – | –".into()
+                    };
+                    format!(
+                        "{:.2} | {:+.1}% | {blocks} | {:.1} | {sample_s:.3} | {train_s:.2} | {train_peak:.0} | {build_s:.2} | {:.0} | {build_peak:.0} | {estimate} | {read_cells}",
+                        mib(total),
+                        100.0 * (total as f64 / base as f64 - 1.0),
+                        mib(samples_len),
+                        input_bytes as f64 / 1e6 / build_s,
+                    )
+                });
+                println!("| {} | {input_mib} | {name} | {row} |", dataset.name);
+            }
+        }
     }
 }
