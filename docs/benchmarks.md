@@ -7,7 +7,7 @@ CPU, process and time limits and keeps every fixture on the `/tmp` tmpfs:
 
 ```sh
 scripts/validate.sh bench                  # every mode, one release build
-scripts/validate.sh bench reads durable    # some modes
+scripts/validate.sh bench lookups scans    # some modes
 ```
 
 Timings vary with the machine and between passes; compare configurations
@@ -25,7 +25,10 @@ how far passes disagree.
 | mode | workload | what it shows |
 |---|---|---|
 | `memtable` | 500,000 records of 8 + 100 bytes in a 1 GiB memtable: inserts, overwrites, gets, a scan and deletes | the cost of the write and read paths with nothing flushed |
-| `reads` | 1,000,000 records flushed from a 16 MiB memtable, as flushed and consolidated; 200,000 probes | point lookups, blocks decoded per lookup, absent keys decided by key filters, prefix and full scans |
+| `lookups` | 500,000 records of 8 + 100 bytes in six storage shapes, seven lookup classes, two key layouts, beside a `BTreeMap` | point lookup cost, blocks decoded and allocations by shape and class |
+| `scans` | 491,520 records in a hierarchical key layout, six shapes, prefixes selecting 0 to every record | seek and iteration cost of prefix scans by shape and result size |
+| `readers` | 500,000 records; readers, scanners and a writer in pairs for 1.5 s each | read scaling on 2 CPUs and interference with a writer |
+| `density` | three payloads of 35 B to 2.5 KiB, in a memtable and consolidated, beside a `BTreeMap` | heap per record, compression ratio and the read cost of density |
 | `maintenance` | a 250,000-record flush; a compaction of 8 overlapping runs | flush and compaction throughput, stored size, and key filter size and construction memory |
 | `snapshots` | snapshots taken after a write; 1,000,000 overwrites with 0–16 live snapshots replaced in turn | snapshot cost, and what live snapshots cost writes and memory |
 | `ingest` | 1,000,000 writes by 1–4 writers over 400,000 keys, 4 MiB memtable, background compaction | sustained ingestion with automatic flushes, its latency tail and run shape |
@@ -59,6 +62,8 @@ to the VM disk (the build's own outputs; fixtures stayed on tmpfs).
 charged 112.5 MiB for 51.5 MiB of keys and values
 
 #### Reads: 1000000 records in runs, 200000 probes
+
+From the former `reads` mode, which `lookups` and `scans` replaced in 5V.
 
 | runs | max overlap | filter bits/key | get present ns | blocks/get | get absent ns | blocks/absent get | prefix scan ns (16 records) | full scan ns/record |
 |---|---|---|---|---|---|---|---|---|
@@ -148,6 +153,346 @@ Reading it:
 
 These numbers are a reference point for the suite, not a comparison with
 the historical results below, which used other workloads and harnesses.
+
+## Read baseline (5V)
+
+Point lookups, prefix scans, concurrent reads and memory density, measured
+by the `lookups`, `scans`, `readers` and `density` modes and by one
+codec measurement outside the engine. Two passes in the bounded container
+(2 CPUs of the 4 GiB Colima VM, release build), summarized with
+`summarize_bench.py`; the tables give the mean of the two. The four modes
+took about 130 s a pass, peaked at 304 MiB of container memory and wrote
+nothing to the VM disk beyond the build.
+
+### Method
+
+- **Data.** Fixed seeds throughout. `lookups` and `readers` use 500,000
+  records of 8-byte keys and 100-byte values that compress about 3:1;
+  `scans` uses 491,520 such records in a hierarchical 8-byte key layout
+  whose 6-, 4-, 3- and 2-byte prefixes select 32, 512, 2,048 and 16,384
+  keys and contain 0x00 and 0xFF bytes. After loading, 1 key in 7 is
+  deleted and 1 in 5 of the rest overwritten.
+- **Shapes.** The same records, spread six ways: all in the memtable; one
+  consolidated run; 9 runs that each span the whole key range (8 loads and
+  the updates), with superseded versions; a run and a newer run of the
+  updates; a run with the updates in the memtable; and a snapshot of the
+  last, read while later writes overwrite a third of the keys.
+- **Lookup classes.** Present keys in random order, in ascending order and
+  within a hot 4,096-key range; overwritten keys; deleted keys
+  (tombstones); absent keys inside the runs' key ranges (decided by the
+  10-bit key filters); and absent keys beyond the last key.
+- **Procedure.** Each class is 50,000 probes. The first pass after building
+  gives the *cold* figure (the first touch after building; there is no
+  block cache, so "cold" differs from "warm" only in CPU caches). A
+  verification pass checks every result against the model and counts
+  blocks decoded through `EngineWorkspace::blocks_loaded`. *Warm* is the
+  median of 3 timed passes; p50 and p99 come from a pass timing each
+  operation, which adds the clock's overhead (about 40 ns). Allocations
+  are counted by a benchmark-only global allocator, enabled only for one
+  pass, so it does not slow the other modes.
+- **Scans.** Each prefix class is a fixed list of prefixes, scanned once
+  to verify every record (order, prefix, value, deleted keys absent)
+  against a `BTreeMap` model, then timed in 3 rounds after a warm-up. *Seek*
+  is from creating the scan (including taking the read guard) to its first
+  record; the rest is iteration. *Versions/record* is derived from how the
+  fixture was built, not observed: the engine does not count records
+  examined.
+- **References.** A `BTreeMap<Vec<u8>, Vec<u8>>` of the live records gives an
+  uncompressed in-memory reference. It has no versions, snapshots,
+  compression or memory accounting, so it is a floor for the access
+  pattern, not a competitor.
+- **Noise.** Between the two passes, single-threaded lookup and scan cells
+  differ by a median of 1–2% (a few cells up to 16–38%, mostly
+  sub-microsecond seeks). Concurrent rows differ by a median of 21% and up
+  to 77%, and `density` timings by 8–17%: treat those as indicative.
+  Differences smaller than these spreads are not results.
+
+### Point lookups
+
+| shape | runs / overlap | lookup | cold ns | warm ns | p50 µs | p99 µs | blocks/get |
+|---|---|---|---|---|---|---|---|
+| memtable | 0 / 0 | present, random order | 676 | 602 | 0.67 | 1.2 | 0.00 |
+| memtable | 0 / 0 | present, ascending order | 284 | 266 | 0.25 | 0.9 | 0.00 |
+| memtable | 0 / 0 | present, hot 4,096-key range | 162 | 162 | 0.17 | 0.3 | 0.00 |
+| memtable | 0 / 0 | overwritten | 700 | 651 | 0.73 | 1.2 | 0.00 |
+| memtable | 0 / 0 | deleted | 673 | 635 | 0.65 | 1.0 | 0.00 |
+| memtable | 0 / 0 | absent, inside run ranges | 630 | 570 | 0.58 | 1.0 | 0.00 |
+| memtable | 0 / 0 | absent, beyond the last key | 61 | 58 | 0.08 | 0.1 | 0.00 |
+| consolidated | 1 / 1 | present, random order | 7,920 | 7,831 | 7.86 | 10.9 | 1.00 |
+| consolidated | 1 / 1 | present, ascending order | 7,407 | 7,352 | 7.40 | 11.2 | 1.00 |
+| consolidated | 1 / 1 | present, hot 4,096-key range | 7,406 | 7,412 | 7.48 | 9.9 | 1.00 |
+| consolidated | 1 / 1 | overwritten | 7,888 | 7,832 | 7.90 | 10.9 | 1.00 |
+| consolidated | 1 / 1 | deleted | 7,828 | 7,866 | 7.94 | 11.2 | 1.00 |
+| consolidated | 1 / 1 | absent, inside run ranges | 111 | 108 | 0.04 | 0.1 | 0.01 |
+| consolidated | 1 / 1 | absent, beyond the last key | 44 | 42 | 0.04 | 0.1 | 0.00 |
+| 9 overlapping runs | 9 / 9 | present, random order | 10,788 | 10,716 | 8.56 | 24.9 | 1.27 |
+| 9 overlapping runs | 9 / 9 | present, ascending order | 9,588 | 9,606 | 7.67 | 22.5 | 1.27 |
+| 9 overlapping runs | 9 / 9 | present, hot 4,096-key range | 9,551 | 9,511 | 7.54 | 22.4 | 1.27 |
+| 9 overlapping runs | 9 / 9 | overwritten | 17,673 | 17,682 | 17.14 | 26.3 | 2.06 |
+| 9 overlapping runs | 9 / 9 | deleted | 17,660 | 17,590 | 17.09 | 26.2 | 2.06 |
+| 9 overlapping runs | 9 / 9 | absent, inside run ranges | 878 | 860 | 0.25 | 9.1 | 0.07 |
+| 9 overlapping runs | 9 / 9 | absent, beyond the last key | 286 | 286 | 0.29 | 0.3 | 0.00 |
+| run + newer run | 2 / 2 | present, random order | 9,682 | 9,584 | 7.83 | 17.4 | 1.21 |
+| run + newer run | 2 / 2 | present, ascending order | 8,952 | 8,970 | 7.46 | 16.4 | 1.21 |
+| run + newer run | 2 / 2 | present, hot 4,096-key range | 8,932 | 8,957 | 7.48 | 15.6 | 1.21 |
+| run + newer run | 2 / 2 | overwritten | 16,389 | 16,349 | 16.36 | 20.8 | 2.00 |
+| run + newer run | 2 / 2 | deleted | 16,367 | 16,370 | 16.38 | 20.9 | 2.00 |
+| run + newer run | 2 / 2 | absent, inside run ranges | 198 | 193 | 0.08 | 7.9 | 0.02 |
+| run + newer run | 2 / 2 | absent, beyond the last key | 78 | 74 | 0.08 | 0.1 | 0.00 |
+| run + memtable | 1 / 1 | present, random order | 6,828 | 6,764 | 8.14 | 9.4 | 0.80 |
+| run + memtable | 1 / 1 | present, ascending order | 6,020 | 6,018 | 7.38 | 9.2 | 0.80 |
+| run + memtable | 1 / 1 | present, hot 4,096-key range | 5,972 | 5,966 | 7.29 | 8.5 | 0.80 |
+| run + memtable | 1 / 1 | overwritten | 378 | 310 | 0.33 | 0.6 | 0.00 |
+| run + memtable | 1 / 1 | deleted | 310 | 312 | 0.33 | 0.5 | 0.00 |
+| run + memtable | 1 / 1 | absent, inside run ranges | 455 | 420 | 0.35 | 0.7 | 0.01 |
+| run + memtable | 1 / 1 | absent, beyond the last key | 91 | 86 | 0.08 | 0.1 | 0.00 |
+| snapshot of run + memtable | 1 / 1 | present, random order | 6,832 | 6,790 | 8.19 | 10.0 | 0.80 |
+| snapshot of run + memtable | 1 / 1 | present, ascending order | 6,038 | 6,017 | 7.38 | 9.1 | 0.80 |
+| snapshot of run + memtable | 1 / 1 | present, hot 4,096-key range | 5,934 | 5,945 | 7.29 | 8.6 | 0.80 |
+| snapshot of run + memtable | 1 / 1 | overwritten | 404 | 315 | 0.33 | 0.5 | 0.00 |
+| snapshot of run + memtable | 1 / 1 | deleted | 322 | 303 | 0.33 | 0.6 | 0.00 |
+| snapshot of run + memtable | 1 / 1 | absent, inside run ranges | 447 | 413 | 0.35 | 0.7 | 0.01 |
+| snapshot of run + memtable | 1 / 1 | absent, beyond the last key | 88 | 82 | 0.08 | 0.1 | 0.00 |
+| consolidated, 31-byte shared-prefix keys | 2 / 1 | present, random order | 9,280 | 9,256 | 9.21 | 13.1 | 1.00 |
+| consolidated, 31-byte shared-prefix keys | 2 / 1 | absent, inside run ranges | 132 | 128 | 0.08 | 0.1 | 0.01 |
+| 9 overlapping runs, 31-byte shared-prefix keys | 9 / 9 | present, random order | 12,084 | 12,062 | 9.48 | 28.3 | 1.26 |
+| 9 overlapping runs, 31-byte shared-prefix keys | 9 / 9 | absent, inside run ranges | 958 | 943 | 0.25 | 10.5 | 0.08 |
+| BTreeMap (reference) | – | present, random order | 439 | 378 | 0.40 | 0.6 | – |
+| BTreeMap (reference) | – | present, ascending order | 96 | 88 | 0.08 | 0.2 | – |
+| BTreeMap (reference) | – | present, hot 4,096-key range | 99 | 98 | 0.12 | 0.2 | – |
+| BTreeMap (reference) | – | overwritten | 407 | 376 | 0.40 | 0.7 | – |
+| BTreeMap (reference) | – | deleted | 414 | 412 | 0.44 | 0.7 | – |
+| BTreeMap (reference) | – | absent, inside run ranges | 380 | 356 | 0.40 | 0.7 | – |
+| BTreeMap (reference) | – | absent, beyond the last key | 56 | 56 | 0.08 | 0.1 | – |
+
+- **Decompression dominates every run lookup.** A lookup that reaches a run
+  decodes one 16 KiB Zstandard block, about 7.4–7.9 µs, against 0.2–0.7
+  µs in the memtable and 0.1–0.4 µs in the `BTreeMap`. Allocation is zero
+  per lookup in every shape.
+- **Locality helps memory, not runs.** Ascending and hot-range lookups are
+  2–4× faster in the memtable and the `BTreeMap`, but within 6–11% of
+  random order in runs: with no decoded-block cache, every lookup decodes its
+  block again, however recently it was read.
+- **Absent keys are cheap.** Filters reject 99% of absent keys per run
+  (0.01 blocks a lookup in one run, 0.07 across 9), and keys beyond a
+  run's range never reach its filter. A false positive costs a full
+  decode, which is the 7.9–9.1 µs p99 of absent keys with overlapping runs.
+- **Older versions cost a decode each.** A lookup reads every run its
+  filter cannot exclude and keeps the highest sequence number, also
+  checking that duplicate copies agree. A key overwritten or deleted in a
+  newer run therefore decodes the newer run's block *and* the older run's:
+  2.0–2.1 blocks and about 16–17 µs, twice a key with one version. Keys
+  that live in the memtable never reach the runs (0.3 µs).
+- **Snapshots read like the engine.** Snapshot lookups match the engine's
+  within noise while writes continue behind them.
+- **Key shape.** 31-byte keys with long shared prefixes add about 18% to a
+  run lookup (9.3 against 7.8 µs).
+
+### Prefix scans
+
+| shape | prefix | records/scan | seek µs | scan µs | ns/record after seek | blocks/scan | versions/record |
+|---|---|---|---|---|---|---|---|
+| memtable | 32 keys (6 B) | 27 | 0.6 | 1.3 | 27 | 0.0 | 1.17 |
+| memtable | 512 keys (4 B) | 439 | 0.7 | 11.2 | 24 | 0.0 | 1.17 |
+| memtable | 2,048 keys (3 B) | 1,755 | 0.7 | 40.5 | 23 | 0.0 | 1.17 |
+| memtable | 16,384 keys (2 B, ends FF) | 14,044 | 0.5 | 270.8 | 20 | 0.0 | 1.17 |
+| memtable | every key (empty) | 421,303 | 1.3 | 13,520.1 | 32 | 0.0 | 1.17 |
+| memtable | no match, inside range | 0 | 0.1 | 0.2 | – | 0.0 | – |
+| memtable | no match, beyond last key | 0 | 0.1 | 0.1 | – | 0.0 | – |
+| consolidated | 32 keys (6 B) | 27 | 8.3 | 10.9 | 99 | 1.2 | – |
+| consolidated | 512 keys (4 B) | 439 | 8.2 | 49.5 | 94 | 3.9 | – |
+| consolidated | 2,048 keys (3 B) | 1,755 | 8.2 | 172.2 | 94 | 12.7 | – |
+| consolidated | 16,384 keys (2 B, ends FF) | 14,044 | 8.0 | 1,324.5 | 94 | 95.9 | – |
+| consolidated | every key (empty) | 421,303 | 8.6 | 39,563.6 | 94 | 2,828.0 | – |
+| consolidated | no match, inside range | 0 | 7.6 | 7.7 | – | 1.0 | – |
+| consolidated | no match, beyond last key | 0 | 0.1 | 0.1 | – | 0.0 | – |
+| 9 overlapping runs | 32 keys (6 B) | 27 | 76.7 | 82.0 | 205 | 9.3 | 1.53 |
+| 9 overlapping runs | 512 keys (4 B) | 439 | 75.7 | 166.2 | 207 | 13.1 | 1.53 |
+| 9 overlapping runs | 2,048 keys (3 B) | 1,755 | 74.4 | 428.6 | 202 | 24.8 | 1.53 |
+| 9 overlapping runs | 16,384 keys (2 B, ends FF) | 14,044 | 74.3 | 2,943.6 | 204 | 138.2 | 1.53 |
+| 9 overlapping runs | every key (empty) | 421,303 | 20.2 | 86,693.3 | 206 | 3,875.0 | 1.53 |
+| 9 overlapping runs | no match, inside range | 0 | 70.7 | 70.7 | – | 9.0 | – |
+| 9 overlapping runs | no match, beyond last key | 0 | 0.4 | 0.5 | – | 0.0 | – |
+| run + newer run | 32 keys (6 B) | 27 | 17.2 | 20.9 | 140 | 2.2 | 1.53 |
+| run + newer run | 512 keys (4 B) | 439 | 17.0 | 75.7 | 134 | 6.1 | 1.53 |
+| run + newer run | 2,048 keys (3 B) | 1,755 | 17.0 | 249.8 | 132 | 18.1 | 1.53 |
+| run + newer run | 16,384 keys (2 B, ends FF) | 14,044 | 18.3 | 1,860.8 | 131 | 131.0 | 1.53 |
+| run + newer run | every key (empty) | 421,303 | 17.4 | 55,925.4 | 132 | 3,854.0 | 1.53 |
+| run + newer run | no match, inside range | 0 | 16.1 | 16.1 | – | 2.0 | – |
+| run + newer run | no match, beyond last key | 0 | 0.1 | 0.2 | – | 0.0 | – |
+| run + memtable | 32 keys (6 B) | 27 | 8.2 | 11.2 | 116 | 1.2 | 1.53 |
+| run + memtable | 512 keys (4 B) | 439 | 8.2 | 56.6 | 110 | 4.4 | 1.53 |
+| run + memtable | 2,048 keys (3 B) | 1,755 | 8.2 | 201.0 | 110 | 14.6 | 1.53 |
+| run + memtable | 16,384 keys (2 B, ends FF) | 14,044 | 8.1 | 1,564.4 | 110 | 110.0 | 1.53 |
+| run + memtable | every key (empty) | 421,303 | 9.3 | 48,825.2 | 116 | 3,256.0 | 1.53 |
+| run + memtable | no match, inside range | 0 | 7.4 | 7.4 | – | 1.0 | – |
+| run + memtable | no match, beyond last key | 0 | 0.2 | 0.2 | – | 0.0 | – |
+| snapshot of run + memtable | 32 keys (6 B) | 27 | 8.6 | 11.9 | 123 | 1.2 | 1.53 |
+| snapshot of run + memtable | 512 keys (4 B) | 439 | 8.4 | 56.6 | 110 | 4.4 | 1.53 |
+| snapshot of run + memtable | 2,048 keys (3 B) | 1,755 | 8.2 | 201.4 | 110 | 14.6 | 1.53 |
+| snapshot of run + memtable | 16,384 keys (2 B, ends FF) | 14,044 | 7.9 | 1,542.8 | 110 | 110.0 | 1.53 |
+| snapshot of run + memtable | every key (empty) | 421,303 | 9.1 | 49,286.1 | 117 | 3,256.0 | 1.53 |
+| snapshot of run + memtable | no match, inside range | 0 | 7.4 | 7.5 | – | 1.0 | – |
+| snapshot of run + memtable | no match, beyond last key | 0 | 0.1 | 0.2 | – | 0.0 | – |
+| BTreeMap (reference) | 32 keys (6 B) | 27 | 0.4 | 0.7 | 8 | – | 1.00 |
+| BTreeMap (reference) | 512 keys (4 B) | 439 | 0.4 | 2.5 | 4 | – | 1.00 |
+| BTreeMap (reference) | 2,048 keys (3 B) | 1,755 | 0.3 | 7.0 | 4 | – | 1.00 |
+| BTreeMap (reference) | 16,384 keys (2 B, ends FF) | 14,044 | 0.2 | 37.1 | 3 | – | 1.00 |
+| BTreeMap (reference) | every key (empty) | 421,303 | 0.4 | 1,126.2 | 3 | – | 1.00 |
+| BTreeMap (reference) | no match, inside range | 0 | 0.1 | 0.1 | – | – | 1.00 |
+| BTreeMap (reference) | no match, beyond last key | 0 | 0.1 | 0.1 | – | – | 1.00 |
+
+The 2-byte prefixes ending 0x00 and the prefix `FF FF`, which has no upper
+bound, measured within 3% of the 0xFF row and are left out; all returned
+exactly the model's records.
+
+- **Seek is one block decode per participating run.** About 8 µs on one
+  run, 16–17 µs on two, 52–77 µs across 9 overlapping runs, against
+  0.5–0.7 µs in the memtable and 0.2–0.4 µs in the `BTreeMap`. Seek cost
+  does not depend on how many records the prefix selects.
+- **Short scans are seeks.** For about 27 records the seek is 76% of the
+  scan on one run and 93% on 9 runs. From hundreds of records iteration
+  dominates.
+- **Iteration is merge- and decode-bound.** After the seek a record costs
+  about 92 ns from one run, 110 ns from a run beside the memtable, 131 ns
+  from two runs and 205 ns from 9 (with 1.5 versions per returned record),
+  against 17–32 ns from the memtable and 2–9 ns from the `BTreeMap`.
+  Throughput is therefore about 4.9–10.8 million records a second from
+  runs, flat from 512 records to the whole dataset.
+- **No-match prefixes inside the key range cost a decode per run** (7.6 µs
+  on one run, 71 µs on 9): filters cannot exclude a prefix, and the block
+  that would hold it must be read. Prefixes beyond every run's range are
+  rejected from the key ranges in 0.1–0.4 µs.
+- **Workspace.** A scan holds one decoded block (16 KiB) per participating
+  run, 144 KiB across 9 runs, and makes 1–2 allocations when created and
+  none per record.
+
+### Concurrent reads
+
+`readers`: 500,000 records in one run with the updates in the memtable;
+each row runs its threads for 1.5 s. Per-thread rates, as the range of the
+two passes:
+
+| threads | role | ops/s per thread | p99 µs |
+|---|---|---|---|
+| 1 get | get | 167–169 k | 9–12 |
+| 2 gets | get | 164–166 k each | 9–13 |
+| 2 snapshot gets | snapshot get | 167–177 k each | 9 |
+| 1 guard scan, 4,096 keys | scan | 2.4–2.6 k | 430–444 |
+| 2 guard scans | scan | 1.8–2.5 k each | 440–777 |
+| 2 snapshot scans | scan | 1.4–2.4 k each | 447–797 |
+| get + guard scan | get / scan | 118–164 k / 1.7–2.4 k | 10–17 / 448–660 |
+| 1 put | put | 1.16–1.25 M | 1.5–1.8 |
+| get + put | get / put | 74–131 k / 616–755 k | 32–39 / 11–12 |
+| guard scan + put | scan / put | 1.8–2.1 k / 19–23 k | 550–636 / 510–588 |
+| snapshot scan + put | scan / put | 1.7–2.4 k / 0.99–1.21 M | 449–654 / 1.4–1.6 |
+
+- Two point readers each keep the single reader's rate in both passes, so
+  lookups scale to the 2 CPUs: reads take the state lock only to search
+  the memtable and copy the run list, and decode outside it.
+- Two scanners each kept the single scanner's rate in one pass and lost
+  25–40% in the other; with 2 CPUs and a shared host, this run cannot
+  separate contention from host noise.
+- **A scan through a `ReadGuard` stalls writers for its duration**, as
+  documented: beside one 4,096-key guard scan a writer manages about 20 k
+  writes a second with a p99 equal to the scan time. The same scan through
+  a `Snapshot` leaves the writer at about 1 M writes a second. Long scans
+  beside writes should use snapshots.
+- A writer beside a point reader cost the reader 56% of its rate in one
+  pass and 22% in the other, with a 32–39 µs p99; nothing beyond
+  2 CPUs was measured.
+
+### Memory density
+
+`density` loads each payload in random order into a 1 GiB memtable, then
+flushes and consolidates. *Heap* is what the engine holds on the heap by
+the counting allocator (allocations it made, less those freed); it includes
+runs, their indexes, key filters, the empty memtable and structure
+overhead, but not allocator fragmentation or RSS.
+
+| payload | records | mean key + value | logical | memtable heap | memtable charged | runs heap (run + filter) | logical / run bytes | heap per record in runs | `BTreeMap` heap |
+|---|---|---|---|---|---|---|---|---|---|
+| sensor readings, 14–32 B values | 1,500,000 | 35 B | 50.1 MiB | 154.5 MiB | 233.2 MiB | 35.6 MiB (33.8 + 1.8) | 1.48 | 25 B | 134.7 MiB |
+| JSON profiles, ~150 B–1 KiB | 120,000 | 556 B | 63.6 MiB | 72.0 MiB | 78.3 MiB | 16.9 MiB (16.7 + 0.1) | 3.80 | 147 B | 121.3 MiB |
+| order documents, ~1–6 KiB | 15,000 | 2,506 B | 35.9 MiB | 36.9 MiB | 37.7 MiB | 8.6 MiB (8.6 + 0.02) | 4.19 | 600 B | 72.3 MiB |
+
+| payload | get ns, memtable | get ns, runs | scan ns/record, runs | get ns, `BTreeMap` |
+|---|---|---|---|---|
+| sensor readings | 940–1,170 | 15,640–15,700 | 65–69 | 560–630 |
+| JSON profiles | 600–650 | 13,500–15,800 | 480–580 | 260–290 |
+| order documents | 450–480 | 12,850–15,060 | 1,950–2,250 | 110–135 |
+
+- **Consolidated runs hold the data in 3.8–8.4× less heap than a
+  `BTreeMap` of the same records**, and in 24–27% of their logical size
+  for the JSON and document payloads (71% for sensor readings). Small
+  records gain least: 8-byte random
+  parts compress poorly and per-record framing is large beside them.
+- **The memtable is no denser than a `BTreeMap`.** Its charge overstates
+  its heap for small records (233 against 155 MiB): the accounting is a
+  conservative admission estimate, so a budget fills before the memory it
+  names is used.
+- **Density costs access.** A run lookup costs 13–16 µs on these payloads,
+  25–120× the `BTreeMap` lookup, and scanning a large-value run costs
+  about 0.8–1 ns per decompressed byte. Key filters stay small (10 bits a
+  key), so they cost most, relatively, for small records (5% of the run
+  bytes).
+
+### Compressed and uncompressed runs
+
+The engine always writes Zstandard level 3, so this comes from the run
+layer directly: `cargo test --release --lib run::tests::costs -- --ignored
+--nocapture` builds one run per payload and codec (smaller, simplified
+versions of the `density` payloads, with 10-byte keys) and reads it
+without an engine, so it shows block costs, not the engine's read path.
+
+| payload | codec | logical / run | get ns | scan ns/record |
+|---|---|---|---|---|
+| sensor readings | none | 1.14 | 516 | 16 |
+| sensor readings | LZ4 | 1.38 | 5,842 | 25 |
+| sensor readings | Zstandard | 1.73 | 15,642 | 42 |
+| JSON profiles | none | 1.00 | 402 | 22 |
+| JSON profiles | LZ4 | 2.47 | 5,781 | 161 |
+| JSON profiles | Zstandard | 5.99 | 11,633 | 327 |
+| order documents | none | 1.00 | 205 | 20 |
+| order documents | LZ4 | 2.91 | 4,241 | 495 |
+| order documents | Zstandard | 5.40 | 11,750 | 1,396 |
+
+One pass. Indexes are 15–30 KiB for 11–22 MiB of data in every codec.
+Uncompressed blocks are read in place, so a lookup is 0.2–0.5 µs; LZ4 costs
+36–50% of Zstandard's lookup time at 41–80% of its compression ratio (41–54%
+on the structured values). The block-level decode cost, not the merge
+or the index, is what separates run lookups from memory lookups.
+
+### Reading it
+
+- **Where it does well:** absent keys (filters), keys still in the
+  memtable, lookups that scale across both CPUs, snapshot reads that do
+  not disturb writers, and dense storage of structured values (3.8–4.2×
+  smaller than logical size for JSON-like and document data, 7–8× less heap
+  than a `BTreeMap`).
+- **Where decompression dominates:** every point lookup that reaches a
+  run, every scan seek, and short scans. Repeated access gains nothing,
+  since decoded blocks are not kept.
+- **Where overlap costs:** seeks (one decode per run), keys with older
+  versions in other runs (one decode per version), iteration (2.2× slower
+  from 9 runs than from one), and the filter false-positive tail.
+  Consolidation (`compact` with `max_overlap: 1`) removes all of it.
+- **Prefix scans by size:** below about a hundred records the seek
+  decides the cost; from hundreds upwards it is 90–210 ns a record,
+  depending on overlap, flat to the whole dataset.
+- **Locality:** helps the memtable and the `BTreeMap` 2–4×, runs not at
+  all.
+- **Limits of the environment:** a 2-CPU VM on a shared laptop host; no
+  scaling claim beyond 2 CPUs, concurrent figures within ±40%, datasets of
+  36–64 MiB (far beyond CPU caches, small beside RAM), and no comparison
+  with another engine.
+- **Possible improvements, not made:** a decoded-block cache would turn
+  repeated and hot run lookups into memory lookups, at the cost of memory
+  the compression saved; per-run sequence bounds would let a lookup stop
+  at the newest run holding a key, halving the cost of overwritten keys in
+  overlapping runs; and a choice of codec (LZ4, or none for hot data)
+  would trade density for 2–3× (LZ4) or 20–60× (none) cheaper decodes. Each is a design decision
+  beyond this baseline.
 
 ## Historical results
 

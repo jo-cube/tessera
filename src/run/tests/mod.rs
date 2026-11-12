@@ -2,6 +2,7 @@
 //! ranged reads.
 
 mod compact;
+mod costs;
 mod format;
 mod logical;
 mod merge;

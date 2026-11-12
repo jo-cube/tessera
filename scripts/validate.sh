@@ -7,8 +7,9 @@
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
 #   scripts/validate.sh bench [MODE…]      the benchmark suite, or some of its modes:
-#                                          memtable reads maintenance snapshots
-#                                          ingest mixed durable recovery
+#                                          memtable lookups scans readers density
+#                                          maintenance snapshots ingest mixed
+#                                          durable recovery
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -164,7 +165,7 @@ limits() {
 # with no features, so every mode reuses the same binary.
 bench() {
   local modes=("$@")
-  [ ${#modes[@]} -gt 0 ] || modes=(memtable reads maintenance snapshots ingest mixed durable recovery)
+  [ ${#modes[@]} -gt 0 ] || modes=(memtable lookups scans readers density maintenance snapshots ingest mixed durable recovery)
   bounded bench 1800 sh -c 'cargo build --locked --release --example bench && for mode; do /cache/target/release/examples/bench "$mode" /tmp || exit; done' sh "${modes[@]}"
 }
 
