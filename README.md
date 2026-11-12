@@ -3,6 +3,12 @@
 Tessera is a RAM-first, compressed LSM key-value store, written in Rust as an
 embedded library.
 
+It suits an application that keeps a byte-keyed dataset in its own process
+and wants it compressed in memory: point lookups and ordered or prefix scans
+that never touch disk, single-key writes, consistent snapshots, and
+optionally checkpoints and a write-ahead log for restarts. The dataset must
+fit in memory once compressed.
+
 ## Status
 
 Prerelease and unpublished; not production-ready. The engine, its
@@ -194,6 +200,11 @@ it.
   guard's own reads. A `Snapshot` holds no lock.
 - A panic in the background worker stops it; `background_status` reports it
   and the engine keeps working without it.
+- Dropping the engine is shutdown: it waits for the worker's current
+  compaction, writes nothing and releases the directory lock. A RAM-only
+  engine's data goes with it unless checkpointed; a durable engine's
+  acknowledged writes are already in the log, and a `durable_checkpoint`
+  before dropping only shortens the next `open`.
 - The dataset must fit in memory: there is no disk tiering.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.
@@ -209,10 +220,25 @@ checkpoints and rotations, damage and a file-level model of lost unsynced
 data. Real power loss, and how a device orders the pages of one write, have
 not been tested. After a failed sync, check the device before reopening.
 
+## Platform
+
+- Built and tested only with Rust 1.98.1 (edition 2024) on Linux aarch64, in
+  the container described under [Validate](#validate). No minimum supported
+  Rust version is declared yet. Other targets, including x86-64, macOS and
+  Windows, are untested.
+- RAM-only engines touch no files and need no platform support beyond
+  threads. Checkpoints and the log need a filesystem with the guarantees under
+  [Durability](#durability), and use advisory file locks (`File::try_lock`).
+- Zstandard is C code: `zstd-safe` builds the bundled libzstd 1.5.7
+  (`vendored`), so building needs a C compiler but no system library. LZ4
+  and CRC-32 are pure Rust. `Cargo.lock` pins every dependency; build with
+  `--locked`.
+- `unsafe` is forbidden in the crate itself.
+
 ## Performance
 
 Measured in a 2-CPU, 4 GiB Linux VM, not on characterised hardware, with the
-benchmarks of earlier milestones. RAM-only
+benchmarks in `examples/bench.rs`. RAM-only
 writes run at about 1.2–1.7 million a second from 1–4 writers. One durable
 writer on the VM's virtual disk manages about 6,000–8,000 writes a second
 (one sync each, p50 about 125 µs); group commit reaches about 30,000–36,000

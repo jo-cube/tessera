@@ -251,6 +251,17 @@
 //! a write-ahead log in its directory, synced before the write is applied,
 //! and [`Engine::durable_checkpoint`] bounds the log. Other engines touch no
 //! file. See [`DurableOptions`] and the contract in the source of `wal.rs`.
+//!
+//! # Shutdown
+//!
+//! There is no close call: dropping the engine is shutdown. It stops the
+//! background worker after the compaction it is running and waits for it,
+//! then releases the directory's lock. Nothing is written on drop. A RAM-only
+//! engine's state is gone unless a checkpoint holds it; a durable engine
+//! needs nothing more, as every acknowledged write is already in the log,
+//! though a [`Engine::durable_checkpoint`] first shortens the replay of the
+//! next [`Engine::open`]. Snapshots may outlive the engine and keep what
+//! they read alive until dropped.
 
 mod checkpoint;
 mod group;
