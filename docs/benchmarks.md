@@ -49,6 +49,9 @@ Kinds of result in this file:
   with automatic flushes and background compaction.
 - **Run layer only:** "Compressed and uncompressed runs" and the block-cache
   simulation, which read runs without an engine.
+- **Competitive baseline:** the 5Y section, Tessera against RocksDB on
+  identical data and operations, from the separate harness in
+  `tools/compare`; read-only phases, plus the cost of building them.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -827,6 +830,322 @@ p50 / p99 in µs, Zstandard / LZ4 / uncompressed:
 - **Not measured:** a dataset near the run limits, where a less compact
   codec would refuse flushes sooner; larger values, where Zstandard's
   density advantage grows (5W: 3.8–4.2× on JSON-like and document data).
+
+## RocksDB baseline (5Y)
+
+*Competitive baseline.* Tessera against RocksDB, an established compressed
+LSM engine, on identical keys, values and operations, at three scales up
+to 2 GiB of logical data. The question is whether compressed RAM-resident
+runs give a better density–latency trade than RocksDB with its SST files
+held in memory. Results are from two passes with the engine order
+reversed between them; a cell is marked where the passes differed by 5%
+or more.
+
+### Setup
+
+- **Harness:** `tools/compare`, a separate package (its own lockfile, a
+  path dependency on Tessera) linking the system RocksDB through a few
+  hand-declared C API calls, so RocksDB never enters Tessera's dependency
+  graph. It is opt-in: `scripts/validate.sh` never builds it or its
+  image, and installs nothing; the image is built once, by hand, in the
+  Colima VM. One engine per process and per bounded container, so memory
+  peaks are that engine's alone:
+
+  ```sh
+  docker --context colima build -t tessera-compare:rocksdb-7.8.3 - < tools/compare/Dockerfile
+  TESSERA_IMAGE=tessera-compare:rocksdb-7.8.3 scripts/validate.sh exec 600 sh -c \
+    'cd tools/compare && CARGO_TARGET_DIR=/cache/compare-target cargo build --locked --release'
+  TESSERA_IMAGE=tessera-compare:rocksdb-7.8.3 TESSERA_TMPFS_SIZE=1536m scripts/validate.sh exec 1200 \
+    /cache/compare-target/release/tessera-compare rocksdb json:256 /tmp
+  ```
+
+- **RocksDB:** 7.8.3 (November 2022), Debian's `librocksdb-dev 7.8.3-2`
+  (bookworm; no newer build is packaged for it, and compiling a current
+  release on two CPUs was not attempted). It is a historical version
+  without later releases' changes, so this is a baseline for the
+  architecture rather than for RocksDB's best.
+- **Environment:** Rust 1.98.1, the bounded container (2 CPUs, 3 GiB, no
+  swap), `/tmp` a tmpfs raised to 1.5 GiB (`TESSERA_TMPFS_SIZE`) and
+  charged to the same 3 GiB. Tessera's Zstandard is the vendored 1.5.7,
+  RocksDB's the system 1.5.4; LZ4 is `lz4_flex` 0.14 against liblz4
+  1.9.4. Both engines use glibc's allocator.
+- **Matched configuration (`rocksdb`):** 16 KiB blocks, Zstandard level 3,
+  a full Bloom filter of 10 bits per key (format version 5, about 1%
+  false positives; Tessera's is 10 bits, about 0.8%), **no block cache**
+  (every read decompresses its block, as in Tessera), index and filter
+  blocks in the table readers' heap (the default), 64 MiB memtables (two
+  at most), 64 MiB target files, two background jobs, level compaction
+  with default sizes, writes without the WAL, checksums verified on read.
+  Files on the tmpfs, so a block read is a copy from the page cache.
+- **Tuned configuration (`rocksdb-tuned`):** the same plus a 64 MiB LRU
+  cache of decompressed blocks, mmap reads and dynamic level sizes.
+- **Tessera:** defaults (64 MiB memtable, 64 MiB of input per run,
+  Zstandard) with background compaction and `max_runs` raised from the
+  provisional 64 to 256, since RocksDB has no file limit. Non-durable
+  (`Engine::new`), as RocksDB without the WAL.
+- **Not equivalent:** Tessera flushes inside the write that fills the
+  memtable, RocksDB on a background thread; RocksDB's target file size is
+  stored bytes, Tessera's input bytes, so Tessera has about four times
+  as many, smaller runs; their compaction policies differ (below), and
+  so does the overlapping state they leave.
+
+### Datasets and states
+
+- **Keys:** the 8-byte `scans` layout, extended to up to 256 groups of
+  16,384 records: prefixes of 6, 4, 3 and 2 bytes select 32, 512, 2,048
+  and 16,384 consecutive records, with 0x00 and 0xFF bytes throughout.
+- **Datasets:** JSON profiles (`json_record`, about 200 B to 1 KiB) at
+  8 groups (131,072 records, 69 MiB logical, cache-friendly and comparable
+  to 5V–5X), 64 groups (1,048,576 records, 553 MiB, far beyond the CPU
+  caches) and 256 groups (4,194,304 records, 2.2 GiB, the largest the key
+  layout allows; its peak was 1.33 GiB of the 3 GiB, so larger would have
+  been possible but was not needed). Binary sensor readings (14–32 B) at
+  256 groups (122 MiB logical).
+- **History:** records loaded in a fixed random order with background
+  compaction, then consolidated; then one key in 16 overwritten and
+  another one in 16 deleted, in another random order, and flushed: the
+  *overlapping* state. Then consolidated again: the *consolidated* state,
+  with no tombstones and one version per key (RocksDB: a forced
+  bottom-level `CompactRange`; Tessera: compaction to overlap 1). Live
+  data in both: 15/16 of the records.
+- **Reads:** timed only when no flush or compaction is running or due, on
+  one thread, warm (every page resident, a warm-up round first). Gets:
+  present (uniform), overwritten, deleted, missing (between two keys),
+  localized (90% in a window of 1% of the keys); 3 rounds of 30,000 each.
+  Scans: an empty in-range prefix, a whole key (trailing 0xFF, so the upper
+  bound carries), 6-, 4-, 3- and 2-byte prefixes (the last of an odd group
+  `[g, 0xFF]`, or of `[0xFF, 0xFF]` with no upper bound). Tessera scans
+  through a read guard; RocksDB through an iterator with the prefix's
+  successor as upper bound. Both are consistent views; Tessera's guard
+  blocks writers for its duration, RocksDB's iterator does not.
+- **Checked, untimed:** every value and every scan's keys, values and order
+  in a separate counted pass, and a full ordered scan of every live record
+  against the generator, in both states. No copy of the data is held; the
+  generator recomputes each expected record. Every check passed in every
+  run, so both engines returned identical results.
+
+### Memory
+
+Resident bytes per engine after consolidation. *Total* is what the
+engine needs to keep the dataset in memory: for Tessera its process's
+anonymous memory, for RocksDB its anonymous memory plus its files on the
+tmpfs (not counted twice: without mmap, file pages are not in the process
+RSS). Measured after `malloc_trim`, which returns freed heap; the
+untrimmed figure is what a process that never trims holds.
+
+| dataset | engine | engine's own accounting MiB | total resident MiB, trimmed (untrimmed) | bytes per live record | logical ÷ total | peak while building MiB (container) |
+|---|---|---|---|---|---|---|
+| JSON, 131k | Tessera | runs 17.2 + filters 0.1 | 19.8 (44.4) | 169 | 3.26 | 92 (94) |
+| | RocksDB | SST 16.9 + readers 0.2 | 21.0 (25.3) | 179 | 3.07 | 108 (115) |
+| JSON, 1M | Tessera | runs 138.2 + filters 1.2 | 152.4 (185.4) | 163 | 3.40 | 296 (298) |
+| | RocksDB | SST 135.2 + readers 1.8 | 143.2 (151.9) | 153 | 3.62 | 414 (377–431) |
+| | RocksDB tuned | + cache 61.5 | 205.2 | 219 | 2.53 | 411 (442) |
+| JSON, 4.2M | Tessera | runs 556.2 + filters 4.7 | 587.6 (758.9) | 157 | 3.54 | 965 (925–985) |
+| | RocksDB | SST 541.4 + readers 7.2 | 553.8 (565.2) | 148 | 3.75 | 1,300 (1,239–1,329) |
+| | RocksDB tuned | + cache 61.4 | 613.7 | 164 | 3.38 | 1,243 (1,300) |
+| sensor, 4.2M | Tessera | runs 87.1 + filters 4.7 | 115.2 (167.3) | 31 | 1.01 | 258 (259) |
+| | RocksDB | SST 79.2 + readers 4.8 | 88.7 (115.1) | 24 | 1.31 | 244 (288–305) |
+| JSON 1M, LZ4 | Tessera | runs 235.8 + filters 1.2 | 258.6 | 276 | 2.00 | 438 (440) |
+| | RocksDB | SST 233.2 + readers 1.8 | 240.3 | 256 | 2.16 | 538 (592) |
+
+- **Density: RocksDB is denser, slightly on JSON and clearly on small
+  records.** Tessera's runs are 2–3% larger than RocksDB's SST files on
+  JSON (which also hold RocksDB's index and filters) and 10% larger on
+  sensor records, plus filters; complete resident footprints are 6% (JSON,
+  4.2M) and 30% (sensor) larger. On the smallest dataset Tessera is 6%
+  smaller, from RocksDB's fixed costs.
+- **Allocator retention is Tessera's largest memory cost.** Right after
+  consolidation, glibc held 759 MiB for Tessera's 567 MiB of live
+  allocations at 4.2M records (22–124% above the trimmed figure across
+  datasets, most on the smallest) until `malloc_trim`: freed memtables and compaction inputs
+  stay in the heap. RocksDB's data lives in files, so its anonymous
+  memory stays at 10–35 MiB. Untrimmed, Tessera's footprint is 34% (JSON)
+  and 45% (sensor) above RocksDB's. Even trimmed, 4–19% of Tessera's
+  anonymous memory is free heap glibc did not return.
+- **Peaks favour Tessera on JSON:** 25–30% lower while building the
+  largest dataset, since RocksDB holds compaction inputs and outputs as
+  files beside its heap and memtables; on sensor records Tessera's
+  sampled peak is 6% higher. Both stay far within 3 GiB.
+- **The tuned cache** adds its 64 MiB to the footprint.
+
+### Point lookups
+
+p50 µs (p99), and blocks decoded per lookup; RocksDB's filter checks per
+lookup are the files consulted.
+
+| dataset | engine | present | overwritten, overlapping | deleted, overlapping | missing, consolidated | missing, overlapping | localized, consolidated |
+|---|---|---|---|---|---|---|---|
+| JSON, 131k | Tessera | 13.6 (23), 1.0 | 26.5 (33), 2.0 | 26.5 (33), 2.0 | 0.08 | 0.08 | 12.5 |
+| | RocksDB | 13.6 (19), 1.0 | 13.1 (18), 1.0 | 13.0 (18), 1.0 | 0.21 | 0.29 | 12.5 |
+| JSON, 1M | Tessera | 13.9 (18), 1.0 | 27.5 (34), 2.0 | 27.5 (34), 2.0 | 0.31 | 0.33 | 13.2 |
+| | RocksDB | 13.7 (19), 1.0 | 13.4 (18), 1.0 | 13.3 (18), 1.0 | 0.23 | 0.29 | 12.9 |
+| | RocksDB tuned | 13.9 (19), 0.9 | 0.92 (1.7), 0.5 | 0.83 (1.5), 0.2 | 0.23 | 0.29 | 0.79 |
+| JSON, 4.2M | Tessera | 14.8 (20), 1.0 | 28.8 (36), 2.0 | 29.3 (46), 2.0 | 1.10 | 1.27 | 14.3 |
+| | RocksDB | 13.9 (19), 1.0 | 13.9 (27), 1.0 | 13.8 (27), 1.0 | 0.23 | 0.46 | 13.1 |
+| | RocksDB tuned | 14.1 (19), 1.0 | 13.8 (19), 0.7 | 13.7 (19), 0.6 | 0.25 | 0.46 | 0.88 |
+| sensor, 4.2M | Tessera | 14.9 (20), 1.0 | 33.0 (45), 2.0 | 33.0 (45), 2.0 | 0.12 | 0.17 | 13.4 |
+| | RocksDB | 19.0 (25), 1.0 | 21.2 (27), 1.0 | 21.1 (27), 1.0 | 0.21 | 0.33 | 16.9 |
+| JSON 1M, LZ4 | Tessera | 6.0 (7.5), 1.0 | 11.8 (16), 2.0 | 11.8 (16), 2.0 | 0.29 | 0.33 | 5.4 |
+| | RocksDB | 6.6 (11), 1.0 | 6.3 (8.4), 1.0 | 6.3 (8.5), 1.0 | 0.21 | 0.29 | 5.9 |
+
+- **A lookup that decodes a block costs the same in both** (13.6–14.8 µs
+  on JSON with Zstandard, 6.0–6.6 µs with LZ4): the block decode
+  dominates, and the codec, not the engine, sets the price. Tessera is
+  22% faster on sensor records and 9% with LZ4; RocksDB 7% faster at
+  4.2M JSON records.
+- **Overwritten and deleted keys cost Tessera twice as much** in the
+  overlapping state: it decodes the newer run and the older one (2.0
+  blocks), RocksDB stops at the newest version it finds (1.0). This holds
+  at every scale and codec. See the audit below.
+- **Tessera's lookup grows with the number of runs.** Missing keys cost
+  0.08 µs with 2–3 runs, 0.31 µs with 10 and 1.10 µs with 38 (RocksDB
+  0.21–0.25 µs at every scale), and the same ~1 µs is in every 4.2M
+  lookup: every published run's key range and filter are checked in turn,
+  where RocksDB binary-searches the files of each level.
+- **A block cache changes only skewed reads:** the tuned configuration
+  serves the 1% hot window at 0.8–0.9 µs (15× faster) for 64 MiB, and
+  gives uniform lookups nothing. Tessera has no equivalent.
+
+### Prefix scans and ordered iteration
+
+Consolidated state; first record p50 µs; whole scan p50 µs; ns per
+record after the first; blocks per scan.
+
+| dataset | engine | empty prefix | whole key | 6 bytes (30) | 4 bytes (480) | 3 bytes (1,920) | 2 bytes (15,360) | full scan, M records/s |
+|---|---|---|---|---|---|---|---|---|
+| JSON, 1M | Tessera | 13.8 | 14.0 | 13.9; 27.8; 493; 2.0 | 14.2; 240; 476; 17.3 | 14.4; 921; 474; 66 | 15.4; 7,245; 472 | 2.11 |
+| | RocksDB | 13.7 | 14.0 | 14.0; 29.1; 532; 2.0 | 14.4; 264; 520; 17.7 | 14.9; 1,006; 518; 68 | 16.1; 7,991; 518 | 1.93 |
+| JSON, 4.2M | Tessera | 15.0 | 15.1 | 15.1; 29.1; 496; 2.0 | 15.5; 243; 480; 17.3 | 15.9; 930; 478; 67 | 17.1; 7,358; 482 | 2.09 |
+| | RocksDB | 14.0 | 14.1 | 14.1; 29.1; 527; 2.0 | 14.6; 263; 517; 17.8 | 15.2; 1,006; 517; 68 | 17.0; 7,942; 518 | 1.94 |
+| sensor, 4.2M | Tessera | 14.9 | 15.0 | 14.7; 16.3; 74; 1.1 | 14.8; 48; 70; 2.0 | 14.6; 149; 69; 4.9 | 14.4; 1,072; 69 | 14.3 |
+| | RocksDB | 19.2 | 19.4 | 19.2; 21.7; 128; 1.1 | 19.4; 73; 115; 2.1 | 19.4; 233; 113; 5.6 | 20.1; 1,772; 114 | 8.8 |
+| JSON 1M, LZ4 | Tessera | 5.9 | 6.2 | 6.2; 12.3; 217 | 6.4; 105; 209 | 6.6; 402; 207 | 6.5; 3,159; 206 | 4.84 |
+| | RocksDB | 6.8 | 7.1 | 7.0; 14.9; 280 | 7.2; 135; 269 | 7.6; 517; 267 | 8.2; 4,085; 266 | 3.67 |
+
+- **Time to the first record is one block decode in both** (13.7–15 µs
+  for JSON), and dominates scans of tens of records: a 30-record scan is
+  half seek. An empty prefix costs the same seek.
+- **Iteration after the first record is Tessera's clearest advantage:**
+  6–8% fewer ns per JSON record, 22–25% with LZ4, and 39–42% on sensor
+  records, where per-record cost rather than decompression dominates;
+  full ordered scans are 8–14% (JSON), 32% (LZ4) and 62% (sensor) faster.
+- **Overlapping state** (not tabled): every scan seeks in every overlapping
+  source, so the first record costs one block per layer in both: 27–29 µs
+  for Tessera's two layers and RocksDB's two at 1M records, and 56 µs for
+  RocksDB's four at 4.2M, where Tessera's background compaction had
+  merged its five update flushes into one layer (29 µs) and RocksDB left
+  three L0 files below its compaction trigger. Per-record costs keep the
+  consolidated order (Tessera 546–594 ns, RocksDB 608–619). Physical
+  records per logical record are 36/30 in both by construction: each
+  32-record range holds two superseded versions and two tombstones.
+- **Scan workspace:** Tessera's reader held 165–181 KiB of decoded-block
+  buffers; RocksDB does not report its iterators' memory.
+
+### Building the states
+
+| dataset | engine | load s (CPU s) | settle s | consolidate s (CPU s) | runs or files, consolidated | load peak MiB |
+|---|---|---|---|---|---|---|
+| JSON, 1M | Tessera | 2.0 (3.3) | 0.5 | 4.7 (4.7) | 10 runs | 292 |
+| | RocksDB | 1.8 (3.9) | 1.7 | 3.7 (3.7) | 3 files, L1 | 363 |
+| JSON, 4.2M | Tessera | 7.4 (15.9) | 8.2 | 18.9 (18.9) | 38 runs | 935 |
+| | RocksDB | 9.9 (21.7) | 9.0 | 15.3 (15.3) | 9 files, L2 | 1,231 |
+| sensor, 4.2M | Tessera | 2.3 (3.0) | 0.5 | 2.2 (2.2) | 4 runs | 228 |
+| | RocksDB | 6.6 (7.7) | 0.0 | 2.5 (2.5) | 2 files, L1 | 172 |
+
+- Loading takes 25% (JSON, 4.2M) to 65% (sensor) less time in Tessera,
+  with less CPU; at 1M records RocksDB is 10% faster. Data generation is
+  excluded.
+- While loading and settling 2.2 GiB of JSON, RocksDB's leveled compaction
+  wrote 1.8–2.0 GiB and Tessera's background compaction 1.25–1.36 GiB;
+  both flushed 0.58 GiB of compressed runs or files.
+- A full consolidation takes RocksDB 0.8–1.15× Tessera's time, both on
+  one thread (CPU time equals wall time).
+
+### Measurement quality
+
+- Within a process, the p50 of each class varied by under 1% between
+  rounds; between passes, medians agreed within 5% except the cells
+  marked in the raw summary (mostly p99s and missing-key p50s, ±7–45%).
+  Differences under 5% (present-key lookups at 1M, first-record times)
+  are a tie.
+- One thread on two CPUs, warm, no concurrent writes: nothing here
+  measures read scaling, interference or cold starts.
+- RocksDB 7.8 and glibc's allocator; RocksDB's usual jemalloc and newer
+  releases were not measured.
+
+### Read-amplification audit
+
+Why Tessera decodes two blocks for an updated key where RocksDB decodes
+one, examined against the code (`lookup_state`, `latest_in`, `select`):
+
+- **The lookup reads every run that may hold the key**, keeps the highest
+  sequence number and checks it for a conflicting copy; it cannot stop
+  early because the run list is not in recency order (compaction outputs
+  are appended after newer flushes) and runs carry no sequence bounds.
+  RocksDB visits memtables, L0 newest first and then levels in order, and
+  stops at the first version.
+- **Runs need not be chronological, and their sequence ranges can
+  interleave:** selection takes the *smallest* runs covering the deepest
+  key, so it can merge an old run with a new one and skip a middle-aged,
+  larger run between them. Pruning does not require chronological
+  compaction: visiting runs in descending order of their largest sequence
+  number and skipping any run whose largest sequence number is below the
+  version already found is correct for interleaved ranges too; it only
+  prunes less there.
+- **The metadata is cheap:** a run's largest sequence number is not
+  stored, but builders see every record's sequence number, a compaction
+  output's is its inputs' largest, and recovery already computes it
+  (`Run::recover`). It can live beside the run in memory, with no format
+  change.
+- **Conflict checks:** the contract compares copies only at the newest
+  version. A copy of that version has the same sequence number, so it can
+  only be in a run whose largest sequence number is at least that one,
+  which the rule still reads; the check is preserved exactly. Nothing in
+  the engine creates copies today (flushes and compactions replace
+  atomically, log replay skips what the checkpoint holds), so the check
+  guards against damage; compaction already rejects conflicting copies
+  among its inputs, and recovery could do the same across runs, but the
+  read-time check costs nothing extra under pruning.
+- **Tombstones** are versions like any other and end the search the same
+  way, which is why deleted keys gain as much as overwritten ones.
+- **Snapshots** pin their own run list and every record in it is visible
+  to them, so the same rule applies unchanged.
+- **Practical benefit, measured on the overlapping state:** overwritten
+  and deleted keys would drop from 2.0 to 1.0 blocks, from 26.5–29.3 µs to
+  about the 13–14 µs of a present key (sensor 33 → ~15 µs; LZ4 11.8 →
+  ~6 µs), a factor of 2, and by more for keys in deeper histories. It does
+  nothing for consolidated data, present keys in one run, or missing keys.
+- **The smallest plausible change** (not made): record each published
+  run's largest sequence number, keep the run list ordered by it, and in
+  `latest_in` stop once the next run's largest sequence number is below
+  the version found. The separate cost that grows with the number of
+  runs (1.1 µs at 38 runs) is independent of it: it comes from checking
+  every run's key range in turn.
+
+### Reading it
+
+- **Tessera does not beat RocksDB overall.** On the architecture-matched
+  comparison the two are equivalent where the block decode dominates
+  (lookups and scan seeks of JSON at every scale): the codec sets the
+  price in both.
+- **Tessera is better at:** iterating records (6–8% per JSON record, 22%
+  with LZ4, 40% on small records), lookups of small records (22%), loading
+  (up to 65% less time) and peak memory while building JSON (25–30%
+  lower).
+- **RocksDB is better at:** reads of updated keys before consolidation (2×),
+  lookups among many runs (missing keys 4–5× at 38 runs, 7% on present
+  keys), density (6% on JSON, 30% on small records, complete footprint)
+  and, decisively, memory stability: its data lives in files, so freed
+  memory does not accumulate in a heap; Tessera's process held 31–79%
+  more than its live allocations (more on the smallest dataset) until
+  `malloc_trim`.
+- **Tuned RocksDB** buys 15× faster skewed lookups for 64 MiB, a trade
+  Tessera cannot offer without a block cache.
+- The original premise, a better density–latency trade from compressed
+  runs in RAM, is not supported against RocksDB with its files in memory:
+  the same compressed blocks in a page cache achieve the same latency at
+  equal or better density. Tessera's measurable advantages are in
+  iteration, small records and ingestion, not in lookup latency per byte.
 
 ## Historical results
 

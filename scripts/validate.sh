@@ -51,6 +51,10 @@ offline=true
 extra_mounts=()
 
 memory=3g
+# The /tmp tmpfs, charged to the container's memory. TESSERA_TMPFS_SIZE
+# raises it for the RocksDB comparison in tools/compare, whose largest
+# dataset needs about 1.2 GiB of files during a full compaction.
+tmpfs_size="${TESSERA_TMPFS_SIZE:-512m}"
 cpus=2
 pids=256
 run_label="tessera.validate=$$"
@@ -119,7 +123,7 @@ bounded() {
     --label "$run_label" \
     --memory "$memory" --memory-swap "$memory" --cpus "$cpus" --pids-limit "$pids" \
     --ulimit core=0 --cap-drop ALL --security-opt no-new-privileges \
-    --tmpfs /tmp:rw,exec,size=512m,mode=1777 \
+    --tmpfs "/tmp:rw,exec,size=$tmpfs_size,mode=1777" \
     --volume "$source_dir:/work:ro" --volume "$cache_mount" --volume "$crates_mount" \
     ${extra_mounts[@]+"${extra_mounts[@]}"} --workdir /work \
     --env STEP="$label" --env CARGO_HOME=/crates --env CARGO_TARGET_DIR=/cache/target \
