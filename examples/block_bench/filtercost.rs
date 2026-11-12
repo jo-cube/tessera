@@ -18,8 +18,8 @@ use std::hash::{DefaultHasher, Hasher};
 use std::hint::black_box;
 use std::time::Instant;
 
-use tessera::engine::{CompactionOptions, Engine, EngineOptions, UpdateError};
-use tessera::memtable::{TARGET_RUN_LEN, WriteError};
+use tessera::engine::{CompactionOptions, Engine, EngineOptions};
+use tessera::memtable::{ENTRY_OVERHEAD, TARGET_RUN_LEN};
 use tessera::run::{MergeWorkspace, Run, RunBuilder};
 
 use super::{
@@ -234,11 +234,12 @@ pub(super) fn filter_cost_bench() {
 fn fill_table(engine: &Engine, first: u64, step: u64, value: &mut impl FnMut() -> Vec<u8>) -> u64 {
     for i in 0..100_000_000u64 {
         let key = tree_key(first + i * step, (1_000, 100, 1_000));
-        match engine.put(&key, &value()) {
-            Ok(_) => {}
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => return i,
-            Err(error) => panic!("{error}"),
+        let value = value();
+        let usage = engine.stats().active;
+        if usage.charged + key.len() + value.len() + ENTRY_OVERHEAD > usage.budget {
+            return i;
         }
+        engine.put(&key, &value).unwrap();
     }
     panic!("the memtable did not fill");
 }

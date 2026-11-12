@@ -11,10 +11,11 @@ use std::thread;
 
 use tessera::block::MAX_KEY_LEN;
 use tessera::engine::{
-    BuiltFlush, Engine, EngineOptions, EngineStats, EngineWorkspace, FlushError, FlushJob,
-    ReadGuard, SnapshotLimits, UpdateError,
+    BuiltFlush, CompactionError, CompactionOptions, Engine, EngineOptions, EngineStats,
+    EngineWorkspace, FlushError, FlushJob, ReadGuard, SnapshotLimits, UpdateError,
 };
 use tessera::memtable::{ENTRY_OVERHEAD, WriteError};
+use tessera::run::MergeWorkspace;
 
 type Live = (Vec<u8>, u64, Vec<u8>);
 
@@ -157,10 +158,29 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
             WriteError::RecordExceedsBudget { .. }
         ))
     ));
-    assert!(budget_rejection(engine.put(b"b", &[0; 40]).unwrap_err()));
     assert_eq!(engine.stats(), before);
-    assert_eq!(value_of(&engine, b"b"), None);
-    assert_eq!(engine.put(b"a", b"w"), Ok(2));
+
+    // A write with no room freezes the full table and lands in the next even
+    // though the run limits refuse the flush, which leaves the table frozen.
+    engine.set_run_limits(0, 0);
+    assert_eq!(engine.put(b"b", &[0; 40]), Ok(2));
+    let before = engine.stats();
+    assert_eq!((before.frozen_tables, before.runs), (1, 0));
+    // Both budgets are now held, so the next write with no room is refused,
+    // from the kept refusal rather than by building the flush again.
+    let refused = engine.put(b"c", &[0; 40]);
+    assert!(
+        matches!(refused, Err(UpdateError::FlushRefused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(engine.put(b"c", &[0; 40]), refused);
+    assert_eq!(engine.stats(), before);
+    assert_eq!(value_of(&engine, b"c"), None);
+    // Raising the limits lets the next write flush both tables.
+    engine.set_run_limits(64, usize::MAX);
+    assert_eq!(engine.put(b"c", &[0; 40]), Ok(3));
+    let stats = engine.stats();
+    assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
 }
 
 #[test]
@@ -517,17 +537,22 @@ fn writes_continue_into_the_active_table_after_a_rejected_flush() {
 // Budgets.
 
 #[test]
-fn a_full_table_rejects_writes_until_a_flush_makes_room() {
+fn a_write_to_a_full_table_flushes_it_and_lands_in_the_next() {
     let budget = 1 + 1 + ENTRY_OVERHEAD;
     let engine = Engine::new(EngineOptions {
         memtable_budget: budget,
         ..EngineOptions::default()
     });
-    engine.put(b"a", b"v").unwrap();
-    assert!(budget_rejection(engine.put(b"b", b"v").unwrap_err()));
-    engine.flush().unwrap();
-    engine.put(b"b", b"v").unwrap();
-    assert_eq!(scanned(&engine, b"").len(), 2);
+    let a = engine.put(b"a", b"v").unwrap();
+    let b = engine.put(b"b", b"v").unwrap();
+    assert_eq!(b, a + 1);
+    let stats = engine.stats();
+    assert_eq!((stats.runs, stats.frozen_tables), (1, 0));
+    assert_eq!(stats.active.charged, budget);
+    assert_eq!(
+        scanned(&engine, b""),
+        [live(b"a", a, b"v"), live(b"b", b, b"v")]
+    );
 }
 
 #[test]
@@ -561,6 +586,152 @@ fn a_flush_accounts_for_each_table_separately() {
     let stats = engine.stats();
     assert_eq!(stats.active.payload, 3);
     assert!(stats.run_bytes > 0);
+}
+
+// Automatic flushing.
+
+/// Writers that fill the table together share its flushes: every write lands
+/// exactly once with its own number, without a gap, and the tables flushed
+/// are full ones. Meanwhile each snapshot sees exactly the writes up to its
+/// sequence number, and each writer's writes in order, across every freeze
+/// and publication.
+#[test]
+fn concurrent_writers_flush_full_tables_once_and_snapshots_stay_coherent() {
+    const WRITERS: u8 = 4;
+    const EACH: u32 = 1_500;
+    const BUDGET: usize = 128 << 10;
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: BUDGET,
+        target_run_len: 1 << 30,
+        ..EngineOptions::default()
+    });
+    let key = |writer: u8, at: u32| [&[writer][..], &at.to_be_bytes()].concat();
+    let done = AtomicBool::new(false);
+    let (seqs, snapshots) = thread::scope(|scope| {
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let engine = &engine;
+                scope.spawn(move || {
+                    (0..EACH)
+                        .map(|at| engine.put(&key(writer, at), &[writer; 100]).unwrap())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let reader = scope.spawn(|| {
+            let mut checked = 0;
+            while !done.load(Ordering::Acquire) {
+                let snapshot = engine.snapshot().unwrap();
+                let mut workspace = EngineWorkspace::new();
+                let mut seen = 0;
+                for writer in 0..WRITERS {
+                    let mut scan = snapshot.scan_prefix(&[writer], &mut workspace);
+                    let mut next = 0u32;
+                    while let Some(record) = scan.next_record().unwrap() {
+                        assert_eq!(record.key, key(writer, next), "a gap in writer {writer}");
+                        assert!(record.seq <= snapshot.last_seq());
+                        next += 1;
+                    }
+                    seen += u64::from(next);
+                }
+                assert_eq!(seen, snapshot.last_seq());
+                checked += 1;
+            }
+            checked
+        });
+        let seqs: Vec<u64> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect();
+        done.store(true, Ordering::Release);
+        (seqs, reader.join().unwrap())
+    });
+    assert!(snapshots > 0);
+    let total = u64::from(WRITERS) * u64::from(EACH);
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=total).collect::<Vec<_>>());
+    let stats = engine.stats();
+    assert_eq!(stats.last_seq, total);
+    // Each flush took a full table, at least half of it records (the rest
+    // history the snapshots pinned): not one flush per writer that found the
+    // table full.
+    let charge = (5 + 100 + ENTRY_OVERHEAD) as u64;
+    let full_tables = total * charge / BUDGET as u64;
+    assert!(stats.flushes >= full_tables - 1, "{stats:?}");
+    assert!(stats.flushes <= 2 * full_tables + 1, "{stats:?}");
+    assert_eq!(stats.runs as u64, stats.flushes);
+    let mut workspace = EngineWorkspace::new();
+    for writer in 0..WRITERS {
+        for at in [0, EACH / 2, EACH - 1] {
+            let found = engine
+                .get(&key(writer, at), &mut workspace)
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.value, [writer; 100]);
+        }
+    }
+}
+
+/// While a snapshot keeps compaction from running, the run limits refuse the
+/// flushes writes need, and the writes are refused, changing nothing, until
+/// the snapshot is dropped and a compaction makes room.
+#[test]
+fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: 4 << 10,
+        max_runs: 2,
+        snapshots: SnapshotLimits {
+            max_retained_bytes: 0,
+            ..SnapshotLimits::default()
+        },
+        ..EngineOptions::default()
+    });
+    // Holds the first table once it is flushed.
+    engine.put(b"first", b"v").unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    let mut refused = None;
+    for at in 0..1_000u32 {
+        // Spread, so that every table and run spans the key range.
+        match engine.put(&(at * 37 % 64).to_be_bytes(), &[1; 100]) {
+            Ok(_) => {}
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    let refused = refused.expect("the run limits refused a flush");
+    assert!(
+        matches!(
+            refused,
+            UpdateError::FlushRefused(FlushError { max_runs: 2, .. })
+        ),
+        "{refused}"
+    );
+    let before = engine.stats();
+    assert_eq!(before.runs, 2);
+    assert_eq!(engine.put(b"late", &[1; 100]), Err(refused));
+    assert_eq!(engine.stats(), before);
+    let merge_all = CompactionOptions {
+        max_overlap: 1,
+        ..CompactionOptions::default()
+    };
+    let mut workspace = MergeWorkspace::new();
+    let blocked = engine.compact(merge_all, &mut workspace);
+    assert!(
+        matches!(blocked, Err(CompactionError::Retained { .. })),
+        "{blocked:?}"
+    );
+    assert_eq!(engine.put(b"late", &[1; 100]), Err(refused));
+
+    drop(snapshot);
+    engine.compact(merge_all, &mut workspace).unwrap().unwrap();
+    let seq = engine.put(b"late", &[1; 100]).unwrap();
+    assert_eq!(seq, before.last_seq + 1);
+    let stats = engine.stats();
+    assert_eq!(stats.flushes, before.flushes + 1);
+    assert_eq!(value_of(&engine, b"late"), Some((seq, vec![1; 100])));
 }
 
 // Scans.
@@ -1028,6 +1199,7 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
     let pool = key_pool();
     let long_key = vec![b'x'; MAX_KEY_LEN + 1];
     let (mut rejected, mut flushes, mut abandoned, mut refused) = (0, 0, 0, 0);
+    let mut automatic = 0;
 
     for seed in 0..SEEDS {
         let mut rng = Rng(seed);
@@ -1083,9 +1255,17 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
                     } else {
                         engine.put(&key, &value)
                     };
-                    if fits {
+                    // A write with no room flushes every table and lands
+                    // alone in a new one, unless a staged flush is held.
+                    let flushes_first = !fits && charge <= budget && matches!(stage, Stage::Idle);
+                    if fits || flushes_first {
                         last_seq += 1;
                         assert_eq!(result, Ok(last_seq), "seed {seed}");
+                        if flushes_first {
+                            active.clear();
+                            has_frozen = false;
+                            automatic += 1;
+                        }
                         active.insert(key.clone(), charge);
                         model.insert(key, (last_seq, (!delete).then_some(value)));
                     } else {
@@ -1140,5 +1320,6 @@ fn randomized_operations_match_an_independent_model_at_every_flush_stage() {
     assert!(flushes > 100, "{flushes}");
     assert!(abandoned > 50, "{abandoned}");
     assert!(refused > 10, "{refused}");
-    assert!(rejected > 100, "{rejected}");
+    assert!(rejected > 20, "{rejected}");
+    assert!(automatic > 50, "{automatic}");
 }

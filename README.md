@@ -54,11 +54,15 @@ snapshot holding them is dropped. History a snapshot pins in a memtable
 counts against that memtable's budget, and `SnapshotLimits` bound live
 snapshots and retained bytes.
 
-**Flushing** is explicit. When the active memtable is full a write is
-refused with `WriteError::BudgetExceeded`, and the caller flushes and
-retries. `flush` freezes the active table, compresses it into runs outside
-the lock, and publishes them in one step; a refused or abandoned flush leaves
-the tables readable for a retry.
+**Flushing** is automatic. A write that finds the active memtable full
+waits for any flush in progress, freezes the table if it is still full,
+lands in the new one and flushes the frozen table before returning, so
+writers that run out of room together share one flush. A flush compresses
+outside the lock and publishes its runs in one step; a refused or abandoned
+flush leaves the tables readable for a retry. `flush` flushes on demand. If
+the run limits refuse the flush, writes that need room fail with
+`UpdateError::FlushRefused` until compaction or `set_run_limits` makes room;
+the refusal is kept, not rebuilt for every write.
 
 **Compaction** merges runs into disjoint runs that keep only the newest
 version of each key. `Engine::compact` selects inputs under the shared lock,
@@ -72,7 +76,10 @@ reports failures.
 **Durable writes** are committed by bounded group commit: the first writer
 in the queue leads a batch of those behind it, appends it, syncs once and
 publishes it in sequence order; a lone writer never waits for company. The
-sync happens outside the state lock, so reads continue meanwhile. A failed
+sync happens outside the state lock, so reads continue meanwhile. If the
+memtable has no room for a write, the leader logs the writes before it,
+flushes, and commits the rest, so nothing is logged for a write that is then
+refused. A failed
 append or sync fails every write of its batch, whose outcome is then
 uncertain until the database is reopened, and closes the log.
 `Engine::inspect` reads a database as `open` would, changing nothing, and
@@ -121,8 +128,9 @@ it.
 
 ## Operating requirements and limitations
 
-- Callers flush: nothing flushes on its own, and writes are refused once the
-  memtables are full.
+- Writes wait for flushes when the memtables are full, and are refused with
+  `FlushRefused` when the run limits are reached, until compaction makes
+  room; with no background compaction, call `compact`.
 - A durable log grows until `durable_checkpoint` is called.
 - Do not call engine methods while holding a `ReadGuard`; use the guard's own
   reads.
@@ -148,7 +156,9 @@ writes run at about 1.2–1.7 million a second from 1–4 writers. One durable
 writer on the VM's virtual disk manages about 6,000–8,000 writes a second
 (one sync each, p50 about 125 µs); group commit reaches about 30,000–36,000
 with 8 writers, with about 0.2 syncs a write. Recovery replays the log at
-about 270–290 MiB a second. Methods, workloads and full results are in
+about 270–290 MiB a second. Writes that flush for themselves measured level
+with caller-driven flushing, and several writers share one flush per full
+table. Methods, workloads and full results are in
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Validate

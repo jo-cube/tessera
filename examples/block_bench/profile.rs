@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tessera::engine::{Engine, EngineOptions, Snapshot, UpdateError};
-use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN, WriteError};
+use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
 
 use super::{
     MEMTABLE_BUDGET, Owned, allocations_during, insert_all, shuffled, snapshot_base,
@@ -282,7 +282,7 @@ fn sustained_split(name: &str, records: &[Owned], held: usize) {
             put_ns += begun.elapsed().as_nanos();
             match result {
                 Ok(_) => break,
-                Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => loop {
+                Err(UpdateError::FlushRefused(_)) => loop {
                     let Some(job) = engine.begin_flush() else {
                         break;
                     };

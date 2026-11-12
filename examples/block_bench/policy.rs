@@ -12,7 +12,6 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tessera::engine::{CompactionOptions, Engine, EngineOptions, EngineWorkspace, UpdateError};
-use tessera::memtable::WriteError;
 use tessera::run::MergeWorkspace;
 
 use super::{
@@ -492,7 +491,7 @@ fn put(engine: &Engine, shared: &Shared, key: &[u8], value: &[u8], flushed: &mut
     for _ in 0..4 {
         match engine.put(key, value) {
             Ok(_) => return,
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
+            Err(UpdateError::FlushRefused(_)) => {
                 shared.flush(engine, flushed);
             }
             Err(error) => panic!("{error}"),

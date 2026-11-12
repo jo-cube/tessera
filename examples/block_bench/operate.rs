@@ -13,7 +13,6 @@ use tessera::engine::{
     BackgroundError, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
     SnapshotLimits, UpdateError,
 };
-use tessera::memtable::WriteError;
 use tessera::run::{MergeWorkspace, ReadWorkspace, Run};
 
 use super::{
@@ -139,8 +138,9 @@ fn put(engine: &Engine, key: &[u8], value: &[u8], w: &mut Writes) -> Result<(), 
     for _ in 0..3 {
         match engine.put(key, value) {
             Ok(_) => return Ok(()),
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                // Another writer may be flushing; this waits for it.
+            Err(UpdateError::FlushRefused(_)) => {
+                // The run limits refused the write's flush; this waits for
+                // compaction and flushes.
                 flush(engine, w)?;
             }
             Err(error) => panic!("{error}"),

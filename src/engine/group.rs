@@ -23,7 +23,9 @@
 //!    the next sequence number only if the active memtable admits it beside
 //!    the earlier writes of the batch (their full charges are reserved), and
 //!    if the log has room for it. A refused write gets its error and no
-//!    number, so the accepted ones still have consecutive numbers.
+//!    number, so the accepted ones still have consecutive numbers. The
+//!    first write the memtables have no room for ends the batch's
+//!    validation: it and the writes after it are deferred, unlogged.
 //! 2. **Log**, without the state lock: the accepted records get their
 //!    numbers and checksums and are appended with vector writes and synced
 //!    once (twice if the batch starts a segment: the old segment is synced
@@ -33,6 +35,22 @@
 //!    so no reader or snapshot sees a later write without an earlier one.
 //! 4. **Acknowledge**: each member gets its sequence number, after the
 //!    publication.
+//!
+//! If writes were deferred, the leader, holding the log no longer, makes room
+//! (see "Automatic flushing" in `engine.rs`): it waits for any flush the
+//! engine is running, freezes the active table, and commits the deferred
+//! writes again, in order, as the rest of its batch. It builds and publishes
+//! the flush only after finishing the batch, so the next batch commits into
+//! the new table meanwhile, and its own write returns after the flush, which
+//! is the backpressure. If the new table still has no room (tables were
+//! already frozen, or the batch outgrows a table), it publishes the flush
+//! first and retries. A published flush leaves an empty table of a whole
+//! budget, so each round after one commits at least one write, and the
+//! rounds are bounded by the batch. If a round after a flush accepts
+//! nothing, the deferred writes fail, having logged nothing: with
+//! [`UpdateError::FlushRefused`] if the run limits refused it. While the
+//! leader holds the flush slot it takes the log and state locks; nothing
+//! takes the slot while holding either, so the order is slot, log, state.
 //!
 //! So a write is visible only after its record is synced, acknowledged only
 //! after it is visible, a refused write logs nothing and uses no number, and
@@ -90,7 +108,7 @@ use std::sync::{MutexGuard, PoisonError};
 use crate::memtable::ENTRY_OVERHEAD;
 
 use super::wal::{Durable, MAX_BATCH_RECORDS, Unsealed, encode, encoded_len};
-use super::{Core, UpdateError};
+use super::{Core, FlushError, FlushJob, UpdateError};
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 use crate::memtable::WriteError;
 
@@ -366,26 +384,85 @@ impl Core {
             mine: ticket,
             finished: false,
         };
-        let (outcomes, closed) = self.commit(durable, batch);
-        leading.finish(outcomes, closed)
+        let (outcomes, closed, flush) = self.commit_making_room(durable, batch);
+        let outcome = leading.finish(outcomes, closed);
+        // Built after the next batch may start; a refusal is remembered.
+        if let Some(job) = flush {
+            let _ = job.build().publish();
+        }
+        outcome
     }
 
-    /// Validates, logs and publishes one batch, holding the log throughout.
-    /// Returns each member's outcome and whether the log is now closed.
-    fn commit(&self, durable: &Durable, mut batch: Vec<Request>) -> (Vec<(u64, Outcome)>, bool) {
+    /// Commits a batch, making room whenever the memtables defer the rest of
+    /// it. Returns each member's outcome, whether the log is now closed, and
+    /// a flush of tables frozen for room, for the leader to publish.
+    fn commit_making_room(
+        &self,
+        durable: &Durable,
+        mut batch: Vec<Request>,
+    ) -> (Vec<(u64, Outcome)>, bool, Option<FlushJob<'_>>) {
         let mut outcomes = Vec::with_capacity(batch.len());
-        let closed = |batch: &[Request]| {
-            let outcomes = batch
-                .iter()
-                .map(|request| (request.ticket, Err(UpdateError::LogClosed)))
-                .collect();
-            (outcomes, true)
+        // Tables frozen for room and not yet flushed: freezing is what makes
+        // room, so the flush is left until the batch is committed.
+        let mut frozen: Option<FlushJob<'_>> = None;
+        // The flush published since a write was last accepted.
+        let mut flushed: Option<Result<(), FlushError>> = None;
+        loop {
+            let round = self.commit(durable, batch, &mut outcomes);
+            if round.closed || round.deferred.is_empty() {
+                return (outcomes, round.closed, frozen);
+            }
+            batch = round.deferred;
+            if round.accepted {
+                flushed = None;
+            }
+            // Freezing made too little room: earlier tables were frozen.
+            if let Some(job) = frozen.take() {
+                flushed = Some(job.build().publish().map(drop));
+                continue;
+            }
+            let error = match flushed {
+                None => match self.freeze_for_room() {
+                    Some(Ok(job)) => {
+                        // Nothing in memory leaves nothing to flush.
+                        flushed = job.is_none().then_some(Ok(()));
+                        frozen = job;
+                        continue;
+                    }
+                    Some(Err(refused)) => UpdateError::FlushRefused(refused),
+                    None => round.full,
+                },
+                Some(Err(refused)) => UpdateError::FlushRefused(refused),
+                // A flush published and the table still had no room.
+                Some(Ok(())) => round.full,
+            };
+            outcomes.extend(batch.iter().map(|request| (request.ticket, Err(error))));
+            return (outcomes, false, frozen);
+        }
+    }
+
+    /// Validates, logs and publishes the batch up to the first write the
+    /// memtables have no room for, holding the log throughout, and adds the
+    /// outcomes of the others to `outcomes`.
+    fn commit(
+        &self,
+        durable: &Durable,
+        mut batch: Vec<Request>,
+        outcomes: &mut Vec<(u64, Outcome)>,
+    ) -> Round {
+        let closed = |batch: Vec<Request>, outcomes: &mut Vec<(u64, Outcome)>| {
+            outcomes.extend(
+                batch
+                    .iter()
+                    .map(|request| (request.ticket, Err(UpdateError::LogClosed))),
+            );
+            Round::closed()
         };
         let Ok(mut wal) = durable.wal.lock() else {
-            return closed(&batch);
+            return closed(batch, outcomes);
         };
         if wal.closed.is_some() {
-            return closed(&batch);
+            return closed(batch, outcomes);
         }
 
         // 1. Validate and reserve.
@@ -393,6 +470,7 @@ impl Core {
         // The member, its sequence number and the base of a segment to start
         // before it.
         let mut accepted: Vec<(usize, u64, Option<u64>)> = Vec::with_capacity(batch.len());
+        let mut full = None;
         {
             let mut state = self.write_state();
             let (mut last, mut reserved) = (state.last_seq, 0usize);
@@ -415,12 +493,27 @@ impl Core {
                         last = seq;
                         reserved += request.charge();
                     }
+                    Err(error @ UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
+                        full = Some((index, error));
+                        break;
+                    }
                     Err(error) => outcomes.push((request.ticket, Err(error))),
                 }
             }
         }
+        // Unlogged, for the next round.
+        let (deferred, full) = match full {
+            Some((index, error)) => (batch.split_off(index), error),
+            None => (Vec::new(), UpdateError::LogClosed),
+        };
+        let round = |any_accepted: bool| Round {
+            closed: false,
+            accepted: any_accepted,
+            deferred,
+            full,
+        };
         if accepted.is_empty() {
-            return (outcomes, false);
+            return round(false);
         }
 
         // 2. Log.
@@ -444,7 +537,15 @@ impl Core {
                     .iter()
                     .map(|&(index, ..)| (batch[index].ticket, Err(UpdateError::LogFailed(kind)))),
             );
-            return (outcomes, true);
+            // Nothing deferred was logged, but the log is closed now.
+            let mut round = round(true);
+            outcomes.extend(
+                std::mem::take(&mut round.deferred)
+                    .iter()
+                    .map(|request| (request.ticket, Err(UpdateError::LogClosed))),
+            );
+            round.closed = true;
+            return round;
         }
         drop(records);
         #[cfg(test)]
@@ -473,7 +574,30 @@ impl Core {
                 .iter()
                 .map(|&(index, seq, _)| (batch[index].ticket, Ok(seq))),
         );
-        (outcomes, false)
+        round(true)
+    }
+}
+
+/// What one [`Core::commit`] left to do.
+struct Round {
+    /// Whether the log is closed.
+    closed: bool,
+    /// Whether any write was accepted.
+    accepted: bool,
+    /// Writes from the first the memtables had no room for, unlogged.
+    deferred: Vec<Request>,
+    /// That first write's refusal.
+    full: UpdateError,
+}
+
+impl Round {
+    fn closed() -> Self {
+        Self {
+            closed: true,
+            accepted: false,
+            deferred: Vec::new(),
+            full: UpdateError::LogClosed,
+        }
     }
 }
 
@@ -605,9 +729,11 @@ mod tests {
         }
     }
 
-    /// In a batch, a write the memtable refuses, alone or beside the earlier
-    /// writes the batch reserved room for, gets its error and no sequence
-    /// number; the others are numbered without a gap.
+    /// In a batch, a write the memtable refuses for good gets its error and
+    /// no sequence number. One that has no room beside the earlier writes the
+    /// batch reserved room for is deferred, unlogged, with the writes after
+    /// it: the leader commits the earlier ones, flushes, and commits the
+    /// deferred ones in order. Every accepted write is numbered without a gap.
     #[test]
     fn refused_writes_in_a_batch_use_no_sequence_number() {
         let dir = scratch("refused");
@@ -656,25 +782,32 @@ mod tests {
                 WriteError::RecordExceedsBudget { .. }
             ))
         ));
-        assert_eq!(outcomes[2], Ok(3));
-        assert!(matches!(
-            outcomes[3],
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. }))
-        ));
-        assert_eq!(outcomes[4], Ok(4));
-        let active = engine.stats().active;
-        assert!(active.charged <= active.budget, "{active:?}");
-        assert_eq!(engine.log_status().unwrap().records, 4);
+        assert_eq!(outcomes[2..], [Ok(3), Ok(4), Ok(5)]);
+        let stats = engine.stats();
+        assert_eq!((stats.runs, stats.frozen_tables), (1, 0));
+        assert!(stats.active.charged <= stats.active.budget, "{stats:?}");
+        let status = engine.log_status().unwrap();
+        // The batch of five took two appends, one before the flush.
+        assert_eq!((status.records, status.batches), (5, 3), "{status:?}");
+        for (key, len) in &writes {
+            let expected = (*len < 16 << 10).then(|| vec![7; *len]);
+            assert_eq!(
+                get(&engine, key).map(|v| v.len()),
+                expected.map(|v| v.len()),
+                "{key:?}"
+            );
+        }
         // Lengths are checked before a write is queued or encoded.
         assert!(matches!(
             engine.put(&vec![0; MAX_KEY_LEN + 1], b""),
             Err(UpdateError::Rejected(WriteError::KeyTooLong { .. }))
         ));
-        assert_eq!(engine.stats().last_seq, 4);
+        assert_eq!(engine.stats().last_seq, 5);
         drop(engine);
         let (engine, report) = Engine::open(&dir, options, DurableOptions::default()).unwrap();
-        assert_eq!(report.last_seq, 4);
-        assert_eq!(get(&engine, b"c"), None);
+        assert_eq!(report.last_seq, 5);
+        assert_eq!(get(&engine, b"c"), Some(vec![7; 6 << 10]));
+        assert_eq!(get(&engine, b"z"), None);
         drop(engine);
         fs::remove_dir_all(&dir).unwrap();
     }

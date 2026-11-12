@@ -11,9 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tessera::engine::{
     CompactionOptions, Engine, EngineOptions, EngineWorkspace, Snapshot, SnapshotLimits,
-    UpdateError,
 };
-use tessera::memtable::{FrozenMemtable, Memtable, WriteError};
+use tessera::memtable::{FrozenMemtable, Memtable};
 use tessera::run::MergeWorkspace;
 
 struct Counting;
@@ -190,18 +189,15 @@ fn engine_checkpoints(seed: u64) -> usize {
     let mut checked = 0;
     for step in 0..8_000 {
         let key = key(&mut rng, 2_000);
-        let written = if rng.chance(10) {
-            engine.delete(&key)
+        let flushes = engine.stats().flushes;
+        if rng.chance(10) {
+            engine.delete(&key).unwrap();
         } else {
-            engine.put(&key, &value(&mut rng))
-        };
-        match written {
-            Ok(_) => {}
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                engine.flush().unwrap();
-                compact_some(&engine, &mut rng, &mut merge);
-            }
-            Err(error) => panic!("{error}"),
+            engine.put(&key, &value(&mut rng)).unwrap();
+        }
+        // The write flushed a full table.
+        if engine.stats().flushes != flushes {
+            compact_some(&engine, &mut rng, &mut merge);
         }
         if rng.chance(3) && held.len() < 48 {
             held.push(engine.snapshot().unwrap());

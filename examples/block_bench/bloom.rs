@@ -5,8 +5,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use tessera::engine::{CompactionOptions, Engine, EngineWorkspace, UpdateError};
-use tessera::memtable::WriteError;
+use tessera::engine::{CompactionOptions, Engine, EngineWorkspace};
+use tessera::memtable::ENTRY_OVERHEAD;
 use tessera::run::{LogicalWorkspace, MergeWorkspace, ReadWorkspace, Run, RunSet, RunView};
 
 use super::{
@@ -38,17 +38,15 @@ fn flush_puts(engine: &Engine, count: usize, mut next: impl FnMut() -> (Vec<u8>,
     let mut tally = FlushTally::default();
     for _ in 0..10_000_000 {
         let (key, value) = next();
-        match engine.put(&key, &value) {
-            Ok(_) => continue,
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                tally.flush(engine);
-                if tally.flushes == count {
-                    return;
-                }
-                engine.put(&key, &value).unwrap();
+        // Flushed here before a write that would not fit, which would flush.
+        let usage = engine.stats().active;
+        if usage.charged + key.len() + value.len() + ENTRY_OVERHEAD > usage.budget {
+            tally.flush(engine);
+            if tally.flushes == count {
+                return;
             }
-            Err(error) => panic!("{error}"),
         }
+        engine.put(&key, &value).unwrap();
     }
     panic!("flushing did not finish");
 }

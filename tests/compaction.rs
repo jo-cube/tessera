@@ -14,7 +14,6 @@ use tessera::block::Value;
 use tessera::engine::{
     CompactionOptions, Engine, EngineOptions, EngineWorkspace, Snapshot, UpdateError,
 };
-use tessera::memtable::WriteError;
 use tessera::run::{
     CONTEXT_ALLOWANCE, CompactError, CompactLimits, Compacted, ConflictingCopies, MergeWorkspace,
     ReadError, ReadWorkspace, Run, RunBuilder, compact,
@@ -722,7 +721,7 @@ fn randomized_compactions_match_an_independent_model() {
         .chain([Vec::new(), vec![0xFF; 3]])
         .collect();
     let (mut compactions, mut incomplete, mut dropped_tombstones) = (0, 0, 0);
-    let (mut snapshots, mut outlived, mut refused) = (0, 0, 0);
+    let (mut snapshots, mut outlived) = (0, 0);
 
     // Then a few seeds again with a background worker compacting beside the
     // staged manual compactions. Counts come from the manual seeds only.
@@ -738,7 +737,7 @@ fn randomized_compactions_match_an_independent_model() {
                 ..CompactionOptions::default()
             }),
             // Odd seeds use small memtables, which the history pinned by
-            // snapshots fills, so writes are refused and retried after a flush.
+            // snapshots fills, so writes flush them.
             memtable_budget: if seed % 2 == 0 { 64 << 20 } else { 4 << 10 },
             ..EngineOptions::default()
         });
@@ -772,22 +771,9 @@ fn randomized_compactions_match_an_independent_model() {
                         Some(value) => engine.put(&key, value),
                         None => engine.delete(&key),
                     };
+                    // A write with no room flushes first.
                     if let Err(error) = write(&engine) {
-                        assert!(
-                            matches!(
-                                error,
-                                UpdateError::Rejected(WriteError::BudgetExceeded { .. })
-                            ),
-                            "seed {seed}: {error}"
-                        );
-                        // A refused write changed nothing that reads can see.
-                        assert_eq!(
-                            everything(&engine),
-                            model.clone().into_iter().collect::<Vec<_>>()
-                        );
-                        refused += 1;
-                        engine.flush().unwrap();
-                        write(&engine).unwrap();
+                        panic!("seed {seed}: {error}");
                     }
                     match value {
                         Some(value) => model.insert(key, value),
@@ -893,7 +879,6 @@ fn randomized_compactions_match_an_independent_model() {
         assert_eq!((stats.snapshots, stats.retained_bytes), (0, 0));
     }
     assert!(snapshots > 300, "{snapshots}");
-    assert!(refused > 0, "{refused}");
     assert!(outlived > 20, "{outlived}");
     assert!(compactions > 300, "{compactions}");
     assert!(incomplete > 50, "{incomplete}");

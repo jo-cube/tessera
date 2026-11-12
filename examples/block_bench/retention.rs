@@ -10,7 +10,7 @@ use tessera::engine::{
     CompactionError, CompactionOptions, Engine, EngineOptions, EngineStats, EngineWorkspace,
     Snapshot, SnapshotLimits, UpdateError,
 };
-use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN, WriteError};
+use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
 
 use super::{
     FlushTally, GROUP_LEN, LIVE, MEMTABLE_BUDGET, MEMTABLE_ROUNDS, Owned, Rng, TENANT_LEN,
@@ -278,7 +278,7 @@ fn backpressure(workload: &Workload) {
             .unwrap();
         match engine.put(&record.key, value) {
             Ok(_) => at += 1,
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
+            Err(UpdateError::FlushRefused(_)) => {
                 if engine.flush().is_ok() {
                     loop {
                         match engine.compact(CompactionOptions::default(), &mut workspace) {

@@ -1445,3 +1445,57 @@ The disk rows vary by about 20% between runs of the same code (W=1 fell
 to 6.1 k in one run with p95 351 µs, a disk hiccup, not a code change).
 Nothing here is outside that spread, and the one extra sync at open is not
 visible in recovery time.
+
+## Automatic flushing (5R)
+
+Writes now flush the memtables themselves when they are full. One A/B
+harness, built against the 5Q commit (`3fb2c9f`), where the caller flushes
+on `BudgetExceeded` and retries, and against 5R, where that arm is never
+taken: W writers put 8-byte keys and 100-byte values (half random, so
+about 0.28 stored per payload byte) over 100,000 keys, beside one reader
+doing point gets and, every 16th read, a 20-key prefix scan through a read
+guard. One run per flush (`target_run_len` 1 GiB), no compaction, tmpfs,
+release build, the bounded container. `fits` has a 1 GiB budget (400,000
+writes, no flush); `flushing` and `durable` a 4 MiB budget (400,000 and
+100,000 writes; durable with default group commit, syncs on tmpfs). The
+harness was not kept.
+
+| row | W | 5Q k writes/s | 5R k writes/s | 5Q runs (caller flushes) | 5R runs | 5Q max ms | 5R max ms | scan p99 µs, 5Q / 5R |
+|---|---|---|---|---|---|---|---|---|
+| fits | 1 | 1,271–1,314 | 1,223–1,288 | 0 | 0 | 0.1–0.2 | 0.06–0.2 | 8 / 8 |
+| fits | 4 | 2,077–2,283 | 2,009–2,181 | 0 | 0 | 6–10 | 6 | 6–7 / 6–9 |
+| flushing | 1 | 1,627–1,647 | 1,605–1,626 | 20 (20) | 20 | 4.9–5.1 | 4.9–5.3 | 166 / 164–168 |
+| flushing | 2 | 1,902–1,964 | 1,888–1,894 | 20–22 (23–24) | 20 | 15 | 9–11 | 184–191 / 177 |
+| flushing | 4 | 1,285–2,416 (7 runs) | 1,949–2,512 (8 runs) | 20–24 (20–25) | 20 | 14–35 | 10–19 | 200–1,339 / 177–201 |
+| durable | 1 | 503–506 | 496–522 | 5 (5) | 5 | 4.8–4.9 | 4.8–5.0 | 37–39 / 37–39 |
+| durable | 4 | 189–381 (7 runs), median 346 | 199–396 (8 runs), median 304 | 5–7 (5–9) | 5 | 11–29 | 9–35 | 37–74 / 36–54 |
+| durable | 8 | 141–318 (7 runs), median 182 | 199–301 (8 runs), median 228 | 6–11 (7–16) | 5 | 10–44 | 8–20 | 60–107 / 36–48 |
+
+- The fast path is unchanged in structure (one exclusive lock hold; the
+  slow path is a separate cold function), and `fits` is within the spread
+  between passes; a 2–3% difference in the medians is not established.
+- With several writers, 5Q callers that found the table full each flushed,
+  so later ones flushed small tables: up to 24 flushes for 20 tables, and
+  more runs. In 5R writers that run out of room together share one flush:
+  always 20 (5 durable), one per full table.
+- Stored bytes flushed are in the same ranges (11.4–11.8 MiB; 2.4–3.0 MiB
+  durable), and so are the peak memtable charge (at most 8.0 MiB, two
+  budgets), the process peak (12–38 MiB) and the share of writer time in
+  writes of 100 µs or more (the writes that flush, 12–77% by row; the flush
+  is inside a write in both versions).
+- The contended rows vary by up to a factor of two between passes in both
+  versions (8 writers and a reader on 2 CPUs). Across them 5R is at least
+  level, with lower maxima and scan tails. Durable W=8 had a higher median
+  latency in 5R (11–21 µs in 7 of 8 passes against 1.5–7.6 µs) at equal
+  or higher throughput; batch sizes were not recorded.
+- A first 5R version built the durable flush while still leading its
+  batch, so no batch committed during the build: W=4 measured 347–356
+  against 376–381. The leader now freezes the table, finishes its batch,
+  and builds and publishes the flush after the next batch may start.
+- No disk rows were run: the change does not touch the sync path, and the
+  disk rows write to the host SSD.
+
+The older benchmark modes drove flushes from `BudgetExceeded`. They now
+rely on the engine's flushes, handle `FlushRefused` where they waited for
+compaction, and use `EngineStats::flushes`; results recorded above for those
+modes predate 5R and were not re-run.

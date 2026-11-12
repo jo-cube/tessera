@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use tessera::engine::{
     BackgroundError, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
-    Snapshot, SnapshotError, SnapshotLimits, UpdateError,
+    Snapshot, SnapshotError, SnapshotLimits,
 };
-use tessera::memtable::WriteError;
 use tessera::run::MergeWorkspace;
 
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -232,8 +231,10 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     engine.put(b"seen", b"1").unwrap();
     let small = engine.snapshot().unwrap();
     let seen = engine.stats().active.charged;
+    // Nearly full: a write that found no room would flush.
     let mut key = 0u32;
-    while engine.put(&key.to_be_bytes(), &[7; 100]).is_ok() {
+    while engine.stats().active.charged + (4 << 10) <= 256 << 10 {
+        engine.put(&key.to_be_bytes(), &[7; 100]).unwrap();
         key += 1;
     }
     let full = engine.stats().active.charged;
@@ -344,8 +345,8 @@ fn frequent_snapshots_freeze_and_flush_nothing() {
 }
 
 /// A table's budget covers the history its snapshots pin, so a long-lived
-/// snapshot brings the next flush forward, and dropping it frees the room
-/// without a flush.
+/// snapshot brings the next flush forward: the write that finds no room
+/// makes it.
 #[test]
 fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     const BUDGET: usize = 64 << 10;
@@ -359,30 +360,28 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     }
     let live = engine.stats().active.charged;
     let snapshot = engine.snapshot().unwrap();
-    let mut written = 0;
-    let refused = loop {
-        match engine.put(&key(written % 200), &[1; 100]) {
-            Ok(_) => written += 1,
-            Err(error) => break error,
+    let (mut written, mut full) = (0, engine.stats());
+    loop {
+        engine.put(&key(written % 200), &[1; 100]).unwrap();
+        let stats = engine.stats();
+        if stats.runs > 0 {
+            break;
         }
-    };
-    assert!(matches!(
-        refused,
-        UpdateError::Rejected(WriteError::BudgetExceeded { .. })
-    ));
-    let stats = engine.stats();
-    assert!(stats.active.charged <= BUDGET);
-    assert_eq!(stats.active.charged, live + stats.active.pinned);
+        (written, full) = (written + 1, stats);
+    }
+    assert!(full.active.charged <= BUDGET);
+    assert_eq!(full.active.charged, live + full.active.pinned);
+    assert!(full.active.pinned > 0);
     // Every key was overwritten at most once: the leaves and values the
     // snapshot shares are pinned once each.
     assert!(written <= 200, "{written}");
+    let stats = engine.stats();
+    assert_eq!((stats.frozen_tables, stats.active.pinned), (0, 0));
     assert_eq!(scanned(&snapshot, b"k").len(), 200);
     assert!(scanned(&snapshot, b"k").iter().all(|(_, v)| v == &[0; 100]));
 
     drop(snapshot);
-    assert_eq!(engine.stats().active.pinned, 0);
-    engine.put(&key(written % 200), &[1; 100]).unwrap();
-    assert_eq!(engine.stats().frozen_tables, 0);
+    assert_eq!(engine.stats().retained_bytes, 0);
 }
 
 /// A snapshot taken while a flush or compaction is part way through sees

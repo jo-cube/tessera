@@ -41,7 +41,7 @@ use tessera::block::{Block, BlockBuilder, BlockPosition, BlockView, Record, Valu
 use tessera::engine::{
     CompactionOptions, Engine, EngineOptions, EngineWorkspace, SnapshotLimits, UpdateError,
 };
-use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN, WriteError};
+use tessera::memtable::{FrozenMemtable, Memtable, TARGET_RUN_LEN};
 use tessera::run::{
     Codec, LogicalCursor, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run,
     RunBuilder, RunCursor, RunSet, RunView,
@@ -3400,12 +3400,8 @@ fn sustained_run(
             }
         });
 
-        let flush = |out: &mut Sustained, workspace: &mut MergeWorkspace| {
-            let begin = Instant::now();
-            let report = engine.flush().unwrap();
-            out.flush_s += begin.elapsed().as_secs_f64();
-            out.flushes += 1;
-            out.flushed_bytes += report.run_bytes;
+        // What follows each flush, which the writes make themselves.
+        let after_flush = |out: &mut Sustained, workspace: &mut MergeWorkspace| {
             if mode == Mode::Sync {
                 let (begin, cpu) = (Instant::now(), task_cpu_ns("thread-self"));
                 if let Some(report) = engine.compact(options, workspace).unwrap() {
@@ -3424,24 +3420,29 @@ fn sustained_run(
             for &index in order {
                 let record = &records[index];
                 let value = record.value.as_deref().unwrap();
-                let sampled = puts % LATENCY_EVERY == 0;
-                let begin = sampled.then(Instant::now);
-                loop {
-                    match engine.put(&record.key, value) {
-                        Ok(_) => break,
-                        Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                            flush(&mut out, &mut workspace);
-                        }
-                        Err(error) => panic!("{error}"),
-                    }
+                let begin = Instant::now();
+                engine.put(&record.key, value).unwrap();
+                let ns = begin.elapsed().as_nanos() as u64;
+                // Only a write that flushed takes this long, and then it
+                // includes the flush.
+                if ns > 50_000 && engine.stats().flushes != out.flushes as u64 {
+                    out.flushes = engine.stats().flushes as usize;
+                    out.flush_s += ns as f64 / 1e9;
+                    after_flush(&mut out, &mut workspace);
                 }
-                if let Some(begin) = begin {
-                    out.write_latency.push(begin.elapsed().as_nanos() as u64);
+                if puts % LATENCY_EVERY == 0 {
+                    out.write_latency.push(ns);
                 }
                 puts += 1;
             }
         }
-        flush(&mut out, &mut workspace);
+        let begin = Instant::now();
+        engine.flush().unwrap();
+        out.flush_s += begin.elapsed().as_secs_f64();
+        after_flush(&mut out, &mut workspace);
+        let stats = engine.stats();
+        out.flushes = stats.flushes as usize;
+        out.flushed_bytes = stats.flushed_bytes as usize;
         out.write_s = start.elapsed().as_secs_f64();
         let stats = engine.stats();
         (out.pending_runs, out.pending_overlap) = (stats.runs, stats.max_overlap);
@@ -3651,12 +3652,13 @@ impl FlushTally {
     }
 }
 
-/// Puts `value` under `key`, flushing first whenever the memtable is full.
+/// Puts `value` under `key`. The engine flushes when the memtable is full;
+/// a flush the run limits refuse is retried here once compaction has run.
 fn put_flushing(engine: &Engine, key: &[u8], value: &[u8], tally: &mut FlushTally) {
     for _ in 0..3 {
         match engine.put(key, value) {
             Ok(_) => return,
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => tally.flush(engine),
+            Err(UpdateError::FlushRefused(_)) => tally.flush(engine),
             Err(error) => panic!("{error}"),
         }
     }

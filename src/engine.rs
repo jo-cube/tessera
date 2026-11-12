@@ -95,8 +95,9 @@
 //!
 //! # Flushing
 //!
-//! Flushing is explicit. [`Engine::flush`] does the whole job, and
-//! [`Engine::begin_flush`] exposes its stages:
+//! A write the memtables have no room for flushes them itself; see
+//! [Automatic flushing](self#automatic-flushing). [`Engine::flush`] flushes
+//! on demand, and [`Engine::begin_flush`] exposes its stages:
 //!
 //! 1. The active memtable is frozen and replaced, under the lock, unless
 //!    frozen tables are waiting from an abandoned or refused flush.
@@ -108,6 +109,43 @@
 //! Frozen tables stay readable throughout, and no reader sees their runs
 //! until they replace them. A flush abandoned or rejected at any stage leaves
 //! the tables frozen, and the next flush retries them.
+//!
+//! # Automatic flushing
+//!
+//! A write refused only because the memtables are full
+//! ([`WriteError::BudgetExceeded`]) makes room and is retried within the
+//! call, so callers never flush for room. The write waits for the flush slot,
+//! that is for any flush in progress, and retries; if the active table is
+//! still full it freezes it and retries in the successor in the same hold of
+//! the lock, then builds and publishes the flush itself before returning. So
+//! writers that run out of room together wait for one flush, and only the
+//! first to find the table full again starts the next. The successful path
+//! is unchanged: a write that fits takes the lock once, as before.
+//!
+//! A write applied once is never applied again: a retry follows only a
+//! refusal, which changes nothing and uses no sequence number. A write's
+//! record fits a new table, so it fails to land after freezing only if
+//! earlier tables were still frozen; it then retries only after its own
+//! flush of all of them published. So a write runs at most two flushes,
+//! unless callers abandon flush jobs meanwhile, and never retries without a
+//! flush having published.
+//!
+//! A refused flush (see [Memory](self#memory)) is remembered until a flush
+//! or compaction publishes or the run limits change, which is when it could
+//! succeed; until then a write needing room fails at once with
+//! [`UpdateError::FlushRefused`] instead of building the same flush again.
+//! Writes are not held waiting for compaction: the caller can
+//! [`Engine::wait_for_compaction`] or [`Engine::compact`] and retry. A record
+//! larger than a whole budget ([`WriteError::RecordExceedsBudget`]) and every
+//! other refusal are returned as they are.
+//!
+//! Durable writes do the same in their batch's leader; see `group.rs`.
+//!
+//! A write needing room waits only for flushes the engine runs. While a
+//! caller holds a job from [`Engine::begin_flush`], it is refused with
+//! [`WriteError::BudgetExceeded`] as before, since that job's publication is
+//! what makes room; waiting could deadlock if the caller's own thread wrote,
+//! or a durable write of its waited for this writer's batch.
 //!
 //! # Compaction
 //!
@@ -156,17 +194,16 @@
 //! Memtables are limited to two budgets in all: the active table and at most
 //! one frozen table, or several left by abandoned flushes, whose charge
 //! lowers the active table's budget until a flush removes them. When the
-//! active table is full a write is rejected with [`WriteError::BudgetExceeded`]
-//! and the caller should flush. A table's charge includes the nodes and values
+//! active table is full a write flushes it. A table's charge includes the nodes and values
 //! its writes copied or replaced while a snapshot still shares them
 //! ([`MemoryUsage::pinned`]), so the two budgets bound the memtables together
 //! with the history their snapshots pin, and a long-lived snapshot makes
 //! flushes come sooner rather than letting memory grow.
 //!
 //! Published runs are limited by a count and a byte total. Once a flush would
-//! exceed either limit it is rejected, and writes stop when the memtables are
-//! full. Compaction can make room, and [`Engine::set_run_limits`] raises the
-//! limits.
+//! exceed either limit it is rejected, and writes needing room fail with
+//! [`UpdateError::FlushRefused`]. Compaction can make room, and
+//! [`Engine::set_run_limits`] raises the limits.
 //!
 //! A compaction adds, until it publishes, its output and workspace, each
 //! limited by [`CompactionOptions`]. Only one compaction builds at a time,
@@ -180,10 +217,9 @@
 //! more runs or bytes than both the limits, or what it replaces.
 //!
 //! When flushes outpace compaction, the run limits reject flushes, the
-//! memtables fill and writes are rejected with
-//! [`WriteError::BudgetExceeded`]. Nothing waits on its own: a refused flush
-//! asks the worker for a pass, and a caller can
-//! [`Engine::wait_for_compaction`] and retry.
+//! memtables fill and writes are rejected with [`UpdateError::FlushRefused`].
+//! No write waits for compaction on its own: a refused flush asks the worker
+//! for a pass, and a caller can [`Engine::wait_for_compaction`] and retry.
 //!
 //! Snapshots keep memory in two ways, both reported as
 //! [`EngineStats::retained_bytes`]: the history pinned in the engine's
@@ -197,7 +233,7 @@
 //! it lives. While it exceeds [`SnapshotLimits::max_retained_bytes`], new
 //! snapshots are refused and so are compactions, whose output would be held
 //! beside inputs that snapshots keep. That is the backpressure: runs then
-//! accumulate until flushes and finally writes are refused, until snapshots
+//! accumulate until flushes and so writes are refused, until snapshots
 //! are dropped. Each reader's [`EngineWorkspace`] adds one decoded block per
 //! run it reads.
 //!
@@ -230,7 +266,7 @@ pub use worker::{BackgroundError, BackgroundStatus};
 
 use std::fmt;
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
 
 use crate::block::{Record, Value, Version};
@@ -359,20 +395,28 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
-/// Why a write was rejected. The engine is unchanged, and no sequence number
-/// was used, though after [`Self::LogFailed`] the record may survive in the
-/// log.
+/// Why a write was rejected. It was not applied and used no sequence number,
+/// and reads see no change, though after [`Self::LogFailed`] the record may
+/// survive in the log. A flush the write started may have frozen the active
+/// table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateError {
-    /// The memtable refused the update. If it is
-    /// [`WriteError::BudgetExceeded`], flushing makes room.
+    /// The memtable refused the update. A write that does not fit flushes
+    /// instead, so [`WriteError::BudgetExceeded`] is returned only while a
+    /// job from [`Engine::begin_flush`] is held. See
+    /// [Automatic flushing](self#automatic-flushing).
     Rejected(WriteError),
+    /// The memtables are full and the flush that would make room is refused
+    /// by the run limits, now or since they or the runs last changed. Compaction or
+    /// [`Engine::set_run_limits`] can make room.
+    FlushRefused(FlushError),
     /// Every sequence number has been used.
     SequencesExhausted,
     /// Logging this write failed (its append or sync, or the thread logging
     /// its batch panicked: [`std::io::ErrorKind::Other`]), so it was not
     /// applied, but its record may survive and be recovered: its outcome is
-    /// uncertain until the database is reopened. The log is now closed. See "Durable writes" in `src/engine/wal.rs`.
+    /// uncertain until the database is reopened. The log is now closed. See
+    /// "Durable writes" in `src/engine/wal.rs`.
     LogFailed(std::io::ErrorKind),
     /// An earlier log failure closed the log: nothing was logged. Reopen the
     /// database to write again.
@@ -391,6 +435,7 @@ impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(error) => error.fmt(f),
+            Self::FlushRefused(error) => write!(f, "the memtables are full and {error}"),
             Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
             Self::LogFailed(kind) => {
                 write!(f, "logging the write failed ({kind}); the log is closed")
@@ -486,6 +531,11 @@ pub struct EngineStats {
     pub retained_run_bytes: usize,
     /// The part of `retained_bytes` that is those runs' filters.
     pub retained_filter_bytes: usize,
+    /// Flushes published since the engine started, whether a write or the
+    /// caller started them.
+    pub flushes: u64,
+    /// Stored bytes those flushes published.
+    pub flushed_bytes: u64,
 }
 
 struct State {
@@ -510,6 +560,13 @@ struct State {
     /// taken at. Every write raises `last_seq`, so while it is unchanged the
     /// snapshot still equals the active table and can be shared.
     last_view: Option<(u64, Weak<FrozenMemtable>)>,
+    /// The last flush's refusal, until a flush or compaction publishes or
+    /// the run limits change: the same flush would be refused again, so a
+    /// write needing room does not build it.
+    refused: Option<FlushError>,
+    /// Flushes published, and their stored bytes.
+    flushes: u64,
+    flushed_bytes: u64,
 }
 
 /// A source the engine released, with the bytes it accounts for.
@@ -592,7 +649,7 @@ struct Core {
     /// overtaking a waiting writer. The standard lock does not promise this.
     gate: Mutex<()>,
     /// Held by a flush from start to end, so that flushes run one at a time.
-    flushing: Mutex<()>,
+    flushing: FlushSlot,
     /// Held by a compaction from selection to publication, so that runs are
     /// removed by one compaction at a time.
     compacting: Mutex<()>,
@@ -793,9 +850,12 @@ impl Core {
                 max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
                 last_view: None,
+                refused: None,
+                flushes: 0,
+                flushed_bytes: 0,
             }),
             gate: Mutex::new(()),
-            flushing: Mutex::new(()),
+            flushing: FlushSlot::default(),
             compacting: Mutex::new(()),
             checkpointing: Mutex::new(()),
             durable: std::sync::OnceLock::new(),
@@ -823,7 +883,81 @@ impl Core {
         if let Some(durable) = self.durable.get() {
             return self.update_durable(durable, key, value);
         }
-        let mut state = self.write_state();
+        let written = self.write(&mut self.write_state(), key, value);
+        if is_full(&written) {
+            return self.write_making_room(key, value, written);
+        }
+        written
+    }
+
+    /// A RAM-only write the memtables had no room for, refused with
+    /// `written`. See [Automatic flushing](self#automatic-flushing).
+    #[cold]
+    fn write_making_room(
+        &self,
+        key: &[u8],
+        value: Value<'_>,
+        mut written: Result<u64, UpdateError>,
+    ) -> Result<u64, UpdateError> {
+        loop {
+            // While a caller holds the slot, that job's publication makes room.
+            let Some(serial) = self.flushing.take_for_room() else {
+                return written;
+            };
+            let mut state = self.write_state();
+            // A flush that finished while this waited may have made room.
+            written = self.write(&mut state, key, value);
+            if !is_full(&written) {
+                return written;
+            }
+            let job = match self.begin_making_room(serial, &mut state) {
+                Ok(Some(job)) => job,
+                Ok(None) => return written,
+                Err(refused) => return Err(UpdateError::FlushRefused(refused)),
+            };
+            // Fits the new active table unless tables were already frozen.
+            written = self.write(&mut state, key, value);
+            drop(state);
+            let flushed = job.build().publish();
+            if !is_full(&written) {
+                return written;
+            }
+            flushed.map_err(UpdateError::FlushRefused)?;
+        }
+    }
+
+    /// Freezes the active table for durable writes the memtables refused,
+    /// returning the flush of every frozen table, which its batch's leader
+    /// publishes after committing the batch; `None` while a caller holds a
+    /// flush job. See [Automatic flushing](self#automatic-flushing).
+    pub(super) fn freeze_for_room(&self) -> Option<Result<Option<FlushJob<'_>>, FlushError>> {
+        let serial = self.flushing.take_for_room()?;
+        Some(self.begin_making_room(serial, &mut self.write_state()))
+    }
+
+    /// With the flush slot `serial`, freezes the active table and returns a
+    /// flush of every frozen table, or `None` if nothing is in memory. Returns
+    /// the last refusal instead if it still stands.
+    fn begin_making_room<'e>(
+        &'e self,
+        serial: SlotGuard<'e>,
+        state: &mut State,
+    ) -> Result<Option<FlushJob<'e>>, FlushError> {
+        if let Some(refused) = state.refused {
+            return Err(refused);
+        }
+        if !state.active.is_empty() {
+            self.freeze_active(state);
+        }
+        Ok((!state.frozen.is_empty()).then(|| FlushJob {
+            engine: self,
+            _serial: serial,
+            tables: state.frozen.clone(),
+        }))
+    }
+
+    /// Applies a RAM-only write to the active table.
+    fn write(&self, state: &mut State, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
         let seq = state
             .last_seq
             .checked_add(1)
@@ -832,7 +966,7 @@ impl Core {
             Value::Bytes(bytes) => state.active.put(key, seq, bytes),
             Value::Tombstone => state.active.delete(key, seq),
         };
-        written.map_err(|error| UpdateError::Rejected(self.reason(&state, error)))?;
+        written.map_err(|error| UpdateError::Rejected(self.reason(state, error)))?;
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         Ok(seq)
@@ -968,22 +1102,20 @@ impl Core {
     }
 
     fn flush(&self) -> Result<FlushReport, FlushError> {
-        match self.begin(true) {
+        match self.begin(true, Holder::Engine) {
             Some(job) => job.build().publish(),
             None => Ok(FlushReport::default()),
         }
     }
 
     fn begin_flush(&self) -> Option<FlushJob<'_>> {
-        self.begin(false)
+        self.begin(false, Holder::Caller)
     }
 
     /// Starts a flush of every frozen table, freezing the active one first if
     /// `with_active` or if no table is frozen.
-    fn begin(&self, with_active: bool) -> Option<FlushJob<'_>> {
-        // This mutex guards no data, so a panic elsewhere leaves nothing to
-        // distrust, and the flush must stay retryable.
-        let serial = self.flushing.lock().unwrap_or_else(PoisonError::into_inner);
+    fn begin(&self, with_active: bool, holder: Holder) -> Option<FlushJob<'_>> {
+        let serial = self.flushing.take(holder);
         let mut state = self.write_state();
         if !state.active.is_empty() && (with_active || state.frozen.is_empty()) {
             self.freeze_active(&mut state);
@@ -1074,6 +1206,7 @@ impl Core {
         let mut state = self.write_state();
         state.max_runs = max_runs;
         state.max_run_bytes = max_run_bytes;
+        state.refused = None;
         drop(state);
         self.notify_worker();
     }
@@ -1111,6 +1244,8 @@ impl Core {
             retained_bytes: retained.bytes,
             retained_run_bytes: retained.run_bytes,
             retained_filter_bytes: retained.filter_bytes,
+            flushes: state.flushes,
+            flushed_bytes: state.flushed_bytes,
         }
     }
 
@@ -1128,6 +1263,14 @@ impl Core {
         // The gate guards no data, so a panic elsewhere leaves nothing wrong.
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Whether a write was refused only because the memtables are full.
+fn is_full<T>(outcome: &Result<T, UpdateError>) -> bool {
+    matches!(
+        outcome,
+        Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. }))
+    )
 }
 
 /// Returns the most runs whose inclusive key ranges share a key.
@@ -1185,13 +1328,85 @@ impl fmt::Debug for Engine {
 /// A flush whose tables are frozen and whose runs are not built yet.
 ///
 /// Dropping it abandons the flush and keeps the tables frozen. Holding it
-/// blocks other flushes, but not reads, writes or snapshots.
+/// blocks other flushes, but not reads, writes or snapshots; a write that
+/// needs room meanwhile is refused with [`WriteError::BudgetExceeded`].
 pub struct FlushJob<'e> {
     engine: &'e Core,
-    _serial: MutexGuard<'e, ()>,
+    _serial: SlotGuard<'e>,
     /// Oldest first: a prefix of the state's frozen tables, since only
     /// flushes, one at a time, add or remove them.
     tables: Vec<Arc<FrozenMemtable>>,
+}
+
+/// Who holds the [`FlushSlot`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// A flush the engine runs to completion: [`Engine::flush`] or a write's.
+    Engine,
+    /// A [`FlushJob`] from [`Engine::begin_flush`], which its caller holds
+    /// for as long as it likes.
+    Caller,
+}
+
+/// Lets one flush run at a time. A write that needs room waits for a flush
+/// the engine is running, but not for a job a caller holds: that caller may
+/// be the writer's own thread, or wait for the writer, as a durable write
+/// waits for its batch's leader.
+#[derive(Default)]
+struct FlushSlot {
+    // Guards no data beyond itself, so a panic elsewhere leaves nothing to
+    // distrust, and the flush must stay retryable.
+    held: Mutex<Option<Holder>>,
+    freed: Condvar,
+}
+
+impl FlushSlot {
+    fn lock(&self) -> MutexGuard<'_, Option<Holder>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for the slot and takes it.
+    fn take(&self, holder: Holder) -> SlotGuard<'_> {
+        let mut held = self.lock();
+        while held.is_some() {
+            held = self
+                .freed
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *held = Some(holder);
+        SlotGuard(self)
+    }
+
+    /// Waits for the slot and takes it for a write that needs room, or
+    /// returns `None` once a caller holds it.
+    fn take_for_room(&self) -> Option<SlotGuard<'_>> {
+        let mut held = self.lock();
+        loop {
+            match *held {
+                None => break,
+                Some(Holder::Caller) => return None,
+                Some(Holder::Engine) => {
+                    held = self
+                        .freed
+                        .wait(held)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+        }
+        *held = Some(Holder::Engine);
+        Some(SlotGuard(self))
+    }
+}
+
+/// Frees the [`FlushSlot`] when dropped.
+struct SlotGuard<'s>(&'s FlushSlot);
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock() = None;
+        self.0.freed.notify_all();
+    }
 }
 
 impl<'e> FlushJob<'e> {
@@ -1260,6 +1475,7 @@ impl BuiltFlush<'_> {
                 run_bytes: total_bytes,
                 max_run_bytes: state.max_run_bytes,
             };
+            state.refused = Some(error);
             drop(state);
             // Compaction is what makes room. A pass that failed earlier, say
             // while snapshots retained too much, is otherwise not retried.
@@ -1277,6 +1493,9 @@ impl BuiltFlush<'_> {
         state.runs.extend(published(runs));
         state.run_bytes += report.run_bytes;
         state.filter_bytes += report.filter_bytes;
+        state.refused = None;
+        state.flushes += 1;
+        state.flushed_bytes += report.run_bytes as u64;
         for table in state.frozen.drain(..flushed).collect::<Vec<_>>() {
             // This and the job's are the engine's references, and snapshots
             // are taken only under the lock, so any other is a snapshot's,
@@ -1685,6 +1904,7 @@ impl BuiltCompaction<'_> {
         state.runs.extend(published(output.runs));
         state.run_bytes = stored;
         state.filter_bytes = filters;
+        state.refused = None;
         for input in &job.inputs {
             let (bytes, filter) = (input.run.as_bytes().len(), input.run.filter_bytes());
             state.retire(

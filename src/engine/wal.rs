@@ -20,7 +20,11 @@
 //! its record is durable, it is **acknowledged** (its sequence number
 //! returned) only after that, no record is logged for a write the engine
 //! refused, and none logged is left unapplied. Reads proceed while a batch
-//! syncs, and see the state before it.
+//! syncs, and see the state before it. A write the memtables have no room
+//! for is not logged until a flush has made room: the leader defers it, with
+//! the writes behind it, flushes, and commits them in order; if the run
+//! limits refuse that flush, they fail with [`UpdateError::FlushRefused`],
+//! unlogged.
 //!
 //! **Recovered history.** Every acknowledged write is recovered, under the
 //! filesystem assumptions below. Recovery may also include writes after them
@@ -1744,7 +1748,7 @@ mod tests {
 
     /// A snapshot taken while a record syncs can leave its update no longer
     /// fitting the budget; it is logged, so it is applied, over the budget by
-    /// that update, and the next write is refused as usual.
+    /// that update, and the next write flushes as usual.
     #[test]
     fn a_logged_update_is_applied_even_if_the_budget_shrank_while_it_synced() {
         let dir = scratch("over-budget");
@@ -1753,8 +1757,10 @@ mod tests {
             ..EngineOptions::default()
         };
         let engine = Engine::create(&dir, options, small()).unwrap();
+        let charge = 4 + 100 + crate::memtable::ENTRY_OVERHEAD;
         let mut keys = 0u32;
-        while engine.put(&keys.to_be_bytes(), &[1; 100]).is_ok() {
+        while engine.stats().active.charged + charge <= 16 << 10 {
+            engine.put(&keys.to_be_bytes(), &[1; 100]).unwrap();
             keys += 1;
         }
         // Fits now, replacing a value of the same length...
@@ -1771,15 +1777,15 @@ mod tests {
         let active = engine.stats().active;
         assert!(active.charged > active.budget, "{active:?}");
         assert_eq!(get(&engine, &0u32.to_be_bytes()), Some(vec![2; 100]));
-        assert!(matches!(
-            engine.put(&1u32.to_be_bytes(), &[3; 100]),
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. }))
-        ));
+        let next = engine.put(&1u32.to_be_bytes(), &[3; 100]).unwrap();
+        assert_eq!(next, seq + 1);
+        assert_eq!(engine.stats().runs, 1);
         drop(snapshot);
         drop(engine);
         let (engine, report) = Engine::open(&dir, options, small()).unwrap();
-        assert_eq!(report.last_seq, seq);
+        assert_eq!(report.last_seq, next);
         assert_eq!(get(&engine, &0u32.to_be_bytes()), Some(vec![2; 100]));
+        assert_eq!(get(&engine, &1u32.to_be_bytes()), Some(vec![3; 100]));
         drop(engine);
         fs::remove_dir_all(&dir).unwrap();
     }

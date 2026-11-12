@@ -14,7 +14,6 @@ use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions,
     EngineWorkspace, LogDamage, RecoveryError, UpdateError, Verdict,
 };
-use tessera::memtable::WriteError;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -75,24 +74,21 @@ fn open(dir: &Path) -> Engine {
         .0
 }
 
-/// Writes (or deletes, without a value), flushing when the memtables are
-/// full.
+/// Writes (or deletes, without a value), waiting for compaction when the
+/// run limits refuse the flush the write needs.
 fn write(engine: &Engine, key: &[u8], value: Option<&[u8]>) -> u64 {
-    loop {
+    for _ in 0..100 {
         let result = match value {
             Some(value) => engine.put(key, value),
             None => engine.delete(key),
         };
         match result {
             Ok(seq) => return seq,
-            Err(UpdateError::Rejected(WriteError::BudgetExceeded { .. })) => {
-                if engine.flush().is_err() {
-                    engine.wait_for_compaction().unwrap();
-                }
-            }
+            Err(UpdateError::FlushRefused(_)) => engine.wait_for_compaction().unwrap(),
             Err(error) => panic!("{error}"),
         }
     }
+    panic!("compaction made no room");
 }
 
 #[test]
@@ -626,4 +622,164 @@ fn a_full_log_refuses_writes_until_a_checkpoint_prunes_it() {
     let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), durable).unwrap();
     assert_eq!(report.last_seq, acked + 1);
     assert_eq!(contents(&engine).len() as u64, acked + 1);
+}
+
+/// A durable write that fills the table flushes it and is logged once. While
+/// the run limits refuse the flush a write needs, the write is refused before
+/// it is logged; raising them lets the next write flush, and recovery holds
+/// every acknowledged write and nothing refused.
+#[test]
+fn durable_writes_flush_for_room_and_log_nothing_when_refused() {
+    let scratch = Scratch::new("room");
+    let options = EngineOptions {
+        memtable_budget: 4 << 10,
+        ..EngineOptions::default()
+    };
+    let engine = Engine::create(&scratch.0, options, small()).unwrap();
+    let mut model = Model::new();
+    let mut put = |engine: &Engine, at: u32| {
+        let key = (at % 100).to_be_bytes().to_vec();
+        let result = engine.put(&key, &at.to_be_bytes().repeat(25));
+        if result.is_ok() {
+            model.insert(key, at.to_be_bytes().repeat(25));
+        }
+        result
+    };
+    for at in 0..100 {
+        assert_eq!(put(&engine, at), Ok(u64::from(at) + 1));
+    }
+    let stats = engine.stats();
+    assert!(stats.flushes > 0, "{stats:?}");
+    assert_eq!(engine.log_status().unwrap().records, 100);
+
+    engine.set_run_limits(0, 0);
+    let mut at = 100;
+    let refused = loop {
+        match put(&engine, at) {
+            Ok(_) => at += 1,
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(refused, UpdateError::FlushRefused(_)), "{refused}");
+    let (stats, log) = (engine.stats(), engine.log_status().unwrap());
+    assert_eq!(log.records, stats.last_seq);
+    assert_eq!(put(&engine, at), Err(refused));
+    assert_eq!(engine.log_status().unwrap().records, log.records);
+    assert_eq!(engine.stats(), stats);
+
+    engine.set_run_limits(64, usize::MAX);
+    assert_eq!(put(&engine, at), Ok(stats.last_seq + 1));
+    assert_eq!(engine.stats().flushes, stats.flushes + 1);
+    drop(engine);
+    let (engine, report) = Engine::open(&scratch.0, options, small()).unwrap();
+    assert_eq!(report.last_seq, stats.last_seq + 1);
+    assert_eq!(contents(&engine), model);
+}
+
+/// Durable writers that keep filling a small table, beside durable
+/// checkpoints and readers, flush without deadlock among the queue, the log,
+/// the flush slot and the state lock, and every acknowledged write is
+/// recovered once.
+#[test]
+fn concurrent_durable_writers_flush_beside_checkpoints_and_recover() {
+    const WRITERS: u8 = 4;
+    const EACH: u32 = 300;
+    let scratch = Scratch::new("concurrent-room");
+    let options = EngineOptions {
+        memtable_budget: 16 << 10,
+        background_compaction: Some(CompactionOptions::default()),
+        ..EngineOptions::default()
+    };
+    let durable = DurableOptions {
+        segment_bytes: 16 << 10,
+        ..DurableOptions::default()
+    };
+    let engine = Engine::create(&scratch.0, options, durable).unwrap();
+    let key = |writer: u8, at: u32| [&[writer][..], &at.to_be_bytes()].concat();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let seqs = thread::scope(|scope| {
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let engine = &engine;
+                scope.spawn(move || {
+                    (0..EACH)
+                        .map(|at| write(engine, &key(writer, at), Some(&[writer; 200])))
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let checkpoints = scope.spawn(|| {
+            let mut taken = 0;
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                engine
+                    .durable_checkpoint(CheckpointOptions::default())
+                    .unwrap();
+                taken += 1;
+            }
+            taken
+        });
+        scope.spawn(|| {
+            let mut workspace = EngineWorkspace::new();
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                engine.get(&key(0, 0), &mut workspace).unwrap();
+                let guard = engine.read();
+                let mut scan = guard.scan_prefix(&[1], &mut workspace);
+                while scan.next_record().unwrap().is_some() {}
+            }
+        });
+        let seqs: Vec<u64> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        assert!(checkpoints.join().unwrap() > 0);
+        seqs
+    });
+    let total = u64::from(WRITERS) * u64::from(EACH);
+    let mut sorted = seqs;
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=total).collect::<Vec<_>>());
+    assert!(engine.stats().flushes > 10, "{:?}", engine.stats());
+    let expected: Model = (0..WRITERS)
+        .flat_map(|writer| (0..EACH).map(move |at| (key(writer, at), vec![writer; 200])))
+        .collect();
+    assert_eq!(contents(&engine), expected);
+    drop(engine);
+    let (engine, report) = Engine::open(&scratch.0, options, durable).unwrap();
+    assert_eq!(report.last_seq, total);
+    assert_eq!(contents(&engine), expected);
+}
+
+/// A durable write needing room does not wait for a flush job its caller
+/// holds, which would deadlock: it is refused, unlogged, until the job is
+/// published.
+#[test]
+fn a_durable_write_needing_room_beside_a_held_flush_job_is_refused_unlogged() {
+    let scratch = Scratch::new("held-job");
+    let options = EngineOptions {
+        memtable_budget: 4 << 10,
+        ..EngineOptions::default()
+    };
+    let engine = Engine::create(&scratch.0, options, small()).unwrap();
+    engine.put(b"a", &[1; 100]).unwrap();
+    let job = engine.begin_flush().unwrap();
+    let mut at = 0u32;
+    let refused = loop {
+        match engine.put(&at.to_be_bytes(), &[2; 100]) {
+            Ok(_) => at += 1,
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            refused,
+            UpdateError::Rejected(tessera::memtable::WriteError::BudgetExceeded { .. })
+        ),
+        "{refused}"
+    );
+    let records = engine.log_status().unwrap().records;
+    assert_eq!(records, engine.stats().last_seq);
+    job.build().publish().unwrap();
+    engine.put(&at.to_be_bytes(), &[2; 100]).unwrap();
+    assert_eq!(engine.log_status().unwrap().records, records + 1);
 }
