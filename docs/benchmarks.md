@@ -77,6 +77,9 @@ Kinds of result in this file:
   RocksDB's own dictionaries, on JSON and document data, a mixed
   read/write workload, and a run-layer study of dictionary reuse; the
   engine is unchanged.
+- **Sustained writes:** the 5AH section, background compaction under a
+  paced write workload, the overlap allowance's trade-off, and 5AG's
+  comparison repeated at normal speed; the engine is unchanged.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -3140,6 +3143,11 @@ not with the tables above.**
   to 15 runs, 14 with dictionaries, 6 distinct. The density benefit is
   therefore mostly in the base, and the number of distinct dictionaries
   stays near the 5AF curve's low end (4.0 µs at 5).
+  *Corrected in 5AH:* the replay writes about 30 times faster than the
+  harness, because it does not read, so its compaction falls behind; at
+  the harness's rate, compaction keeps up and converts each flushed run
+  within about 1 s of becoming eligible. What stays plain is up to four
+  flushed runs that `max_overlap` 4 tolerates by design.
 
 ### Dictionary reuse (run layer, M)
 
@@ -3232,9 +3240,10 @@ per setup in the slowed state.
   RocksDB's dictionary setups (relative, not replicated at normal speed).
 - **Where it does not:** localized reads against a block cache (6–7× slower:
   4.7–5.5 against 0.75–0.83 µs), filtered misses (0.3–0.4 against 0.2 µs),
-  stable memory after sustained writes (lazy compaction keeps 14 runs and
-  14–19% more resident memory than RocksDB), and long scans against
-  Tessera's own 16 KiB default (4–12% slower).
+  stable memory after sustained writes (14 runs and 14–19% more resident
+  memory than RocksDB; 5AH traces it to versions the overlap allowance
+  leaves behind, not to lazy compaction), and long scans against Tessera's
+  own 16 KiB default (4–17% slower).
 - **Limits:** one RocksDB version (7.8.3, 2022) from a distribution
   package, so newer releases' dictionary and cache work is not
   represented; two dataset families at 64 and 16 groups; one CPU-bound
@@ -3242,11 +3251,209 @@ per setup in the slowed state.
   the mixed workload in a slowed machine state; RocksDB's dictionary
   sizes set to Tessera's, not tuned for RocksDB.
 
-**Decision:** keep `Compression::ZstdDictionary` opt-in and unchanged,
-and do not build dictionary reuse. The advantage is real at equal
-density and block size, but it is a latency advantage on uniform reads
-and scans, not a density one, and the mixed workload shows lazy
-compaction leaving new data plain and memory above RocksDB's.
+**Decision:** keep `Compression::ZstdDictionary` opt-in and unchanged, and
+do not build dictionary reuse. The advantage is real at equal density and
+block size, but it is a latency advantage on uniform reads and scans, not a
+density one, and the mixed workload leaves Tessera's memory above RocksDB's
+(see 5AH for the cause).
+
+## Background compaction under sustained writes (5AH)
+
+*Diagnosis and policy evaluation; no engine change.* Does Tessera keep
+its dictionary-compressed read and memory advantages while writes
+continue, and does background compaction need a policy change? Labels:
+**M** measured, **D** derived, **A** assumed.
+
+### Environment and replication
+
+The slowdown that affected 5AG persisted into this milestone (Tessera
+16 KiB JSON load 3.44 s against 1.82 s) and cleared after the host slept.
+A probe before and after the measurements below read 1.75 and 1.78 s
+(load), 9.27 s (overlapping reads) and 13.88 µs (present p50), as 5AG's
+pass 1. Everything in this section was measured at that speed, except
+where marked; compaction counts and bytes, which depend only on the write
+sequence while compaction keeps up, matched exactly across both states.
+
+**5AG repeated at normal speed (M):** `tessera-dict` and
+`rocksdb-4k-dict` on `json:64`, ABBA order, then one mixed run each.
+
+| measurement | Tessera 4 KiB + dictionary | RocksDB 4 KiB + dictionary |
+|---|---|---|
+| present p50 (p99), consolidated | 5.17–5.46 µs (7.5–8.3) | 8.21–8.25 µs (12.0–12.4) |
+| present p50, overlapping | 5.04–5.38 µs | 8.34–8.38 µs |
+| short scan p50 (first record) | 22.5–23.1 µs (5.4–5.8) | 40.5–41.0 µs (8.7–8.8) |
+| long scan, M rec/s | 1.65–1.72 | 0.81–0.91 |
+| resident, consolidated | 129.3–129.4 MiB | 128.0–134.1 MiB |
+| peak during the run | 302 MiB | 494–539 MiB |
+| mixed get p50/p99 | 5.54/11.8 µs | 10.38/20.4 µs |
+| mixed short scan p50/p99 | 38.3/68.1 µs | 66.3/129.9 µs |
+| mixed put p50/p99 | 0.88/1.96 µs | 2.21/7.17 µs |
+| mixed writes/s (read-bound) | 10,665 | 6,201 |
+| mixed background CPU | 2.3 s | 6.5 s |
+| stored bytes written per logical byte in the mixed phase (D) | 0.57 | 0.73 |
+| resident after the mixed phase | 347.6 MiB (207.3 runs, 62.7 memtable) | 288.8 MiB (158.2 SSTs, 55 memtable) |
+| peak during the mixed phase | 458 MiB | 651 MiB |
+
+- The 5AG ordering holds: lookups 1.5–1.6× faster than RocksDB with
+  dictionaries (5AG pass 1: 1.7–1.9×), short and long scans 1.8–2.0×,
+  equal stable memory, lower peaks. Tessera's own dictionary lookup
+  varies between sessions (4.83 µs in 5AG pass 1, 5.17–5.46 here,
+  5.46–5.71 in 5AF), the placement-dependent part 5AF left unexplained.
+- Write amplification (D) uses 414.75 MiB of logical writes (786,432
+  values of the generator's average size) against Tessera's flushed plus
+  compacted output (121.0 + 116.5 MiB) and RocksDB's flushed plus
+  compaction-written bytes (88.1 + 215.0 MiB). RocksDB compresses its
+  flushes with the dictionary too; Tessera's flushes are plain.
+
+### How background compaction proceeds
+
+From the code (`src/engine.rs` `select`, `src/engine/worker.rs`):
+
+- **Eligibility:** a compaction exists when some key is covered by more
+  than `max_overlap` runs (4 by default), or, with no overlap, when there
+  are more than `disjoint_runs_above` runs (16). It merges the fewest of
+  the smallest runs covering the deepest key that bring it within the
+  allowance, then each next run no larger than those taken (at most 8
+  inputs, 256 MiB).
+- **Scheduling:** every flush requests a pass; the single worker
+  compacts until nothing is eligible. Requests are counted, not queued.
+- **Dictionaries:** flushes write plain runs; a compaction trains one
+  when its decoded input is at least 6.4 MiB, its workspace fits (about
+  20 MiB beside the merge, against 64 MiB) and the estimate saves at
+  least 10%. Every flushed run here (about 17 MiB stored) qualifies.
+
+Random updates make every flush span the whole key space, so each flush
+adds one to the overlap everywhere: three flushes are tolerated, the
+fourth makes a compaction eligible.
+
+### Instrument
+
+`sustained_compaction` (`src/run/tests/sustained.rs`, ignored) loads 7 of
+every 8 keys of `json:64` (917,504 records, 116 MiB in 9 dictionary
+runs after consolidation) and then runs a paced workload: per step, an
+update, or a delete (15% of present keys), or an insert when the key is
+absent, then four uniform lookups, each value checked, and one short
+prefix scan. The same reads at the same pace run before the writes and
+after compaction settles, so read latencies compare like with like (the
+paced loop's latencies are higher than the harness's unpaced ones,
+because its caches cool between steps). A thread samples every 50 ms:
+runs, overlap, dictionary and plain bytes, distinct prepared
+dictionaries, the worker's state, rewritten bytes, failures, the
+worker's CPU and RSS. A full scan checks every record at the end.
+`SUSTAIN_READS=0` drops the reads to follow many cycles quickly.
+
+### What happens under sustained writes (M)
+
+3,000 writes/s for 300 s (900,000 writes: 114,225 inserts, 667,955
+updates, 117,820 deletes; 413.5 MiB logical), default policy:
+
+- **A flush every 38.8 s** (about 116,000 writes), each a plain
+  full-range run of 16.9 MiB; overlap 2, 3, 4, then 5 at the fourth.
+- **No deferral:** the worker was busy in the same 50 ms sample in which
+  the overlap first exceeded 4, every time. Busy periods were 1.1 and
+  0.9 s; the worker was busy 1% of the active phase and used 2.0 CPU
+  seconds. No failure or refusal occurred (run, input, output, workspace
+  and retention limits were never reached).
+- **Each episode converted all plain data:** plain bytes reached 67.7 MiB
+  (four flushes) and returned to 0, with one or two compactions writing
+  dictionary runs. Dictionary coverage averaged 88% of run bytes.
+- **Stale versions are the cost.** The live data stayed the same size
+  (913,909 records at the end against 917,504), but run bytes grew from
+  116.3 to 174.3 MiB in 13 runs. A compaction merges the flushed runs with
+  the smallest base run covering the deepest key; the versions that the new
+  data replaces in the other base runs stay until those runs are merged in
+  turn. At the end every run had a dictionary, so the excess is retained
+  versions and tombstones, not plain data: about 58.5 MiB, a third of the
+  run bytes (D: 174.3 MiB against the base's density for the 913,909 live
+  records, 115.8 MiB).
+- **Amplification (M):** 118.4 MiB flushed in 7 flushes and 111.9 MiB
+  written by 3 compactions: 0.56 stored bytes per logical byte.
+
+Of the six cases the milestone distinguished, this is the first: between
+triggers no compaction is eligible under the policy, by design. It is
+not scheduling delay (eligible work started within 50 ms), not
+throughput (busy 1%), not refusal (none), not too-small inputs (every
+compaction trained a dictionary) and not a write rate that outruns
+compaction (at 25,000 writes/s without reads, below, the worker was busy
+12%). 5AG's replay, which showed compaction falling behind, wrote about
+30 times faster than its harness.
+
+### Over many cycles, and the overlap allowance (M)
+
+Write-only at 25,000 writes/s for 160 s (4,000,000 writes, 1,839 MiB
+logical, 34 flushes), per `max_overlap`:
+
+| `max_overlap` | compactions | stored written per logical byte (flush + compaction) | worker busy / CPU | mean runs, overlap | mean run MiB (run-byte amplification, to 116 live) | settled run MiB | mean dictionary coverage | reads after: get / short scan p50 (before: 3.9–4.0 / 16.3–16.6) |
+|---|---|---|---|---|---|---|---|---|
+| 4 (default) | 27 | 0.88 (0.31 + 0.56) | 12% / 18.5 s | 12.0, 3.7 | 161.8 (1.39×) | 158.7 | 93% | 4.79 / 32.5 µs |
+| 3 | 51 | 1.29 (0.31 + 0.97) | 19% / 29.2 s | 11.1, 3.0 | 142.2 (1.22×) | 131.2 | 96% | 4.63 / 22.7 µs |
+| 2 | 109 | 2.14 (0.31 + 1.83) | 34% / 53.4 s | 10.0, 2.3 | 128.4 (1.11×) | 121.7 | 98% | 4.46 / 17.7 µs |
+
+Two different amplifications appear here: *write amplification* is the
+stored bytes written per logical byte written; *run-byte amplification*
+is the run bytes held per byte that the live records need at the base's
+density, a measure of space.
+
+- **Stale data is bounded.** Under the default, run bytes oscillate
+  between about 135 and 180 MiB over eight cycles rather than growing:
+  each cycle merges another base run and drops its replaced versions.
+- **The allowance trades rewriting for density and scans.** Going from 4
+  to 2 rewrites 3.3× as many bytes and uses 2.9× the worker CPU, for 21%
+  fewer run bytes on average and short scans after the workload within
+  9% of the pre-write state (against 96% slower at 4). Point lookups
+  differ little (filters skip the extra runs).
+
+Paired at the realistic rate (3,000 writes/s with reads, 300 s):
+
+| `max_overlap` | stored written per logical byte | worker CPU | mean run MiB | settled run MiB | mean RSS / peak RSS | active put p50 | active short scan p50 | short scan after p50 |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 0.56 | 2.0 s | 156.3 | 174.3 | 335 / 405 MiB | 3.79 µs | 90.9 µs | 99.5 µs |
+| 2 | 1.54 | 8.4 s | 129.1 | 123.2 | 345 / 450 MiB | 4.88 µs | 78.9 µs | 73.1 µs |
+
+Gets were 15.7–20.3 µs throughout in both, within this paced loop's noise.
+At 2, run memory falls 17% on average and 29% once settled, and scans are
+13–26% faster, but process memory during the writes is no lower (the extra
+compactions' buffers offset the smaller runs), the peak is 11% higher, puts
+are 29% slower, and 2.75 times the stored bytes are written.
+
+### Assessment
+
+- **No policy change.** No scheduling, progress or admission defect
+  exists: eligible compactions start at once, finish in about a second,
+  are never refused and convert flushed data to dictionary runs. What
+  remains plain is up to three tolerated flushes, and what costs memory
+  is replaced versions that the overlap allowance leaves until their run
+  is next merged. Both are the intended price of the default's low write
+  amplification (0.56–0.88 stored bytes per logical byte), and the
+  allowance is already a setting: `max_overlap` 2 or 3 suits workloads
+  that value scan latency and settled density over rewriting. Lowering
+  the default would make every workload pay 1.5–2.4× the rewriting for a
+  benefit that only scan-heavy ones see.
+- **Competitively (M):** under the mixed workload Tessera keeps its read
+  advantage (gets 1.9×, short scans 1.7× faster than RocksDB with
+  dictionaries) with cheaper puts, a third of the background CPU and a lower
+  peak, while writing fewer stored bytes. RocksDB keeps less data resident
+  after the writes (288.8 against 347.6 MiB; SSTs 158.2 against runs 207.3
+  MiB). The likely reasons (A) are that its flushes are
+  dictionary-compressed and its levelled compaction leaves fewer replaced
+  versions, where Tessera's flushes are plain and it tolerates overlap.
+- **Limits:** one dataset (JSON), uniform random keys (the worst case for
+  full-range flushes), one rate per comparison, a 50 ms sampling
+  resolution, and no split of compaction time into selection,
+  construction and publication (selection is quadratic in at most 16
+  runs and publication is a state swap, so A: construction dominates).
+  The host slept during two earlier diagnostic runs; their in-test clocks
+  were consistent and they are not used above.
+
+### Reproduction
+
+```sh
+scripts/validate.sh exec 1500 env SUSTAIN_RATE=3000 SUSTAIN_SECS=300 SUSTAIN_OVERLAP=4 \
+  cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
+scripts/validate.sh exec 1500 env SUSTAIN_READS=0 SUSTAIN_RATE=25000 SUSTAIN_SECS=160 \
+  SUSTAIN_READ_SECS=10 SUSTAIN_OVERLAP=2 \
+  cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
+```
 
 ## Historical results
 

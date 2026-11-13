@@ -1136,7 +1136,9 @@ fn dictionary_reuse_costs() {
 /// default) with background compaction, without its reads: what runs and
 /// dictionaries it leaves after each round, which the harness cannot see.
 /// The load, consolidation and overwrites match the harness's; the timing
-/// of background compactions does not.
+/// of background compactions does not. Without reads it writes about 30
+/// times faster than the harness, so compaction falls behind here where it
+/// keeps up there (5AH); `sustained` paces its writes.
 #[test]
 #[ignore = "a measurement: run in release with --ignored --nocapture"]
 fn mixed_dictionary_counts() {
@@ -1174,16 +1176,25 @@ fn mixed_dictionary_counts() {
     let mut merge = MergeWorkspace::new();
     while engine.compact(options, &mut merge).unwrap().is_some() {}
     engine.wait_for_compaction().unwrap();
+    let start = std::time::Instant::now();
     let report = |label: &str| {
-        let (with, prepared, contents) = engine.dictionary_counts();
+        let (with, prepared, contents, _) = engine.dictionary_counts();
         let status = engine.background_status().unwrap();
         let stats = engine.stats();
         println!(
-            "| {label} | runs {} | with a dictionary {with} | distinct prepared {prepared} | distinct contents {contents} | background compactions {} | {:.2} MiB + {:.2} |",
+            "| {label} | {:.2} s | runs {} | overlap {} | with a dictionary {with} | distinct prepared {prepared} | distinct contents {contents} | background compactions {} passes {} failures {} busy {} | rewritten {:.1} -> {:.1} MiB | {:.2} MiB + {:.2} | last failure {:?} |",
+            start.elapsed().as_secs_f64(),
             stats.runs,
+            stats.max_overlap,
             status.compactions,
+            status.passes,
+            status.failures,
+            status.busy,
+            status.input_bytes as f64 / f64::from(1 << 20),
+            status.output_bytes as f64 / f64::from(1 << 20),
             stats.run_bytes as f64 / f64::from(1 << 20),
             stats.held_bytes as f64 / f64::from(1 << 20),
+            status.last_failure,
         );
     };
     report("consolidated");
