@@ -17,7 +17,10 @@
 //! without reading during the active phase, to follow many compaction
 //! cycles quickly: the policy depends on the writes, not on the time.
 //! `SUSTAIN_APPEND=1` loads the lowest quarter of the keys and then inserts
-//! the rest in ascending key order, so that flushed runs never overlap.
+//! the rest in ascending key order, so that flushed runs never overlap;
+//! with `SUSTAIN_UPDATES` (0) percent of the writes updating a random
+//! inserted key instead. `SUSTAIN_HOT=1` puts nine writes in ten within the
+//! lowest eighth of the keys.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,6 +159,10 @@ struct Workload {
     reads: bool,
     /// The next key to insert, when writes append in key order instead.
     append: Option<u64>,
+    /// When appending, the percentage of writes that update an inserted key.
+    updates_share: u64,
+    /// Whether nine writes in ten fall within the lowest eighth of the keys.
+    hot: bool,
     puts: Vec<u64>,
     gets: Vec<u64>,
     scans: Vec<u64>,
@@ -199,12 +206,15 @@ impl Workload {
     /// An update, or 15% of the time a delete, of a random key; an insert if
     /// the key is absent.
     fn write(&mut self, engine: &Engine, step: u64) {
+        let records = self.versions.len() as u64;
         let index = match &mut self.append {
+            Some(next) if self.rng.below(100) < self.updates_share => self.rng.below(*next),
             Some(next) => {
                 *next += 1;
                 *next - 1
             }
-            None => self.rng.below(self.versions.len() as u64),
+            None if self.hot && self.rng.below(10) < 9 => self.rng.below(records / 8),
+            None => self.rng.below(records),
         };
         let key = self.key(index);
         let present = self.versions[index as usize] != 0;
@@ -318,6 +328,8 @@ fn sustained_compaction() {
         workspace: EngineWorkspace::new(),
         reads: env("SUSTAIN_READS", 1) != 0,
         append: (env("SUSTAIN_APPEND", 0) != 0).then_some(records / 4),
+        updates_share: env("SUSTAIN_UPDATES", 0),
+        hot: env("SUSTAIN_HOT", 0) != 0,
         puts: Vec::new(),
         gets: Vec::new(),
         scans: Vec::new(),

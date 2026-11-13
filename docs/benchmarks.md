@@ -83,6 +83,10 @@ Kinds of result in this file:
 - **Flush compression bound:** the 5AI section, how much memory
   dictionary-assisted flushes could save under sustained writes, with
   uniform and ascending keys; the engine is unchanged.
+- **Compaction selection:** the 5AJ section, how much obsolete data the
+  selector's legal choices eliminate per byte rewritten under three write
+  histories, against whole-stack and best-of-all-choices alternatives; the
+  selector is unchanged.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -3562,6 +3566,189 @@ rewriting.
 ```sh
 scripts/validate.sh exec 1500 env SUSTAIN_APPEND=1 SUSTAIN_GROUPS=256 SUSTAIN_READS=0 \
   SUSTAIN_RATE=25000 SUSTAIN_SECS=125 SUSTAIN_READ_SECS=10 \
+  cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
+```
+
+## Compaction input selection (5AJ)
+
+*Measurement and decision; the selector is unchanged.* Could the existing
+selector, within its invariants, eliminate materially more obsolete data
+per byte rewritten? Labels: **M** measured, **D** derived, **A** assumed.
+
+### How the selector chooses
+
+From `select` in `src/engine.rs` and its documentation on `Engine::compact`:
+
+- **Candidates** are all published runs, each reduced to its key range,
+  stored bytes and whether it is a tail. Nothing else (age, record count,
+  obsolete share) is consulted.
+- **Overlap** is counted at each run's smallest key: the runs whose ranges
+  cover it form a stack. The deepest stack is the engine's overlap.
+- **Ranking:** if the deepest stack exceeds `max_overlap`, stacks over the
+  allowance are ordered by depth, then fewest bytes, then key. From the
+  first stack whose two smallest runs fit the input limits, the fewest
+  smallest runs that bring that stack within the allowance are taken, then
+  each next smallest that is no larger than all taken so far. Sizes alone
+  decide: a large run is rewritten only once comparable data lies over it.
+- **Without overlap**, and only with more than `disjoint_runs_above` runs,
+  the longest window of adjacent tails that fits, then the fewest bytes,
+  is merged. Full-length disjoint runs are never rewritten.
+- **Recently overwritten ranges** get no special treatment: a flush under
+  uniform or mixed writes is a single full-range run, so it lies in every
+  stack, and which base run it is merged with depends only on size.
+- **What a merge eliminates:** within its inputs, every version but the
+  newest of each key, and a newest tombstone unless an unselected run's
+  range covers the key. Versions in unselected runs stay, even when the
+  merge holds a newer copy, until their own run is merged; so do older
+  values under a tombstone that must be kept.
+- **Snapshots** retain whole runs, not versions: a merge drops versions
+  regardless of snapshots, and a snapshot keeps its inputs allocated until
+  it is dropped. Past `SnapshotLimits::max_retained_bytes` compaction is
+  refused.
+- **Eligibility:** inputs are bounded by count and bytes (8, 256 MiB);
+  output and workspace limits are checked as the merge is built and fail it
+  safely; publication requires every input to be still published and
+  accepts an over-limit result only if it is no larger than what it
+  replaces. Under these workloads none of these limits was reached.
+
+Retention inherent to the policy is everything the allowance tolerates:
+up to `max_overlap` runs may cover a key, so up to three older layers hold
+versions that newer ones replace. Ranking only decides which of those
+layers a merge collapses first.
+
+### Instrument
+
+`run::tests::selection` (new, ignored) drives the 5AH workload and two
+variants through an engine without a worker, compacting after each flush
+until nothing is eligible, as the worker does, so that every decision is
+deterministic. Between flushes the runs do not change, so each state is
+weighted by the writes it served. Its historical bytes are measured
+exactly: run bytes less what one merge of every run would store, built and
+abandoned. At chosen decisions every legal choice (any two or more runs of
+an over-allowance stack within the input limits, or adjacent tails) is
+built through the production job and abandoned. Two alternatives can be
+published instead of the production choice, through the same job, tombstone
+rule, limits and publication: **stack**, every run of the stack the
+selector takes from; and **oracle**, of the legal choices with at most 1.25
+times the production choice's input, the one that frees the most stored
+bytes, found by building each. The oracle is a research bound on what
+ranking could gain, not a practical algorithm: it builds every candidate
+merge before each decision. A full verifying scan ends every run.
+
+Histories, 4,000,000 writes each (3,500,000 for append), `max_overlap` 4,
+4 KiB blocks, dictionaries:
+
+- **uniform:** the 5AH workload on `json:64`, updates and 15% deletes of
+  random keys;
+- **hot:** the same, with nine writes in ten within the lowest eighth of
+  the keys;
+- **append:** on `json:256`, from the lowest quarter of the keys, eight
+  writes in ten insert the next key and two update a random inserted key.
+
+### Baseline (M)
+
+| history | mean run MiB | of which historical (exact) | of which plain | live, stored (D) | run-byte amplification (D) | mean runs, overlap | compacted in → out MiB | versions, tombstones dropped | write amplification: flush + compaction |
+|---|---|---|---|---|---|---|---|---|---|
+| uniform | 159.1 | 43.5 | 8.1 | 115.6 | 1.38× | 11.8, 3.53 | 1,560.8 → 1,024.7 | 3,116,474, 293,754 | 0.31 + 0.56 = 0.87 |
+| hot | 151.1 | 35.1 | 12.4 | 116.0 | 1.30× | 10.9, 3.23 | 699.3 → 374.9 | 1,977,987, 51,281 | 0.19 + 0.20 = 0.40 |
+| append | 328.7 | 23.3 | 8.3 | 305.4 | 1.08× | 24.5, 3.51 | 1,880.7 → 1,661.1 | 434,360, 0 | 0.33 + 0.90 = 1.22 |
+
+Historical bytes include the plain runs' extra size over dictionary
+storage (a quarter of the plain column, 5AI). *Live, stored* is the mean
+run bytes less the historical bytes; run-byte amplification divides the
+two. Write amplification counts stored bytes written per logical byte
+written; it is a cost in rewriting, not in space.
+
+The same histories timed, paced at 3,000 writes/s with reads for 300 s
+under the background worker (`run::tests::sustained`; uniform is 5AH's
+run, the others new):
+
+| history | put p50 | get p50 before / during / after | short scan p50 before / during / after | worker busy, CPU | mean / peak RSS | write amplification |
+|---|---|---|---|---|---|---|
+| uniform (5AH) | 3.79 µs | 15.7–20.3 µs throughout | – / 90.9 / 99.5 µs | 1%, 2.0 s | 335 / 405 MiB | 0.56 |
+| hot | 4.38 µs | 12.50 / 14.08 / 17.12 µs | 44.0 / 68.4 / 77.1 µs | 0%, 0.9 s | 288 / 374 MiB | 0.27 |
+| append | 1.08 µs | 3.17 / 5.38 / 8.71 µs | 4.21 / 6.42 / 9.38 µs | 1%, 2.1 s | 403 / 511 MiB | 0.59 |
+
+Over 300 s these see 4–9 flushes, mostly the first cycle; the
+deterministic runs above follow 21–35. The append history's RSS grows with
+its data (719,635 inserts). Every timed run verified every record.
+
+### Candidate choices (M)
+
+Freed is stored input less stored output, MiB; *freed / in* its share of
+the input. For append, most of what is freed is plain flushes recompressed
+with a dictionary: obsolete versions were 0.3–8% of records read.
+
+| history, decision | legal choices | production: freed / in MiB (ratio) | best ratio: freed / in MiB (ratio), what | whole stack |
+|---|---|---|---|---|
+| uniform 1 | 131 | 30.3 / 79.5 (0.381) | 25.9 / 67.7 (0.382), the four flushes alone | = production |
+| uniform 2 | 146 | 30.2 / 80.6 (0.375) | 30.4 / 80.7 (0.376), another base run | = production |
+| uniform 5 | 26 | 10.5 / 35.4 (0.296) | = production | = production |
+| uniform 12 | 41 | 0.2 / 5.4 (0.045), two small runs | 9.9 / 35.3 (0.279) | 12.6 / 47.9 (0.264) |
+| uniform 20 | 26 | 29.4 / 77.2 (0.381) | = production | = production |
+| hot 1 | 131 | 47.1 / 79.2 (0.595) | 60.8 / 82.5 (0.736), the base run under the hot range | = production |
+| hot 4 | 108 | 0.3 / 6.8 (0.044), three small runs | 16.9 / 34.0 (0.499), two flushes | 17.4 / 40.7 (0.428) |
+| hot 10 | 26 | 57.7 / 79.0 (0.730) | = production | = production |
+| append 1 | 146 | 20.5 / 81.9 (0.251) | 19.8 / 68.5 (0.289), flushes alone | = production |
+| append 4 | 168 | 15.9 / 81.2 (0.196) | 9.5 / 34.2 (0.276), two flushes | = production |
+| append 10 | 26 | 6.3 / 68.7 (0.091) | 4.8 / 23.9 (0.200) | = production |
+| append 20 | 56 | 9.5 / 77.1 (0.123) | 8.2 / 47.2 (0.174) | = production |
+
+Two ranking losses appear. The size order can merge a few small runs that
+free almost nothing and leave the stack over the allowance, so another
+merge follows at once (uniform 12, hot 4: 5–7 MiB rewritten for
+0.2–0.3 MiB). And size alone cannot see where updates landed: under hot
+writes the smallest base run is taken, not the one the updates replaced
+(hot 1). Under append, choices with a better ratio leave the base run out
+and so free less in total; they postpone work rather than avoid it.
+
+### Steady state (M)
+
+| history | policy | mean run MiB | mean historical MiB | mean overlap | compactions | compacted in → out MiB | compaction write amplification | choosing time |
+|---|---|---|---|---|---|---|---|---|
+| uniform | production | 159.1 | 43.5 | 3.53 | 26 | 1,560.8 → 1,024.7 | 0.56 | – |
+| uniform | stack | 161.8 | 46.1 | 3.53 | 22 | 1,542.6 → 1,007.7 | 0.55 | – |
+| uniform | oracle | 158.6 | 42.9 | 3.48 | 25 | 1,510.0 → 986.9 | 0.54 | 755 s |
+| hot | production | 151.1 | 35.1 | 3.23 | 11 | 699.3 → 374.9 | 0.20 | – |
+| hot | oracle | 146.2 | 30.3 | 3.22 | 10 | 688.4 → 356.9 | 0.19 | 403 s |
+| append | production | 328.7 | 23.3 | 3.51 | 27 | 1,880.7 → 1,661.1 | 0.90 | – |
+| append | oracle | 323.8 | 18.4 | 3.60 | 34 | 2,205.9 → 1,974.1 | 1.07 | 1,528 s |
+
+Over whole histories the per-decision gains mostly vanish: a better choice
+now changes what the next one finds. Even an oracle that builds every
+comparable legal choice before each decision lowers mean run bytes by
+0.3% (uniform), 3.2% (hot) and 1.5% (append, at 19% more rewriting).
+Merging whole stacks is slightly worse. Against process memory (D, the
+timed runs' mean RSS) the gains are about 0.1% (uniform), 1.7% (hot)
+and 1.2% (append).
+
+### Decision
+
+Keep the production selector. Representative legal choices produce
+similar outcomes. The one ranking signal worth anything (hot ranges) is
+worth at most 3% of run bytes, and only when every candidate merge is
+built. A cheap proxy would have to estimate obsolete bytes per run from
+metadata the engine does not keep, which is new state and new scoring. The
+tiny-run merge costs a few MiB of rewriting and no memory. What remains is
+inherent to the overlap allowance, and `max_overlap` already trades it
+against rewriting (5AH: 21% fewer run bytes at 2, for 2.4× the bytes
+written).
+
+### Reproduction
+
+```sh
+# Deterministic: one history and policy per run. Enumerated decisions are listed.
+scripts/validate.sh exec 2400 env SELECT_HISTORY=uniform SELECT_ENUMERATE=1,2,5,12,20 \
+  cargo test --locked --release --lib run::tests::selection -- --ignored --nocapture
+scripts/validate.sh exec 2400 env SELECT_HISTORY=hot SELECT_POLICY=oracle \
+  cargo test --locked --release --lib run::tests::selection -- --ignored --nocapture
+scripts/validate.sh exec 3600 env SELECT_HISTORY=append SELECT_WRITES=3500000 SELECT_POLICY=oracle \
+  cargo test --locked --release --lib run::tests::selection -- --ignored --nocapture
+# Timed, under the worker.
+scripts/validate.sh exec 1500 env SUSTAIN_HOT=1 SUSTAIN_RATE=3000 SUSTAIN_SECS=300 \
+  cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
+scripts/validate.sh exec 1500 env SUSTAIN_APPEND=1 SUSTAIN_UPDATES=20 SUSTAIN_GROUPS=256 \
+  SUSTAIN_RATE=3000 SUSTAIN_SECS=300 \
   cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
 ```
 

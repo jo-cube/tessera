@@ -1397,6 +1397,19 @@ impl Core {
         &self,
         options: CompactionOptions,
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
+        self.begin_compaction_with(options, select)
+    }
+
+    /// Begins a compaction of the runs that `choose` picks, which must be at
+    /// least two that share a key or, if none overlap, adjacent tails.
+    fn begin_compaction_with(
+        &self,
+        options: CompactionOptions,
+        choose: impl FnOnce(
+            &[Candidate<'_>],
+            CompactionOptions,
+        ) -> Result<Option<Vec<usize>>, CompactionError>,
+    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         // As for flushing, this mutex guards no data.
         let serial = self
             .compacting
@@ -1408,20 +1421,8 @@ impl Core {
         if bytes > max {
             return Err(CompactionError::Retained { bytes, max });
         }
-        let candidates: Vec<Candidate<'_>> = state
-            .runs
-            .iter()
-            .map(|run| {
-                let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
-                Candidate {
-                    min: range.min,
-                    max: range.max,
-                    bytes: run.run.as_bytes().len(),
-                    tail: run.tail,
-                }
-            })
-            .collect();
-        let Some(selected) = select(&candidates, options)? else {
+        let candidates = candidates(&state.runs);
+        let Some(selected) = choose(&candidates, options)? else {
             return Ok(None);
         };
         let min = selected.iter().map(|&index| candidates[index].min).min();
@@ -1848,6 +1849,21 @@ struct Candidate<'a> {
     max: &'a [u8],
     bytes: usize,
     tail: bool,
+}
+
+/// Each published run as the selector sees it, in the same order.
+fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
+    runs.iter()
+        .map(|run| {
+            let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+            Candidate {
+                min: range.min,
+                max: range.max,
+                bytes: run.run.as_bytes().len(),
+                tail: run.tail,
+            }
+        })
+        .collect()
 }
 
 /// Chooses run indices to compact, as documented on
@@ -2422,6 +2438,109 @@ impl Engine {
         contents.sort_unstable();
         contents.dedup();
         (parts.len(), prepared.len(), contents.len(), bytes)
+    }
+}
+
+/// A published run as the compaction selector sees it, for the tests'
+/// selection measurements (5AJ).
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RunShape {
+    pub(crate) min: Vec<u8>,
+    pub(crate) max: Vec<u8>,
+    pub(crate) bytes: usize,
+    pub(crate) tail: bool,
+    pub(crate) max_seq: u64,
+    pub(crate) dictionary: bool,
+}
+
+/// A merge built and abandoned: what publishing it would have changed.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct DryCompaction {
+    pub(crate) input_bytes: usize,
+    pub(crate) output_bytes: usize,
+    pub(crate) stats: CompactStats,
+    /// The output runs' key ranges.
+    pub(crate) ranges: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// For the tests' selection measurements (5AJ). Indices are into
+/// [`Engine::run_shapes`], valid while nothing else changes the runs.
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn run_shapes(&self) -> Vec<RunShape> {
+        let state = self.core.read_state();
+        state
+            .runs
+            .iter()
+            .map(|run| {
+                let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+                RunShape {
+                    min: range.min.to_vec(),
+                    max: range.max.to_vec(),
+                    bytes: run.run.as_bytes().len(),
+                    tail: run.tail,
+                    max_seq: run.run.max_seq(),
+                    dictionary: run.run.dictionary_parts().is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// What the production selector would compact now.
+    pub(crate) fn selection(
+        &self,
+        options: CompactionOptions,
+    ) -> Result<Option<Vec<usize>>, CompactionError> {
+        let state = self.core.read_state();
+        select(&candidates(&state.runs), options)
+    }
+
+    /// Compacts `picks` through the production job: the same tombstone
+    /// rule, limits, build and publication.
+    pub(crate) fn compact_picked(
+        &self,
+        options: CompactionOptions,
+        picks: Vec<usize>,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<CompactionReport, CompactionError> {
+        self.core
+            .begin_compaction_with(options, |_, _| Ok(Some(picks)))?
+            .expect("picks given")
+            .build(workspace)?
+            .publish()
+    }
+
+    /// Builds the merge of `picks` as [`Engine::compact_picked`] would, and
+    /// abandons it.
+    pub(crate) fn dry_compact(
+        &self,
+        options: CompactionOptions,
+        picks: Vec<usize>,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<DryCompaction, CompactionError> {
+        let job = self
+            .core
+            .begin_compaction_with(options, |_, _| Ok(Some(picks)))?
+            .expect("picks given");
+        let input_bytes = job.input_bytes;
+        let built = job.build(workspace)?;
+        let ranges = built
+            .output
+            .runs
+            .iter()
+            .map(|run| {
+                let range = run.key_range().expect(BUILT).expect(NOT_EMPTY);
+                (range.min.to_vec(), range.max.to_vec())
+            })
+            .collect();
+        Ok(DryCompaction {
+            input_bytes,
+            output_bytes: built.output.output_bytes,
+            stats: built.output.stats,
+            ranges,
+        })
     }
 }
 
