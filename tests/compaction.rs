@@ -15,6 +15,15 @@ use tessera::engine::{
     CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace, UpdateError,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 /// Merges any overlap, up to `max_inputs` runs at a time.
 fn options(max_inputs: usize) -> CompactionOptions {
     CompactionOptions {
@@ -61,7 +70,7 @@ fn compact_fully(engine: &Engine) {
 /// the value it hides must be kept, and may go only once that run is merged.
 #[test]
 fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     for i in 0..500 {
         engine.put(format!("k{i:03}").as_bytes(), b"old").unwrap();
     }
@@ -102,7 +111,7 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
 /// few small ones is left in place rather than rewritten to absorb them.
 #[test]
 fn small_runs_are_merged_without_rewriting_a_large_run_over_them() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     for i in 0..2_000 {
         engine.put(format!("k{i:04}").as_bytes(), b"base").unwrap();
     }
@@ -140,8 +149,9 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
         target_run_len: 4_096,
         max_runs: usize::MAX,
         max_run_bytes: usize::MAX,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let key = |i: u32| format!("key{i:04}").into_bytes();
     let mut model = Model::new();
     for i in 0..1_000 {
@@ -212,8 +222,9 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
 fn a_compaction_over_any_limit_changes_nothing() {
     let engine = Engine::new(EngineOptions {
         target_run_len: 64,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     for round in 0..4 {
         for i in 0..20 {
             engine
@@ -249,7 +260,7 @@ fn a_compaction_over_any_limit_changes_nothing() {
     }
     // Over lowered run limits, a compaction that shrinks storage is still
     // allowed, so that it can make room for flushes.
-    engine.set_run_limits(1, stats.run_bytes / 2);
+    engine.set_run_limits(1, stats.run_bytes / 2).unwrap();
     let report = engine.compact(options(8), &mut workspace).unwrap().unwrap();
     assert!(report.complete);
     assert_eq!(everything(&engine), contents);
@@ -272,8 +283,9 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
             max_overlap: 2,
             ..CompactionOptions::default()
         }),
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let key = |writer: usize, i: usize| format!("w{writer}/{i:03}").into_bytes();
     let barrier = Barrier::new(WRITERS + 3);
     let writing = AtomicBool::new(true);

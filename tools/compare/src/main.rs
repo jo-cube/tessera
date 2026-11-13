@@ -298,7 +298,7 @@ impl Tessera {
                     len.parse().expect("BENCH_BLOCK_LEN is a byte count")
                 }),
             ..EngineOptions::default()
-        });
+        }).expect("valid options");
         Self {
             engine,
             workspace: EngineWorkspace::new(),
@@ -1105,7 +1105,7 @@ fn compactions(data: Dataset, compression: Compression) {
                 len.parse().expect("BENCH_BLOCK_LEN is a byte count")
             }),
         ..EngineOptions::default()
-    });
+    }).expect("valid options");
     let records = data.records();
     for j in 0..records {
         let index = data.shuffled(j, 0x9E37_79B1);
@@ -1200,7 +1200,7 @@ fn cycles(data: Dataset, memtable_budget: Option<usize>) {
             max_runs: 256,
             background_compaction: Some(CompactionOptions::default()),
             ..EngineOptions::default()
-        });
+        }).expect("valid options");
     }
     let (sampler, thread) = Sampler::start(None);
     let records = data.records();

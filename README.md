@@ -70,40 +70,101 @@ engine.durable_checkpoint(Default::default())?;
 writes. Writes never need the caller to flush or retry for room; see
 **Flushing** under [Engine](#engine).
 
-`EngineOptions::compression` chooses how runs store their blocks:
-`Compression::Zstd` (the default, densest), `Lz4`, or `Uncompressed`. A
-lookup that reaches a run costs about 8 µs, 2 µs or 0.5 µs respectively,
-and JSON-like data takes about 1.7× (LZ4) or 3.8× (uncompressed) the
-Zstandard memory. Blocks record their codec, so the setting can change
-between restarts: existing runs and checkpoints stay readable, and
-compaction rewrites runs with the current setting.
-Keep Zstandard when memory is the constraint or values are large and
-structured; choose LZ4 when reads that miss the memtable set your latency
-and about 1.2–1.7× the run memory is affordable; choose `Uncompressed` when
-the uncompressed dataset fits comfortably, which costs least for small
-binary records. The order held with writes and compaction running.
+## Configuration
 
-`EngineOptions::target_block_len` (16 KiB by default) sets the block length
-of new runs. Under Zstandard, 4 KiB blocks made lookups that reach a run
-about 2.4–2.8× faster through the engine; they cost about 4% more run
-memory on small binary records but about 24% more on JSON-like values, and
-scans of hundreds of records or more ran up to 1.7× slower (least on small
-records). Like the codec,
-the setting can change between restarts: runs and checkpoints of any block
-length stay readable.
+Every constructor (`new`, `create`, `open`, `recover`) checks all options
+before it allocates, starts a thread or touches a file, and returns a
+`ConfigError` naming the setting, its value and the accepted range (inside
+`RecoveryError::Config` for the persistent ones). No value is clamped or
+adjusted. `compact` and `set_run_limits` check their arguments the same
+way.
 
-`Compression::ZstdDictionary` (opt-in) pairs with 4 KiB blocks: compactions
-and checkpoints train a 16 KiB Zstandard dictionary from samples of the runs
-they rewrite and use it for every run they build, when a held-out sample
-shows it saving at least 10%. On JSON-like values this held 10% less run
-memory than the 16 KiB default and 27% less than plain 4 KiB blocks, with
-lookups that reach a run at 3.9–5.7 µs (13.8 µs at 16 KiB, 5.9 µs at 4 KiB
-plain). The range is real: each compaction trains its own dictionary, and a
-lookup is slower the more distinct dictionaries the runs use and the less
-of their tables is in cache. Small binary records gain nothing and are left
-plain. Flushes, and runs no compaction merges, stay plain until a
-checkpoint. Dictionary runs use a newer run format, which older builds
-reject.
+The defaults suit general use:
+
+```rust
+use tessera::engine::{Engine, EngineOptions};
+
+let engine = Engine::new(EngineOptions::default())?;
+```
+
+That is 64 MiB memtables, at most 64 runs and 4 GiB of runs, background
+compaction with `CompactionOptions::default()` (overlap allowance 4),
+16 snapshots and 1 GiB retained by them, and plain Zstandard in 16 KiB
+blocks, which favours memory density and longer scans.
+
+For structured values such as JSON, where point reads set the latency,
+4 KiB blocks with dictionary compression made lookups that reach a run
+2.4–3.5 times faster, with about 10% less run memory, in the measurements
+in `docs/benchmarks.md`:
+
+```rust
+use tessera::engine::{Compression, Engine, EngineOptions};
+
+let engine = Engine::new(EngineOptions {
+    compression: Compression::ZstdDictionary,
+    target_block_len: 4 << 10,
+    ..EngineOptions::default()
+})?;
+```
+
+Ranges, all inclusive:
+
+| setting | accepted |
+|---|---|
+| `memtable_budget` | `ENTRY_OVERHEAD` (an empty record's charge) to `usize::MAX / 2` |
+| `target_run_len` | 1 byte to 1 GiB |
+| `max_runs`, `max_run_bytes` | at least 1 |
+| `target_block_len` | 1 byte (a block per record) to 64 KiB |
+| `CompactionOptions::max_inputs` | at least 2 |
+| `CompactionOptions::max_input_bytes`, `max_output_bytes`, `max_workspace_bytes`, `max_overlap` | at least 1 |
+| `CompactionOptions::disjoint_runs_above` | any |
+| `SnapshotLimits::max_live`, `max_retained_bytes` | any; 0 refuses snapshots |
+| `DurableOptions::segment_bytes`, `max_batch_bytes`, `max_queue_bytes` | at least 1 |
+| `DurableOptions::max_log_bytes` | more than `segment_bytes` plus a segment header |
+| `DurableOptions::max_batch_records` | 1 to 256 |
+
+These are the values the engine accepts and handles correctly, not
+recommendations: a 1-byte block length is safe but stores each record as
+its own block, at about 20 bytes of overhead each. The measured choices
+for block length are 4 KiB and 16 KiB.
+
+Valid options can still meet limits at run time, and the operation they
+stop reports it: run limits refuse flushes (`UpdateError::FlushRefused`),
+the log limit refuses writes (`UpdateError::LogFull`), snapshot limits
+refuse snapshots and compactions, and compaction limits refuse a merge.
+None of these is a configuration error.
+
+**Compression and blocks.** `compression` (`Zstd`, `Lz4`, `Uncompressed` or
+`ZstdDictionary`) and `target_block_len` decide only how new runs are
+built. Every run records its own codec, block lengths and dictionary, so
+runs and checkpoints written under other settings are read and recovered
+as they are, and take the current settings only when a compaction or
+checkpoint rewrites them. Settings may change freely between restarts.
+Smaller blocks make a read of a run cheaper and cost memory and long-scan
+speed; LZ4 and `Uncompressed` trade memory for cheaper reads.
+
+**Dictionaries.** With `ZstdDictionary`, flushes stay plain Zstandard;
+each compaction and checkpoint that rewrites at least about 6.4 MiB trains
+a 16 KiB dictionary from its input and uses it only if it saves at least
+10% on held-out blocks, and only if the compaction workspace leaves room
+for training (the default does). It is accepted with any block length and
+the requested length is kept. It was measured only at 4 KiB; at any length
+the 10% check decides, per rewrite, whether the output uses the dictionary.
+Small binary records gain nothing and stay plain. Dictionary runs use a newer run format, which older builds reject.
+
+**Background compaction** is on by default: one worker thread compacts
+after each flush, keeping the overlap within `max_overlap` without any call
+from the application. Setting `background_compaction: None` makes
+compaction explicit; then the application must call `Engine::compact`, or
+runs accumulate until flushes, and the writes that need them, are refused
+with `FlushRefused`. Dropping the engine waits for the compaction in
+progress, if any, and joins the worker.
+
+**Persistence** depends only on the constructor: `new` and `recover` make
+RAM-only engines, and `create` and `open` durable ones, which additionally
+take `DurableOptions`. The engine options mean the same in every mode.
+`last_seq` applies to `new` and `create`; `open` takes the sequence from the
+checkpoint and log, and `recover` continues after the larger.
 
 ## Engine
 
@@ -148,9 +209,9 @@ writes and flushes continue. The policy merges the smallest runs covering
 the most deeply overlapped key, and neighbouring short runs once there are
 many disjoint ones. It is not leveled. Calling `compact` until it returns
 `None` with `max_overlap: 1` consolidates the runs so that a lookup reads at
-most one. With `EngineOptions::background_compaction` set, one worker thread
-compacts after each flush; `wait_for_compaction` waits for a pass and
-`background_status` reports failures.
+most one. The background worker (on by default) compacts after each flush;
+`wait_for_compaction` waits for a pass and `background_status` reports
+failures.
 
 **Durable writes** are committed by bounded group commit: the first writer
 in the queue leads a batch of those behind it, appends it, syncs once and
@@ -223,8 +284,8 @@ it.
   engine.
 - Writes wait for flushes when the memtables are full, and are refused with
   `FlushRefused` when the run limits are reached, until compaction makes
-  room; with no background compaction, call `compact`. A caller that wants
-  to wait can call `wait_for_compaction` or `compact` and retry.
+  room; with background compaction turned off, call `compact`. A caller
+  that wants to wait can call `wait_for_compaction` or `compact` and retry.
 - A durable log grows until `durable_checkpoint` is called; writes past
   `max_log_bytes` are refused with `LogFull`. Checkpoints are never taken
   automatically, and cannot prune the active segment, so `max_log_bytes`

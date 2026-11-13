@@ -108,7 +108,7 @@ use std::sync::{MutexGuard, PoisonError};
 
 use crate::memtable::ENTRY_OVERHEAD;
 
-use super::wal::{Durable, MAX_BATCH_RECORDS, Unsealed, encode, encoded_len};
+use super::wal::{Durable, Unsealed, encode, encoded_len};
 use super::{Core, FlushError, FlushJob, UpdateError};
 use super::{Refusal, WriteError};
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
@@ -163,7 +163,7 @@ pub(super) struct Group {
 impl Group {
     /// The batch at the front of the queue.
     fn take(&mut self, options: &super::DurableOptions) -> Vec<Request> {
-        let records = options.max_batch_records.clamp(1, MAX_BATCH_RECORDS);
+        let records = options.max_batch_records;
         let mut batch = Vec::new();
         let mut bytes = 0;
         while let Some(front) = self.queue.front() {
@@ -603,6 +603,15 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The defaults without the background worker: these tests flush and
+    /// compact by hand and count what each step leaves.
+    fn manual() -> EngineOptions {
+        EngineOptions {
+            background_compaction: None,
+            ..EngineOptions::default()
+        }
+    }
     use crate::block::MAX_KEY_LEN;
     use crate::engine::wal::{BEFORE_PUBLISH, Fault};
     use crate::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
@@ -679,7 +688,7 @@ mod tests {
                 segment_bytes,
                 ..DurableOptions::default()
             };
-            let engine = Engine::create(&dir, EngineOptions::default(), options).unwrap();
+            let engine = Engine::create(&dir, manual(), options).unwrap();
             let seqs = thread::scope(|scope| {
                 let (leader, writers) = behind_a_held_leader(
                     &engine,
@@ -713,7 +722,7 @@ mod tests {
                 assert_eq!(get(&engine, &[at]), Some(vec![at; 300]));
             }
             drop(engine);
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), options).unwrap();
+            let (engine, report) = Engine::open(&dir, manual(), options).unwrap();
             assert_eq!((report.last_seq, report.replayed), (5, 5));
             assert_eq!(get(&engine, &[3]), Some(vec![3; 300]));
             drop(engine);
@@ -731,7 +740,7 @@ mod tests {
         let dir = scratch("refused");
         let options = EngineOptions {
             memtable_budget: 16 << 10,
-            ..EngineOptions::default()
+            ..manual()
         };
         let engine = Engine::create(&dir, options, DurableOptions::default()).unwrap();
         let writes: Vec<(Vec<u8>, usize)> = vec![
@@ -812,7 +821,7 @@ mod tests {
         let dir = scratch("twice");
         let options = EngineOptions {
             memtable_budget: 16 << 10,
-            ..EngineOptions::default()
+            ..manual()
         };
         let engine = Engine::create(&dir, options, DurableOptions::default()).unwrap();
         let outcomes = thread::scope(|scope| {
@@ -859,7 +868,7 @@ mod tests {
                 max_queue_bytes: 2 * (300 + 200),
                 ..DurableOptions::default()
             };
-            let engine = Engine::create(&dir, EngineOptions::default(), options).unwrap();
+            let engine = Engine::create(&dir, manual(), options).unwrap();
             let outcomes = thread::scope(|scope| {
                 let (leader, writers) = behind_a_held_leader(
                     &engine,
@@ -901,7 +910,7 @@ mod tests {
             assert_eq!(get(&engine, &[0]), None);
             assert_eq!(engine.stats().last_seq, 1);
             drop(engine);
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), options).unwrap();
+            let (engine, report) = Engine::open(&dir, manual(), options).unwrap();
             let failed = outcomes
                 .iter()
                 .filter(|outcome| matches!(outcome, Err(UpdateError::LogFailed(_))))
@@ -928,7 +937,7 @@ mod tests {
             max_queue_bytes: 1000,
             ..DurableOptions::default()
         };
-        let engine = Engine::create(&dir, EngineOptions::default(), options).unwrap();
+        let engine = Engine::create(&dir, manual(), options).unwrap();
         let outcomes = thread::scope(|scope| {
             let (leader, writers) = behind_a_held_leader(
                 &engine,
@@ -966,7 +975,7 @@ mod tests {
             max_batch_records: 2,
             ..DurableOptions::default()
         };
-        let engine = Engine::create(&dir, EngineOptions::default(), options).unwrap();
+        let engine = Engine::create(&dir, manual(), options).unwrap();
         thread::scope(|scope| {
             let (leader, (panicking, writers)) = behind_a_held_leader(
                 &engine,
@@ -1009,8 +1018,7 @@ mod tests {
         assert_eq!(get(&engine, b"leader"), Some(b"first".to_vec()));
         assert_eq!(get(&engine, &[1]), None);
         drop(engine);
-        let (engine, report) =
-            Engine::open(&dir, EngineOptions::default(), DurableOptions::default()).unwrap();
+        let (engine, report) = Engine::open(&dir, manual(), DurableOptions::default()).unwrap();
         assert_eq!(report.last_seq, 3);
         assert_eq!(get(&engine, &[0]), Some(b"x".to_vec()));
         assert_eq!(get(&engine, &[1]), Some(b"x".to_vec()));

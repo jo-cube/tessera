@@ -434,7 +434,8 @@ fn compaction_selection() {
         compression: Compression::ZstdDictionary,
         target_block_len: 4 << 10,
         ..EngineOptions::default()
-    });
+    })
+    .unwrap();
 
     // The sustained instrument's load: seven keys in eight, or when
     // appending the lowest quarter, consolidated.

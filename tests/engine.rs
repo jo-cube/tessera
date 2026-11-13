@@ -15,10 +15,19 @@ use tessera::engine::{
     SnapshotLimits, UpdateError, WriteError,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 type Live = (Vec<u8>, u64, Vec<u8>);
 
 fn engine() -> Engine {
-    Engine::new(EngineOptions::default())
+    Engine::new(manual()).unwrap()
 }
 
 fn value_of(engine: &Engine, key: &[u8]) -> Option<(u64, Vec<u8>)> {
@@ -108,8 +117,9 @@ fn a_reused_workspace_returns_each_value_alone() {
 fn sequence_numbers_start_after_the_configured_value_and_increase() {
     let engine = Engine::new(EngineOptions {
         last_seq: 41,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     assert_eq!(engine.put(b"a", b"v"), Ok(42));
     assert_eq!(engine.delete(b"a"), Ok(43));
     assert_eq!(engine.stats().last_seq, 43);
@@ -131,8 +141,9 @@ fn sequence_numbers_continue_across_flushes() {
 fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
     let engine = Engine::new(EngineOptions {
         memtable_budget: 200,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     engine.put(b"a", b"v").unwrap();
     let before = engine.stats();
 
@@ -155,7 +166,7 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
 
     // A write with no room freezes the full table and lands in the next even
     // though the run limits refuse the flush, which leaves the table frozen.
-    engine.set_run_limits(0, 0);
+    engine.set_run_limits(1, 1).unwrap();
     assert_eq!(engine.put(b"b", &[0; 40]), Ok(2));
     let before = engine.stats();
     assert_eq!((before.frozen_tables, before.runs), (1, 0));
@@ -170,7 +181,7 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
     assert_eq!(engine.stats(), before);
     assert_eq!(value_of(&engine, b"c"), None);
     // Raising the limits lets the next write flush both tables.
-    engine.set_run_limits(64, usize::MAX);
+    engine.set_run_limits(64, usize::MAX).unwrap();
     assert_eq!(engine.put(b"c", &[0; 40]), Ok(3));
     let stats = engine.stats();
     assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
@@ -180,8 +191,9 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
 fn the_last_sequence_number_is_used_once_and_then_writes_stop() {
     let engine = Engine::new(EngineOptions {
         last_seq: u64::MAX - 1,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     assert_eq!(engine.put(b"a", b"v"), Ok(u64::MAX));
     let before = engine.stats();
     assert_eq!(engine.put(b"b", b"v"), Err(UpdateError::SequencesExhausted));
@@ -196,8 +208,9 @@ fn the_last_sequence_number_is_used_once_and_then_writes_stop() {
 fn an_engine_after_the_largest_sequence_number_accepts_nothing() {
     let engine = Engine::new(EngineOptions {
         last_seq: u64::MAX,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     assert_eq!(engine.put(b"a", b"v"), Err(UpdateError::SequencesExhausted));
 }
 
@@ -285,8 +298,9 @@ fn a_repeated_flush_adds_nothing() {
 fn a_flush_splits_output_at_the_configured_run_length() {
     let engine = Engine::new(EngineOptions {
         target_run_len: 1,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     engine.put(b"a", b"v").unwrap();
     engine.put(b"b", b"v").unwrap();
     assert_eq!(engine.flush().unwrap().runs, 2);
@@ -311,8 +325,9 @@ fn limited(max_runs: usize, max_run_bytes: usize) -> Engine {
     Engine::new(EngineOptions {
         max_runs,
         max_run_bytes,
-        ..EngineOptions::default()
+        ..manual()
     })
+    .unwrap()
 }
 
 /// What one small flush counts against the run byte limit: its stored bytes
@@ -326,11 +341,12 @@ fn flushed_size() -> usize {
 }
 
 #[test]
-fn a_flush_over_the_run_count_is_rejected_and_stays_readable() {
-    let engine = limited(0, usize::MAX);
+fn a_flush_over_the_run_limits_is_rejected_and_stays_readable() {
+    let engine = limited(1, 1);
     let seq = engine.put(b"a", b"v").unwrap();
     let error = engine.flush().unwrap_err();
-    assert_eq!((error.runs, error.max_runs), (1, 0));
+    assert_eq!((error.runs, error.max_runs, error.max_run_bytes), (1, 1, 1));
+    assert!(error.run_bytes > 1);
     assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
     let stats = engine.stats();
     assert!(stats.frozen.is_some());
@@ -369,10 +385,10 @@ fn run_bytes_are_limited_inclusively() {
 
 #[test]
 fn a_rejected_flush_succeeds_once_the_limits_are_raised() {
-    let engine = limited(0, 0);
+    let engine = limited(1, 1);
     let seq = engine.put(b"a", b"v").unwrap();
     engine.flush().unwrap_err();
-    engine.set_run_limits(1, usize::MAX);
+    engine.set_run_limits(1, usize::MAX).unwrap();
     assert_eq!(engine.flush().unwrap().tables, 1);
     assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
     assert_eq!(engine.stats().runs, 1);
@@ -380,7 +396,7 @@ fn a_rejected_flush_succeeds_once_the_limits_are_raised() {
 
 #[test]
 fn writes_continue_into_the_active_table_after_a_rejected_flush() {
-    let engine = limited(0, 0);
+    let engine = limited(1, 1);
     engine.put(b"a", b"v").unwrap();
     engine.flush().unwrap_err();
     let seq = engine.put(b"b", b"w").unwrap();
@@ -395,8 +411,9 @@ fn a_write_to_a_full_table_flushes_it_and_lands_in_the_next() {
     let budget = 1 + 1 + ENTRY_OVERHEAD;
     let engine = Engine::new(EngineOptions {
         memtable_budget: budget,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let a = engine.put(b"a", b"v").unwrap();
     let b = engine.put(b"b", b"v").unwrap();
     assert_eq!(b, a + 1);
@@ -414,11 +431,12 @@ fn at_most_one_table_is_frozen_while_the_new_one_fills() {
     let budget = 1 + 1 + ENTRY_OVERHEAD;
     let engine = Engine::new(EngineOptions {
         memtable_budget: budget,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     engine.put(b"a", b"v").unwrap();
     // A refused flush leaves its table frozen.
-    engine.set_run_limits(0, 0);
+    engine.set_run_limits(1, 1).unwrap();
     engine.flush().unwrap_err();
     engine.put(b"b", b"v").unwrap();
     let refused = engine.put(b"c", b"v").unwrap_err();
@@ -426,7 +444,7 @@ fn at_most_one_table_is_frozen_while_the_new_one_fills() {
     let stats = engine.stats();
     assert_eq!(stats.active.charged, budget);
     assert_eq!(stats.frozen.unwrap().charged, budget);
-    engine.set_run_limits(usize::MAX, usize::MAX);
+    engine.set_run_limits(usize::MAX, usize::MAX).unwrap();
     engine.put(b"c", b"v").unwrap();
     assert_eq!(engine.stats().frozen, None);
 }
@@ -446,8 +464,9 @@ fn concurrent_writers_flush_full_tables_once_and_snapshots_stay_coherent() {
     let engine = Engine::new(EngineOptions {
         memtable_budget: BUDGET,
         target_run_len: 1 << 30,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let key = |writer: u8, at: u32| [&[writer][..], &at.to_be_bytes()].concat();
     let done = AtomicBool::new(false);
     let (seqs, snapshots) = thread::scope(|scope| {
@@ -528,8 +547,9 @@ fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
             max_retained_bytes: 0,
             ..SnapshotLimits::default()
         },
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     // Holds the first table once it is flushed.
     engine.put(b"first", b"v").unwrap();
     let snapshot = engine.snapshot().unwrap();
@@ -801,8 +821,9 @@ fn concurrent_writers_readers_and_flushes_keep_every_invariant() {
 
     let engine = Engine::new(EngineOptions {
         max_runs: 1000,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     for writer in 0..WRITERS {
         engine
             .put(&pair_key(writer, "a"), &0u64.to_be_bytes())
@@ -993,7 +1014,8 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                 Compression::ZstdDictionary,
             ][rng.below(4)],
             target_block_len: [64, 2 << 10, 16 << 10][rng.below(3)],
-        });
+        })
+        .unwrap();
         let mut model = Model::new();
         // Charged per key in the active table, and what frozen tables are
         // charged: a refused flush leaves its tables frozen.
@@ -1060,9 +1082,9 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                 75..=85 => {
                     let empty = !has_frozen && active.is_empty();
                     if rng.below(5) == 0 {
-                        engine.set_run_limits(0, 0);
+                        engine.set_run_limits(1, 1).unwrap();
                         let result = engine.flush();
-                        engine.set_run_limits(100_000, usize::MAX);
+                        engine.set_run_limits(100_000, usize::MAX).unwrap();
                         if empty {
                             assert_eq!(result.unwrap().tables, 0);
                         } else {
@@ -1091,4 +1113,308 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
     assert!(refused > 10, "{refused}");
     assert!(rejected > 20, "{rejected}");
     assert!(automatic > 50, "{automatic}");
+}
+
+// Configuration.
+
+/// The defaults are valid, run a worker with the default compaction
+/// options, and keep the overlap within its allowance without any call to
+/// `compact`.
+#[test]
+fn the_defaults_compact_in_the_background() {
+    let defaults = EngineOptions::default();
+    assert_eq!(
+        defaults.background_compaction,
+        Some(CompactionOptions::default())
+    );
+    assert_eq!(CompactionOptions::default().max_overlap, 4);
+    assert_eq!(
+        (defaults.compression, defaults.target_block_len),
+        (Compression::Zstd, 16 << 10)
+    );
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: 16 << 10,
+        ..defaults
+    })
+    .unwrap();
+    assert!(engine.background_status().unwrap().running);
+    // Eight flushes of the same keys: eight overlapping runs, unless
+    // compacted.
+    for round in 0..8u32 {
+        for i in 0..50u32 {
+            engine.put(&i.to_be_bytes(), &round.to_be_bytes()).unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    engine.wait_for_compaction().unwrap();
+    let status = engine.background_status().unwrap();
+    assert!(status.compactions >= 1, "{status:?}");
+    assert!(engine.stats().max_overlap <= 4, "{:?}", engine.stats());
+    let mut workspace = EngineWorkspace::new();
+    for i in 0..50u32 {
+        let found = engine.get(&i.to_be_bytes(), &mut workspace).unwrap();
+        assert_eq!(found.unwrap().value, 7u32.to_be_bytes());
+    }
+}
+
+/// Every setting outside its documented range is refused with its own name
+/// and range, nothing is adjusted, and each bound itself is accepted.
+#[test]
+fn each_setting_out_of_range_is_refused_by_name() {
+    let compaction = |change: fn(&mut CompactionOptions)| {
+        let mut options = CompactionOptions::default();
+        change(&mut options);
+        EngineOptions {
+            background_compaction: Some(options),
+            ..EngineOptions::default()
+        }
+    };
+    let engine = |change: fn(&mut EngineOptions)| {
+        let mut options = EngineOptions::default();
+        change(&mut options);
+        options
+    };
+    let half = (usize::MAX / 2) as u64;
+    let refused: Vec<(EngineOptions, &str, u64, u64, u64)> = vec![
+        (
+            engine(|o| o.memtable_budget = 0),
+            "EngineOptions::memtable_budget",
+            0,
+            ENTRY_OVERHEAD as u64,
+            half,
+        ),
+        (
+            engine(|o| o.memtable_budget = ENTRY_OVERHEAD - 1),
+            "EngineOptions::memtable_budget",
+            ENTRY_OVERHEAD as u64 - 1,
+            ENTRY_OVERHEAD as u64,
+            half,
+        ),
+        (
+            engine(|o| o.memtable_budget = usize::MAX / 2 + 1),
+            "EngineOptions::memtable_budget",
+            half + 1,
+            ENTRY_OVERHEAD as u64,
+            half,
+        ),
+        (
+            engine(|o| o.target_run_len = 0),
+            "EngineOptions::target_run_len",
+            0,
+            1,
+            1 << 30,
+        ),
+        (
+            engine(|o| o.target_run_len = (1 << 30) + 1),
+            "EngineOptions::target_run_len",
+            (1 << 30) + 1,
+            1,
+            1 << 30,
+        ),
+        (
+            engine(|o| o.max_runs = 0),
+            "EngineOptions::max_runs",
+            0,
+            1,
+            u64::MAX,
+        ),
+        (
+            engine(|o| o.max_run_bytes = 0),
+            "EngineOptions::max_run_bytes",
+            0,
+            1,
+            u64::MAX,
+        ),
+        (
+            engine(|o| o.target_block_len = 0),
+            "EngineOptions::target_block_len",
+            0,
+            1,
+            64 << 10,
+        ),
+        (
+            engine(|o| o.target_block_len = (64 << 10) + 1),
+            "EngineOptions::target_block_len",
+            (64 << 10) + 1,
+            1,
+            64 << 10,
+        ),
+        (
+            compaction(|c| c.max_overlap = 0),
+            "CompactionOptions::max_overlap",
+            0,
+            1,
+            u64::MAX,
+        ),
+        (
+            compaction(|c| c.max_inputs = 1),
+            "CompactionOptions::max_inputs",
+            1,
+            2,
+            u64::MAX,
+        ),
+        (
+            compaction(|c| c.max_input_bytes = 0),
+            "CompactionOptions::max_input_bytes",
+            0,
+            1,
+            u64::MAX,
+        ),
+        (
+            compaction(|c| c.max_output_bytes = 0),
+            "CompactionOptions::max_output_bytes",
+            0,
+            1,
+            u64::MAX,
+        ),
+        (
+            compaction(|c| c.max_workspace_bytes = 0),
+            "CompactionOptions::max_workspace_bytes",
+            0,
+            1,
+            u64::MAX,
+        ),
+    ];
+    for (options, setting, value, min, max) in refused {
+        let error = Engine::new(options).map(drop).unwrap_err();
+        assert_eq!(
+            (error.setting, error.value, error.min, error.max),
+            (setting, value, min, max)
+        );
+        let message = error.to_string();
+        assert!(message.starts_with(setting), "{message}");
+        assert!(message.contains(&value.to_string()), "{message}");
+    }
+
+    let accepted = [
+        engine(|o| o.memtable_budget = ENTRY_OVERHEAD),
+        engine(|o| o.target_run_len = 1),
+        engine(|o| o.target_run_len = 1 << 30),
+        engine(|o| o.max_runs = 1),
+        engine(|o| o.max_run_bytes = 1),
+        engine(|o| o.target_block_len = 1),
+        engine(|o| o.target_block_len = 64 << 10),
+        engine(|o| o.background_compaction = None),
+        engine(|o| {
+            o.snapshots = SnapshotLimits {
+                max_live: 0,
+                max_retained_bytes: 0,
+            }
+        }),
+        compaction(|c| c.max_overlap = 1),
+        compaction(|c| c.max_inputs = 2),
+        compaction(|c| c.disjoint_runs_above = 0),
+    ];
+    for options in accepted {
+        Engine::new(options).unwrap();
+    }
+}
+
+/// The smallest budget admits exactly the smallest record: an empty key
+/// with no value.
+#[test]
+fn the_smallest_budget_admits_the_smallest_record() {
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: ENTRY_OVERHEAD,
+        ..manual()
+    })
+    .unwrap();
+    engine.delete(b"").unwrap();
+    assert!(matches!(
+        engine.put(b"k", b""),
+        Err(UpdateError::Rejected(
+            WriteError::RecordExceedsBudget { .. }
+        ))
+    ));
+}
+
+/// Zero snapshot limits are valid and mean what they say: no snapshot is
+/// ever admitted.
+#[test]
+fn zero_snapshot_limits_refuse_every_snapshot() {
+    let engine = Engine::new(EngineOptions {
+        snapshots: SnapshotLimits {
+            max_live: 0,
+            max_retained_bytes: 0,
+        },
+        ..EngineOptions::default()
+    })
+    .unwrap();
+    engine.put(b"k", b"v").unwrap();
+    assert!(engine.snapshot().is_err());
+}
+
+/// Options given to `compact` and `set_run_limits` are checked the same way,
+/// and refusing them changes nothing.
+#[test]
+fn runtime_options_are_checked_like_construction() {
+    let engine = Engine::new(manual()).unwrap();
+    for round in 0..6u32 {
+        engine.put(b"k", &round.to_be_bytes()).unwrap();
+        engine.flush().unwrap();
+    }
+    let before = engine.stats();
+    let mut workspace = MergeWorkspace::new();
+    for options in [
+        CompactionOptions {
+            max_overlap: 0,
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_inputs: 0,
+            ..CompactionOptions::default()
+        },
+    ] {
+        let refused = engine.compact(options, &mut workspace).unwrap_err();
+        assert!(matches!(refused, CompactionError::Config(_)), "{refused}");
+    }
+    let refused = engine.set_run_limits(0, usize::MAX).unwrap_err();
+    assert_eq!(refused.setting, "EngineOptions::max_runs");
+    let refused = engine.set_run_limits(1, 0).unwrap_err();
+    assert_eq!(refused.setting, "EngineOptions::max_run_bytes");
+    assert_eq!(engine.stats(), before);
+    // The runs stay within the limits they had: another flush publishes.
+    engine.put(b"k", b"new").unwrap();
+    engine.flush().unwrap();
+    assert!(
+        engine
+            .compact(CompactionOptions::default(), &mut workspace)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Dictionary compression is accepted with any valid block length, as
+/// requested: a dictionary is trained and kept only where it saves enough,
+/// whatever the length.
+#[test]
+fn dictionary_compression_accepts_every_block_length() {
+    for target_block_len in [1, 4 << 10, 16 << 10, 64 << 10] {
+        let engine = Engine::new(EngineOptions {
+            compression: Compression::ZstdDictionary,
+            target_block_len,
+            ..manual()
+        })
+        .unwrap();
+        for round in 0..6u32 {
+            for i in 0..200u32 {
+                let value = format!(r#"{{"id":{i},"round":{round},"name":"user {i}"}}"#);
+                engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        let mut workspace = MergeWorkspace::new();
+        while engine
+            .compact(CompactionOptions::default(), &mut workspace)
+            .unwrap()
+            .is_some()
+        {}
+        let mut reads = EngineWorkspace::new();
+        let found = engine.get(&7u32.to_be_bytes(), &mut reads).unwrap();
+        assert_eq!(
+            found.unwrap().value,
+            br#"{"id":7,"round":5,"name":"user 7"}"#,
+            "{target_block_len}"
+        );
+    }
 }

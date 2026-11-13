@@ -10,10 +10,19 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use tessera::engine::{
-    CheckpointError, CheckpointOptions, CompactionOptions, DurableOptions, Engine, EngineOptions,
-    EngineWorkspace, LogDamage, MAX_KEY_LEN, MAX_VALUE_LEN, RecoveryError, UpdateError, Verdict,
-    WriteError,
+    CheckpointError, CheckpointOptions, CompactionOptions, Compression, ConfigError,
+    DurableOptions, Engine, EngineOptions, EngineWorkspace, LogDamage, MAX_KEY_LEN, MAX_VALUE_LEN,
+    RecoveryError, UpdateError, Verdict, WriteError,
 };
+
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -69,9 +78,7 @@ fn small() -> DurableOptions {
 }
 
 fn open(dir: &Path) -> Engine {
-    Engine::open(dir, EngineOptions::default(), small())
-        .unwrap()
-        .0
+    Engine::open(dir, manual(), small()).unwrap().0
 }
 
 /// Writes (or deletes, without a value), waiting for compaction when the
@@ -94,7 +101,7 @@ fn write(engine: &Engine, key: &[u8], value: Option<&[u8]>) -> u64 {
 #[test]
 fn reopening_recovers_puts_overwrites_deletes_and_reinsertions_and_continues_the_sequence() {
     let scratch = Scratch::new("round-trip");
-    let engine = Engine::create(&scratch.0, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(&scratch.0, manual(), small()).unwrap();
     let mut model = Model::new();
     let keys: Vec<Vec<u8>> = vec![
         b"".to_vec(),
@@ -130,7 +137,7 @@ fn reopening_recovers_puts_overwrites_deletes_and_reinsertions_and_continues_the
     drop(engine);
 
     for reopen in 0..2 {
-        let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&scratch.0, manual(), small()).unwrap();
         assert_eq!(report.checkpoint_seq, 0);
         assert_eq!(report.last_seq, seq);
         assert_eq!(report.replayed, seq);
@@ -150,7 +157,7 @@ fn the_largest_key_and_value_are_logged_and_recovered() {
     let scratch = Scratch::new("largest");
     let options = EngineOptions {
         memtable_budget: MAX_VALUE_LEN + (1 << 20),
-        ..EngineOptions::default()
+        ..manual()
     };
     let engine = Engine::create(&scratch.0, options, DurableOptions::default()).unwrap();
     let key = vec![0xab; MAX_KEY_LEN];
@@ -176,7 +183,7 @@ fn checkpoints_prune_covered_segments_and_recovery_spans_checkpoint_and_log() {
     let scratch = Scratch::new("prune");
     let options = EngineOptions {
         target_run_len: 16 << 10,
-        ..EngineOptions::default()
+        ..manual()
     };
     let engine = Engine::create(&scratch.0, options, small()).unwrap();
     let mut model = Model::new();
@@ -221,7 +228,7 @@ fn checkpoints_beside_writes_flushes_and_compactions_lose_no_acknowledged_write(
         memtable_budget: 256 << 10,
         target_run_len: 64 << 10,
         background_compaction: Some(CompactionOptions::default()),
-        ..EngineOptions::default()
+        ..manual()
     };
     let durable = DurableOptions {
         segment_bytes: 32 << 10,
@@ -279,7 +286,7 @@ fn log_damage(result: Result<(Engine, tessera::engine::OpenReport), RecoveryErro
 /// A database with records in several segments after its checkpoint, and a
 /// copy of its files to restore between damages.
 fn damaged_fixture(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let engine = Engine::create(dir, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(dir, manual(), small()).unwrap();
     for at in 0..300u32 {
         engine.put(&at.to_be_bytes(), &[at as u8; 40]).unwrap();
     }
@@ -311,7 +318,7 @@ fn damage_to_acknowledged_history_is_rejected_but_a_torn_tail_is_truncated() {
     let scratch = Scratch::new("damage");
     let dir = &scratch.0;
     let files = damaged_fixture(dir);
-    let open = || Engine::open(dir, EngineOptions::default(), small());
+    let open = || Engine::open(dir, manual(), small());
     assert!(files.len() >= 4);
     let (middle, middle_bytes) = &files[files.len() / 2];
     let (last, last_bytes) = files.last().unwrap();
@@ -398,7 +405,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     let len = last_bytes.len() as u64;
     let inspect = |dir: &Path| {
         let before = listing(dir);
-        let inspection = Engine::inspect(dir, EngineOptions::default()).unwrap();
+        let inspection = Engine::inspect(dir, manual()).unwrap();
         assert_eq!(listing(dir), before, "inspect changed {}", dir.display());
         inspection
     };
@@ -438,7 +445,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     // A refused open changes nothing either: no truncation, no new segment.
     let before = listing(dir);
     assert!(matches!(
-        log_damage(Engine::open(dir, EngineOptions::default(), small())),
+        log_damage(Engine::open(dir, manual(), small())),
         LogDamage::Checksum | LogDamage::Frame | LogDamage::Length(_)
     ));
     assert_eq!(listing(dir), before);
@@ -462,19 +469,19 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     // A durable engine holds the directory against inspection.
     let engine = open(dir);
     assert!(matches!(
-        Engine::inspect(dir, EngineOptions::default()),
+        Engine::inspect(dir, manual()),
         Err(RecoveryError::Locked(_))
     ));
     drop(engine);
 
     // Interrupted creation: everything but CURRENT. Inspect creates no LOCK.
     let created = dir.join("created");
-    drop(Engine::create(&created, EngineOptions::default(), small()).unwrap());
+    drop(Engine::create(&created, manual(), small()).unwrap());
     fs::remove_file(created.join("CURRENT")).unwrap();
     fs::remove_file(created.join("LOCK")).unwrap();
     let before = listing(&created);
     assert!(matches!(
-        Engine::open(&created, EngineOptions::default(), small()),
+        Engine::open(&created, manual(), small()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
     // Refused before it would create LOCK, and never initialized.
@@ -482,7 +489,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     assert!(matches!(inspect(&created).verdict, Verdict::Uncommitted));
     // The same with a write logged has lost its CURRENT.
     let lost = dir.join("lost");
-    let engine = Engine::create(&lost, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(&lost, manual(), small()).unwrap();
     engine.put(b"k", b"v").unwrap();
     drop(engine);
     fs::remove_file(lost.join("CURRENT")).unwrap();
@@ -490,7 +497,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     assert!(matches!(inspection.verdict, Verdict::NoCheckpoint));
     assert_eq!(inspection.last_valid.unwrap().seq, 1);
     assert!(matches!(
-        Engine::inspect(&dir.join("absent"), EngineOptions::default()),
+        Engine::inspect(&dir.join("absent"), manual()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
 }
@@ -499,7 +506,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
 fn a_log_ending_before_its_checkpoint_or_starting_after_it_is_rejected() {
     let scratch = Scratch::new("behind");
     let dir = &scratch.0;
-    let engine = Engine::create(dir, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(dir, manual(), small()).unwrap();
     for at in 0..200u32 {
         engine.put(&at.to_be_bytes(), &[0; 40]).unwrap();
     }
@@ -513,7 +520,7 @@ fn a_log_ending_before_its_checkpoint_or_starting_after_it_is_rejected() {
     let header = fs::read(active).unwrap()[..36].to_vec();
     fs::write(active, &header).unwrap();
     assert!(matches!(
-        log_damage(Engine::open(dir, EngineOptions::default(), small())),
+        log_damage(Engine::open(dir, manual(), small())),
         LogDamage::Behind { .. }
     ));
     // Only a segment based after the ceiling remains.
@@ -524,7 +531,7 @@ fn a_log_ending_before_its_checkpoint_or_starting_after_it_is_rejected() {
         &dir.join("other"),
         EngineOptions {
             last_seq: 1000,
-            ..EngineOptions::default()
+            ..manual()
         },
         small(),
     )
@@ -533,7 +540,7 @@ fn a_log_ending_before_its_checkpoint_or_starting_after_it_is_rejected() {
     let foreign = segments(&dir.join("other")).remove(0);
     fs::copy(&foreign, dir.join("wal-00000000000000000001")).unwrap();
     assert!(matches!(
-        log_damage(Engine::open(dir, EngineOptions::default(), small())),
+        log_damage(Engine::open(dir, manual(), small())),
         LogDamage::Gap { .. }
     ));
 }
@@ -544,18 +551,18 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     let dir = &scratch.0;
     // Nothing there is not a database.
     assert!(matches!(
-        Engine::open(dir, EngineOptions::default(), small()),
+        Engine::open(dir, manual(), small()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
-    let engine = Engine::create(dir, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(dir, manual(), small()).unwrap();
     engine.put(b"k", b"v").unwrap();
     // An open database is locked against a second open, a recovery and a
     // checkpoint from another engine.
     assert!(matches!(
-        Engine::open(dir, EngineOptions::default(), small()),
+        Engine::open(dir, manual(), small()),
         Err(RecoveryError::Locked(_))
     ));
-    let other = Engine::new(EngineOptions::default());
+    let other = Engine::new(manual()).unwrap();
     assert!(matches!(
         other.checkpoint(dir, CheckpointOptions::default()),
         Err(CheckpointError::Locked(_))
@@ -568,7 +575,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     // Closed, it is still not a place for a checkpoint-only recovery, a
     // foreign checkpoint, or a second database.
     assert!(matches!(
-        Engine::recover(dir, EngineOptions::default()),
+        Engine::recover(dir, manual()),
         Err(RecoveryError::HasLog(_))
     ));
     assert!(matches!(
@@ -576,7 +583,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
         Err(CheckpointError::HasLog(_))
     ));
     assert!(matches!(
-        Engine::create(dir, EngineOptions::default(), small()),
+        Engine::create(dir, manual(), small()),
         Err(RecoveryError::NotEmpty(_))
     ));
     // A checkpoint-only directory has no log to open.
@@ -585,7 +592,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
         .checkpoint(&plain, CheckpointOptions::default())
         .unwrap();
     assert_eq!(
-        log_damage(Engine::open(&plain, EngineOptions::default(), small())),
+        log_damage(Engine::open(&plain, manual(), small())),
         LogDamage::NoSegments
     );
     // The database still opens, with its write.
@@ -601,7 +608,7 @@ fn a_full_log_refuses_writes_until_a_checkpoint_prunes_it() {
         max_log_bytes: 8192,
         ..DurableOptions::default()
     };
-    let engine = Engine::create(&scratch.0, EngineOptions::default(), durable).unwrap();
+    let engine = Engine::create(&scratch.0, manual(), durable).unwrap();
     let mut acked = 0u64;
     let refused = loop {
         match engine.put(&acked.to_be_bytes(), &[3; 100]) {
@@ -619,7 +626,7 @@ fn a_full_log_refuses_writes_until_a_checkpoint_prunes_it() {
         .unwrap();
     assert_eq!(engine.put(b"next", b"").unwrap(), acked + 1);
     drop(engine);
-    let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), durable).unwrap();
+    let (engine, report) = Engine::open(&scratch.0, manual(), durable).unwrap();
     assert_eq!(report.last_seq, acked + 1);
     assert_eq!(contents(&engine).len() as u64, acked + 1);
 }
@@ -633,7 +640,7 @@ fn durable_writes_flush_for_room_and_log_nothing_when_refused() {
     let scratch = Scratch::new("room");
     let options = EngineOptions {
         memtable_budget: 4 << 10,
-        ..EngineOptions::default()
+        ..manual()
     };
     let engine = Engine::create(&scratch.0, options, small()).unwrap();
     let mut model = Model::new();
@@ -652,7 +659,7 @@ fn durable_writes_flush_for_room_and_log_nothing_when_refused() {
     assert!(stats.flushes > 0, "{stats:?}");
     assert_eq!(engine.log_status().unwrap().records, 100);
 
-    engine.set_run_limits(0, 0);
+    engine.set_run_limits(1, 1).unwrap();
     let mut at = 100;
     let refused = loop {
         match put(&engine, at) {
@@ -667,7 +674,7 @@ fn durable_writes_flush_for_room_and_log_nothing_when_refused() {
     assert_eq!(engine.log_status().unwrap().records, log.records);
     assert_eq!(engine.stats(), stats);
 
-    engine.set_run_limits(64, usize::MAX);
+    engine.set_run_limits(64, usize::MAX).unwrap();
     assert_eq!(put(&engine, at), Ok(stats.last_seq + 1));
     assert_eq!(engine.stats().flushes, stats.flushes + 1);
     drop(engine);
@@ -688,7 +695,7 @@ fn concurrent_durable_writers_flush_beside_checkpoints_and_recover() {
     let options = EngineOptions {
         memtable_budget: 16 << 10,
         background_compaction: Some(CompactionOptions::default()),
-        ..EngineOptions::default()
+        ..manual()
     };
     let durable = DurableOptions {
         segment_bytes: 16 << 10,
@@ -756,17 +763,12 @@ fn concurrent_durable_writers_flush_beside_checkpoints_and_recover() {
 #[test]
 fn replay_refuses_a_record_larger_than_a_reduced_budget() {
     let scratch = Scratch::new("replay-budget");
-    let engine = Engine::create(
-        &scratch.0,
-        EngineOptions::default(),
-        DurableOptions::default(),
-    )
-    .unwrap();
+    let engine = Engine::create(&scratch.0, manual(), DurableOptions::default()).unwrap();
     engine.put(b"k", &[1; 4096]).unwrap();
     drop(engine);
     let small = EngineOptions {
         memtable_budget: 1024,
-        ..EngineOptions::default()
+        ..manual()
     };
     let refused = Engine::open(&scratch.0, small, DurableOptions::default()).map(drop);
     assert!(
@@ -795,22 +797,119 @@ fn a_log_limit_without_room_beside_a_full_segment_is_refused() {
         max_log_bytes: 4096,
         ..DurableOptions::default()
     };
-    let refused = Engine::create(&dir, EngineOptions::default(), durable).map(drop);
+    let refused = Engine::create(&dir, manual(), durable).map(drop);
     assert!(
         matches!(
             refused,
-            Err(RecoveryError::LogTooSmall {
-                max_log_bytes: 4096,
-                min_exceeded,
-            }) if min_exceeded > 4096
+            Err(RecoveryError::Config(ConfigError {
+                setting: "DurableOptions::max_log_bytes",
+                value: 4096,
+                min,
+                ..
+            })) if min > 4096
         ),
         "{refused:?}"
     );
     assert!(!dir.exists());
-    Engine::create(&dir, EngineOptions::default(), small()).unwrap();
-    let refused = Engine::open(&dir, EngineOptions::default(), durable).map(drop);
+    Engine::create(&dir, manual(), small()).unwrap();
+    let refused = Engine::open(&dir, manual(), durable).map(drop);
     assert!(
-        matches!(refused, Err(RecoveryError::LogTooSmall { .. })),
+        matches!(refused, Err(RecoveryError::Config(_))),
         "{refused:?}"
     );
+}
+
+/// Invalid engine or log options are refused before the directory is
+/// created, locked or read, by every durable entry point.
+#[test]
+fn invalid_options_are_refused_before_the_directory_is_touched() {
+    let scratch = Scratch::new("invalid-options");
+    let dir = scratch.0.join("db");
+    let bad_engine = EngineOptions {
+        max_runs: 0,
+        ..manual()
+    };
+    let bad_logs = [
+        DurableOptions {
+            segment_bytes: 0,
+            ..small()
+        },
+        DurableOptions {
+            max_batch_records: 0,
+            ..small()
+        },
+        DurableOptions {
+            max_batch_records: 257,
+            ..small()
+        },
+        DurableOptions {
+            max_batch_bytes: 0,
+            ..small()
+        },
+        DurableOptions {
+            max_queue_bytes: 0,
+            ..small()
+        },
+    ];
+    let config = |result: Result<(), RecoveryError>| match result {
+        Err(RecoveryError::Config(error)) => error,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        config(Engine::create(&dir, bad_engine, small()).map(drop)).setting,
+        "EngineOptions::max_runs"
+    );
+    for durable in bad_logs {
+        let error = config(Engine::create(&dir, manual(), durable).map(drop));
+        assert!(error.setting.starts_with("DurableOptions::"), "{error}");
+    }
+    assert!(!dir.exists());
+
+    // An existing database: refused without taking its lock or reading it.
+    Engine::create(&dir, manual(), small()).unwrap();
+    config(Engine::open(&dir, bad_engine, small()).map(drop));
+    for durable in bad_logs {
+        config(Engine::open(&dir, manual(), durable).map(drop));
+    }
+    config(Engine::recover(&dir, bad_engine).map(drop));
+    open(&dir);
+}
+
+/// A database written under one compression and block length reopens under
+/// any other: its runs keep their stored form, and new runs use the new
+/// settings.
+#[test]
+fn a_database_reopens_under_other_valid_compression_settings() {
+    let scratch = Scratch::new("reopen-settings");
+    let dir = scratch.0.join("db");
+    let settings = [
+        (Compression::Zstd, 16 << 10),
+        (Compression::ZstdDictionary, 4 << 10),
+        (Compression::Lz4, 1),
+        (Compression::Uncompressed, 64 << 10),
+    ];
+    let with = |(compression, target_block_len): (Compression, usize)| EngineOptions {
+        compression,
+        target_block_len,
+        ..manual()
+    };
+    let mut model = Model::new();
+    let engine = Engine::create(&dir, with(settings[0]), small()).unwrap();
+    drop(engine);
+    for (round, &setting) in settings.iter().enumerate() {
+        let (engine, _) = Engine::open(&dir, with(setting), small()).unwrap();
+        assert_eq!(contents(&engine), model, "{setting:?}");
+        for i in 0..100u32 {
+            let key = i.to_be_bytes().to_vec();
+            let value = format!("{round}:{i}").into_bytes();
+            engine.put(&key, &value).unwrap();
+            model.insert(key, value);
+        }
+        engine.flush().unwrap();
+        engine
+            .durable_checkpoint(CheckpointOptions::default())
+            .unwrap();
+    }
+    let (engine, _) = Engine::open(&dir, manual(), small()).unwrap();
+    assert_eq!(contents(&engine), model);
 }

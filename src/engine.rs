@@ -7,7 +7,7 @@
 //! ```
 //! use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
 //!
-//! let engine = Engine::new(EngineOptions::default());
+//! let engine = Engine::new(EngineOptions::default())?;
 //! let mut workspace = EngineWorkspace::new();
 //! engine.put(b"apple", b"red")?;
 //! engine.flush()?;
@@ -147,9 +147,9 @@
 //!
 //! # Compaction
 //!
-//! Compaction is explicit unless [background
-//! compaction](self#background-compaction) is configured. [`Engine::compact`]
-//! does one in three stages, like a flush: inputs are selected under the
+//! [Background compaction](self#background-compaction) is on by default;
+//! with [`EngineOptions::background_compaction`] set to `None`, compaction is
+//! explicit. [`Engine::compact`] does one in three stages, like a flush: inputs are selected under the
 //! shared lock, merged without any lock, and replaced by the output in one
 //! step under the exclusive lock. Readers see either all of the inputs or all
 //! of the output. Compactions run one at a time; flushes, reads and writes
@@ -185,8 +185,30 @@
 //! same way; the engine stays usable without it.
 //!
 //! Dropping the engine stops the worker after the compaction it is running,
-//! which is published, and joins the thread. The thread holds the engine's
-//! shared core, not the engine, so nothing keeps the engine alive.
+//! which is published, and joins the thread, so a drop can wait for one
+//! compaction (within [`CompactionOptions::max_input_bytes`]). The thread
+//! holds the engine's shared core, not the engine, so nothing keeps the
+//! engine alive.
+//!
+//! # Configuration
+//!
+//! [`Engine::new`], [`Engine::create`], [`Engine::open`] and
+//! [`Engine::recover`] check every option before they allocate, start the
+//! worker or touch a file, and refuse one outside its documented range with a
+//! [`ConfigError`] naming it (inside [`RecoveryError::Config`] for the last
+//! three); [`Engine::compact`] and [`Engine::set_run_limits`] check theirs
+//! the same way. No value is adjusted. Options that pass can still meet
+//! runtime limits, which the operation they stop reports: run limits refuse
+//! flushes ([`UpdateError::FlushRefused`]), log limits refuse writes
+//! ([`UpdateError::LogFull`]), snapshot limits refuse snapshots and
+//! compactions, and compaction limits refuse a merge
+//! ([`CompactionError::InputLimit`], [`CompactError`]).
+//!
+//! Compression and block length choose how new runs are built, nothing
+//! else. Every run records its own codec, block lengths and dictionary, so
+//! runs and checkpoints written under other settings are read and recovered
+//! as they are, and are rebuilt with the current settings only when a
+//! compaction or checkpoint rewrites their records.
 //!
 //! # Memory
 //!
@@ -295,8 +317,8 @@ use crate::memtable::{
 };
 use crate::run::{
     Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
-    MAX_ENGINE_BLOCK_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, Run, RunView, TARGET_BLOCK_LEN,
-    compact, latest_in,
+    MAX_ENGINE_BLOCK_LEN, MAX_TARGET_RUN_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, Run,
+    RunView, TARGET_BLOCK_LEN, compact, latest_in,
 };
 
 type SharedRun = Arc<Published>;
@@ -330,18 +352,22 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
 /// [Memory](self#memory).
 #[derive(Clone, Copy, Debug)]
 pub struct EngineOptions {
-    /// Charged bytes each memtable may hold. The active table and the tables
-    /// being flushed share twice this. A record charged more is refused with
-    /// [`WriteError::RecordExceedsBudget`].
+    /// Charged bytes each memtable may hold, from [`ENTRY_OVERHEAD`] (the
+    /// charge of an empty record) to half of `usize::MAX`. The active table
+    /// and the tables being flushed share twice this. A record charged more
+    /// is refused with [`WriteError::RecordExceedsBudget`].
     pub memtable_budget: usize,
     /// Bytes of memtable records per run a flush writes, so that a large
-    /// flush writes several runs with disjoint key ranges. Values above
-    /// 1 GiB are treated as 1 GiB; a run holds at least one record.
+    /// flush writes several runs with disjoint key ranges: from 1 to 1 GiB.
+    /// A run holds at least one record.
     pub target_run_len: usize,
-    /// The most runs that may be published.
+    /// The most runs that may be published, at least 1. A flush that would
+    /// exceed it is refused, and the writes waiting for it with
+    /// [`UpdateError::FlushRefused`], until compaction makes room.
     pub max_runs: usize,
-    /// The most bytes of published runs: their stored bytes, key filters
-    /// and prepared dictionaries together.
+    /// The most bytes of published runs, at least 1: their stored bytes, key
+    /// filters and prepared dictionaries together. Exceeding it refuses
+    /// flushes as for `max_runs`.
     pub max_run_bytes: usize,
     /// The sequence number a new engine continues after: the first write
     /// uses the next. [`Engine::new`] and [`Engine::create`] use it;
@@ -350,9 +376,15 @@ pub struct EngineOptions {
     /// checkpoint's ceiling.
     pub last_seq: u64,
     /// Starts a background worker that compacts with these options whenever
-    /// a flush publishes runs. See [Background compaction](self#background-compaction).
+    /// a flush publishes runs; on by default with
+    /// [`CompactionOptions::default`]. `None` runs no worker, and then the
+    /// application must call [`Engine::compact`], or runs accumulate until
+    /// flushes, and the writes that need them, are refused. See
+    /// [Background compaction](self#background-compaction).
     pub background_compaction: Option<CompactionOptions>,
-    /// Limits on [`Engine::snapshot`].
+    /// Limits on [`Engine::snapshot`]. Zero is valid for both and refuses
+    /// every snapshot (`max_live`) or every snapshot and compaction while a
+    /// snapshot retains anything (`max_retained_bytes`).
     pub snapshots: SnapshotLimits,
     /// How the runs this engine builds store their blocks. See
     /// [`Compression`].
@@ -363,11 +395,10 @@ pub struct EngineOptions {
     /// first record of a scan cheaper, and cost memory: each block compresses
     /// on its own and adds an index entry and a frame header (see
     /// `docs/benchmarks.md`). Blocks are cut at record boundaries, so a
-    /// record larger than this is a block of its own. Values above 64 KiB are
-    /// treated as 64 KiB, which keeps compression contexts within the
-    /// compaction workspace estimate. Any smaller value is valid, down to a
-    /// block per record, at about 20 bytes of index and frame header a
-    /// block.
+    /// record larger than this is a block of its own. From 1 (a block per
+    /// record, at about 20 bytes of index and frame header a block) to
+    /// 64 KiB, which keeps compression contexts within the compaction
+    /// workspace estimate.
     ///
     /// Each block records its own length, so an engine reads runs of every
     /// block length whatever this is set to, as with [`Self::compression`]:
@@ -377,9 +408,11 @@ pub struct EngineOptions {
 }
 
 impl Default for EngineOptions {
-    /// Provisional limits: 64 MiB memtables, 64 runs and 4 GiB of runs, no
-    /// background compaction, the default snapshot limits, and Zstandard in
-    /// 16 KiB blocks.
+    /// 64 MiB memtables, 64 runs and 4 GiB of runs, background compaction
+    /// with [`CompactionOptions::default`], the default snapshot limits, and
+    /// plain Zstandard in 16 KiB blocks: a general-purpose default that
+    /// favours density and scans. See [`Compression`] for the
+    /// latency-oriented alternative.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -387,13 +420,136 @@ impl Default for EngineOptions {
             max_runs: 64,
             max_run_bytes: 4 << 30,
             last_seq: 0,
-            background_compaction: None,
+            background_compaction: Some(CompactionOptions::default()),
             snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
             target_block_len: TARGET_BLOCK_LEN,
         }
     }
 }
+
+impl EngineOptions {
+    /// The one check of these options, made before an engine starts a
+    /// worker, allocates or touches a file. See [`ConfigError`].
+    fn validate(&self) -> Result<(), ConfigError> {
+        ConfigError::check(
+            "EngineOptions::memtable_budget",
+            self.memtable_budget as u64,
+            ENTRY_OVERHEAD as u64,
+            (usize::MAX / 2) as u64,
+            "it must admit the smallest record, and twice it must not overflow",
+        )?;
+        ConfigError::check(
+            "EngineOptions::target_run_len",
+            self.target_run_len as u64,
+            1,
+            MAX_TARGET_RUN_LEN as u64,
+            "runs are at most 1 GiB",
+        )?;
+        ConfigError::check_run_limits(self.max_runs, self.max_run_bytes)?;
+        ConfigError::check(
+            "EngineOptions::target_block_len",
+            self.target_block_len as u64,
+            1,
+            MAX_ENGINE_BLOCK_LEN as u64,
+            "the compaction workspace estimate covers blocks of up to 64 KiB",
+        )?;
+        if let Some(compaction) = &self.background_compaction {
+            compaction.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Why options were refused: a setting outside the range the engine
+/// supports, or one that contradicts another. Nothing was started,
+/// allocated or written.
+///
+/// Every setting is checked, and none is adjusted: a value is accepted as
+/// given or refused here. Settings that are valid can still meet runtime
+/// limits, which are reported by the operation they stop, such as
+/// [`UpdateError::FlushRefused`] or [`CompactionError::InputLimit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfigError {
+    /// The setting, as `Type::field`.
+    pub setting: &'static str,
+    /// Its value.
+    pub value: u64,
+    /// The least value accepted, given the other settings.
+    pub min: u64,
+    /// The greatest value accepted.
+    pub max: u64,
+    /// Why the range is what it is.
+    pub reason: &'static str,
+}
+
+impl ConfigError {
+    /// Refuses `value` outside `min..=max`. Callers widen `usize` settings,
+    /// which fit in `u64` on every target.
+    fn check(
+        setting: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
+        reason: &'static str,
+    ) -> Result<(), Self> {
+        if (min..=max).contains(&value) {
+            return Ok(());
+        }
+        Err(Self {
+            setting,
+            value,
+            min,
+            max,
+            reason,
+        })
+    }
+
+    /// [`EngineOptions::max_runs`] and [`EngineOptions::max_run_bytes`], as
+    /// given or as [`Engine::set_run_limits`] replaces them.
+    fn check_run_limits(max_runs: usize, max_run_bytes: usize) -> Result<(), Self> {
+        Self::check(
+            "EngineOptions::max_runs",
+            max_runs as u64,
+            1,
+            usize::MAX as u64,
+            "with no runs allowed, no flush could publish",
+        )?;
+        Self::check(
+            "EngineOptions::max_run_bytes",
+            max_run_bytes as u64,
+            1,
+            usize::MAX as u64,
+            "with no run bytes allowed, no flush could publish",
+        )
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            setting,
+            value,
+            min,
+            max,
+            reason,
+        } = self;
+        if *max == u64::MAX {
+            write!(
+                f,
+                "{setting} is {value} but must be at least {min}: {reason}"
+            )
+        } else {
+            write!(
+                f,
+                "{setting} is {value} but must be from {min} to {max}: {reason}"
+            )
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// How the runs that flushes, compactions and checkpoints build store their
 /// blocks: the trade between memory and the cost of reading a run.
@@ -422,6 +578,9 @@ impl Default for EngineOptions {
 /// dictionary learned from the data restores most of what they lose, so it
 /// is meant to pair with small blocks: it was measured with
 /// [`EngineOptions::target_block_len`] at 4 KiB, which is not set for you.
+/// Every valid block length is accepted and kept as requested; at any
+/// length, the check below decides per rewrite whether the output uses the
+/// dictionary.
 /// On JSON-like values through the engine (`docs/benchmarks.md`), 4 KiB
 /// blocks with a dictionary held 10% less run memory than 16 KiB plain
 /// blocks and 27% less than 4 KiB plain blocks, and lookups that reached a
@@ -932,10 +1091,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Creates an empty engine, starting a background compaction worker if
-    /// [`EngineOptions::background_compaction`] is set.
-    pub fn new(options: EngineOptions) -> Self {
-        Self::start(Arc::new(Core::new(&options)), &options)
+    /// Creates an empty RAM-only engine, starting a background compaction
+    /// worker if [`EngineOptions::background_compaction`] is set (the
+    /// default). Refused with a [`ConfigError`] if any option is outside its
+    /// range, before anything is allocated or started.
+    pub fn new(options: EngineOptions) -> Result<Self, ConfigError> {
+        options.validate()?;
+        Ok(Self::start(Arc::new(Core::new(&options)), &options))
     }
 
     /// Wraps `core`, starting its worker if `options` ask for one.
@@ -1042,9 +1204,15 @@ impl Engine {
         self.core.compact(options, workspace)
     }
 
-    /// Replaces the limits on published runs.
-    pub fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
-        self.core.set_run_limits(max_runs, max_run_bytes)
+    /// Replaces the limits on published runs, as for
+    /// [`EngineOptions::max_runs`] and [`EngineOptions::max_run_bytes`].
+    /// Values below what is published now are accepted: flushes are then
+    /// refused until compaction makes room. Refused, changing nothing, if
+    /// either is 0.
+    pub fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) -> Result<(), ConfigError> {
+        ConfigError::check_run_limits(max_runs, max_run_bytes)?;
+        self.core.set_run_limits(max_runs, max_run_bytes);
+        Ok(())
     }
 
     /// Returns a summary of the current state.
@@ -1103,7 +1271,7 @@ impl Core {
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
             dictionary: options.compression == Compression::ZstdDictionary,
-            target_block_len: options.target_block_len.min(MAX_ENGINE_BLOCK_LEN),
+            target_block_len: options.target_block_len,
             snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
             background: options.background_compaction.map(|_| worker::Signal::new()),
@@ -1387,6 +1555,7 @@ impl Core {
         options: CompactionOptions,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
+        options.validate().map_err(CompactionError::Config)?;
         match self.begin_compaction(options)? {
             Some(job) => job.build(workspace)?.publish().map(Some),
             None => Ok(None),
@@ -1723,13 +1892,13 @@ impl fmt::Debug for BuiltFlush<'_> {
 /// Bounds and policy for one compaction. See [`Engine::compact`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
-    /// The most runs merged at once.
+    /// The most runs merged at once, at least 2.
     pub max_inputs: usize,
-    /// The most stored bytes of input runs.
+    /// The most stored bytes of input runs, at least 1.
     pub max_input_bytes: usize,
     /// The most bytes of output, stored bytes and key filters together,
     /// built and held until publication, as for
-    /// [`EngineOptions::max_run_bytes`]. It counts bytes written, not
+    /// [`EngineOptions::max_run_bytes`]; at least 1. It counts bytes written, not
     /// allocated: the run being built grows its buffer by doubling, so it may
     /// hold up to its own size again in unused capacity until it is finished.
     pub max_output_bytes: usize,
@@ -1739,19 +1908,23 @@ pub struct CompactionOptions {
     /// estimate exceeds it fails before decoding anything. What the estimate
     /// leaves bounds the buffer of key hashes for the output's key filter;
     /// an output run that would need more is published without a filter.
+    /// At least 1.
     pub max_workspace_bytes: usize,
     /// The most runs whose key ranges may share a key. A point read decodes
-    /// at most this many blocks once compaction has caught up. Values below 1
-    /// are treated as 1, which merges any overlap.
+    /// at most this many blocks once compaction has caught up. At least 1,
+    /// which merges any overlap.
     pub max_overlap: usize,
     /// How many runs are tolerated, when none overlap, before neighbouring
-    /// tails are merged.
+    /// tails are merged. Any value is valid; 0 merges neighbouring tails
+    /// whenever there are two.
     pub disjoint_runs_above: usize,
 }
 
 impl Default for CompactionOptions {
-    /// Provisional limits: 8 inputs, 256 MiB in and out, 64 MiB of
-    /// workspace, an overlap of 4, and up to 16 disjoint runs.
+    /// 8 inputs, 256 MiB in and out, 64 MiB of workspace (room for a
+    /// dictionary's training beside the merge), an overlap of 4, and up to
+    /// 16 disjoint runs. The overlap trades rewriting against run memory and
+    /// scans; `docs/benchmarks.md` measures 2 to 4.
     fn default() -> Self {
         Self {
             max_inputs: 8,
@@ -1761,6 +1934,43 @@ impl Default for CompactionOptions {
             max_overlap: 4,
             disjoint_runs_above: 16,
         }
+    }
+}
+
+impl CompactionOptions {
+    /// The one check of these options, made when an engine is built with
+    /// them for its worker and by every [`Engine::compact`].
+    fn validate(&self) -> Result<(), ConfigError> {
+        ConfigError::check(
+            "CompactionOptions::max_inputs",
+            self.max_inputs as u64,
+            2,
+            usize::MAX as u64,
+            "a merge takes at least two runs",
+        )?;
+        for (setting, value) in [
+            ("CompactionOptions::max_input_bytes", self.max_input_bytes),
+            ("CompactionOptions::max_output_bytes", self.max_output_bytes),
+            (
+                "CompactionOptions::max_workspace_bytes",
+                self.max_workspace_bytes,
+            ),
+        ] {
+            ConfigError::check(
+                setting,
+                value as u64,
+                1,
+                usize::MAX as u64,
+                "no merge fits in nothing",
+            )?;
+        }
+        ConfigError::check(
+            "CompactionOptions::max_overlap",
+            self.max_overlap as u64,
+            1,
+            usize::MAX as u64,
+            "every key lies in at least one run; 1 merges any overlap",
+        )
     }
 }
 
@@ -1787,6 +1997,8 @@ pub enum CompactionError {
         /// The limit.
         max: usize,
     },
+    /// The options were refused before anything was selected.
+    Config(ConfigError),
 }
 
 impl From<CompactError> for CompactionError {
@@ -1811,6 +2023,7 @@ impl fmt::Display for CompactionError {
                 f,
                 "snapshots retain {bytes} bytes, over the limit of {max}; compaction waits"
             ),
+            Self::Config(error) => error.fmt(f),
         }
     }
 }
@@ -1890,7 +2103,7 @@ fn select(
         .max()
         .unwrap_or(0);
 
-    let limit = options.max_overlap.max(1);
+    let limit = options.max_overlap;
     if deepest > limit {
         stacks.retain(|(_, stack)| stack.len() > limit);
         stacks.sort_by(|(a, x), (b, y)| (y.len(), bytes(x), *a).cmp(&(x.len(), bytes(y), *b)));
@@ -2218,7 +2431,7 @@ impl fmt::Debug for ReadGuard<'_> {
 /// [`SnapshotLimits::max_live`]. Share one by reference or in an `Arc`:
 ///
 /// ```compile_fail,E0599
-/// # let engine = tessera::engine::Engine::new(Default::default());
+/// # let engine = tessera::engine::Engine::new(Default::default()).unwrap();
 /// let snapshot = engine.snapshot().unwrap();
 /// let second = snapshot.clone();
 /// ```
@@ -2548,6 +2761,15 @@ impl Engine {
 mod tests {
     use super::*;
 
+    /// The defaults without the background worker: these tests flush and
+    /// compact by hand and count what each step leaves.
+    fn manual() -> EngineOptions {
+        EngineOptions {
+            background_compaction: None,
+            ..EngineOptions::default()
+        }
+    }
+
     fn frozen_handle(engine: &Engine) -> Arc<FrozenMemtable> {
         let state = engine.core.read_state();
         assert_eq!(state.frozen.len(), 1);
@@ -2558,7 +2780,7 @@ mod tests {
     /// lock until it has it, the gate every reader must pass is closed.
     #[test]
     fn a_waiting_writer_holds_the_gate_until_it_has_the_lock() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         engine.put(b"k", b"old").unwrap();
         let held = engine.read();
         std::thread::scope(|scope| {
@@ -2586,7 +2808,7 @@ mod tests {
 
     #[test]
     fn publication_releases_every_engine_reference_to_the_frozen_table() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         engine.put(b"k", b"v").unwrap();
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
@@ -2597,7 +2819,7 @@ mod tests {
 
     #[test]
     fn an_abandoned_flush_releases_only_its_own_reference() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         engine.put(b"k", b"v").unwrap();
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
@@ -2608,9 +2830,10 @@ mod tests {
     #[test]
     fn a_rejected_publication_keeps_the_frozen_table_in_the_engine() {
         let engine = Engine::new(EngineOptions {
-            max_runs: 0,
-            ..EngineOptions::default()
-        });
+            max_run_bytes: 1,
+            ..manual()
+        })
+        .unwrap();
         engine.put(b"k", b"v").unwrap();
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
@@ -2760,7 +2983,7 @@ mod tests {
 
     #[test]
     fn a_lookup_decodes_only_the_newest_run_holding_the_key() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         engine.put(b"m", b"live").unwrap();
         engine.delete(b"z").unwrap();
@@ -2799,7 +3022,7 @@ mod tests {
     /// holds the newest of "j".
     #[test]
     fn a_partial_compaction_leaves_interleaved_runs_that_read_correctly() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         engine.put(b"j", b"j1").unwrap();
         engine.put(b"k", b"k1").unwrap();
         engine.flush().unwrap();
@@ -2852,7 +3075,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "compactions are serialized")]
     fn publication_checks_that_its_inputs_are_published() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         let built = engine
             .core
@@ -2871,7 +3094,7 @@ mod tests {
     /// validation timeout stops.
     #[test]
     fn building_a_compaction_takes_no_lock() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         let job = engine
             .core
@@ -2904,7 +3127,7 @@ mod tests {
 
     #[test]
     fn publication_frees_the_inputs_once_nothing_holds_them() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
         engine
@@ -2916,10 +3139,10 @@ mod tests {
 
     #[test]
     fn publication_refuses_growth_past_the_run_limits_but_allows_shrinking() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         let stats = engine.stats();
-        engine.set_run_limits(1, 1);
+        engine.set_run_limits(1, 1).unwrap();
         let begin = || {
             engine
                 .core
@@ -2952,7 +3175,7 @@ mod tests {
                 max_overlap,
                 ..CompactionOptions::default()
             }),
-            ..EngineOptions::default()
+            ..manual()
         }
     }
 
@@ -2981,7 +3204,7 @@ mod tests {
 
     #[test]
     fn a_flush_wakes_the_worker_which_compacts_and_goes_idle() {
-        let engine = Engine::new(background(1));
+        let engine = Engine::new(background(1)).unwrap();
         assert_eq!(engine.background_status().unwrap().passes, 0);
         overlapping_runs(&engine);
         engine.wait_for_compaction().unwrap();
@@ -3002,7 +3225,7 @@ mod tests {
     /// Requests made while the worker cannot run count as one more pass.
     #[test]
     fn requests_coalesce_while_the_worker_is_busy() {
-        let engine = Engine::new(background(1));
+        let engine = Engine::new(background(1)).unwrap();
         let slot = engine.core.compacting.lock().unwrap();
         for round in 0..10 {
             engine.put(b"a", &[round]).unwrap();
@@ -3023,7 +3246,7 @@ mod tests {
     /// flush publishes beside them; publication keeps the flushed run.
     #[test]
     fn reads_and_flushes_proceed_while_the_worker_compacts() {
-        let engine = Engine::new(background(2));
+        let engine = Engine::new(background(2)).unwrap();
         let (built, release) = pause_after_build(&engine);
         overlapping_runs(&engine);
         built.wait();
@@ -3045,7 +3268,7 @@ mod tests {
 
     #[test]
     fn dropping_an_idle_engine_joins_the_worker_and_frees_the_core() {
-        let engine = Engine::new(background(1));
+        let engine = Engine::new(background(1)).unwrap();
         overlapping_runs(&engine);
         engine.wait_for_compaction().unwrap();
         let core = Arc::clone(&engine.core);
@@ -3060,7 +3283,7 @@ mod tests {
     /// published, and starts no other.
     #[test]
     fn dropping_during_a_compaction_publishes_it_and_then_stops() {
-        let engine = Engine::new(background(1));
+        let engine = Engine::new(background(1)).unwrap();
         let (built, release) = pause_after_build(&engine);
         // Held while the runs are flushed, so that one compaction takes all.
         let slot = engine.core.compacting.lock().unwrap();
@@ -3092,8 +3315,9 @@ mod tests {
                 max_output_bytes: 30 << 10,
                 ..CompactionOptions::default()
             }),
-            ..EngineOptions::default()
-        });
+            ..manual()
+        })
+        .unwrap();
         let mut seed = 7u64;
         let mut noise = || {
             (0..2048)
@@ -3144,7 +3368,7 @@ mod tests {
     /// working without it and is still dropped cleanly.
     #[test]
     fn a_panicked_worker_is_reported_and_the_engine_stays_usable() {
-        let engine = Engine::new(background(1));
+        let engine = Engine::new(background(1)).unwrap();
         engine.core.panic_worker.store(true, Ordering::Relaxed);
         overlapping_runs(&engine);
         assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Stopped));
@@ -3166,7 +3390,7 @@ mod tests {
 
     #[test]
     fn an_engine_without_a_worker_says_so() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         assert_eq!(engine.background_status(), None);
         assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Disabled));
     }

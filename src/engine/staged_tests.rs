@@ -11,6 +11,15 @@ use std::thread;
 
 use super::*;
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 /// Flush stages: what reads see while tables are frozen, built and published.
 mod flush {
     use super::*;
@@ -18,7 +27,7 @@ mod flush {
     type Live = (Vec<u8>, u64, Vec<u8>);
 
     fn engine() -> Engine {
-        Engine::new(EngineOptions::default())
+        Engine::new(manual()).unwrap()
     }
 
     fn value_of(engine: &Engine, key: &[u8]) -> Option<(u64, Vec<u8>)> {
@@ -297,7 +306,7 @@ mod snapshot {
     /// the same state as one taken before or after it.
     #[test]
     fn no_source_transition_leaves_a_gap() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         let mut expected: Pairs = Vec::new();
         let mut held: Vec<(Snapshot, Pairs)> = Vec::new();
         let mut take = |engine: &Engine, expected: &Pairs| {
@@ -408,7 +417,7 @@ mod compaction {
     /// newer than every input. They stay published and keep winning.
     #[test]
     fn publication_keeps_what_was_flushed_and_written_meanwhile() {
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         for round in 0..3 {
             engine.put(b"a", format!("a{round}").as_bytes()).unwrap();
             engine.put(b"b", b"b").unwrap();
@@ -495,8 +504,9 @@ mod compaction {
                 // Odd seeds use small memtables, which the history pinned by
                 // snapshots fills, so writes flush them.
                 memtable_budget: if seed % 2 == 0 { 64 << 20 } else { 4 << 10 },
-                ..EngineOptions::default()
-            });
+                ..manual()
+            })
+            .unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             let mut stage = Stage::Idle;
             let mut workspace = MergeWorkspace::new();

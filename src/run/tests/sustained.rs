@@ -316,7 +316,8 @@ fn sustained_compaction() {
         compression,
         target_block_len: block,
         ..EngineOptions::default()
-    });
+    })
+    .unwrap();
 
     // Seven keys in eight, in a fixed random order, consolidated as the
     // comparison harness consolidates its load; when appending, the lowest

@@ -132,6 +132,7 @@ fn options(memtable_budget: usize) -> EngineOptions {
             max_live: 1 << 10,
             max_retained_bytes: usize::MAX,
         },
+        background_compaction: None,
         ..EngineOptions::default()
     }
 }
@@ -289,7 +290,7 @@ fn memtable() {
     let sequential: Vec<u64> = (0..RECORDS).collect();
     let budget = 1 << 30;
     let loaded = || {
-        let engine = Engine::new(options(budget));
+        let engine = Engine::new(options(budget)).expect("valid options");
         fill(&engine, &random, &values);
         engine
     };
@@ -304,13 +305,21 @@ fn memtable() {
     row(
         "insert, ascending keys",
         ns_per_op(ROUNDS, n, || {
-            fill(&Engine::new(options(budget)), &sequential, &values)
+            fill(
+                &Engine::new(options(budget)).expect("valid options"),
+                &sequential,
+                &values,
+            )
         }),
     );
     row(
         "insert, random keys",
         ns_per_op(ROUNDS, n, || {
-            fill(&Engine::new(options(budget)), &random, &values)
+            fill(
+                &Engine::new(options(budget)).expect("valid options"),
+                &random,
+                &values,
+            )
         }),
     );
     let engine = loaded();
@@ -541,7 +550,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(shape: Shape, count: u64, key: fn(u64) -> Vec<u8>, values: &Values) -> Self {
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         let load = |order: &[u64]| {
             for &index in order {
                 engine.put(&key(index), values.get(index)).unwrap();
@@ -784,7 +793,7 @@ fn lookups() {
     // overwritten in each of 8 flushes, so those keys have a version in 9
     // runs. A snapshot taken after the fourth flush sees the fourth version.
     {
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         for index in shuffled(RECORDS, 50) {
             engine.put(&point_key(index), values.get(index)).unwrap();
         }
@@ -1353,7 +1362,7 @@ fn density() {
         };
 
         let heap = live_heap();
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         let mut logical = 0usize;
         for index in shuffled(count, 72) {
             let (key, value) = record(index);
@@ -1429,7 +1438,7 @@ fn maintenance() {
     );
     let order = shuffled(RECORDS, 6);
     let (secs, report) = median_secs(ROUNDS, || {
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         fill(&engine, &order, &values);
         let start = Instant::now();
         let report = engine.flush().unwrap();
@@ -1458,7 +1467,7 @@ fn maintenance() {
         ],
     );
     let (secs, report) = median_secs(ROUNDS, || {
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         let mut rng = Rng::new(7);
         let key_space = RECORDS * RUNS / 2;
         for _ in 0..RUNS {
@@ -1500,7 +1509,7 @@ fn snapshots() {
         &["records in memtable", "runs", "snapshot ns"],
     );
     for records in [1_000u64, 100_000, 1_000_000] {
-        let engine = Engine::new(options(1 << 30));
+        let engine = Engine::new(options(1 << 30)).expect("valid options");
         fill(&engine, &shuffled(records, 8), &values);
         if records == 1_000_000 {
             engine.flush().unwrap();
@@ -1540,7 +1549,7 @@ fn snapshots() {
         ],
     );
     for live in [0usize, 1, 4, 16] {
-        let engine = Engine::new(options(16 << 20));
+        let engine = Engine::new(options(16 << 20)).expect("valid options");
         fill(&engine, &shuffled(KEYS, 10), &values);
         engine.flush().unwrap();
         let flushes = engine.stats().flushes;
@@ -1607,7 +1616,8 @@ fn ingest() {
         let engine = Engine::new(EngineOptions {
             background_compaction: Some(CompactionOptions::default()),
             ..options(4 << 20)
-        });
+        })
+        .expect("valid options");
         let start = Instant::now();
         let latency = Latencies::merge(thread::scope(|scope| {
             let handles: Vec<_> = (0..writers)
@@ -1672,7 +1682,8 @@ fn mixed() {
         let engine = Engine::new(EngineOptions {
             background_compaction: Some(CompactionOptions::default()),
             ..options(4 << 20)
-        });
+        })
+        .expect("valid options");
         fill(&engine, &shuffled(KEYS, 12), &values);
         engine.wait_for_compaction().unwrap();
         let writing = AtomicBool::new(true);
@@ -2031,7 +2042,8 @@ fn workloads(compression: Compression) {
             background_compaction: Some(CompactionOptions::default()),
             compression,
             ..options(4 << 20)
-        });
+        })
+        .expect("valid options");
         // The starting state: every key in one run, then a seventh deleted
         // and a fifth of the rest overwritten in newer runs.
         for &index in &shuffled(RECORDS, 12) {
@@ -2375,7 +2387,7 @@ fn recovery(base: &Path) {
     };
 
     let scratch = Scratch::new(base, "checkpoint");
-    let engine = Engine::new(engine_options());
+    let engine = Engine::new(engine_options()).expect("valid options");
     fill(&engine, &shuffled(RECORDS, 13), &values);
     let start = Instant::now();
     let report = engine

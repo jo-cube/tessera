@@ -16,6 +16,15 @@ use tessera::engine::{
     SnapshotLimits,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 struct Scratch(PathBuf);
@@ -78,8 +87,9 @@ fn compact_all(engine: &Engine) {
 fn varied_engine() -> (Engine, Model) {
     let engine = Engine::new(EngineOptions {
         target_run_len: 4096,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let mut model = Model::new();
     let mut put = |key: Vec<u8>, value: Vec<u8>| {
         engine.put(&key, &value).unwrap();
@@ -122,7 +132,7 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         ["CURRENT", "ckpt-00000000000000000001"]
     );
 
-    let recovered = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
     assert_eq!(
         contents(&recovered, &[0, 0, 3]),
@@ -147,7 +157,7 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         &scratch.0,
         EngineOptions {
             last_seq: report.last_seq + 100,
-            ..EngineOptions::default()
+            ..manual()
         },
     )
     .unwrap();
@@ -165,7 +175,7 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         checkpoint_dirs(&scratch.0),
         ["CURRENT", "ckpt-00000000000000000002"]
     );
-    let again = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let again = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&again, b""), contents(&recovered, b""));
     assert_eq!(get(&again, &4u32.to_be_bytes()), None);
 }
@@ -183,12 +193,12 @@ fn checkpoints_recover_under_any_compression() {
     let with = |compression| EngineOptions {
         target_run_len: 4096,
         compression,
-        ..EngineOptions::default()
+        ..manual()
     };
     let mut run_bytes = Vec::new();
     for written in ALL {
         let scratch = Scratch::new(&format!("compression-{written:?}"));
-        let engine = Engine::new(with(written));
+        let engine = Engine::new(with(written)).unwrap();
         let mut model = Model::new();
         for i in 0..3_000u32 {
             let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
@@ -268,7 +278,7 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     let with = |target_block_len| EngineOptions {
         target_run_len: 1 << 20,
         target_block_len,
-        ..EngineOptions::default()
+        ..manual()
     };
     // The decoded block one lookup leaves in a fresh workspace.
     let block_of = |engine: &Engine, key: u32| {
@@ -282,7 +292,7 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     let mut blocks = Vec::new();
     for written in LENGTHS {
         let scratch = Scratch::new(&format!("block-length-{written}"));
-        let engine = Engine::new(with(written));
+        let engine = Engine::new(with(written)).unwrap();
         let mut model = Model::new();
         for i in 0..3_000u32 {
             let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
@@ -353,9 +363,15 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     }
     assert!(blocks[0] > blocks[1] && blocks[1] > blocks[2], "{blocks:?}");
 
-    // Lengths above the largest the engine builds are treated as it: these
-    // records, about 100 KB, would otherwise be one block.
-    let engine = Engine::new(with(usize::MAX));
+    // Lengths above the largest the engine builds are refused, not
+    // adjusted; at the largest, these records of about 100 KB are cut into
+    // blocks of at most 64 KiB.
+    let refused = Engine::new(with((64 << 10) + 1)).map(drop).unwrap_err();
+    assert_eq!(
+        (refused.setting, refused.max),
+        ("EngineOptions::target_block_len", 64 << 10)
+    );
+    let engine = Engine::new(with(64 << 10)).unwrap();
     for i in 0..3_000u32 {
         let value = format!("value {} of {i}", i % 10);
         engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();
@@ -445,9 +461,9 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     let with = |compression| EngineOptions {
         target_block_len: 4 << 10,
         compression,
-        ..EngineOptions::default()
+        ..manual()
     };
-    let engine = Engine::new(with(Compression::ZstdDictionary));
+    let engine = Engine::new(with(Compression::ZstdDictionary)).unwrap();
     let mut model = Model::new();
     let put = |engine: &Engine, model: &mut Model, i: u32, version: u32| {
         let (key, value) = (format!("user/{i:06}").into_bytes(), profile(i, version));
@@ -589,8 +605,9 @@ fn dictionary_compaction_falls_back_on_sensor_records() {
     let engine = Engine::new(EngineOptions {
         target_block_len: 4 << 10,
         compression: Compression::ZstdDictionary,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let reading = |i: u32, version: u32| {
         let mut value = (1_700_000_000_000u64 + u64::from(i) * 250 + u64::from(version))
             .to_be_bytes()
@@ -632,9 +649,9 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
     let with = |compression| EngineOptions {
         target_run_len: 4096,
         compression,
-        ..EngineOptions::default()
+        ..manual()
     };
-    let engine = Engine::new(with(Compression::Zstd));
+    let engine = Engine::new(with(Compression::Zstd)).unwrap();
     let mut model = Model::new();
     for i in 0..3_000u32 {
         let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
@@ -657,7 +674,9 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
     let snapshot = recovered.snapshot().unwrap();
     let before = recovered.stats();
     assert!(before.max_overlap > 1, "{before:?}");
-    recovered.set_run_limits(usize::MAX, before.run_bytes + before.held_bytes);
+    recovered
+        .set_run_limits(usize::MAX, before.run_bytes + before.held_bytes)
+        .unwrap();
     let options = CompactionOptions {
         max_overlap: 1,
         ..CompactionOptions::default()
@@ -680,7 +699,7 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
     };
     assert_eq!(snapshot_contents(&snapshot), model);
 
-    recovered.set_run_limits(usize::MAX, usize::MAX);
+    recovered.set_run_limits(usize::MAX, usize::MAX).unwrap();
     compact_all(&recovered);
     assert!(recovered.stats().run_bytes > before.run_bytes);
     assert_eq!(contents(&recovered, b""), model);
@@ -691,23 +710,24 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
 fn an_empty_engine_checkpoints_and_recovers_empty_but_nothing_is_not_a_checkpoint() {
     let scratch = Scratch::new("empty");
     assert!(matches!(
-        Engine::recover(&scratch.0, EngineOptions::default()),
+        Engine::recover(&scratch.0, manual()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
     fs::create_dir_all(&scratch.0).unwrap();
     assert!(matches!(
-        Engine::recover(&scratch.0, EngineOptions::default()),
+        Engine::recover(&scratch.0, manual()),
         Err(RecoveryError::NoCheckpoint(_))
     ));
     let engine = Engine::new(EngineOptions {
         last_seq: 41,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let report = engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
     assert_eq!((report.records, report.runs, report.last_seq), (0, 0, 41));
-    let recovered = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert!(contents(&recovered, b"").is_empty());
     assert_eq!(recovered.put(b"a", b"1").unwrap(), 42);
 }
@@ -732,8 +752,9 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
         memtable_budget: 256 << 10,
         target_run_len: 64 << 10,
         background_compaction: Some(CompactionOptions::default()),
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let done = AtomicBool::new(false);
     let mut log: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut reports = Vec::new();
@@ -785,7 +806,7 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
             None => model.remove(key),
         };
     }
-    let recovered = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
     assert_eq!(recovered.stats().last_seq, last.last_seq);
     assert!(
@@ -821,7 +842,7 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
             fs::write(path, bytes).unwrap();
         }
     };
-    let damage = |path: &Path| match Engine::recover(&scratch.0, EngineOptions::default()) {
+    let damage = |path: &Path| match Engine::recover(&scratch.0, manual()) {
         Err(RecoveryError::Corrupt { path: at, damage }) => {
             assert_eq!(at, path);
             damage
@@ -867,7 +888,7 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
     restore();
 
     // Recovery changed nothing, and the restored checkpoint recovers.
-    Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    Engine::recover(&scratch.0, manual()).unwrap();
 }
 
 #[test]
@@ -891,7 +912,7 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
         checkpoint_dirs(&scratch.0),
         ["CURRENT", "ckpt-00000000000000000001"]
     );
-    let recovered = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
     assert_eq!(recovered.stats().last_seq, first.last_seq);
 
@@ -901,8 +922,9 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
             max_live: 0,
             ..SnapshotLimits::default()
         },
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     assert!(matches!(
         limited.checkpoint(&scratch.0, CheckpointOptions::default()),
         Err(CheckpointError::Snapshot(_))
@@ -918,10 +940,7 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
         .unwrap();
     assert!(next.generation > first.generation);
     assert_eq!(
-        get(
-            &Engine::recover(&scratch.0, EngineOptions::default()).unwrap(),
-            b"later"
-        ),
+        get(&Engine::recover(&scratch.0, manual()).unwrap(), b"later"),
         Some(b"x".to_vec())
     );
 }
@@ -937,7 +956,7 @@ fn recovery_refuses_more_runs_than_the_options_allow() {
         &scratch.0,
         EngineOptions {
             max_runs: report.runs - 1,
-            ..EngineOptions::default()
+            ..manual()
         },
     );
     assert!(matches!(error, Err(RecoveryError::RunLimit(_))));
@@ -946,7 +965,7 @@ fn recovery_refuses_more_runs_than_the_options_allow() {
         &scratch.0,
         EngineOptions {
             max_run_bytes: report.largest_run_bytes,
-            ..EngineOptions::default()
+            ..manual()
         },
     );
     assert!(matches!(error, Err(RecoveryError::RunLimit(_))));
@@ -975,7 +994,7 @@ fn oversized_files_are_refused_before_they_are_read() {
             .unwrap()
             .set_len(64 << 30)
             .unwrap();
-        let error = Engine::recover(&scratch.0, EngineOptions::default());
+        let error = Engine::recover(&scratch.0, manual());
         assert!(
             matches!(
                 error,
@@ -992,5 +1011,5 @@ fn oversized_files_are_refused_before_they_are_read() {
         );
         fs::write(&path, original).unwrap();
     }
-    Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    Engine::recover(&scratch.0, manual()).unwrap();
 }

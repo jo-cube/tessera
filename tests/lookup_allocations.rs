@@ -17,6 +17,15 @@ use tessera::engine::{
     MergeWorkspace,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -85,8 +94,9 @@ fn consolidated(compression: Compression) -> (Engine, Vec<DictionaryChoice>) {
         compression,
         max_runs: usize::MAX,
         max_run_bytes: usize::MAX,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     // A fixed permutation, flushed in four parts whose key ranges overlap.
     for j in 0..RECORDS {
         let index = j.wrapping_mul(7_919) % RECORDS;

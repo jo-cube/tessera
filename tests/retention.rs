@@ -14,6 +14,15 @@ use tessera::engine::{
     SnapshotLimits,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -93,8 +102,9 @@ fn memtable_only() -> Engine {
             max_live: 64,
             max_retained_bytes: usize::MAX,
         },
-        ..EngineOptions::default()
+        ..manual()
     })
+    .unwrap()
 }
 
 /// The active table's pinned bytes cover what only its snapshots hold.
@@ -171,7 +181,7 @@ fn engine_options() -> EngineOptions {
             max_live: 64,
             max_retained_bytes: usize::MAX,
         },
-        ..EngineOptions::default()
+        ..manual()
     }
 }
 
@@ -191,7 +201,7 @@ fn compact_some(engine: &Engine, rng: &mut Rng, workspace: &mut MergeWorkspace) 
 /// memtable history and released tables and runs.
 fn engine_checkpoints(seed: u64) -> usize {
     let mut rng = Rng(seed);
-    let engine = Engine::new(engine_options());
+    let engine = Engine::new(engine_options()).unwrap();
     let mut held: Vec<Snapshot> = Vec::with_capacity(64);
     let mut merge = MergeWorkspace::new();
     let mut workspace = EngineWorkspace::new();

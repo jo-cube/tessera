@@ -235,7 +235,7 @@ use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 use super::checkpoint::{
     self, CheckpointError, CheckpointOptions, CheckpointReport, RecoveryError,
 };
-use super::{Core, Engine, EngineOptions, UpdateError};
+use super::{ConfigError, Core, Engine, EngineOptions, UpdateError};
 
 const PREFIX: &str = "wal-";
 const SEGMENT_MAGIC: [u8; 8] = *b"TSRWAL\0\x01";
@@ -260,13 +260,13 @@ pub struct DurableOptions {
     /// with [`UpdateError::LogFull`] until a checkpoint prunes segments. A
     /// checkpoint cannot prune the active segment, so this must exceed
     /// `segment_bytes` and a segment header, or creating and opening fail
-    /// with [`RecoveryError::LogTooSmall`]. Beyond that, after a checkpoint
+    /// with [`RecoveryError::Config`]. Beyond that, after a checkpoint
     /// a record is admitted if it fits beside the active segment. With
     /// records of at most `r` bytes logged (29 plus the key and value for a
     /// put) and 36-byte segment headers, `segment_bytes + 2 * (r + 36)` is
     /// always enough.
     pub max_log_bytes: u64,
-    /// The most writes one batch logs with one sync, at most 256. 1 syncs
+    /// The most writes one batch logs with one sync, from 1 to 256. 1 syncs
     /// every write on its own.
     pub max_batch_records: usize,
     /// The most encoded bytes one batch logs, though a single larger write
@@ -280,17 +280,47 @@ pub struct DurableOptions {
 }
 
 impl DurableOptions {
-    /// Refuses a log limit that a full active segment would exhaust: the next
-    /// record starts a segment, which needs room for its header and the
+    /// The one check of these options, made before [`Engine::create`] or
+    /// [`Engine::open`] touches the directory. Besides nonzero limits, it
+    /// refuses a log limit that a full active segment would exhaust: the
+    /// next record starts a segment, which needs room for its header and the
     /// record beside the full one, and a checkpoint cannot prune the active
     /// segment.
-    fn check(&self) -> Result<(), RecoveryError> {
-        let min_exceeded = self.segment_bytes.saturating_add(SEGMENT_HEADER_LEN as u64);
-        if self.max_log_bytes <= min_exceeded {
-            return Err(RecoveryError::LogTooSmall {
-                max_log_bytes: self.max_log_bytes,
-                min_exceeded,
-            });
+    fn validate(&self) -> Result<(), ConfigError> {
+        let header = SEGMENT_HEADER_LEN as u64;
+        ConfigError::check(
+            "DurableOptions::segment_bytes",
+            self.segment_bytes,
+            1,
+            u64::MAX - header - 1,
+            "a segment must hold something, and the log limit must exceed it and a header",
+        )?;
+        ConfigError::check(
+            "DurableOptions::max_log_bytes",
+            self.max_log_bytes,
+            self.segment_bytes + header + 1,
+            u64::MAX,
+            "it must exceed a full segment and a segment header, or the log could fill \
+             with nothing a checkpoint can prune",
+        )?;
+        ConfigError::check(
+            "DurableOptions::max_batch_records",
+            self.max_batch_records as u64,
+            1,
+            MAX_BATCH_RECORDS as u64,
+            "a batch logs at least one write and at most 256",
+        )?;
+        for (setting, value) in [
+            ("DurableOptions::max_batch_bytes", self.max_batch_bytes),
+            ("DurableOptions::max_queue_bytes", self.max_queue_bytes),
+        ] {
+            ConfigError::check(
+                setting,
+                value as u64,
+                1,
+                usize::MAX as u64,
+                "a zero limit would admit writes only one at a time, which max_batch_records = 1 expresses",
+            )?;
         }
         Ok(())
     }
@@ -1347,7 +1377,8 @@ impl Engine {
         options: EngineOptions,
         durable: DurableOptions,
     ) -> Result<Engine, RecoveryError> {
-        durable.check()?;
+        options.validate().map_err(RecoveryError::Config)?;
+        durable.validate().map_err(RecoveryError::Config)?;
         let io = |path: &Path| {
             let path = path.to_owned();
             move |error| RecoveryError::Io { path, error }
@@ -1363,7 +1394,7 @@ impl Engine {
             }
         }
         let wal = Wal::new(dir, durable, Vec::new(), options.last_seq).map_err(io(dir))?;
-        let engine = Engine::new(options);
+        let engine = Engine::start(Arc::new(Core::new(&options)), &options);
         let published = engine.publish(dir, CheckpointOptions::default());
         let installed = Durable::new(dir, durable, lock, wal);
         match published {
@@ -1400,7 +1431,8 @@ impl Engine {
         options: EngineOptions,
         durable: DurableOptions,
     ) -> Result<(Engine, OpenReport), RecoveryError> {
-        durable.check()?;
+        options.validate().map_err(RecoveryError::Config)?;
+        durable.validate().map_err(RecoveryError::Config)?;
         let lock = checkpoint::lock_existing(dir)?;
         let loaded = checkpoint::load(dir, &options)?;
         let (generation, ceiling) = (loaded.generation, loaded.ceiling);
@@ -1663,6 +1695,15 @@ impl fmt::Debug for Durable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defaults without the background worker: these tests flush and
+    /// compact by hand and count what each step leaves.
+    fn manual() -> EngineOptions {
+        EngineOptions {
+            background_compaction: None,
+            ..EngineOptions::default()
+        }
+    }
     use crate::engine::EngineWorkspace;
     use crate::engine::checkpoint::{CRASH_AT, Crash};
     use crate::memtable::TableError;
@@ -1749,7 +1790,7 @@ mod tests {
     fn a_failed_append_closes_the_log_and_recovery_keeps_what_was_acknowledged() {
         for (fault, survives) in [(Fault::TornAppend, false), (Fault::SyncFails, true)] {
             let dir = scratch(&format!("{fault:?}"));
-            let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+            let engine = Engine::create(&dir, manual(), small()).unwrap();
             assert_eq!(engine.put(b"a", b"1").unwrap(), 1);
             assert_eq!(engine.delete(b"a").unwrap(), 2);
             inject(&engine, fault);
@@ -1763,14 +1804,14 @@ mod tests {
             assert!(engine.log_status().unwrap().closed.is_some());
             drop(engine);
 
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
             assert_eq!(report.torn_tail.is_some(), !survives, "{fault:?}");
             assert_eq!(get(&engine, b"a"), None);
             assert_eq!(get(&engine, b"b").is_some(), survives);
             let next = if survives { 4 } else { 3 };
             assert_eq!(engine.put(b"d", b"4").unwrap(), next);
             drop(engine);
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
             assert_eq!(report.torn_tail, None);
             assert_eq!(report.last_seq, next);
             assert_eq!(get(&engine, b"d"), Some(b"4".to_vec()));
@@ -1787,7 +1828,7 @@ mod tests {
         let dir = scratch("over-budget");
         let options = EngineOptions {
             memtable_budget: 16 << 10,
-            ..EngineOptions::default()
+            ..manual()
         };
         let engine = Engine::create(&dir, options, small()).unwrap();
         let charge = 4 + 100 + crate::memtable::ENTRY_OVERHEAD;
@@ -1862,7 +1903,7 @@ mod tests {
     fn a_checkpoint_during_an_in_flight_write_keeps_its_record() {
         use std::sync::mpsc;
         let dir = scratch("in-flight");
-        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        let engine = Engine::create(&dir, manual(), small()).unwrap();
         for at in 0..20u32 {
             engine.put(&at.to_be_bytes(), &[1; 100]).unwrap();
         }
@@ -1903,7 +1944,7 @@ mod tests {
             assert!(report.pruned_segments > 0, "{report:?}");
         });
         drop(engine);
-        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
         assert_eq!((report.replayed, report.last_seq), (1, 21));
         assert_eq!(get(&engine, b"in-flight"), Some(vec![2; 900]));
         drop(engine);
@@ -1913,7 +1954,7 @@ mod tests {
     #[test]
     fn an_interrupted_rotation_is_removed_on_open() {
         let dir = scratch("rotation");
-        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        let engine = Engine::create(&dir, manual(), small()).unwrap();
         let value = [7; 400];
         engine.put(b"a", &value).unwrap();
         engine.put(b"b", &value).unwrap();
@@ -1924,13 +1965,13 @@ mod tests {
             Err(UpdateError::LogFailed(_))
         ));
         drop(engine);
-        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
         assert_eq!(report.interrupted_segment, Some(dir.join(segment_name(2))));
         assert_eq!(report.last_seq, 2);
         assert_eq!(get(&engine, b"b"), Some(value.to_vec()));
         engine.put(b"c", &value).unwrap();
         drop(engine);
-        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
         assert_eq!((report.last_seq, report.interrupted_segment), (3, None));
         assert_eq!(get(&engine, b"c"), Some(value.to_vec()));
         drop(engine);
@@ -1971,7 +2012,7 @@ mod tests {
     fn a_power_loss_after_a_crash_and_reopen_keeps_every_acknowledged_write() {
         for zeros in [false, true] {
             let dir = scratch(&format!("power-{zeros}"));
-            let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+            let engine = Engine::create(&dir, manual(), small()).unwrap();
             let mut model = Vec::new();
             for at in 0..3u8 {
                 engine.put(&[at], &[at; 100]).unwrap();
@@ -1981,7 +2022,7 @@ mod tests {
             inject(&engine, Fault::SyncFails);
             assert!(engine.put(&[3], &[3; 100]).is_err());
             drop(engine);
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+            let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
             assert_eq!(report.last_seq, 4, "recovered from the page cache");
             model.push((vec![3], vec![3; 100]));
             // Acknowledged after the reopen, across several new segments.
@@ -1995,7 +2036,7 @@ mod tests {
             drop(engine);
 
             power_loss(&dir, zeros);
-            let (engine, report) = Engine::open(&dir, EngineOptions::default(), small())
+            let (engine, report) = Engine::open(&dir, manual(), small())
                 .unwrap_or_else(|error| panic!("zeros {zeros}: {error}"));
             assert_eq!(report.last_seq, 80);
             assert_eq!(state(&engine), model);
@@ -2009,14 +2050,14 @@ mod tests {
     #[test]
     fn a_log_of_more_segments_than_open_files_is_recovered() {
         let dir = scratch("many");
-        let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+        let engine = Engine::create(&dir, manual(), small()).unwrap();
         engine.put(b"a", b"1").unwrap();
         drop(engine);
         // What 1,200 opens without a checkpoint would leave: empty segments.
         for number in 2..=1_201 {
             fs::write(dir.join(segment_name(number)), encode_header(number, 1)).unwrap();
         }
-        let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&dir, manual(), small()).unwrap();
         assert_eq!((report.last_seq, report.segments), (1, 1_201));
         assert_eq!(get(&engine, b"a"), Some(b"1".to_vec()));
         let checkpoint = engine
@@ -2044,7 +2085,7 @@ mod tests {
             let dir = scratch(&format!("durable-{crash:?}"));
             let options = EngineOptions {
                 target_run_len: 1024,
-                ..EngineOptions::default()
+                ..manual()
             };
             let engine = Engine::create(&dir, options, small()).unwrap();
             for round in 0..3u8 {

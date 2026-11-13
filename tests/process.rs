@@ -19,6 +19,15 @@ use tessera::engine::{
     RecoveryError,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 /// Held by each parent test, so that one test never forks while the other
 /// has a lock open.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -63,8 +72,9 @@ fn contents(engine: &Engine) -> Model {
 fn varied_engine() -> (Engine, Model) {
     let engine = Engine::new(EngineOptions {
         target_run_len: 4096,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let mut model = Model::new();
     for i in 0..2_000u32 {
         let (key, value) = (i.to_be_bytes().to_vec(), format!("v{i}").into_bytes());
@@ -133,7 +143,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
         Err(CheckpointError::Locked(_))
     ));
     assert!(matches!(
-        Engine::recover(&scratch.0, EngineOptions::default()),
+        Engine::recover(&scratch.0, manual()),
         Err(RecoveryError::Locked(_))
     ));
 
@@ -145,7 +155,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
     assert_eq!(report.generation, 2);
-    let recovered = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered), model);
 }
 
@@ -166,7 +176,7 @@ fn child_value(round: u64, thread: u64, at: u64) -> Vec<u8> {
 /// sequence number, with a checkpoint every few hundred writes.
 fn write_as_child(dir: &str, round: u64) {
     let dir = Path::new(dir);
-    let (engine, report) = Engine::open(dir, EngineOptions::default(), small()).unwrap();
+    let (engine, report) = Engine::open(dir, manual(), small()).unwrap();
     let out = std::sync::Mutex::new(std::io::stdout());
     writeln!(
         out.lock().unwrap(),
@@ -220,7 +230,7 @@ fn a_killed_process_loses_no_acknowledged_write() {
     }
     let _serial = one_at_a_time();
     let scratch = Scratch::new("killed");
-    drop(Engine::create(&scratch.0, EngineOptions::default(), small()).unwrap());
+    drop(Engine::create(&scratch.0, manual(), small()).unwrap());
     // Per round and thread, the sequence number of each acknowledged write.
     let mut acked: Vec<Vec<Vec<u64>>> = Vec::new();
     let mut last_recovered = 0;
@@ -265,7 +275,7 @@ fn a_killed_process_loses_no_acknowledged_write() {
             let count = record(&line, &mut this);
             if count == writes / 2 {
                 assert!(matches!(
-                    Engine::open(&scratch.0, EngineOptions::default(), small()),
+                    Engine::open(&scratch.0, manual(), small()),
                     Err(RecoveryError::Locked(_))
                 ));
             }
@@ -287,7 +297,7 @@ fn a_killed_process_loses_no_acknowledged_write() {
         assert_eq!(opened, Some(last_recovered), "round {round}");
         acked.push(this);
 
-        let (engine, report) = Engine::open(&scratch.0, EngineOptions::default(), small()).unwrap();
+        let (engine, report) = Engine::open(&scratch.0, manual(), small()).unwrap();
         let mut workspace = EngineWorkspace::new();
         let mut most = 0;
         for (r, threads) in acked.iter().enumerate() {
@@ -334,7 +344,7 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
     }
     let _serial = one_at_a_time();
     let scratch = Scratch::new("exec");
-    let engine = Engine::create(&scratch.0, EngineOptions::default(), small()).unwrap();
+    let engine = Engine::create(&scratch.0, manual(), small()).unwrap();
     engine.put(b"k", b"v").unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -347,7 +357,7 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
         .spawn()
         .unwrap();
     drop(engine);
-    let reopened = Engine::open(&scratch.0, EngineOptions::default(), small());
+    let reopened = Engine::open(&scratch.0, manual(), small());
     child.kill().unwrap();
     child.wait().unwrap();
     let (engine, report) = reopened.unwrap();

@@ -15,6 +15,15 @@ use tessera::engine::{
     MergeWorkspace, Snapshot, SnapshotError, SnapshotLimits,
 };
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> EngineOptions {
+    EngineOptions {
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn pairs(items: &[(&[u8], &[u8])]) -> Pairs {
@@ -67,7 +76,7 @@ fn compact_all(engine: &Engine) -> usize {
 
 #[test]
 fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     for key in [&b"a"[..], b"b", b"c", b"\xff\x00"] {
         engine.put(key, b"1").unwrap();
     }
@@ -134,7 +143,7 @@ fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
 fn a_long_scan_lets_writes_flushes_and_compactions_publish() {
     const KEYS: usize = 200;
     let key = |i: usize| format!("k{i:03}").into_bytes();
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     for round in [b"0", b"1"] {
         for i in 0..KEYS {
             engine.put(&key(i), round).unwrap();
@@ -177,7 +186,7 @@ fn a_long_scan_lets_writes_flushes_and_compactions_publish() {
 
 #[test]
 fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     engine.put(b"a", b"1").unwrap();
     engine.flush().unwrap();
     engine.put(b"a", b"2").unwrap();
@@ -225,8 +234,9 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
 fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     let engine = Engine::new(EngineOptions {
         memtable_budget: 256 << 10,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     engine.put(b"seen", b"1").unwrap();
     let small = engine.snapshot().unwrap();
     let seen = engine.stats().active.charged;
@@ -248,11 +258,11 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     // A snapshot holding the frozen table itself keeps all of it. A refused
     // flush leaves the table frozen.
     engine.put(b"seen", b"2").unwrap();
-    engine.set_run_limits(0, 0);
+    engine.set_run_limits(1, 1).unwrap();
     engine.flush().unwrap_err();
     let whole = engine.snapshot().unwrap();
     let frozen = engine.stats().frozen.unwrap().charged;
-    engine.set_run_limits(usize::MAX, usize::MAX);
+    engine.set_run_limits(usize::MAX, usize::MAX).unwrap();
     engine.flush().unwrap();
     assert_eq!(engine.stats().retained_bytes, retained + frozen);
 
@@ -269,8 +279,9 @@ fn each_limit_refuses_with_its_own_error_and_changes_nothing() {
             max_live: 2,
             max_retained_bytes: 0,
         },
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     for (key, value) in [(b"a", b"1"), (b"z", b"1"), (b"a", b"2"), (b"z", b"2")] {
         engine.put(key, value).unwrap();
         engine.flush().unwrap();
@@ -326,7 +337,7 @@ fn each_limit_refuses_with_its_own_error_and_changes_nothing() {
 /// flushed for them, and a write after each copies one leaf at most.
 #[test]
 fn frequent_snapshots_freeze_and_flush_nothing() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     let key = |i: usize| format!("k{i:05}").into_bytes();
     for i in 0..2_000 {
         engine.put(&key(i), b"0").unwrap();
@@ -351,8 +362,9 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     const BUDGET: usize = 64 << 10;
     let engine = Engine::new(EngineOptions {
         memtable_budget: BUDGET,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let key = |i: usize| format!("k{i:03}").into_bytes();
     for i in 0..200 {
         engine.put(&key(i), &[0; 100]).unwrap();
@@ -392,8 +404,9 @@ fn concurrent_snapshots_see_a_prefix_of_the_writes() {
     let key = |i: usize| format!("k{i:05}").into_bytes();
     let engine = Engine::new(EngineOptions {
         background_compaction: Some(merge_all()),
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     let start = Barrier::new(2);
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -436,8 +449,9 @@ fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
             max_overlap: 1,
             ..CompactionOptions::default()
         }),
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     for round in 0..3u8 {
         for i in 0..100 {
             engine.put(&key(i), &[round]).unwrap();
@@ -483,8 +497,9 @@ fn a_flush_refused_after_retention_blocked_compaction_recovers_on_its_own() {
             max_live: 1,
             max_retained_bytes: 0,
         },
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     engine.put(b"a", b"1").unwrap();
     let snapshot = engine.snapshot().unwrap();
     // Pins the snapshot's leaf, over the limit of zero.
@@ -524,7 +539,7 @@ fn a_flush_refused_after_retention_blocked_compaction_recovers_on_its_own() {
 /// compaction has replaced.
 #[test]
 fn a_point_read_keeps_no_replaced_run_alive_after_it_returns() {
-    let engine = Engine::new(EngineOptions::default());
+    let engine = Engine::new(manual()).unwrap();
     // Overlapping ranges, so that compaction replaces both runs.
     for keys in [[b"a", b"z"], [b"b", b"y"]] {
         for key in keys {

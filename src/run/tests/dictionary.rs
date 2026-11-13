@@ -14,6 +14,15 @@ use crate::run::{
 
 use super::costs::compare;
 
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> crate::engine::EngineOptions {
+    crate::engine::EngineOptions {
+        background_compaction: None,
+        ..crate::engine::EngineOptions::default()
+    }
+}
+
 type Owned = (Vec<u8>, u64, Option<Vec<u8>>);
 
 const FOOTER_V3: usize = 32;
@@ -589,8 +598,9 @@ fn engine_lookup_costs() {
             max_runs: usize::MAX,
             max_run_bytes: usize::MAX,
             background_compaction: background.then(CompactionOptions::default),
-            ..EngineOptions::default()
-        });
+            ..manual()
+        })
+        .unwrap();
         // Shuffled, as the comparison harness loads, so that flushes overlap.
         let mut order: Vec<usize> = (0..records.len()).collect();
         let mut shuffle = super::costs::Rng::new(11);
@@ -641,7 +651,7 @@ fn engine_lookup_costs() {
                 compression,
                 max_runs: usize::MAX,
                 max_run_bytes: usize::MAX,
-                ..EngineOptions::default()
+                ..manual()
             },
         )
         .unwrap();
@@ -1156,8 +1166,9 @@ fn mixed_dictionary_counts() {
         background_compaction: Some(CompactionOptions::default()),
         compression: Compression::ZstdDictionary,
         target_block_len: SMALL_BLOCK,
-        ..EngineOptions::default()
-    });
+        ..manual()
+    })
+    .unwrap();
     for j in 0..records {
         let index = shuffled(j, 0x9E37_79B1);
         engine

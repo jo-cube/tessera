@@ -366,17 +366,9 @@ pub enum RecoveryError {
     },
     /// The checkpoint holds more runs or bytes than the options allow.
     RunLimit(FlushError),
-    /// [`DurableOptions::max_log_bytes`](super::DurableOptions::max_log_bytes)
-    /// leaves no room to start a segment beside a full one. A checkpoint
-    /// cannot prune the active segment, so once it filled, every write would
-    /// be refused with [`UpdateError::LogFull`](super::UpdateError::LogFull)
-    /// until the database was reopened.
-    LogTooSmall {
-        /// The limit.
-        max_log_bytes: u64,
-        /// The least it must exceed: a full segment and a segment header.
-        min_exceeded: u64,
-    },
+    /// The engine or log options were refused before the directory was
+    /// touched.
+    Config(super::ConfigError),
 }
 
 impl fmt::Display for RecoveryError {
@@ -413,15 +405,7 @@ impl fmt::Display for RecoveryError {
                 )
             }
             Self::RunLimit(error) => write!(f, "recovered runs exceed the limits: {error}"),
-            Self::LogTooSmall {
-                max_log_bytes,
-                min_exceeded,
-            } => write!(
-                f,
-                "a log limit of {max_log_bytes} bytes must exceed {min_exceeded}, \
-                 a full segment and a segment header, or the log could fill \
-                 with nothing a checkpoint can prune"
-            ),
+            Self::Config(error) => error.fmt(f),
         }
     }
 }
@@ -936,6 +920,7 @@ impl Engine {
     /// returns an empty engine for a missing or damaged checkpoint, nor falls
     /// back to an older one.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, RecoveryError> {
+        options.validate().map_err(RecoveryError::Config)?;
         let _lock = lock_existing(dir)?;
         if super::wal::has_log(dir).map_err(|error| RecoveryError::Io {
             path: dir.to_owned(),
@@ -1236,6 +1221,15 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
 mod tests {
     use super::*;
 
+    /// The defaults without the background worker: these tests flush and
+    /// compact by hand and count what each step leaves.
+    fn manual() -> EngineOptions {
+        EngineOptions {
+            background_compaction: None,
+            ..EngineOptions::default()
+        }
+    }
+
     #[test]
     fn manifest_and_current_round_trip_and_reject_damage() {
         let manifest = Manifest {
@@ -1305,8 +1299,9 @@ mod tests {
             let dir = scratch(&format!("{crash:?}"));
             let engine = Engine::new(EngineOptions {
                 target_run_len: 1024,
-                ..EngineOptions::default()
-            });
+                ..manual()
+            })
+            .unwrap();
             for i in 0..500u32 {
                 engine.put(&i.to_be_bytes(), b"old").unwrap();
             }
@@ -1325,7 +1320,7 @@ mod tests {
             let error = engine.checkpoint(&dir, CheckpointOptions::default());
             CRASH_AT.with(|at| at.set(None));
             assert!(error.is_err(), "{crash:?}");
-            let recovered = Engine::recover(&dir, EngineOptions::default()).unwrap();
+            let recovered = Engine::recover(&dir, manual()).unwrap();
             let expected = if committed { &new } else { &old };
             assert_eq!(&state(&recovered), expected, "{crash:?}");
             drop(recovered);
@@ -1340,7 +1335,7 @@ mod tests {
                 [CURRENT.to_owned(), format!("{PREFIX}{:020}", 3)],
                 "{crash:?}"
             );
-            let recovered = Engine::recover(&dir, EngineOptions::default()).unwrap();
+            let recovered = Engine::recover(&dir, manual()).unwrap();
             assert_eq!(state(&recovered), new, "{crash:?}");
             fs::remove_dir_all(&dir).unwrap();
         }
@@ -1350,7 +1345,7 @@ mod tests {
     #[test]
     fn the_lock_keeps_a_second_user_out() {
         let dir = scratch("lock");
-        let engine = Engine::new(EngineOptions::default());
+        let engine = Engine::new(manual()).unwrap();
         engine.put(b"a", b"1").unwrap();
         engine
             .checkpoint(&dir, CheckpointOptions::default())
@@ -1363,11 +1358,11 @@ mod tests {
             Err(CheckpointError::Locked(_))
         ));
         assert!(matches!(
-            Engine::recover(&dir, EngineOptions::default()),
+            Engine::recover(&dir, manual()),
             Err(RecoveryError::Locked(_))
         ));
         drop(held);
-        Engine::recover(&dir, EngineOptions::default()).unwrap();
+        Engine::recover(&dir, manual()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }
