@@ -29,11 +29,13 @@
 //!
 //! // Bound the log: checkpoint, then drop the segments it covers.
 //! engine.durable_checkpoint(CheckpointOptions::default())?;
-//! drop((snapshot, engine));
+//! // Stop the worker and release the directory; snapshots stay readable.
+//! engine.close()?;
+//! drop(snapshot);
 //!
 //! let (engine, _report) = Engine::open(&dir, EngineOptions::default(), DurableOptions::default())?;
 //! assert_eq!(engine.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
-//! # drop(engine);
+//! # engine.close()?;
 //! # std::fs::remove_dir_all(&dir)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

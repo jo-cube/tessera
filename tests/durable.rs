@@ -12,7 +12,7 @@ use std::thread;
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionOptions, Compression, ConfigError,
     DurableOptions, Engine, EngineOptions, EngineWorkspace, LogDamage, MAX_KEY_LEN, MAX_VALUE_LEN,
-    RecoveryError, UpdateError, Verdict, WriteError,
+    OpenError, UpdateError, Verdict, WriteError,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -275,9 +275,9 @@ fn flip(path: &Path, at: u64) {
     fs::write(path, bytes).unwrap();
 }
 
-fn log_damage(result: Result<(Engine, tessera::engine::OpenReport), RecoveryError>) -> LogDamage {
+fn log_damage(result: Result<(Engine, tessera::engine::OpenReport), OpenError>) -> LogDamage {
     match result {
-        Err(RecoveryError::Log { damage, .. }) => damage,
+        Err(OpenError::Log { damage, .. }) => damage,
         Err(error) => panic!("{error}"),
         Ok(_) => panic!("damage was accepted"),
     }
@@ -470,7 +470,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     let engine = open(dir);
     assert!(matches!(
         Engine::inspect(dir, manual()),
-        Err(RecoveryError::Locked(_))
+        Err(OpenError::Locked(_))
     ));
     drop(engine);
 
@@ -482,7 +482,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     let before = listing(&created);
     assert!(matches!(
         Engine::open(&created, manual(), small()),
-        Err(RecoveryError::NoCheckpoint(_))
+        Err(OpenError::NoCheckpoint(_))
     ));
     // Refused before it would create LOCK, and never initialized.
     assert_eq!(listing(&created), before);
@@ -498,7 +498,7 @@ fn inspection_reports_what_open_would_do_and_changes_nothing() {
     assert_eq!(inspection.last_valid.unwrap().seq, 1);
     assert!(matches!(
         Engine::inspect(&dir.join("absent"), manual()),
-        Err(RecoveryError::NoCheckpoint(_))
+        Err(OpenError::NoCheckpoint(_))
     ));
 }
 
@@ -552,7 +552,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     // Nothing there is not a database.
     assert!(matches!(
         Engine::open(dir, manual(), small()),
-        Err(RecoveryError::NoCheckpoint(_))
+        Err(OpenError::NoCheckpoint(_))
     ));
     let engine = Engine::create(dir, manual(), small()).unwrap();
     engine.put(b"k", b"v").unwrap();
@@ -560,7 +560,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     // checkpoint from another engine.
     assert!(matches!(
         Engine::open(dir, manual(), small()),
-        Err(RecoveryError::Locked(_))
+        Err(OpenError::Locked(_))
     ));
     let other = Engine::new(manual()).unwrap();
     assert!(matches!(
@@ -576,7 +576,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     // foreign checkpoint, or a second database.
     assert!(matches!(
         Engine::recover(dir, manual()),
-        Err(RecoveryError::HasLog(_))
+        Err(OpenError::HasLog(_))
     ));
     assert!(matches!(
         other.checkpoint(dir, CheckpointOptions::default()),
@@ -584,7 +584,7 @@ fn databases_are_created_and_opened_explicitly_and_kept_from_other_uses() {
     ));
     assert!(matches!(
         Engine::create(dir, manual(), small()),
-        Err(RecoveryError::NotEmpty(_))
+        Err(OpenError::NotEmpty(_))
     ));
     // A checkpoint-only directory has no log to open.
     let plain = dir.join("plain");
@@ -774,7 +774,7 @@ fn replay_refuses_a_record_larger_than_a_reduced_budget() {
     assert!(
         matches!(
             refused,
-            Err(RecoveryError::Replay(WriteError::RecordExceedsBudget {
+            Err(OpenError::Replay(WriteError::RecordExceedsBudget {
                 budget: 1024,
                 ..
             }))
@@ -801,7 +801,7 @@ fn a_log_limit_without_room_beside_a_full_segment_is_refused() {
     assert!(
         matches!(
             refused,
-            Err(RecoveryError::Config(ConfigError {
+            Err(OpenError::Config(ConfigError {
                 setting: "DurableOptions::max_log_bytes",
                 value: 4096,
                 min,
@@ -813,10 +813,7 @@ fn a_log_limit_without_room_beside_a_full_segment_is_refused() {
     assert!(!dir.exists());
     Engine::create(&dir, manual(), small()).unwrap();
     let refused = Engine::open(&dir, manual(), durable).map(drop);
-    assert!(
-        matches!(refused, Err(RecoveryError::Config(_))),
-        "{refused:?}"
-    );
+    assert!(matches!(refused, Err(OpenError::Config(_))), "{refused:?}");
 }
 
 /// Invalid engine or log options are refused before the directory is
@@ -851,8 +848,8 @@ fn invalid_options_are_refused_before_the_directory_is_touched() {
             ..small()
         },
     ];
-    let config = |result: Result<(), RecoveryError>| match result {
-        Err(RecoveryError::Config(error)) => error,
+    let config = |result: Result<(), OpenError>| match result {
+        Err(OpenError::Config(error)) => error,
         other => panic!("{other:?}"),
     };
     assert_eq!(
@@ -912,4 +909,27 @@ fn a_database_reopens_under_other_valid_compression_settings() {
     }
     let (engine, _) = Engine::open(&dir, manual(), small()).unwrap();
     assert_eq!(contents(&engine), model);
+}
+
+/// Closing a durable engine releases its directory lock at once, so the
+/// database reopens immediately, and writes nothing: no checkpoint is
+/// committed, and every acknowledged write is replayed from the log.
+#[test]
+fn closing_releases_the_lock_and_commits_no_checkpoint() {
+    let scratch = Scratch::new("close");
+    let dir = scratch.0.join("db");
+    let engine = Engine::create(&dir, EngineOptions::default(), small()).unwrap();
+    let locked = Engine::open(&dir, manual(), small()).map(drop);
+    assert!(matches!(locked, Err(OpenError::Locked(_))), "{locked:?}");
+    for i in 0..10u32 {
+        engine.put(&i.to_be_bytes(), b"v").unwrap();
+    }
+    let segments_before = segments(&dir);
+    assert_eq!(engine.close(), Ok(()));
+    assert_eq!(segments(&dir), segments_before);
+
+    let (engine, report) = Engine::open(&dir, EngineOptions::default(), small()).unwrap();
+    assert_eq!((report.generation, report.replayed), (1, 10));
+    assert_eq!(contents(&engine).len(), 10);
+    assert_eq!(engine.close(), Ok(()));
 }

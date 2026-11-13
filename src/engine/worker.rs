@@ -4,7 +4,10 @@
 //! Requests are counted, not queued. A request made while a pass is running
 //! causes one more pass after it, however many requests arrive.
 
+use std::any::Any;
 use std::fmt;
+use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -20,7 +23,7 @@ pub struct BackgroundStatus {
     /// Whether it is in a pass now.
     pub busy: bool,
     /// Passes finished. A pass compacts until nothing is eligible, a
-    /// compaction fails, or the engine is dropped.
+    /// compaction fails, or the engine is closed or dropped.
     pub passes: u64,
     /// Compactions published.
     pub compactions: u64,
@@ -30,10 +33,12 @@ pub struct BackgroundStatus {
     pub output_bytes: u64,
     /// Passes that ended on a failure.
     pub failures: u64,
-    /// The failure that ended the most recent pass, if it failed.
+    /// The failure that ended the most recent pass, if it failed. Such a
+    /// refusal is not terminal: the next request starts another pass.
     pub last_failure: Option<CompactionError>,
-    /// Whether the worker stopped by panicking. It is not restarted.
-    pub panicked: bool,
+    /// The message of the panic that stopped the worker, if it panicked. A
+    /// stopped worker is not restarted; the engine works on without it.
+    pub panic: Option<String>,
 }
 
 /// Why waiting for background compaction did not end in success.
@@ -41,8 +46,8 @@ pub struct BackgroundStatus {
 pub enum BackgroundError {
     /// The engine has no background worker.
     Disabled,
-    /// The worker is not running, because it panicked.
-    Stopped,
+    /// The worker panicked and has stopped for good, with this message.
+    Panicked(String),
     /// The pass waited for ended on this failure. Nothing is retried until
     /// the next flush, refused flush, limit change or wait.
     Failed(CompactionError),
@@ -52,7 +57,9 @@ impl fmt::Display for BackgroundError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("the engine has no background compaction"),
-            Self::Stopped => f.write_str("the background compaction worker has stopped"),
+            Self::Panicked(message) => {
+                write!(f, "the background compaction worker panicked: {message}")
+            }
             Self::Failed(error) => write!(f, "background compaction failed: {error}"),
         }
     }
@@ -119,7 +126,8 @@ impl Signal {
             progress = self.wait_on(progress);
         }
         if progress.finished < target {
-            return Err(BackgroundError::Stopped);
+            let message = progress.status.panic.clone().unwrap_or_default();
+            return Err(BackgroundError::Panicked(message));
         }
         match &progress.status.last_failure {
             Some(error) => Err(BackgroundError::Failed(error.clone())),
@@ -140,16 +148,52 @@ impl Signal {
     }
 }
 
-/// Starts the worker. Its thread holds the core, not the engine, so dropping
-/// the engine can stop and join it.
-///
-/// Panics if the operating system cannot create the thread.
-pub(super) fn start(core: Arc<Core>, options: CompactionOptions) -> JoinHandle<()> {
+/// Starts the worker. Its thread holds the core, not the engine, so closing
+/// or dropping the engine can stop and join it. Fails, leaving the worker
+/// marked as not running, if the operating system cannot create the thread.
+pub(super) fn start(core: Arc<Core>, options: CompactionOptions) -> io::Result<JoinHandle<()>> {
     signal(&core).lock().status.running = true;
+    let thread = Arc::clone(&core);
+    #[cfg(test)]
+    let spawned = if tests::FAIL_SPAWN.with(|fail| fail.replace(false)) {
+        Err(io::Error::other("injected spawn failure"))
+    } else {
+        spawn(thread, options)
+    };
+    #[cfg(not(test))]
+    let spawned = spawn(thread, options);
+    if spawned.is_err() {
+        signal(&core).lock().status.running = false;
+    }
+    spawned
+}
+
+fn spawn(core: Arc<Core>, options: CompactionOptions) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("tessera-compaction".into())
-        .spawn(move || run(&core, options))
-        .expect("the compaction worker thread can be created")
+        .spawn(move || {
+            // A panic is caught here, after unwinding released every lock
+            // it held, so that its message is kept for `wait` and `close`.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&core, options)));
+            let signal = signal(&core);
+            let mut progress = signal.lock();
+            progress.status.running = false;
+            progress.status.busy = false;
+            progress.status.panic = outcome.err().map(|payload| message(&*payload));
+            signal.changed.notify_all();
+        })
+}
+
+/// A panic payload's message, as `std` prints it.
+fn message(payload: &(dyn Any + Send)) -> String {
+    match (
+        payload.downcast_ref::<&str>(),
+        payload.downcast_ref::<String>(),
+    ) {
+        (Some(message), _) => (*message).to_owned(),
+        (_, Some(message)) => message.clone(),
+        _ => String::from("a panic without a message"),
+    }
 }
 
 fn signal(core: &Core) -> &Signal {
@@ -158,22 +202,8 @@ fn signal(core: &Core) -> &Signal {
         .expect("an engine with a worker has its signal")
 }
 
-/// Marks the worker stopped however it exits, so that waiters return.
-struct Exit<'a>(&'a Signal);
-
-impl Drop for Exit<'_> {
-    fn drop(&mut self) {
-        let mut progress = self.0.lock();
-        progress.status.running = false;
-        progress.status.busy = false;
-        progress.status.panicked = thread::panicking();
-        self.0.changed.notify_all();
-    }
-}
-
 fn run(core: &Core, options: CompactionOptions) {
     let signal = signal(core);
-    let _exit = Exit(signal);
     let mut workspace = MergeWorkspace::new();
     loop {
         let generation = {
@@ -225,9 +255,16 @@ fn pass(
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::cell::Cell;
     use std::sync::atomic::Ordering;
 
     use super::Core;
+
+    thread_local! {
+        /// Makes the next worker start on this thread fail as if the
+        /// operating system had refused the thread.
+        pub(in crate::engine) static FAIL_SPAWN: Cell<bool> = const { Cell::new(false) };
+    }
 
     /// Panics the worker at the start of a pass when the test asks.
     pub(super) fn fault_point(core: &Core) {

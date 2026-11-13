@@ -16,7 +16,7 @@ use std::thread;
 
 use tessera::engine::{
     CheckpointError, CheckpointOptions, DurableOptions, Engine, EngineOptions, EngineWorkspace,
-    RecoveryError,
+    OpenError,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -144,7 +144,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
     ));
     assert!(matches!(
         Engine::recover(&scratch.0, manual()),
-        Err(RecoveryError::Locked(_))
+        Err(OpenError::Locked(_))
     ));
 
     // SIGKILL: no destructor runs in the child, and the kernel releases the
@@ -276,7 +276,7 @@ fn a_killed_process_loses_no_acknowledged_write() {
             if count == writes / 2 {
                 assert!(matches!(
                     Engine::open(&scratch.0, manual(), small()),
-                    Err(RecoveryError::Locked(_))
+                    Err(OpenError::Locked(_))
                 ));
             }
             if count >= writes {

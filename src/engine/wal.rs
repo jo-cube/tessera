@@ -93,7 +93,7 @@
 //! never acknowledged; they are truncated (and reported in
 //! [`OpenReport::torn_tail`]) before writing resumes. A last segment whose
 //! header is incomplete or zero is an interrupted rotation and is removed.
-//! Anything else is [`RecoveryError::Log`]: a bad frame or body checksum, a
+//! Anything else is [`OpenError::Log`]: a bad frame or body checksum, a
 //! complete record with a bad checksum even at the very end, an invalid
 //! operation or length, a gap, or a log behind the checkpoint. Acknowledged
 //! history is never discarded as a torn tail, provided an interrupted write
@@ -232,9 +232,7 @@ use crc32fast::Hasher;
 use super::Refusal;
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 
-use super::checkpoint::{
-    self, CheckpointError, CheckpointOptions, CheckpointReport, RecoveryError,
-};
+use super::checkpoint::{self, CheckpointError, CheckpointOptions, CheckpointReport, OpenError};
 use super::{ConfigError, Core, Engine, EngineOptions, UpdateError};
 
 const PREFIX: &str = "wal-";
@@ -260,7 +258,7 @@ pub struct DurableOptions {
     /// with [`UpdateError::LogFull`] until a checkpoint prunes segments. A
     /// checkpoint cannot prune the active segment, so this must exceed
     /// `segment_bytes` and a segment header, or creating and opening fail
-    /// with [`RecoveryError::Config`]. Beyond that, after a checkpoint
+    /// with [`OpenError::Config`]. Beyond that, after a checkpoint
     /// a record is admitted if it fits beside the active segment. With
     /// records of at most `r` bytes logged (29 plus the key and value for a
     /// put) and 36-byte segment headers, `segment_bytes + 2 * (r + 36)` is
@@ -1068,7 +1066,7 @@ struct Scanned {
 }
 
 /// Applies a recovered record.
-type Apply<'a> = dyn FnMut(u64, &[u8], Value<'_>) -> Result<(), RecoveryError> + 'a;
+type Apply<'a> = dyn FnMut(u64, &[u8], Value<'_>) -> Result<(), OpenError> + 'a;
 
 /// Where reading the log has got to.
 struct Replay<'a> {
@@ -1096,7 +1094,7 @@ fn read_segment(
     file_len: u64,
     last: bool,
     replay: &mut Replay<'_>,
-) -> Result<(u64, bool), RecoveryError> {
+) -> Result<(u64, bool), OpenError> {
     let Replay {
         prev,
         number,
@@ -1108,7 +1106,7 @@ fn read_segment(
         apply,
     } = replay;
     let ceiling = *ceiling;
-    let damaged = |offset: u64, damage| RecoveryError::Log {
+    let damaged = |offset: u64, damage| OpenError::Log {
         path: path.to_owned(),
         offset,
         damage,
@@ -1191,7 +1189,7 @@ fn read_segment(
 }
 
 /// Whether the next `len` bytes are all zero.
-fn zeros(reader: &mut impl Read, len: u64, path: &Path) -> Result<bool, RecoveryError> {
+fn zeros(reader: &mut impl Read, len: u64, path: &Path) -> Result<bool, OpenError> {
     let mut chunk = [0u8; 4096];
     let mut left = len;
     while left > 0 {
@@ -1207,8 +1205,8 @@ fn zeros(reader: &mut impl Read, len: u64, path: &Path) -> Result<bool, Recovery
     Ok(true)
 }
 
-fn io_error(path: &Path, error: io::Error) -> RecoveryError {
-    RecoveryError::Io {
+fn io_error(path: &Path, error: io::Error) -> OpenError {
+    OpenError::Io {
         path: path.to_owned(),
         error,
     }
@@ -1224,8 +1222,8 @@ fn scan<'a>(
     ceiling: Option<u64>,
     apply: &'a mut Apply<'a>,
     last_valid: &mut Option<(u64, u64, u64)>,
-) -> Result<Scanned, RecoveryError> {
-    let damaged = |path: PathBuf, offset: u64, damage| RecoveryError::Log {
+) -> Result<Scanned, OpenError> {
+    let damaged = |path: PathBuf, offset: u64, damage| OpenError::Log {
         path,
         offset,
         damage,
@@ -1368,7 +1366,7 @@ impl Engine {
     /// and returns its engine. It writes the first log segment (based at
     /// [`EngineOptions::last_seq`]) and then commits an empty checkpoint,
     /// which marks the directory as a database; until that commit `open`
-    /// refuses it as [`RecoveryError::NoCheckpoint`]. If creation fails or is
+    /// refuses it as [`OpenError::NoCheckpoint`]. If creation fails or is
     /// interrupted, remove the directory before creating it again;
     /// [`Engine::inspect`] tells such a directory ([`Verdict::Uncommitted`])
     /// from one that lost its `CURRENT`.
@@ -1376,25 +1374,27 @@ impl Engine {
         dir: &Path,
         options: EngineOptions,
         durable: DurableOptions,
-    ) -> Result<Engine, RecoveryError> {
-        options.validate().map_err(RecoveryError::Config)?;
-        durable.validate().map_err(RecoveryError::Config)?;
+    ) -> Result<Engine, OpenError> {
+        options.validate().map_err(OpenError::Config)?;
+        durable.validate().map_err(OpenError::Config)?;
+        // Started before the directory is touched, so that a worker that
+        // cannot start leaves nothing behind.
+        let engine = Engine::start(Arc::new(Core::new(&options)), &options)?;
         let io = |path: &Path| {
             let path = path.to_owned();
-            move |error| RecoveryError::Io { path, error }
+            move |error| OpenError::Io { path, error }
         };
         fs::create_dir_all(dir).map_err(io(dir))?;
         let lock = match checkpoint::lock(dir).map_err(io(dir))? {
             Ok(file) => file,
-            Err(()) => return Err(RecoveryError::Locked(dir.to_owned())),
+            Err(()) => return Err(OpenError::Locked(dir.to_owned())),
         };
         for entry in fs::read_dir(dir).map_err(io(dir))? {
             if entry.map_err(io(dir))?.file_name() != checkpoint::LOCK {
-                return Err(RecoveryError::NotEmpty(dir.to_owned()));
+                return Err(OpenError::NotEmpty(dir.to_owned()));
             }
         }
         let wal = Wal::new(dir, durable, Vec::new(), options.last_seq).map_err(io(dir))?;
-        let engine = Engine::start(Arc::new(Core::new(&options)), &options);
         let published = engine.publish(dir, CheckpointOptions::default());
         let installed = Durable::new(dir, durable, lock, wal);
         match published {
@@ -1403,10 +1403,10 @@ impl Engine {
                 path,
                 error,
                 after_commit_point: true,
-            }) => return Err(RecoveryError::Io { path, error }),
+            }) => return Err(OpenError::Io { path, error }),
             Err(error) => {
                 let _ = fs::remove_file(dir.join(segment_name(1)));
-                return Err(RecoveryError::Io {
+                return Err(OpenError::Io {
                     path: dir.to_owned(),
                     error: io::Error::other(error.to_string()),
                 });
@@ -1425,14 +1425,14 @@ impl Engine {
     /// source `src/engine/wal.rs` for the rules. Only then are a torn tail
     /// truncated and an interrupted segment removed, and a new segment
     /// started. A directory without `CURRENT` is
-    /// [`RecoveryError::NoCheckpoint`], never a new empty database.
+    /// [`OpenError::NoCheckpoint`], never a new empty database.
     pub fn open(
         dir: &Path,
         options: EngineOptions,
         durable: DurableOptions,
-    ) -> Result<(Engine, OpenReport), RecoveryError> {
-        options.validate().map_err(RecoveryError::Config)?;
-        durable.validate().map_err(RecoveryError::Config)?;
+    ) -> Result<(Engine, OpenReport), OpenError> {
+        options.validate().map_err(OpenError::Config)?;
+        durable.validate().map_err(OpenError::Config)?;
         let lock = checkpoint::lock_existing(dir)?;
         let loaded = checkpoint::load(dir, &options)?;
         let (generation, ceiling) = (loaded.generation, loaded.ceiling);
@@ -1440,7 +1440,10 @@ impl Engine {
             last_seq: ceiling,
             ..options
         };
-        let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options);
+        // The worker starts before anything on disk is changed: a failure here
+        // drops the loaded state and the lock, and leaves the files as they
+        // were.
+        let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options)?;
         let scanned = scan(
             dir,
             Some(ceiling),
@@ -1529,15 +1532,15 @@ impl Engine {
     /// would do, how far the log is valid and where it is damaged. The
     /// checkpoint's runs are not read: open and [`Engine::recover`] check
     /// them. It takes a shared lock if `LOCK` exists, so it fails with
-    /// [`RecoveryError::Locked`] while an engine has the directory open.
+    /// [`OpenError::Locked`] while an engine has the directory open.
     ///
     /// Damage to `CURRENT` or the manifest is returned as the error open
     /// would return. Nothing is repaired: see [`Verdict::Damaged`].
-    pub fn inspect(dir: &Path, options: EngineOptions) -> Result<Inspection, RecoveryError> {
+    pub fn inspect(dir: &Path, options: EngineOptions) -> Result<Inspection, OpenError> {
         match fs::metadata(dir) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(RecoveryError::NoCheckpoint(dir.to_owned()));
+                return Err(OpenError::NoCheckpoint(dir.to_owned()));
             }
             Err(error) => return Err(io_error(dir, error)),
         }
@@ -1579,7 +1582,7 @@ impl Engine {
             }
             (
                 Some(_),
-                Err(RecoveryError::Log {
+                Err(OpenError::Log {
                     path,
                     offset,
                     damage,
@@ -1635,7 +1638,7 @@ impl Engine {
 
     /// Applies one logged record on recovery, flushing (and waiting for
     /// compaction) when the memtables are full.
-    fn replay(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), RecoveryError> {
+    fn replay(&self, seq: u64, key: &[u8], value: Value<'_>) -> Result<(), OpenError> {
         let mut made_room = false;
         loop {
             match self.core.apply_logged(seq, key, value) {
@@ -1645,7 +1648,7 @@ impl Engine {
                     made_room = true;
                 }
                 Err(Refusal::Error(UpdateError::Rejected(error))) => {
-                    return Err(RecoveryError::Replay(error));
+                    return Err(OpenError::Replay(error));
                 }
                 // The scan checked lengths and sequence numbers, and an empty
                 // table has room for any record within its budget.
@@ -1654,17 +1657,14 @@ impl Engine {
         }
     }
 
-    fn make_room(&self) -> Result<(), RecoveryError> {
+    fn make_room(&self) -> Result<(), OpenError> {
         match self.core.flush() {
             Ok(_) => Ok(()),
             Err(refused) => {
                 if self.core.background.is_none() || self.wait_for_compaction().is_err() {
-                    return Err(RecoveryError::RunLimit(refused));
+                    return Err(OpenError::RunLimit(refused));
                 }
-                self.core
-                    .flush()
-                    .map(|_| ())
-                    .map_err(RecoveryError::RunLimit)
+                self.core.flush().map(|_| ()).map_err(OpenError::RunLimit)
             }
         }
     }
@@ -1695,6 +1695,9 @@ impl fmt::Debug for Durable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineWorkspace;
+    use crate::engine::checkpoint::{CRASH_AT, Crash};
+    use crate::memtable::TableError;
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
@@ -1704,14 +1707,122 @@ mod tests {
             ..EngineOptions::default()
         }
     }
-    use crate::engine::EngineWorkspace;
-    use crate::engine::checkpoint::{CRASH_AT, Crash};
-    use crate::memtable::TableError;
 
     fn scratch(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("tessera-wal-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    /// Every file under `dir` with its length and contents, to show that a
+    /// failed open changed nothing.
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_owned()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A worker that cannot start fails `create` before the directory exists,
+    /// and `open` and `recover` without changing a file; each releases the
+    /// lock, so the next attempt succeeds.
+    #[test]
+    fn a_worker_that_cannot_start_leaves_the_directory_as_it_was() {
+        let fail_next = || crate::engine::worker::tests::FAIL_SPAWN.with(|f| f.set(true));
+        let options = EngineOptions::default();
+        let dir = scratch("spawn-failure");
+        fail_next();
+        let refused = Engine::create(&dir, options, small()).map(drop);
+        assert!(matches!(refused, Err(OpenError::Worker(_))), "{refused:?}");
+        assert!(!dir.exists());
+
+        let engine = Engine::create(&dir, options, small()).unwrap();
+        engine.put(b"k", b"logged").unwrap();
+        engine.close().unwrap();
+        let before = files(&dir);
+        fail_next();
+        let refused = Engine::open(&dir, options, small()).map(drop);
+        assert!(matches!(refused, Err(OpenError::Worker(_))), "{refused:?}");
+        assert_eq!(files(&dir), before);
+        let (engine, _) = Engine::open(&dir, options, small()).unwrap();
+        assert_eq!(get(&engine, b"k").as_deref(), Some(&b"logged"[..]));
+        engine.close().unwrap();
+
+        let checkpoint = scratch("spawn-failure-checkpoint");
+        let engine = Engine::new(options).unwrap();
+        engine.put(b"k", b"checkpointed").unwrap();
+        engine
+            .checkpoint(&checkpoint, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let before = files(&checkpoint);
+        fail_next();
+        let refused = Engine::recover(&checkpoint, options).map(drop);
+        assert!(matches!(refused, Err(OpenError::Worker(_))), "{refused:?}");
+        assert_eq!(files(&checkpoint), before);
+        let engine = Engine::recover(&checkpoint, options).unwrap();
+        assert_eq!(get(&engine, b"k").as_deref(), Some(&b"checkpointed"[..]));
+        engine.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&checkpoint).unwrap();
+    }
+
+    /// A panic while holding the state lock poisons it. Closing takes no
+    /// state lock, so it still stops the worker, reports the worker's own
+    /// panic if the poison reached it, and releases the directory lock.
+    #[test]
+    fn closing_with_a_poisoned_state_lock_still_releases_the_directory() {
+        let dir = scratch("poisoned-close");
+        for worker in [false, true] {
+            let options = if worker {
+                EngineOptions::default()
+            } else {
+                manual()
+            };
+            let engine = if worker {
+                Engine::open(&dir, options, small()).unwrap().0
+            } else {
+                Engine::create(&dir, options, small()).unwrap()
+            };
+            engine.put(b"k", b"logged").unwrap();
+            std::thread::scope(|scope| {
+                let poisoned = scope.spawn(|| {
+                    let _state = engine.core.write_state();
+                    panic!("poison the state lock");
+                });
+                assert!(poisoned.join().is_err());
+            });
+            assert!(engine.core.state.is_poisoned());
+            let core = Arc::clone(&engine.core);
+            if worker {
+                // The worker's next compaction meets the poisoned lock and
+                // panics; that panic is what closing reports.
+                let error = engine.wait_for_compaction().unwrap_err();
+                let crate::engine::BackgroundError::Panicked(message) = &error else {
+                    panic!("{error:?}");
+                };
+                assert!(message.starts_with(crate::engine::LOCK), "{message}");
+                assert_eq!(engine.close(), Err(error));
+            } else {
+                assert_eq!(engine.close(), Ok(()));
+            }
+            assert_eq!(Arc::strong_count(&core), 1);
+            drop(core);
+            let (engine, _) = Engine::open(&dir, manual(), small()).unwrap();
+            assert_eq!(get(&engine, b"k").as_deref(), Some(&b"logged"[..]));
+            engine.close().unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Makes the next batch `engine` logs fail with `fault`.

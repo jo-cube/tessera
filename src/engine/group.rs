@@ -603,6 +603,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::block::MAX_KEY_LEN;
+    use crate::engine::wal::{BEFORE_PUBLISH, Fault};
+    use crate::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
@@ -612,9 +615,6 @@ mod tests {
             ..EngineOptions::default()
         }
     }
-    use crate::block::MAX_KEY_LEN;
-    use crate::engine::wal::{BEFORE_PUBLISH, Fault};
-    use crate::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
 
     fn scratch(name: &str) -> PathBuf {
         let path =

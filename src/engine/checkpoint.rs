@@ -324,11 +324,15 @@ pub enum Damage {
     },
 }
 
-/// Why no engine was recovered. Nothing is exposed and nothing on disk is
-/// changed; recovery never substitutes an empty database or an older
-/// checkpoint.
+/// Why [`Engine::new`], [`Engine::create`], [`Engine::open`] or
+/// [`Engine::recover`] returned no engine. Nothing is exposed, no worker is
+/// left running and any directory lock taken is released. Opening and
+/// recovering change nothing on disk before they succeed, and never
+/// substitute an empty database or an older checkpoint; `create` may leave
+/// an uncommitted directory, as it documents. [`Engine::new`] fails only
+/// with [`Self::Config`] or [`Self::Worker`].
 #[derive(Debug)]
-pub enum RecoveryError {
+pub enum OpenError {
     /// The directory or its `CURRENT` file does not exist.
     NoCheckpoint(PathBuf),
     /// Another process, or a durable engine, holds the directory's `LOCK`.
@@ -366,12 +370,16 @@ pub enum RecoveryError {
     },
     /// The checkpoint holds more runs or bytes than the options allow.
     RunLimit(FlushError),
-    /// The engine or log options were refused before the directory was
-    /// touched.
+    /// The engine or log options were refused before anything was started or
+    /// the directory touched.
     Config(super::ConfigError),
+    /// The operating system could not create the background compaction
+    /// worker's thread. Nothing on disk was changed by `open` or `recover`,
+    /// and `create` had not yet touched the directory.
+    Worker(io::Error),
 }
 
-impl fmt::Display for RecoveryError {
+impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoCheckpoint(path) => write!(f, "no checkpoint in {}", path.display()),
@@ -406,11 +414,14 @@ impl fmt::Display for RecoveryError {
             }
             Self::RunLimit(error) => write!(f, "recovered runs exceed the limits: {error}"),
             Self::Config(error) => error.fmt(f),
+            Self::Worker(error) => {
+                write!(f, "cannot start the background compaction worker: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for RecoveryError {}
+impl std::error::Error for OpenError {}
 
 fn checkpoint_dir(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("{PREFIX}{generation:020}"))
@@ -814,7 +825,7 @@ impl Engine {
         // None if there is no CURRENT, Some(None) if it cannot be read.
         let committed = match read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64) {
             Ok(bytes) => Some(decode_current(&bytes).ok()),
-            Err(RecoveryError::Corrupt {
+            Err(OpenError::Corrupt {
                 damage: Damage::Missing,
                 ..
             }) => None,
@@ -919,34 +930,31 @@ impl Engine {
     /// Nothing on disk is changed. Any failure is an error: recovery never
     /// returns an empty engine for a missing or damaged checkpoint, nor falls
     /// back to an older one.
-    pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, RecoveryError> {
-        options.validate().map_err(RecoveryError::Config)?;
+    pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
+        options.validate().map_err(OpenError::Config)?;
         let _lock = lock_existing(dir)?;
-        if super::wal::has_log(dir).map_err(|error| RecoveryError::Io {
+        if super::wal::has_log(dir).map_err(|error| OpenError::Io {
             path: dir.to_owned(),
             error,
         })? {
-            return Err(RecoveryError::HasLog(dir.to_owned()));
+            return Err(OpenError::HasLog(dir.to_owned()));
         }
         let loaded = load(dir, &options)?;
         let options = EngineOptions {
             last_seq: options.last_seq.max(loaded.ceiling),
             ..options
         };
-        Ok(Engine::start(
-            Arc::new(loaded.into_core(&options)),
-            &options,
-        ))
+        Engine::start(Arc::new(loaded.into_core(&options)), &options)
     }
 }
 
-fn read_error(path: &Path) -> impl FnOnce(io::Error) -> RecoveryError + '_ {
+fn read_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
     move |error: io::Error| match error.kind() {
-        io::ErrorKind::NotFound => RecoveryError::Corrupt {
+        io::ErrorKind::NotFound => OpenError::Corrupt {
             path: path.to_owned(),
             damage: Damage::Missing,
         },
-        _ => RecoveryError::Io {
+        _ => OpenError::Io {
             path: path.to_owned(),
             error,
         },
@@ -955,15 +963,15 @@ fn read_error(path: &Path) -> impl FnOnce(io::Error) -> RecoveryError + '_ {
 
 /// Locks `dir` for a recovery, which needs `CURRENT`: checked first, since
 /// locking would create `LOCK`.
-pub(super) fn lock_existing(dir: &Path) -> Result<File, RecoveryError> {
+pub(super) fn lock_existing(dir: &Path) -> Result<File, OpenError> {
     let current = dir.join(CURRENT);
     match fs::metadata(&current) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(RecoveryError::NoCheckpoint(dir.to_owned()));
+            return Err(OpenError::NoCheckpoint(dir.to_owned()));
         }
         Err(error) => {
-            return Err(RecoveryError::Io {
+            return Err(OpenError::Io {
                 path: current,
                 error,
             });
@@ -971,7 +979,7 @@ pub(super) fn lock_existing(dir: &Path) -> Result<File, RecoveryError> {
     }
     match lock(dir).map_err(read_error(dir))? {
         Ok(file) => Ok(file),
-        Err(()) => Err(RecoveryError::Locked(dir.to_owned())),
+        Err(()) => Err(OpenError::Locked(dir.to_owned())),
     }
 }
 
@@ -1000,8 +1008,8 @@ impl Loaded {
     }
 }
 
-fn corrupt(path: &Path, damage: Damage) -> RecoveryError {
-    RecoveryError::Corrupt {
+fn corrupt(path: &Path, damage: Damage) -> OpenError {
+    OpenError::Corrupt {
         path: path.to_owned(),
         damage,
     }
@@ -1009,7 +1017,7 @@ fn corrupt(path: &Path, damage: Damage) -> RecoveryError {
 
 /// Reads `path` if it holds at most `max` bytes. A longer file is damage,
 /// found before anything is allocated for it.
-fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, RecoveryError> {
+fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, OpenError> {
     let file = File::open(path).map_err(read_error(path))?;
     let len = file.metadata().map_err(read_error(path))?.len();
     let too_long = |found| {
@@ -1038,11 +1046,11 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, RecoveryError> {
 /// `CURRENT` and the manifest alone. The manifest is read only if it is no
 /// longer than a list of `max_runs` runs, or of 2^20 if that is more
 /// (`48 + 12 × max(max_runs, 2^20)` bytes); a longer one is
-/// [`Damage::Length`], not [`RecoveryError::RunLimit`].
+/// [`Damage::Length`], not [`OpenError::RunLimit`].
 fn committed_manifest(
     dir: &Path,
     max_runs: usize,
-) -> Result<(PathBuf, PathBuf, Manifest), RecoveryError> {
+) -> Result<(PathBuf, PathBuf, Manifest), OpenError> {
     let current = dir.join(CURRENT);
     let bytes = read_bounded(&current, CURRENT_LEN as u64)?;
     let generation = decode_current(&bytes).map_err(|damage| corrupt(&current, damage))?;
@@ -1075,7 +1083,7 @@ fn committed_manifest(
 pub(super) fn committed(
     dir: &Path,
     options: &EngineOptions,
-) -> Result<Option<(u64, u64)>, RecoveryError> {
+) -> Result<Option<(u64, u64)>, OpenError> {
     if !dir.join(CURRENT).try_exists().map_err(read_error(dir))? {
         return Ok(None);
     }
@@ -1110,22 +1118,22 @@ pub(super) fn at_most_an_empty_first_checkpoint(dir: &Path) -> io::Result<bool> 
 
 /// A shared lock on `dir`'s `LOCK` for a read-only inspection, without
 /// creating it: `None` if there is no `LOCK`, which no live engine lacks.
-pub(super) fn lock_shared(dir: &Path) -> Result<Option<File>, RecoveryError> {
+pub(super) fn lock_shared(dir: &Path) -> Result<Option<File>, OpenError> {
     let path = dir.join(LOCK);
     let file = match File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(RecoveryError::Io { path, error }),
+        Err(error) => return Err(OpenError::Io { path, error }),
     };
     match file.try_lock_shared() {
         Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Err(RecoveryError::Locked(dir.to_owned())),
-        Err(TryLockError::Error(error)) => Err(RecoveryError::Io { path, error }),
+        Err(TryLockError::WouldBlock) => Err(OpenError::Locked(dir.to_owned())),
+        Err(TryLockError::Error(error)) => Err(OpenError::Io { path, error }),
     }
 }
 
 /// Reads and checks the checkpoint `dir`'s `CURRENT` names, under its lock.
-pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, RecoveryError> {
+pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenError> {
     {
         let (path, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
         let generation = manifest.generation;
@@ -1134,7 +1142,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
         // before reading any. Filters are added to the bytes once rebuilt.
         let listed: u64 = manifest.runs.iter().map(|&(len, _)| len).sum();
         if manifest.runs.len() > options.max_runs || listed > options.max_run_bytes as u64 {
-            return Err(RecoveryError::RunLimit(FlushError {
+            return Err(OpenError::RunLimit(FlushError {
                 runs: manifest.runs.len(),
                 max_runs: options.max_runs,
                 run_bytes: usize::try_from(listed).unwrap_or(usize::MAX),
@@ -1199,7 +1207,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, Recove
         let run_bytes: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
         let held_bytes: usize = runs.iter().map(Run::held_bytes).sum();
         if runs.len() > options.max_runs || run_bytes + held_bytes > options.max_run_bytes {
-            return Err(RecoveryError::RunLimit(FlushError {
+            return Err(OpenError::RunLimit(FlushError {
                 runs: runs.len(),
                 max_runs: options.max_runs,
                 run_bytes: run_bytes + held_bytes,
@@ -1359,7 +1367,7 @@ mod tests {
         ));
         assert!(matches!(
             Engine::recover(&dir, manual()),
-            Err(RecoveryError::Locked(_))
+            Err(OpenError::Locked(_))
         ));
         drop(held);
         Engine::recover(&dir, manual()).unwrap();

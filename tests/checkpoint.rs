@@ -12,8 +12,7 @@ use std::thread;
 
 use tessera::engine::{
     CheckpointError, CheckpointOptions, CompactionError, CompactionOptions, Compression, Damage,
-    Engine, EngineOptions, EngineWorkspace, MergeWorkspace, RecoveryError, Snapshot,
-    SnapshotLimits,
+    Engine, EngineOptions, EngineWorkspace, MergeWorkspace, OpenError, Snapshot, SnapshotLimits,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -366,7 +365,9 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     // Lengths above the largest the engine builds are refused, not
     // adjusted; at the largest, these records of about 100 KB are cut into
     // blocks of at most 64 KiB.
-    let refused = Engine::new(with((64 << 10) + 1)).map(drop).unwrap_err();
+    let Err(OpenError::Config(refused)) = Engine::new(with((64 << 10) + 1)).map(drop) else {
+        panic!("an oversized block length was accepted");
+    };
     assert_eq!(
         (refused.setting, refused.max),
         ("EngineOptions::target_block_len", 64 << 10)
@@ -711,12 +712,12 @@ fn an_empty_engine_checkpoints_and_recovers_empty_but_nothing_is_not_a_checkpoin
     let scratch = Scratch::new("empty");
     assert!(matches!(
         Engine::recover(&scratch.0, manual()),
-        Err(RecoveryError::NoCheckpoint(_))
+        Err(OpenError::NoCheckpoint(_))
     ));
     fs::create_dir_all(&scratch.0).unwrap();
     assert!(matches!(
         Engine::recover(&scratch.0, manual()),
-        Err(RecoveryError::NoCheckpoint(_))
+        Err(OpenError::NoCheckpoint(_))
     ));
     let engine = Engine::new(EngineOptions {
         last_seq: 41,
@@ -843,7 +844,7 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
         }
     };
     let damage = |path: &Path| match Engine::recover(&scratch.0, manual()) {
-        Err(RecoveryError::Corrupt { path: at, damage }) => {
+        Err(OpenError::Corrupt { path: at, damage }) => {
             assert_eq!(at, path);
             damage
         }
@@ -959,7 +960,7 @@ fn recovery_refuses_more_runs_than_the_options_allow() {
             ..manual()
         },
     );
-    assert!(matches!(error, Err(RecoveryError::RunLimit(_))));
+    assert!(matches!(error, Err(OpenError::RunLimit(_))));
     // Refused from the manifest's lengths, before reading a run.
     let error = Engine::recover(
         &scratch.0,
@@ -968,7 +969,7 @@ fn recovery_refuses_more_runs_than_the_options_allow() {
             ..manual()
         },
     );
-    assert!(matches!(error, Err(RecoveryError::RunLimit(_))));
+    assert!(matches!(error, Err(OpenError::RunLimit(_))));
 }
 
 /// A file longer than its manifest entry or format allows is refused before
@@ -998,7 +999,7 @@ fn oversized_files_are_refused_before_they_are_read() {
         assert!(
             matches!(
                 error,
-                Err(RecoveryError::Corrupt {
+                Err(OpenError::Corrupt {
                     damage: Damage::Length {
                         found: 68_719_476_736,
                         ..
@@ -1012,4 +1013,27 @@ fn oversized_files_are_refused_before_they_are_read() {
         fs::write(&path, original).unwrap();
     }
     Engine::recover(&scratch.0, manual()).unwrap();
+}
+
+/// Closing an engine recovered from a checkpoint writes no new one: what
+/// was written after recovery is gone at the next recovery, and the lock
+/// is free.
+#[test]
+fn closing_a_recovered_engine_takes_no_checkpoint() {
+    let scratch = Scratch::new("close-recovered");
+    let engine = Engine::new(EngineOptions::default()).unwrap();
+    engine.put(b"kept", b"1").unwrap();
+    engine
+        .checkpoint(&scratch.0, CheckpointOptions::default())
+        .unwrap();
+    engine.close().unwrap();
+
+    let engine = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    engine.put(b"lost", b"2").unwrap();
+    assert_eq!(engine.close(), Ok(()));
+    let engine = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
+    let mut workspace = EngineWorkspace::new();
+    assert!(engine.get(b"kept", &mut workspace).unwrap().is_some());
+    assert!(engine.get(b"lost", &mut workspace).unwrap().is_none());
+    engine.close().unwrap();
 }

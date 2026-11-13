@@ -11,7 +11,7 @@ use std::thread;
 
 use tessera::engine::{
     CompactionError, CompactionOptions, Compression, ENTRY_OVERHEAD, Engine, EngineOptions,
-    EngineStats, EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, ReadGuard,
+    EngineStats, EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, OpenError, ReadGuard,
     SnapshotLimits, UpdateError, WriteError,
 };
 
@@ -1276,7 +1276,9 @@ fn each_setting_out_of_range_is_refused_by_name() {
         ),
     ];
     for (options, setting, value, min, max) in refused {
-        let error = Engine::new(options).map(drop).unwrap_err();
+        let Err(OpenError::Config(error)) = Engine::new(options).map(drop) else {
+            panic!("{setting} accepted");
+        };
         assert_eq!(
             (error.setting, error.value, error.min, error.max),
             (setting, value, min, max)
@@ -1417,4 +1419,71 @@ fn dictionary_compression_accepts_every_block_length() {
             "{target_block_len}"
         );
     }
+}
+
+// Lifecycle.
+
+/// Closing an idle engine succeeds, with or without a worker.
+#[test]
+fn closing_an_idle_engine_succeeds() {
+    for options in [EngineOptions::default(), manual()] {
+        let engine = Engine::new(options).unwrap();
+        engine.put(b"k", b"v").unwrap();
+        assert_eq!(engine.close(), Ok(()));
+    }
+}
+
+/// Snapshots outlive the engine: readers on other threads keep reading
+/// what they saw while the engine is closed beside them, including during
+/// a background compaction it waits for.
+#[test]
+fn snapshots_stay_readable_while_and_after_the_engine_closes() {
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: 16 << 10,
+        background_compaction: Some(CompactionOptions {
+            max_overlap: 1,
+            ..CompactionOptions::default()
+        }),
+        ..EngineOptions::default()
+    })
+    .unwrap();
+    for round in 0..4u32 {
+        for i in 0..50u32 {
+            engine.put(&i.to_be_bytes(), &round.to_be_bytes()).unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    let snapshots: Vec<_> = (0..3).map(|_| engine.snapshot().unwrap()).collect();
+    let start = Barrier::new(snapshots.len() + 1);
+    thread::scope(|scope| {
+        let readers: Vec<_> = snapshots
+            .iter()
+            .map(|snapshot| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let mut workspace = EngineWorkspace::new();
+                    for _ in 0..20 {
+                        let mut scan = snapshot.scan(&mut workspace);
+                        let mut seen = 0u32;
+                        while let Some(record) = scan.next_record().unwrap() {
+                            assert_eq!(record.value, 3u32.to_be_bytes());
+                            seen += 1;
+                        }
+                        assert_eq!(seen, 50);
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        assert_eq!(engine.close(), Ok(()));
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    });
+    let mut workspace = EngineWorkspace::new();
+    let found = snapshots[0]
+        .get(&7u32.to_be_bytes(), &mut workspace)
+        .unwrap();
+    assert_eq!(found.unwrap().value, 3u32.to_be_bytes());
 }

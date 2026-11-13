@@ -75,7 +75,7 @@ writes. Writes never need the caller to flush or retry for room; see
 Every constructor (`new`, `create`, `open`, `recover`) checks all options
 before it allocates, starts a thread or touches a file, and returns a
 `ConfigError` naming the setting, its value and the accepted range (inside
-`RecoveryError::Config` for the persistent ones). No value is clamped or
+`OpenError::Config` for the persistent ones). No value is clamped or
 adjusted. `compact` and `set_run_limits` check their arguments the same
 way.
 
@@ -157,14 +157,49 @@ after each flush, keeping the overlap within `max_overlap` without any call
 from the application. Setting `background_compaction: None` makes
 compaction explicit; then the application must call `Engine::compact`, or
 runs accumulate until flushes, and the writes that need them, are refused
-with `FlushRefused`. Dropping the engine waits for the compaction in
-progress, if any, and joins the worker.
+with `FlushRefused`.
 
 **Persistence** depends only on the constructor: `new` and `recover` make
 RAM-only engines, and `create` and `open` durable ones, which additionally
 take `DurableOptions`. The engine options mean the same in every mode.
 `last_seq` applies to `new` and `create`; `open` takes the sequence from the
 checkpoint and log, and `recover` continues after the larger.
+
+## Lifecycle
+
+```rust
+use tessera::engine::{DurableOptions, Engine, EngineOptions, OpenError};
+
+let engine = match Engine::open(&dir, EngineOptions::default(), DurableOptions::default()) {
+    Ok((engine, _report)) => engine,
+    Err(OpenError::Config(error)) => panic!("fix the options: {error}"),
+    Err(error) => return Err(error.into()),
+};
+engine.put(b"k", b"v")?;
+// Before exiting: stop the worker and release the directory lock.
+engine.close()?;
+```
+
+Constructors fail with `OpenError` before anything is exposed: `Config` for
+refused options, `Worker` if the worker thread cannot be created, and for
+`create`, `open` and `recover` the directory, lock, log and checkpoint
+errors. A failed `open` or `recover` changes nothing on disk and releases
+the lock.
+
+`close(self)` shuts the engine down: the worker finishes and publishes the
+compaction it is running, if any, starts no other, and is joined; then the
+engine's memory and directory lock are freed. It consumes the engine, so no
+operation can race it or follow it; an engine shared through an `Arc` is
+closed by its last owner (`Arc::into_inner`). Snapshots stay readable
+afterwards. `close` fails only if the worker had panicked, with the panic's
+message, and releases everything regardless. Dropping the engine does the
+same and discards that result.
+
+Closing is not a durability step. It writes, syncs and checkpoints
+nothing: a RAM-only or recovered engine's writes since its last checkpoint
+are gone, and a durable engine's acknowledged writes are in its log, as
+after a crash. Call `checkpoint` or `durable_checkpoint` first if that is
+wanted.
 
 ## Engine
 
@@ -301,13 +336,9 @@ it.
 - A `ReadGuard` blocks writers, flushes and compaction publication while
   held; keep it short. Do not call engine methods while holding one; use the
   guard's own reads. A `Snapshot` holds no lock.
-- A panic in the background worker stops it; `background_status` reports it
-  and the engine keeps working without it.
-- Dropping the engine is shutdown: it waits for the worker's current
-  compaction, writes nothing and releases the directory lock. A RAM-only
-  engine's data goes with it unless checkpointed; a durable engine's
-  acknowledged writes are already in the log, and a `durable_checkpoint`
-  before dropping only shortens the next `open`.
+- A panic in the background worker stops it for good; `background_status`
+  and `wait_for_compaction` report it with its message, `close` returns it,
+  and the engine keeps working without the worker.
 - The dataset must fit in memory: there is no disk tiering.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.

@@ -64,8 +64,10 @@
 //! operation then panics too. No write section is expected to panic short of a
 //! bug, and the engine does not try to recover from one. A panic anywhere else,
 //! including in a caller holding a [`ReadGuard`] or while a flush or
-//! compaction builds without the lock, leaves the engine usable, and so does a panic in the background worker, which stops
-//! it. [`Engine::new`] panics if the worker's thread cannot be created.
+//! compaction builds without the lock, leaves the engine usable, and so does
+//! a panic in the background worker, which stops it and is kept for
+//! [`Engine::wait_for_compaction`] and [`Engine::close`]. No constructor
+//! panics: a worker thread that cannot be created is [`OpenError::Worker`].
 //!
 //! # Snapshots
 //!
@@ -181,21 +183,38 @@
 //! flushes recovers once compaction can run again, for example after the
 //! snapshots that blocked it are dropped.
 //! [`Engine::wait_for_compaction`] requests a pass, waits for it and returns
-//! its failure. A panic in the worker stops it for good and is reported the
-//! same way; the engine stays usable without it.
+//! its failure. A compaction refused this way is not terminal: the next
+//! request tries again. A panic in the worker stops it for good and is
+//! reported as [`BackgroundError::Panicked`] with its message; the engine
+//! stays usable without it.
 //!
-//! Dropping the engine stops the worker after the compaction it is running,
-//! which is published, and joins the thread, so a drop can wait for one
-//! compaction (within [`CompactionOptions::max_input_bytes`]). The thread
-//! holds the engine's shared core, not the engine, so nothing keeps the
-//! engine alive.
+//! # Lifecycle
+//!
+//! An engine is open from the moment a constructor returns it until
+//! [`Engine::close`] or drop, which do the same: tell the worker to stop,
+//! wait for the compaction it is running, which is published at its usual
+//! step (within [`CompactionOptions::max_input_bytes`]), start no other, join
+//! the thread and free the engine and any directory lock. Both consume the
+//! engine, so no other call can be in progress or follow; `close` also
+//! returns a worker panic, where a drop discards it. Closing holds no lock
+//! while it waits, so the worker can always finish.
+//!
+//! The worker thread holds the engine's shared core, not the engine, so
+//! nothing keeps the engine alive, and nothing else holds the core.
+//! [`Snapshot`]s own what they read and stay readable after the engine is
+//! gone; a [`ReadGuard`] borrows the engine, so it ends first.
+//!
+//! Closing writes nothing in any mode: no flush, sync, checkpoint or log
+//! truncation. RAM-only data, including an engine recovered from a
+//! checkpoint, is lost unless checkpointed first; a durable engine's
+//! acknowledged writes are already in its log, exactly as after a crash.
 //!
 //! # Configuration
 //!
 //! [`Engine::new`], [`Engine::create`], [`Engine::open`] and
 //! [`Engine::recover`] check every option before they allocate, start the
 //! worker or touch a file, and refuse one outside its documented range with a
-//! [`ConfigError`] naming it (inside [`RecoveryError::Config`] for the last
+//! [`ConfigError`] naming it (inside [`OpenError::Config`] for the last
 //! three); [`Engine::compact`] and [`Engine::set_run_limits`] check theirs
 //! the same way. No value is adjusted. Options that pass can still meet
 //! runtime limits, which the operation they stop reports: run limits refuse
@@ -293,7 +312,7 @@ mod worker;
 #[cfg(test)]
 mod staged_tests;
 
-pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, RecoveryError};
+pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};
 pub use wal::{
     DurableOptions, Inspection, LogDamage, LogPosition, LogStatus, OpenReport, TornTail, Verdict,
 };
@@ -1093,19 +1112,79 @@ pub struct Engine {
 impl Engine {
     /// Creates an empty RAM-only engine, starting a background compaction
     /// worker if [`EngineOptions::background_compaction`] is set (the
-    /// default). Refused with a [`ConfigError`] if any option is outside its
-    /// range, before anything is allocated or started.
-    pub fn new(options: EngineOptions) -> Result<Self, ConfigError> {
-        options.validate()?;
-        Ok(Self::start(Arc::new(Core::new(&options)), &options))
+    /// default). Fails with [`OpenError::Config`] if any option is outside
+    /// its range, before anything is allocated or started, or with
+    /// [`OpenError::Worker`] if the worker's thread cannot be created.
+    pub fn new(options: EngineOptions) -> Result<Self, OpenError> {
+        options.validate().map_err(OpenError::Config)?;
+        Self::start(Arc::new(Core::new(&options)), &options)
     }
 
-    /// Wraps `core`, starting its worker if `options` ask for one.
-    fn start(core: Arc<Core>, options: &EngineOptions) -> Self {
+    /// Wraps `core`, starting its worker if `options` ask for one. On failure
+    /// the core is dropped with nothing running.
+    fn start(core: Arc<Core>, options: &EngineOptions) -> Result<Self, OpenError> {
         let worker = options
             .background_compaction
-            .map(|compaction| worker::start(Arc::clone(&core), compaction));
-        Self { core, worker }
+            .map(|compaction| worker::start(Arc::clone(&core), compaction))
+            .transpose()
+            .map_err(OpenError::Worker)?;
+        Ok(Self { core, worker })
+    }
+
+    /// Shuts the engine down: stops the background worker after the
+    /// compaction it is running, if any, which is published as usual, joins
+    /// its thread and releases the engine's memory and any directory lock.
+    /// No new compaction starts once this begins.
+    ///
+    /// It consumes the engine, so no read, write, [`ReadGuard`] or other
+    /// call can be in progress or follow; an engine shared through an `Arc`
+    /// is closed once it is the last reference ([`Arc::into_inner`]).
+    /// [`Snapshot`]s are unaffected and stay readable.
+    ///
+    /// Closing writes nothing: no flush, sync, checkpoint or truncation. A
+    /// RAM-only engine's data goes with it; a durable engine's acknowledged
+    /// writes are already in its log, as they would be after a crash.
+    /// Dropping the engine does the same and discards the result.
+    ///
+    /// Fails only with [`BackgroundError::Panicked`] if the worker had
+    /// stopped by panicking, at any time; the engine is shut down all the
+    /// same. A compaction that the worker found refused is not a failure
+    /// here: it is reported by [`Engine::background_status`] while the
+    /// engine is open.
+    ///
+    /// Nothing can use the engine after it is closed, or close it while a
+    /// [`ReadGuard`] is held:
+    ///
+    /// ```compile_fail,E0382
+    /// # use tessera::engine::{Engine, EngineOptions};
+    /// let engine = Engine::new(EngineOptions::default()).unwrap();
+    /// engine.close().unwrap();
+    /// engine.put(b"k", b"v").unwrap();
+    /// ```
+    ///
+    /// ```compile_fail,E0505
+    /// # use tessera::engine::{Engine, EngineOptions};
+    /// let engine = Engine::new(EngineOptions::default()).unwrap();
+    /// let guard = engine.read();
+    /// engine.close().unwrap();
+    /// drop(guard);
+    /// ```
+    pub fn close(mut self) -> Result<(), BackgroundError> {
+        self.stop_worker()
+    }
+
+    fn stop_worker(&mut self) -> Result<(), BackgroundError> {
+        let Some(handle) = self.worker.take() else {
+            return Ok(());
+        };
+        let signal = self.core.background.as_ref().expect(WORKER);
+        signal.stop();
+        // The thread catches its own panics, so joining cannot fail.
+        let _ = handle.join();
+        match signal.status().panic {
+            Some(message) => Err(BackgroundError::Panicked(message)),
+            None => Ok(()),
+        }
     }
 
     /// Sets `key` to `value` and returns the update's sequence number.
@@ -1741,15 +1820,9 @@ const BUILT: &str = "published runs were built by the engine";
 const NOT_EMPTY: &str = "published runs are not empty";
 
 impl Drop for Engine {
-    /// Stops the worker after the compaction it is running, if any, and waits
-    /// for it to exit.
+    /// As [`Engine::close`], discarding its result.
     fn drop(&mut self) {
-        if let Some(handle) = self.worker.take() {
-            self.core.background.as_ref().expect(WORKER).stop();
-            // A panic has been recorded in the status already; dropping must
-            // not raise it again.
-            let _ = handle.join();
-        }
+        let _ = self.stop_worker();
     }
 }
 
@@ -3276,7 +3349,7 @@ mod tests {
         drop(engine);
         assert_eq!(Arc::strong_count(&core), 1);
         let status = core.background.as_ref().unwrap().status();
-        assert!(!status.running && !status.panicked);
+        assert!(!status.running && status.panic.is_none());
     }
 
     /// Dropping the engine mid-compaction waits for that compaction, which is
@@ -3303,6 +3376,80 @@ mod tests {
         let status = core.background.as_ref().unwrap().status();
         assert_eq!((status.running, status.compactions), (false, 1));
         assert_eq!(core.stats().runs, 1);
+    }
+
+    /// Closing waits for the compaction in progress, which is published,
+    /// starts no other, reports success and releases the core; a snapshot
+    /// taken before stays readable.
+    #[test]
+    fn closing_during_a_compaction_publishes_it_and_succeeds() {
+        let engine = Engine::new(background(1)).unwrap();
+        let (built, release) = pause_after_build(&engine);
+        let slot = engine.core.compacting.lock().unwrap();
+        overlapping_runs(&engine);
+        let snapshot = engine.snapshot().unwrap();
+        drop(slot);
+        built.wait();
+        let core = Arc::clone(&engine.core);
+        std::thread::scope(|scope| {
+            let closer = scope.spawn(move || engine.close());
+            while !stop_requested(&core) {
+                std::thread::yield_now();
+            }
+            assert!(!closer.is_finished());
+            release.wait();
+            assert_eq!(closer.join().unwrap(), Ok(()));
+        });
+        assert_eq!(Arc::strong_count(&core), 1);
+        let status = core.background.as_ref().unwrap().status();
+        assert_eq!((status.running, status.compactions), (false, 1));
+        assert_eq!(core.stats().runs, 1);
+        let mut workspace = EngineWorkspace::new();
+        let found = snapshot.get(b"a", &mut workspace).unwrap().unwrap();
+        assert_eq!(found.value, b"3");
+    }
+
+    /// A worker that panicked is reported by `close` with its message, and
+    /// the engine is released all the same; dropping one does not panic.
+    #[test]
+    fn closing_after_a_worker_panic_reports_it_and_releases_the_engine() {
+        for close in [true, false] {
+            let engine = Engine::new(background(1)).unwrap();
+            engine.core.panic_worker.store(true, Ordering::Relaxed);
+            overlapping_runs(&engine);
+            let panicked = Err(BackgroundError::Panicked("injected worker failure".into()));
+            assert_eq!(engine.wait_for_compaction(), panicked);
+            let core = Arc::clone(&engine.core);
+            if close {
+                assert_eq!(engine.close(), panicked);
+            } else {
+                drop(engine);
+            }
+            assert_eq!(Arc::strong_count(&core), 1);
+        }
+    }
+
+    /// A worker that cannot start fails construction with the operating
+    /// system's error and leaves nothing running; an engine without a worker
+    /// never starts one, so it is unaffected.
+    #[test]
+    fn a_worker_that_cannot_start_fails_construction() {
+        worker::tests::FAIL_SPAWN.with(|fail| fail.set(true));
+        let engine = Engine::new(manual()).unwrap();
+        assert_eq!(engine.background_status(), None);
+        drop(engine);
+        let refused = Engine::new(EngineOptions::default()).map(drop);
+        let Err(OpenError::Worker(error)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            error.to_string().contains("injected spawn failure"),
+            "{error}"
+        );
+        // The failure was injected once; the next engine starts its worker.
+        let engine = Engine::new(EngineOptions::default()).unwrap();
+        assert!(engine.background_status().unwrap().running);
+        assert_eq!(engine.close(), Ok(()));
     }
 
     /// A lasting failure ends the pass and waits for the next request: it is
@@ -3371,13 +3518,20 @@ mod tests {
         let engine = Engine::new(background(1)).unwrap();
         engine.core.panic_worker.store(true, Ordering::Relaxed);
         overlapping_runs(&engine);
-        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Stopped));
+        assert_eq!(
+            engine.wait_for_compaction(),
+            Err(BackgroundError::Panicked("injected worker failure".into()))
+        );
         let status = engine.background_status().unwrap();
-        assert!(!status.running && status.panicked);
+        assert!(!status.running);
+        assert_eq!(status.panic.as_deref(), Some("injected worker failure"));
 
         engine.put(b"k", b"v").unwrap();
         engine.flush().unwrap();
-        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Stopped));
+        assert_eq!(
+            engine.wait_for_compaction(),
+            Err(BackgroundError::Panicked("injected worker failure".into()))
+        );
         engine
             .compact(options(8, usize::MAX), &mut MergeWorkspace::new())
             .unwrap()
