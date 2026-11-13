@@ -76,9 +76,10 @@
 //!
 //! # Snapshots
 //!
-//! [`Engine::snapshot`] takes, under the exclusive lock and in constant time
-//! per source, a snapshot of the active memtable and shared
-//! references to the frozen tables and the published runs. The memtable is a
+//! [`Engine::snapshot`] takes, under the exclusive lock, a snapshot of the
+//! active memtable, a shared reference to each frozen table, and one shared
+//! reference to the list of published runs, so its cost does not grow with
+//! the number of runs. The memtable is a
 //! copy-on-write tree, so its snapshot shares every node, and later writes
 //! copy only the nodes they change that a snapshot still shares. Nothing is
 //! frozen or flushed for a snapshot, and taking one costs the same whatever
@@ -1008,8 +1009,9 @@ struct State {
     /// first, so that a version found early lets `latest_in` skip the runs
     /// holding only older ones. Rebuilt by [`State::order_runs`] whenever
     /// `runs` changes; `runs` keeps publication order, which compaction
-    /// selection uses to break ties.
-    lookup_order: Vec<SharedRun>,
+    /// selection uses to break ties. Immutable once built, so a lookup or a
+    /// snapshot shares it with one reference count.
+    lookup_order: Arc<[SharedRun]>,
     run_bytes: usize,
     held_bytes: usize,
     max_runs: usize,
@@ -1048,12 +1050,13 @@ struct Retained {
 }
 
 impl State {
-    /// Rebuilds `lookup_order` from `runs`. Publication is rare and runs are
-    /// few, so this sorts a fresh copy rather than maintaining one.
+    /// Rebuilds `lookup_order` from `runs`. Publication is rare, so this
+    /// sorts a fresh copy rather than maintaining one, and lookups and
+    /// snapshots holding the previous order keep it.
     fn order_runs(&mut self) {
-        self.lookup_order.clone_from(&self.runs);
-        self.lookup_order
-            .sort_by_key(|run| std::cmp::Reverse(run.run.max_seq()));
+        let mut order = self.runs.clone();
+        order.sort_by_key(|run| std::cmp::Reverse(run.run.max_seq()));
+        self.lookup_order = order.into();
     }
 
     /// `held_bytes` is `Some` for a run.
@@ -1267,7 +1270,8 @@ impl Engine {
     /// Returns a view of the current state that holds no lock.
     ///
     /// Takes the exclusive lock to snapshot the active memtable, in constant
-    /// time, and to copy one pointer per run and frozen table; see
+    /// time, to copy one pointer per frozen table, and to share the run list
+    /// with one reference count; see
     /// [Snapshots](self#snapshots). Snapshots taken with nothing written
     /// between them share the same view of the active table.
     ///
@@ -1377,7 +1381,7 @@ impl Core {
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
                 frozen: Vec::new(),
                 runs: Vec::new(),
-                lookup_order: Vec::new(),
+                lookup_order: Arc::new([]),
                 run_bytes: 0,
                 held_bytes: 0,
                 max_runs: options.max_runs,
@@ -1556,12 +1560,7 @@ impl Core {
         key: &[u8],
         workspace: &'w mut EngineWorkspace,
     ) -> Result<Option<LiveValue<'w>>, ReadError> {
-        let EngineWorkspace {
-            logical,
-            value,
-            runs,
-            ..
-        } = workspace;
+        let EngineWorkspace { logical, value, .. } = workspace;
         let state = self.read_state();
         let in_memory = state
             .active
@@ -1581,25 +1580,17 @@ impl Core {
         // The runs are immutable and shared, so they are read after the lock
         // is released: the result is the state at the lock, and a writer or
         // publication waits only for the memtable lookup, not for decoding.
-        runs.clear();
-        runs.extend(state.lookup_order.iter().cloned());
+        let runs = Arc::clone(&state.lookup_order);
         drop(state);
-        let found = latest_in(
-            runs.iter()
-                .map(|run| (run.run.view(), run.run.filter(), run.run.max_seq())),
-            key,
-            logical,
-        )
-        .map(|found| {
-            found.map(|found| {
-                value.clear();
-                value.extend_from_slice(found.value);
-                found.seq
-            })
-        });
-        // Releases the runs at once, so that no workspace keeps one alive.
-        runs.clear();
-        Ok(found?.map(|seq| LiveValue { seq, value }))
+        let found = latest_in(runs.iter().map(|run| &run.run), key, logical)?;
+        Ok(found.map(|found| {
+            value.clear();
+            value.extend_from_slice(found.value);
+            LiveValue {
+                seq: found.seq,
+                value,
+            }
+        }))
     }
 
     fn read(&self) -> ReadGuard<'_> {
@@ -1643,7 +1634,7 @@ impl Core {
         tables.extend(state.frozen.iter().rev().cloned());
         Ok(Snapshot {
             tables,
-            runs: state.lookup_order.clone(),
+            runs: Arc::clone(&state.lookup_order),
             last_seq: state.last_seq,
             _live: Arc::clone(&self.snapshots),
         })
@@ -1842,7 +1833,7 @@ fn deepest_overlap(runs: &[SharedRun]) -> usize {
     let mut bounds: Vec<(&[u8], bool)> = runs
         .iter()
         .flat_map(|run| {
-            let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+            let range = run.run.key_range().expect(NOT_EMPTY);
             [(range.min, false), (range.max, true)]
         })
         .collect();
@@ -1861,7 +1852,6 @@ fn deepest_overlap(runs: &[SharedRun]) -> usize {
 }
 
 const LOCK: &str = "a write section holding the state lock panicked";
-const BUILT: &str = "published runs were built by the engine";
 /// Flushes publish only non-empty tables, and compaction builds a run only
 /// once it has a record.
 const NOT_EMPTY: &str = "published runs are not empty";
@@ -2237,7 +2227,7 @@ struct Candidate<'a> {
 fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
     runs.iter()
         .map(|run| {
-            let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+            let range = run.run.key_range().expect(NOT_EMPTY);
             Candidate {
                 min: range.min,
                 max: range.max,
@@ -2387,7 +2377,7 @@ impl<'e> CompactionJob<'e> {
         let ranges: Vec<_> = self
             .others
             .iter()
-            .map(|run| run.run.key_range().expect(BUILT).expect(NOT_EMPTY))
+            .map(|run| run.run.key_range().expect(NOT_EMPTY))
             .collect();
         let keep_tombstone = |key: &[u8]| {
             ranges
@@ -2516,9 +2506,6 @@ pub struct EngineWorkspace {
     logical: LogicalWorkspace,
     value: Vec<u8>,
     prefix: Vec<u8>,
-    /// The runs an [`Engine::get`] reads after releasing the lock; empty
-    /// between calls.
-    runs: Vec<SharedRun>,
 }
 
 impl EngineWorkspace {
@@ -2528,8 +2515,22 @@ impl EngineWorkspace {
     }
 
     /// Returns the decoded-block bytes retained across all runs.
+    ///
+    /// Point lookups keep two blocks whatever the number of runs. Scans keep
+    /// one per run they have merged.
     pub fn capacity(&self) -> usize {
         self.logical.capacity()
+    }
+
+    /// Returns the bytes held by Zstandard decompression contexts, as
+    /// Zstandard reports them: one context for point lookups, and one per
+    /// run a scan has decoded Zstandard blocks from. A context is created on
+    /// first use and kept for the workspace's lifetime.
+    ///
+    /// These bytes are allocated outside the Rust heap, are not part of
+    /// [`capacity`](Self::capacity), and are charged against no limit.
+    pub fn context_bytes(&self) -> usize {
+        self.logical.context_bytes()
     }
 
     /// Returns how many run blocks reads through this workspace have loaded.
@@ -2638,7 +2639,7 @@ impl fmt::Debug for ReadGuard<'_> {
 pub struct Snapshot {
     /// Newest first.
     tables: Vec<Arc<FrozenMemtable>>,
-    runs: Vec<SharedRun>,
+    runs: Arc<[SharedRun]>,
     last_seq: u64,
     _live: Arc<()>,
 }
@@ -2715,12 +2716,7 @@ fn resolve<'r>(
             value: Value::Bytes(value),
         }) => Ok(Some(LiveValue { seq, value })),
         Some(_) => Ok(None),
-        None => latest_in(
-            runs.iter()
-                .map(|run| (run.run.view(), run.run.filter(), run.run.max_seq())),
-            key,
-            logical,
-        ),
+        None => latest_in(runs.iter().map(|run| &run.run), key, logical),
     }
 }
 
@@ -2888,7 +2884,7 @@ impl Engine {
             .runs
             .iter()
             .map(|run| {
-                let range = run.run.key_range().expect(BUILT).expect(NOT_EMPTY);
+                let range = run.run.key_range().expect(NOT_EMPTY);
                 RunShape {
                     min: range.min.to_vec(),
                     max: range.max.to_vec(),
@@ -2944,7 +2940,7 @@ impl Engine {
             .runs
             .iter()
             .map(|run| {
-                let range = run.key_range().expect(BUILT).expect(NOT_EMPTY);
+                let range = run.key_range().expect(NOT_EMPTY);
                 (range.min.to_vec(), range.max.to_vec())
             })
             .collect();

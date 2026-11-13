@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
@@ -42,6 +43,40 @@ pub struct Run<B> {
     /// The prepared form of the dictionary the run stores, if it stores one,
     /// shared by every reader. Built once, after the dictionary is validated.
     dictionary: Option<Arc<RunDictionary>>,
+    /// Where the smallest and largest user keys lie in `data`, or `None` for
+    /// an empty run, found once so that a lookup can rule the run out
+    /// without opening it.
+    bounds: Option<KeyBounds>,
+}
+
+#[derive(Clone, Debug)]
+struct KeyBounds {
+    min: Range<usize>,
+    max: Range<usize>,
+}
+
+impl KeyBounds {
+    /// The bounds of the valid run `data`.
+    fn of(data: &[u8]) -> Option<Self> {
+        let range = RunView::open(data)
+            .expect(VALIDATED)
+            .key_range()
+            .expect(VALIDATED)?;
+        let within = |key| subslice(data, key).expect("a run's keys lie in its bytes");
+        Some(Self {
+            min: within(range.min),
+            max: within(range.max),
+        })
+    }
+}
+
+/// Where `inner` lies within `outer`, if it is a subslice of it, found from
+/// their addresses: the offset that `<[T]>::subslice_range` (unstable)
+/// computes. An empty `inner` at either end of `outer` lies within it.
+fn subslice(outer: &[u8], inner: &[u8]) -> Option<Range<usize>> {
+    let start = inner.as_ptr().addr().checked_sub(outer.as_ptr().addr())?;
+    let end = start.checked_add(inner.len())?;
+    (end <= outer.len()).then_some(start..end)
 }
 
 const VALIDATED: &str = "run bytes were validated or built by this crate";
@@ -58,11 +93,13 @@ impl<B: AsRef<[u8]>> Run<B> {
     )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         let (max_seq, dictionary) = validate(data.as_ref())?;
+        let bounds = KeyBounds::of(data.as_ref());
         Ok(Self {
             data,
             filter: None,
             max_seq,
             dictionary: dictionary.map(Arc::new),
+            bounds,
         })
     }
 
@@ -72,11 +109,13 @@ impl<B: AsRef<[u8]>> Run<B> {
         max_seq: u64,
         dictionary: Option<Arc<RunDictionary>>,
     ) -> Self {
+        let bounds = KeyBounds::of(data.as_ref());
         Self {
             data,
             filter: filter.map(Box::new),
             max_seq,
             dictionary,
+            bounds,
         }
     }
 
@@ -157,9 +196,30 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 
     /// Returns the smallest and largest user keys, or `None` for an empty run.
-    /// Decodes nothing.
-    pub fn key_range(&self) -> Result<Option<KeyRange<'_>>, CorruptRun> {
-        self.view().key_range()
+    /// They were found when the run was built or validated, so this reads
+    /// only the two keys.
+    pub fn key_range(&self) -> Option<KeyRange<'_>> {
+        let bounds = self.bounds.as_ref()?;
+        let data = self.data.as_ref();
+        Some(KeyRange {
+            min: &data[bounds.min.clone()],
+            max: &data[bounds.max.clone()],
+        })
+    }
+
+    /// Whether the run provably holds no version of `key`: the key is outside
+    /// its range, or its filter rules the key out. This opens nothing, and
+    /// `hash` caches the key's hash across runs.
+    pub(crate) fn excludes(&self, key: &[u8], hash: &mut Option<u64>) -> bool {
+        let Some(range) = self.key_range() else {
+            return true;
+        };
+        if key < range.min || key > range.max {
+            return true;
+        }
+        self.filter().is_some_and(|filter| {
+            !filter.may_contain(*hash.get_or_insert_with(|| key_filter::hash(key)))
+        })
     }
 
     /// Returns the newest version of `user_key`, which may be a tombstone, or
@@ -177,11 +237,10 @@ impl<B: AsRef<[u8]>> Run<B> {
         user_key: &[u8],
         workspace: &'r mut ReadWorkspace,
     ) -> Result<Option<Version<'r>>, CorruptRun> {
-        let view = self.view();
-        if excluded(view, self.filter(), user_key, &mut None)? {
+        if self.excludes(user_key, &mut None) {
             return Ok(None);
         }
-        view.get(user_key, workspace)
+        self.view().get(user_key, workspace)
     }
 
     /// Returns a cursor positioned before the first record, which holds the
@@ -228,26 +287,6 @@ impl Run<Vec<u8>> {
         let run = Self::from_builder(data, hashes.finish(), max_seq, dictionary);
         Ok((run, max_seq))
     }
-}
-
-/// Whether `filter` proves `key` absent from the run `view`, checked only for
-/// a key inside the run's range. `hash` caches the key's hash across runs.
-pub(crate) fn excluded(
-    view: RunView<'_>,
-    filter: Option<&KeyFilter>,
-    key: &[u8],
-    hash: &mut Option<u64>,
-) -> Result<bool, CorruptRun> {
-    let Some(filter) = filter else {
-        return Ok(false);
-    };
-    let Some(range) = view.key_range()? else {
-        return Ok(false);
-    };
-    if key < range.min || key > range.max {
-        return Ok(false);
-    }
-    Ok(!filter.may_contain(*hash.get_or_insert_with(|| key_filter::hash(key))))
 }
 
 /// A run's smallest and largest user keys, bytewise.
@@ -312,39 +351,47 @@ impl ReadWorkspace {
         dictionary: Option<&RunDictionary>,
     ) -> Result<&'r [u8], CorruptRun> {
         self.blocks_loaded += 1;
-        if frame.codec == Codec::None {
-            return Ok(frame.stored);
-        }
-        frame.verify_checksum()?;
-        if frame.codec == Codec::ZstdDictionary {
-            let dictionary = dictionary.ok_or(frame.error(RunCorruption::MissingDictionary))?;
-            if zstd_safe::get_dict_id_from_frame(frame.stored) != Some(dictionary.id()) {
-                return Err(frame.error(RunCorruption::DictionaryMismatch));
-            }
-        }
-
-        // Both checks precede sizing the buffer from a declared length.
-        let len = frame.decoded_len;
-        if !plausible_decoded_len(frame.codec, frame.stored, len) {
-            return Err(frame.error(RunCorruption::InvalidFrame));
-        }
-        // Only growth needs initializing, and stale bytes past `len` are never
-        // exposed.
-        if self.scratch.len() < len {
-            self.scratch.reserve_exact(len - self.scratch.len());
-            self.scratch.resize(len, 0);
-        }
-        let written = self.decompressor.decompress(
-            frame.codec,
-            frame.stored,
-            &mut self.scratch[..len],
-            dictionary,
-        );
-        if written != Some(len) {
-            return Err(frame.error(RunCorruption::CorruptPayload));
-        }
-        Ok(&self.scratch[..len])
+        decode(frame, dictionary, &mut self.scratch, &mut self.decompressor)
     }
+}
+
+/// [`ReadWorkspace::load`], with the buffer and the decompression context
+/// given separately so that a [`LookupWorkspace`] can share one context
+/// between its buffers.
+fn decode<'r>(
+    frame: &Frame<'r>,
+    dictionary: Option<&RunDictionary>,
+    scratch: &'r mut Vec<u8>,
+    decompressor: &mut Decompressor,
+) -> Result<&'r [u8], CorruptRun> {
+    if frame.codec == Codec::None {
+        return Ok(frame.stored);
+    }
+    frame.verify_checksum()?;
+    if frame.codec == Codec::ZstdDictionary {
+        let dictionary = dictionary.ok_or(frame.error(RunCorruption::MissingDictionary))?;
+        if zstd_safe::get_dict_id_from_frame(frame.stored) != Some(dictionary.id()) {
+            return Err(frame.error(RunCorruption::DictionaryMismatch));
+        }
+    }
+
+    // Both checks precede sizing the buffer from a declared length.
+    let len = frame.decoded_len;
+    if !plausible_decoded_len(frame.codec, frame.stored, len) {
+        return Err(frame.error(RunCorruption::InvalidFrame));
+    }
+    // Only growth needs initializing, and stale bytes past `len` are never
+    // exposed.
+    if scratch.len() < len {
+        scratch.reserve_exact(len - scratch.len());
+        scratch.resize(len, 0);
+    }
+    let written =
+        decompressor.decompress(frame.codec, frame.stored, &mut scratch[..len], dictionary);
+    if written != Some(len) {
+        return Err(frame.error(RunCorruption::CorruptPayload));
+    }
+    Ok(&scratch[..len])
 }
 
 /// Returns a block already decoded into `scratch` by [`ReadWorkspace::load`].
@@ -359,6 +406,106 @@ fn loaded_bytes<'r>(scratch: &'r [u8], frame: &Frame<'r>) -> &'r [u8] {
 impl fmt::Debug for ReadWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadWorkspace")
+            .field("capacity", &self.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reusable storage for point lookups across any number of runs, created
+/// once per reader: two decoded-block buffers and one decompression context.
+///
+/// A lookup keeps the newest version found so far in one buffer and decodes
+/// the next run it reads into the other, so two suffice however many runs
+/// there are. The context serves both buffers and every codec and
+/// dictionary, since each call names its dictionary.
+#[derive(Default)]
+pub(crate) struct LookupWorkspace {
+    buffers: [Vec<u8>; 2],
+    decompressor: Decompressor,
+    blocks_loaded: u64,
+}
+
+/// A version [`LookupWorkspace::get`] found, located rather than borrowed so
+/// that the workspace can decode into its other buffer while this is held.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Found<'a> {
+    /// The buffer the block was read into, whether or not it was decoded.
+    pub(crate) buffer: usize,
+    value: Located<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Located<'a> {
+    Tombstone,
+    /// In a stored block, so in the run itself.
+    Stored(&'a [u8]),
+    /// At these offsets in the buffer.
+    Decoded(usize, usize),
+}
+
+impl LookupWorkspace {
+    /// Returns the bytes retained for decoded blocks.
+    pub(crate) fn capacity(&self) -> usize {
+        self.buffers.iter().map(Vec::capacity).sum()
+    }
+
+    /// Returns the bytes held by the decompression context, outside the Rust
+    /// heap.
+    pub(crate) fn context_bytes(&self) -> usize {
+        self.decompressor.context_bytes()
+    }
+
+    /// Returns how many blocks lookups through this workspace have loaded.
+    pub(crate) fn blocks_loaded(&self) -> u64 {
+        self.blocks_loaded
+    }
+
+    /// Returns the sequence number and location of the newest version of
+    /// `target` in `view`, as [`RunView::get`] does, decoding into `buffer`
+    /// (0 or 1) and leaving the other buffer as it was.
+    pub(crate) fn get<'a>(
+        &mut self,
+        view: RunView<'a>,
+        target: &[u8],
+        buffer: usize,
+    ) -> Result<Option<(u64, Found<'a>)>, CorruptRun> {
+        let scratch = &mut self.buffers[buffer];
+        let found = view.find(
+            target,
+            scratch,
+            &mut self.decompressor,
+            &mut self.blocks_loaded,
+        )?;
+        let Some((block, version)) = found else {
+            return Ok(None);
+        };
+        let value = match version.value {
+            Value::Tombstone => Located::Tombstone,
+            Value::Bytes(value) => match subslice(view.frames, value) {
+                Some(range) => Located::Stored(&view.frames[range]),
+                None => {
+                    let range = subslice(block, value).expect("a value lies in its block");
+                    Located::Decoded(range.start, range.end)
+                }
+            },
+        };
+        Ok(Some((version.seq, Found { buffer, value })))
+    }
+
+    /// Returns the value of a version [`get`](Self::get) found. Its buffer
+    /// must not have been decoded into since.
+    pub(crate) fn value<'s, 'a: 's>(&'s self, found: Found<'a>) -> Value<'s> {
+        match found.value {
+            Located::Tombstone => Value::Tombstone,
+            Located::Stored(value) => Value::Bytes(value),
+            Located::Decoded(start, end) => Value::Bytes(&self.buffers[found.buffer][start..end]),
+        }
+    }
+}
+
+impl fmt::Debug for LookupWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LookupWorkspace")
             .field("capacity", &self.capacity())
             .finish_non_exhaustive()
     }
@@ -848,6 +995,28 @@ impl<'a> RunView<'a> {
     where
         'a: 'r,
     {
+        let ReadWorkspace {
+            scratch,
+            decompressor,
+            blocks_loaded,
+            ..
+        } = workspace;
+        let found = self.find(target, scratch, decompressor, blocks_loaded)?;
+        Ok(found.map(|(_, version)| version))
+    }
+
+    /// [`get`](Self::get), with the buffer, context and block count given
+    /// separately. Also returns the block the version is in.
+    fn find<'r>(
+        self,
+        target: &[u8],
+        scratch: &'r mut Vec<u8>,
+        decompressor: &mut Decompressor,
+        blocks_loaded: &mut u64,
+    ) -> Result<Option<(&'r [u8], Version<'r>)>, CorruptRun>
+    where
+        'a: 'r,
+    {
         if target < self.min_key {
             return Ok(None);
         }
@@ -855,10 +1024,12 @@ impl<'a> RunView<'a> {
             return Ok(None);
         };
         let frame = self.frame(block)?;
-        let bytes = workspace.load(&frame, self.dictionary)?;
-        BlockView::open(bytes)
+        *blocks_loaded += 1;
+        let bytes = decode(&frame, self.dictionary, scratch, decompressor)?;
+        let version = BlockView::open(bytes)
             .and_then(|view| view.get(target))
-            .map_err(|error| frame.block_error(error))
+            .map_err(|error| frame.block_error(error))?;
+        Ok(version.map(|version| (bytes, version)))
     }
 
     /// Returns a cursor positioned before the first record.

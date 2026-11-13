@@ -567,7 +567,7 @@ mod compaction {
                                     .output
                                     .runs
                                     .iter()
-                                    .map(|run| run.key_range().unwrap().unwrap())
+                                    .map(|run| run.key_range().unwrap())
                                     .map(|range| (range.min.to_vec(), range.max.to_vec()))
                                     .collect();
                                 assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));

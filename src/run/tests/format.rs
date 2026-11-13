@@ -1000,11 +1000,12 @@ fn runs_work_over_shared_and_borrowed_storage() {
 }
 
 /// Beside its storage a run holds two pointers, to the key filter its
-/// builder made and to its prepared dictionary, if any, and its largest
-/// sequence number.
+/// builder made and to its prepared dictionary, if any, its largest
+/// sequence number, and the four offsets of its smallest and largest keys
+/// with a word saying whether it has any.
 #[test]
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
-    let extra = 2 * size_of::<usize>() + size_of::<u64>();
+    let extra = 2 * size_of::<usize>() + size_of::<u64>() + 5 * size_of::<usize>();
     assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>() + extra);
     assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>() + extra);
 }

@@ -138,11 +138,7 @@ fn output_is_split_into_ascending_disjoint_runs() {
     };
     let out = merge(&[&right, &left], |_| true, limits).unwrap();
     assert!(out.runs.len() > 10, "{}", out.runs.len());
-    let ranges: Vec<_> = out
-        .runs
-        .iter()
-        .map(|r| r.key_range().unwrap().unwrap())
-        .collect();
+    let ranges: Vec<_> = out.runs.iter().map(|r| r.key_range().unwrap()).collect();
     assert!(ranges.windows(2).all(|pair| pair[0].max < pair[1].min));
     assert_eq!(merged(&out).len(), 400);
 }

@@ -3752,6 +3752,136 @@ scripts/validate.sh exec 1500 env SUSTAIN_APPEND=1 SUSTAIN_UPDATES=20 SUSTAIN_GR
   cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
 ```
 
+## Read-path foundations (5AO)
+
+*Change and A/B measurement.* Point lookups, snapshots and reader memory
+against the number of published runs, before levels exist. Labels: **M**
+measured, **D** derived from the measurements or the code.
+
+### What changed
+
+- **Cached key bounds.** A run records, when it is built or validated,
+  where its smallest and largest keys lie in its own bytes (offsets, not
+  copies: 40 bytes per run descriptor, no heap). A lookup checks the
+  sequence bound, then the range, then the filter, and opens the run's
+  footer only if all three admit the key. `Run::key_range` no longer
+  parses the footer.
+- **One shared lookup directory.** The lookup order is an immutable
+  `Arc<[run]>`, rebuilt on publication. `Engine::get` and `snapshot` take
+  one reference count instead of one per run, and a snapshot no longer
+  allocates for its run list.
+- **Two block buffers and one decompression context per lookup
+  workspace.** The newest version found so far stays in one buffer while
+  the next run decodes into the other; the winner is held as an offset
+  range, and the value returned borrows that buffer or the run. Scans keep
+  one buffer and context per run, as before.
+- **One lookup routine.** `latest_in` keeps its pruning, tombstone and
+  duplicate-copy rules and serves both the engine's runs and bare views.
+  No unsafe code, dependency, format change or option was added; one
+  observability method, `EngineWorkspace::context_bytes`, was.
+
+### Method
+
+`examples/read_path.rs`, public API only, built against `72cc463` and
+against the change, release builds, the bounded container (2 CPUs), two
+alternating passes of each (A, B, A, B). 200,000 keys of 150–500-byte JSON
+values in two phases: every key, then an overwrite of one key in ten and a
+delete of another one in ten, flushed into exactly `runs` runs with no
+compaction. **Disjoint**: both phases in key order. **Overlapping**: both
+in a fixed permutation, so every run spans the key space. Each figure is
+the median over 20 batches of 500 probes of the mean per probe. Memory is
+measured on a fresh workspace after one checked pass over 40,000 probes:
+`decoded` is `EngineWorkspace::capacity`, `native` the growth in glibc's
+in-use `malloc` bytes minus Rust heap growth (the Zstandard contexts).
+
+Compared with the reviewer's harness: batch timing instead of a clock read
+per probe, probes built before timing, allocations counted inside the
+timed loops only (its counts included its own result vectors), overwritten
+and deleted keys, an overlapping layout, and native memory, which resident
+memory under-reports (freed pages are reused, and a context's pages are
+not all touched).
+
+### Results (M), ns per lookup, the two passes of each
+
+| layout | runs | present, 72cc463 | present, 5AO | overwritten | deleted | missing | snapshot |
+|---|---|---|---|---|---|---|---|
+| disjoint | 4 | 12,612–13,523 | 12,653–12,661 | 12,482–13,256 → 12,527–12,596 | 12,458–13,193 → 12,501–12,546 | 288–329 → 220–224 | 22–23 → 10 |
+| disjoint | 64 | 13,609–14,632 | 12,846–12,850 | 13,222–13,877 → 12,512–12,534 | 13,223–13,721 → 12,509–13,403 | 1,719–1,768 → 597–607 | 129–134 → 9–10 |
+| disjoint | 256 | 17,352–18,476 | 13,176–13,192 | 15,875–16,783 → 12,555–12,612 | 15,689–16,603 → 12,537–12,571 | 6,421–6,853 → 1,392–1,411 | 452–465 → 9–10 |
+| disjoint | 2,048 | 57,607–60,299 | 17,865–18,034 | 49,704–50,053 → 13,913–14,039 | 47,152–52,000 → 13,967–14,022 | 57,593–59,506 → 10,222–10,246 | 5,297–5,416 → 10 |
+| overlapping | 4 | 12,779–13,575 | 12,871–12,984 | 12,349–13,122 → 12,460–12,500 | 12,411–13,037 → 12,437–12,464 | 541–555 → 507–510 | 25–26 → 9–10 |
+| overlapping | 64 | 17,976–18,945 | 17,161–17,183 | 13,808–14,756 → 13,048–13,120 | 13,766–14,621 → 13,022–13,075 | 8,395–8,869 → 7,712–7,748 | 131–133 → 9–10 |
+| overlapping | 256 | 35,221–36,787 | 30,548–30,585 | 19,683–19,772 → 15,190–15,242 | 19,203–19,468 → 15,192–15,212 | 35,683–38,070 → 31,430–31,666 | 451–474 → 9–10 |
+| overlapping | 2,048 | 173,849–182,859 | 138,214–138,957 | 64,119–68,948 → 31,758–31,830 | 65,371–68,584 → 32,115–32,196 | 252,553–261,419 → 213,977–214,929 | 5,322–5,413 → 10 |
+
+Warm lookups made no Rust heap allocation in either version. A snapshot
+made one before and none after.
+
+Lookup workspace after the pass, KiB, the same in both layouts and passes:
+
+| runs | decoded, 72cc463 | native, 72cc463 | decoded, 5AO | native, 5AO |
+|---|---|---|---|---|
+| 4 | 64 | 374 | 16 | 93 |
+| 64 | 1,035 | 5,999 | 16 | 93 |
+| 256 | 4,132–4,133 | 24,000 | 16 | 93 |
+| 2,048 | 32,433–32,691 | 191,718–191,999 | 16 | 93 |
+
+Prefix scans through a snapshot, µs, before → after: two passes of each
+at 4 runs, and five alternating passes at 2,048 (range, then median):
+
+| layout | runs | 5 keys | 450 keys | empty prefix |
+|---|---|---|---|---|
+| disjoint | 4 | 25.8–26.2 → 25.3–25.5 | 157–159 → 153–154 | 0.21–0.22 → 0.20–0.23 |
+| disjoint | 2,048 | 101–110, 107 → 101–111, 110 | 240–260, 257 → 241–265, 249 | 70–75, 74 → 70–84, 76 |
+| overlapping | 4 | 51.2–53.5 → 51.7–51.8 | 186–198 → 186–187 | 0.21–0.23 → 0.20–0.22 |
+| overlapping | 2,048 | 26,310–27,028, 26,588 → 25,964–28,160, 26,417 | 26,959–28,862, 27,229 → 26,631–27,329, 27,113 | 72.7–83.4, 77.3 → 72.1–80.5, 78.1 |
+
+A scan's workspace was unchanged: 32 MiB decoded and 188 MiB native at
+2,048 overlapping runs.
+
+### Findings
+
+- **Snapshots are constant (M):** 10 ns at every run count, against
+  2.6 ns a run before.
+- **Workspace memory is constant (M):** two block buffers (one was
+  enough here) and one 93 KiB context, against a buffer and a context per
+  run. At 2,048 runs that is 109 KiB against 219 MiB per reader.
+- **Disjoint lookups stay linear, with a much smaller slope (D):** a
+  missing key costs about 4.9 ns a run (10.2 µs at 2,048) against 28 ns;
+  present keys about 2.6 ns a run over the decode. What remains is the
+  walk over the directory: a sequence and range check per run.
+- **Overlapping lookups improve least (D):** about 104 ns a run for a
+  missing key, against 123 ns. Every run's range admits every key, so each
+  run costs a filter probe, and only fewer runs (compaction) or a different
+  filter layout lowers it.
+- **Overwritten and deleted keys** gain most with overlap (2.1× at 2,048),
+  because the old code still cloned and parsed every run it skipped.
+- **Scans are unchanged (M):** every range of the change overlaps the
+  baseline's, and the medians differ by at most 3%, in both directions.
+  Two passes first suggested the empty prefix at 2,048 overlapping runs
+  was 4–7% slower (the run descriptor grew by 40 bytes, so a scan's setup
+  touches more memory per run); five passes do not support it. The scan
+  path was not changed and stays linear in runs, in time and in workspace
+  memory.
+- **No regression was measured.** At 4 runs the lookup rows differ by less
+  than the spread between passes, except missing keys, which became
+  faster.
+
+### Reproduction
+
+```sh
+scripts/validate.sh exec 600 sh -c 'cargo build --locked --release --example read_path &&
+  cp /cache/target/release/examples/read_path /cache/read_path-new'
+scripts/validate.sh exec 1500 sh -c '/cache/read_path-new lookups && /cache/read_path-new scans'
+```
+
+For the baseline, copy `examples/read_path.rs` (public API only) into a
+checkout of `72cc463` and build and run it there in one
+`TESSERA_SOURCE=<checkout> scripts/validate.sh exec` (that source gets a
+build cache discarded with its container), alternating with runs of the
+change's binary. The passes above instead built the baseline in the shared
+cache before the change and copied its binary aside.
+
 ## Historical results
 
 Everything below was measured with the former suite, `examples/block_bench.rs`

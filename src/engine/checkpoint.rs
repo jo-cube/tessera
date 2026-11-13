@@ -1180,16 +1180,12 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                     },
                 ));
             }
-            let range = run
-                .key_range()
-                .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+            let range = run.key_range();
             let follows = match (range, runs.last()) {
                 (None, _) => false,
                 (Some(_), None) => true,
                 (Some(range), Some(previous)) => previous
                     .key_range()
-                    .ok()
-                    .flatten()
                     .is_some_and(|previous| previous.max < range.min),
             };
             if !follows {

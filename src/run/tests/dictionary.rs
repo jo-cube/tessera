@@ -515,7 +515,7 @@ fn lookup_costs() {
                     let index = out
                         .runs
                         .iter()
-                        .position(|run| run.key_range().unwrap().unwrap().max >= *key)
+                        .position(|run| run.key_range().unwrap().max >= *key)
                         .unwrap();
                     let workspace = &mut workspaces[if per_run { index } else { 0 }];
                     std::hint::black_box(out.runs[index].get(key, workspace).unwrap());
@@ -729,7 +729,7 @@ fn dictionary_count_costs() {
                 let start = Instant::now();
                 let run = runs
                     .iter()
-                    .find(|run| run.key_range().unwrap().unwrap().max >= key)
+                    .find(|run| run.key_range().unwrap().max >= key)
                     .unwrap();
                 std::hint::black_box(run.get(key, &mut workspace).unwrap());
                 if round > 0 {

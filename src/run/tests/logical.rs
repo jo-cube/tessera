@@ -843,13 +843,8 @@ type Found = Result<Option<(u64, Vec<u8>)>, ReadError>;
 
 fn get_bounded(runs: &[Run<Vec<u8>>], key: &[u8]) -> (Found, u64) {
     let mut workspace = LogicalWorkspace::new();
-    let found = crate::run::latest_in(
-        runs.iter()
-            .map(|run| (run.view(), run.filter(), run.max_seq())),
-        key,
-        &mut workspace,
-    )
-    .map(|found| found.map(|found| (found.seq, found.value.to_vec())));
+    let found = crate::run::latest_in(runs, key, &mut workspace)
+        .map(|found| found.map(|found| (found.seq, found.value.to_vec())));
     (found, workspace.blocks_loaded())
 }
 

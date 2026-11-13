@@ -45,7 +45,6 @@ fn numbered(range: std::ops::Range<usize>) -> Vec<Input> {
 
 fn range_of(run: &Run<Vec<u8>>) -> Option<(Vec<u8>, Vec<u8>)> {
     run.key_range()
-        .unwrap()
         .map(|KeyRange { min, max }| (min.to_vec(), max.to_vec()))
 }
 
@@ -92,10 +91,10 @@ fn kind_of(error: crate::run::CorruptRun) -> RunCorruption {
 #[test]
 fn an_empty_run_has_no_range_and_no_stored_key() {
     let run = build(Codec::Zstd, &[], SMALL_BLOCK);
-    assert_eq!(run.key_range().unwrap(), None);
+    assert_eq!(run.key_range(), None);
     assert_eq!(run.as_bytes().len(), FOOTER);
     assert_eq!(layout(run.as_bytes()).min_len, 0);
-    assert_eq!(Run::new(run.as_bytes()).unwrap().key_range().unwrap(), None);
+    assert_eq!(Run::new(run.as_bytes()).unwrap().key_range(), None);
 }
 
 #[test]
@@ -686,7 +685,7 @@ fn pruned_reads_match_a_reference_model_and_decode_no_excluded_run() {
         for input in &inputs {
             if let Some((min, max)) = bounds(input) {
                 let run_index = inputs.iter().position(|i| std::ptr::eq(i, input)).unwrap();
-                let range = runs[run_index].key_range().unwrap().unwrap();
+                let range = runs[run_index].key_range().unwrap();
                 assert_eq!((range.min, range.max), (min, max), "seed {seed}");
             }
         }

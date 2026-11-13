@@ -623,8 +623,8 @@ fn a_flush_splits_at_the_target_into_ordered_disjoint_runs() {
     assert_eq!(sizes, [10, 10, 10, 10, 10, 10, 10, 10, 10, 5]);
     let mut flushed = Vec::new();
     for pair in runs.windows(2) {
-        let first = pair[0].key_range().unwrap().unwrap();
-        let second = pair[1].key_range().unwrap().unwrap();
+        let first = pair[0].key_range().unwrap();
+        let second = pair[1].key_range().unwrap();
         assert!(first.max < second.min);
     }
     for run in &runs {
