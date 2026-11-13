@@ -80,6 +80,9 @@ Kinds of result in this file:
 - **Sustained writes:** the 5AH section, background compaction under a
   paced write workload, the overlap allowance's trade-off, and 5AG's
   comparison repeated at normal speed; the engine is unchanged.
+- **Flush compression bound:** the 5AI section, how much memory
+  dictionary-assisted flushes could save under sustained writes, with
+  uniform and ascending keys; the engine is unchanged.
 - **Historical:** everything under "Historical results", from earlier
   harnesses; kept for the decisions it records, not comparable number for
   number.
@@ -3452,6 +3455,113 @@ scripts/validate.sh exec 1500 env SUSTAIN_RATE=3000 SUSTAIN_SECS=300 SUSTAIN_OVE
   cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
 scripts/validate.sh exec 1500 env SUSTAIN_READS=0 SUSTAIN_RATE=25000 SUSTAIN_SECS=160 \
   SUSTAIN_READ_SECS=10 SUSTAIN_OVERLAP=2 \
+  cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
+```
+
+## Dictionary-assisted flushes: the opportunity (5AI)
+
+*Measurement and decision; no engine change, no prototype.* Would
+compressing each flush with a dictionary borrowed from an existing run
+materially reduce memory under sustained writes? The milestone first
+bounds the possible saving, and stops there because the bound is small.
+Labels: **M** measured, **D** derived, **A** assumed.
+
+### Where sustained-write memory goes
+
+The 5AH default-policy run (paced, normal speed, 3,000 writes/s for
+300 s on `json:64`), time-weighted over the samples:
+
+| component | mean MiB | peak MiB | basis |
+|---|---|---|---|
+| dictionary runs | 136.2 | 174.3 | M |
+| plain flushed runs | 20.0 | 67.7 | M |
+| of which, retained versions and tombstones | 35.0 | 74.9 | D |
+| memtables | 32.1 | 48.2 | M |
+| snapshot-retained runs | 0 | 0 | M |
+| process RSS | 335 | 405 | M |
+
+Retained versions are part of the two run rows above, not in addition
+to them: run bytes less the live records at the base's dictionary
+density (115.8 MiB) and less the extra that plain data costs (27.3% of
+the plain bytes, below). Filters and prepared dictionaries add
+1.6–2.7 MiB in these runs.
+
+**Ascending keys (M):** `SUSTAIN_APPEND=1` loads the lowest quarter of
+`json:256` (11 dictionary runs, 132.5 MiB) and inserts the rest in key
+order at 25,000 writes/s (3,125,000 inserts, 31 flushes). Flushed runs
+never overlap, so nothing compacts until there are more than 16 runs
+(the sixth flush): plain bytes reach 102.3 MiB. From then on each flush's
+run is merged with the previous tail within 0.3–0.5 s, the
+disjoint-tail rule; plain bytes average 1.9 MiB, 10.8 MiB over the whole
+run including the ramp. Write amplification is 0.70 stored bytes per
+logical byte, the worker busy 9%, and every record verified.
+
+### The bound
+
+A borrowed dictionary cannot be expected to beat one trained on the same
+data: 5AG measured reuse of an input's dictionary at 21.7% against 22.3%
+trained afresh on stable values, decaying to 3.1% under structural
+change. The optimistic upper bound is therefore the trained dictionary's saving
+at 4 KiB, 27.3% (124.38 against 171.15 MiB on JSON, 5AG):
+
+| workload | plain bytes, mean / peak | saving at most, mean / peak (D) | of RSS |
+|---|---|---|---|
+| uniform updates (5AH default) | 20.0 / 67.7 MiB | 5.5 / 18.5 MiB | 1.6% mean, 4.6% peak |
+| ascending inserts, after the ramp | 1.9 / 17.1 MiB | 0.5 / 4.7 MiB | about 0.1% mean |
+| ascending inserts, the ramp | – / 102.3 MiB | – / 27.9 MiB | transient |
+
+The peak percentage divides the peak saving by peak RSS, which need not
+coincide; it overstates the saving at any one moment. In the append run
+RSS grows with the data, from 379 to 776 MiB after the ramp.
+
+Against the 58.8 MiB by which Tessera's memory exceeded RocksDB's after
+the 5AH mixed workload, the mean saving is at most a tenth. The larger
+components, retained versions (35 MiB mean) and memtables (32 MiB),
+are untouched by flush compression.
+
+### Why it is small
+
+Flushed data is rewritten soon whatever the key order, by the overlap
+rule within four flushes or by the disjoint-tail rule once more than 16
+runs exist, and each rewrite trains a dictionary. A dictionary-assisted
+flush would shrink data shortly before it is rewritten anyway, and would
+save no rewriting. Data stays plain for long only where no compaction is
+ever triggered (at most four overlapping or sixteen disjoint runs); in a
+fresh engine that is also where no dictionary exists to borrow, and a
+checkpoint already trains one.
+
+### What it would have cost (D, from earlier measurements)
+
+- **Flush latency:** a write that finds the memtables full builds and
+  publishes the flush itself before returning, so flush work is write
+  latency. Compressing against a dictionary costs about as much as
+  without (5AD), but each flush would add preparing the compression
+  dictionary, a prepared decoding copy per run, and a selection step.
+- **Format and ownership:** none new. Dictionary runs are format version
+  4 and store their own dictionary, so a flushed run with a copy of a
+  borrowed one stays self-contained and recoverable; the copy costs the
+  dictionary's 16 KiB plus its prepared form per run.
+- **Selection:** the newest overlapping run's dictionary is the obvious
+  heuristic; with uniform updates every dictionary run overlaps a flush,
+  so it reduces to choosing among all of them.
+
+### Decision
+
+Keep plain flushes. The steady-state saving is bounded at 1.6% of
+resident memory for uniform updates and about 0.1% for ascending
+inserts, with transient peaks of 18.5–27.9 MiB, against new work in the
+write path and a selection policy. The run-layer encoding, staleness and
+selection experiments the milestone outlined were not built, because no
+result of theirs could raise the bound. The larger lever on
+sustained-write memory is the retained versions that the overlap
+allowance leaves (5AH), which `max_overlap` already trades against
+rewriting.
+
+### Reproduction
+
+```sh
+scripts/validate.sh exec 1500 env SUSTAIN_APPEND=1 SUSTAIN_GROUPS=256 SUSTAIN_READS=0 \
+  SUSTAIN_RATE=25000 SUSTAIN_SECS=125 SUSTAIN_READ_SECS=10 \
   cargo test --locked --release --lib run::tests::sustained -- --ignored --nocapture
 ```
 

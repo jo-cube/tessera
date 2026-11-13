@@ -16,6 +16,8 @@
 //! plain Zstandard instead of dictionaries. `SUSTAIN_READS=0` writes
 //! without reading during the active phase, to follow many compaction
 //! cycles quickly: the policy depends on the writes, not on the time.
+//! `SUSTAIN_APPEND=1` loads the lowest quarter of the keys and then inserts
+//! the rest in ascending key order, so that flushed runs never overlap.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,6 +154,8 @@ struct Workload {
     workspace: EngineWorkspace,
     /// Whether steps read as well as write.
     reads: bool,
+    /// The next key to insert, when writes append in key order instead.
+    append: Option<u64>,
     puts: Vec<u64>,
     gets: Vec<u64>,
     scans: Vec<u64>,
@@ -195,10 +199,16 @@ impl Workload {
     /// An update, or 15% of the time a delete, of a random key; an insert if
     /// the key is absent.
     fn write(&mut self, engine: &Engine, step: u64) {
-        let index = self.rng.below(self.versions.len() as u64);
+        let index = match &mut self.append {
+            Some(next) => {
+                *next += 1;
+                *next - 1
+            }
+            None => self.rng.below(self.versions.len() as u64),
+        };
         let key = self.key(index);
         let present = self.versions[index as usize] != 0;
-        if present && self.rng.below(100) < 15 {
+        if present && self.append.is_none() && self.rng.below(100) < 15 {
             let begin = Instant::now();
             engine.delete(&key).unwrap();
             self.puts.push(begin.elapsed().as_nanos() as u64);
@@ -299,13 +309,15 @@ fn sustained_compaction() {
     });
 
     // Seven keys in eight, in a fixed random order, consolidated as the
-    // comparison harness consolidates its load.
+    // comparison harness consolidates its load; when appending, the lowest
+    // quarter of the keys instead.
     let mut load = Workload {
         groups,
         rng: Rng::new(50_000),
         versions: vec![0; records as usize],
         workspace: EngineWorkspace::new(),
         reads: env("SUSTAIN_READS", 1) != 0,
+        append: (env("SUSTAIN_APPEND", 0) != 0).then_some(records / 4),
         puts: Vec::new(),
         gets: Vec::new(),
         scans: Vec::new(),
@@ -317,7 +329,11 @@ fn sustained_compaction() {
     };
     for j in 0..records {
         let index = (j.wrapping_mul(0x9E37_79B1).wrapping_add(0x7F4A_7C15)) & (records - 1);
-        if index % 8 != 7 {
+        let loaded = match load.append {
+            Some(first) => index < first,
+            None => index % 8 != 7,
+        };
+        if loaded {
             engine
                 .put(&load.key(index), &compare::json(index, 1))
                 .unwrap();
@@ -342,6 +358,9 @@ fn sustained_compaction() {
         "| phase | s | runs | overlap | dict runs | dict MiB | plain MiB | prepared | memtables MiB | worker | compactions | failures | rewritten MiB | worker CPU s | RSS MiB |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    if let Some(first) = load.append {
+        assert!(rate * secs <= records - first, "appends past the last key");
+    }
     let start = Instant::now();
     let base = sample(&engine, start);
     row("base", &base);
