@@ -15,11 +15,16 @@
 //!
 //! assert_eq!(engine.get(b"apple", &mut workspace)?.unwrap().value, b"red");
 //!
-//! let reader = engine.read();
-//! let mut scan = reader.scan_prefix(b"ap", &mut workspace);
+//! // A snapshot holds no lock, so scanning it delays no writer.
+//! let snapshot = engine.snapshot()?;
+//! let mut scan = snapshot.scan_prefix(b"ap", &mut workspace);
 //! assert_eq!(scan.next_record()?.unwrap().key, b"apple");
 //! assert_eq!(scan.next_record()?.unwrap().key, b"apricot");
 //! assert_eq!(scan.next_record()?, None);
+//! drop(scan);
+//!
+//! // Stops the background worker; a RAM-only engine's data goes with it.
+//! engine.close()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -207,7 +212,9 @@
 //! Closing writes nothing in any mode: no flush, sync, checkpoint or log
 //! truncation. RAM-only data, including an engine recovered from a
 //! checkpoint, is lost unless checkpointed first; a durable engine's
-//! acknowledged writes are already in its log, exactly as after a crash.
+//! acknowledged writes are already in its log, exactly as after a crash,
+//! though a [`Engine::durable_checkpoint`] before closing shortens the
+//! replay of the next [`Engine::open`].
 //!
 //! # Configuration
 //!
@@ -221,7 +228,7 @@
 //! flushes ([`UpdateError::FlushRefused`]), log limits refuse writes
 //! ([`UpdateError::LogFull`]), snapshot limits refuse snapshots and
 //! compactions, and compaction limits refuse a merge
-//! ([`CompactionError::InputLimit`], [`CompactError`]).
+//! ([`CompactionError::InputLimit`] and its neighbours).
 //!
 //! Compression and block length choose how new runs are built, nothing
 //! else. Every run records its own codec, block lengths and dictionary, so
@@ -282,27 +289,64 @@
 //!
 //! # Checkpoints
 //!
-//! [`Engine::checkpoint`] writes one snapshot's state to a directory and
-//! [`Engine::recover`] restores it. See [`CheckpointOptions`] and the format,
-//! publication and recovery contract in the source of `checkpoint.rs`.
+//! [`Engine::checkpoint`] writes the state at one snapshot, its **ceiling**,
+//! to a directory while writes continue, and [`Engine::recover`] restores the
+//! committed checkpoint into a new RAM-only engine. A checkpoint holds every
+//! key live at the ceiling with its newest value and nothing written after
+//! it. A RAM-only engine therefore loses every write since its latest
+//! checkpoint when it is closed or dropped or its process ends. No
+//! checkpoint is ever taken automatically.
+//!
+//! A checkpoint is committed when the directory's `CURRENT` file is renamed
+//! to name it, after its runs and manifest are synced; the previous one
+//! stays committed until then and is removed afterwards. A failed or
+//! interrupted checkpoint leaves the previous one intact. Recovery checks
+//! every file of exactly the committed checkpoint, with no fallback to an
+//! older one, before it returns an engine. One engine or process uses a
+//! directory at a time, through an advisory lock on its `LOCK` file, which
+//! the kernel releases if the process dies.
 //!
 //! # Durability
 //!
-//! An engine from [`Engine::create`] or [`Engine::open`] logs every write to
-//! a write-ahead log in its directory, synced before the write is applied,
-//! and [`Engine::durable_checkpoint`] bounds the log. Other engines touch no
-//! file. See [`DurableOptions`] and the contract in the source of `wal.rs`.
+//! An engine from [`Engine::create`] or [`Engine::open`] is durable: every
+//! write is appended to a write-ahead log in its directory and synced
+//! (`fdatasync`) before it becomes visible or its sequence number is
+//! returned, with concurrent writers sharing a sync by group commit. Under
+//! the filesystem assumptions below:
 //!
-//! # Shutdown
+//! - Every acknowledged write is recovered by [`Engine::open`], from the
+//!   committed checkpoint and the log after it.
+//! - A write that failed with [`UpdateError::LogFailed`], or whose process
+//!   died before it returned, may or may not be recovered: read the key
+//!   back after reopening. It is never applied in part, and never recovered
+//!   without every write before it.
+//! - Any other refused write logged nothing and used no sequence number.
+//! - A failed append or sync closes the log: later writes fail with
+//!   [`UpdateError::LogClosed`] until the database is reopened. Reads,
+//!   flushes, compactions and checkpoints continue.
 //!
-//! There is no close call: dropping the engine is shutdown. It stops the
-//! background worker after the compaction it is running and waits for it,
-//! then releases the directory's lock. Nothing is written on drop. A RAM-only
-//! engine's state is gone unless a checkpoint holds it; a durable engine
-//! needs nothing more, as every acknowledged write is already in the log,
-//! though a [`Engine::durable_checkpoint`] first shortens the replay of the
-//! next [`Engine::open`]. Snapshots may outlive the engine and keep what
-//! they read alive until dropped.
+//! The log grows until [`Engine::durable_checkpoint`] commits a checkpoint
+//! into the same directory and removes the log segments it covers. Writes
+//! that would take it past [`DurableOptions::max_log_bytes`] are refused
+//! with [`UpdateError::LogFull`]. On open, an incomplete final append (a
+//! torn tail, never acknowledged) is truncated and reported in
+//! [`OpenReport::torn_tail`]; any other damage refuses the open with
+//! [`OpenError::Log`] or [`OpenError::Corrupt`], and nothing is repaired.
+//! [`Engine::inspect`] reports what open would do, changing nothing.
+//!
+//! **Filesystem assumptions.** The supported environment is a local Linux
+//! filesystem such as ext4 or XFS, where a file sync makes its contents
+//! durable, a directory sync makes its entries durable and `rename` is
+//! atomic. Network filesystems, devices that acknowledge a sync without
+//! persisting, and writers that bypass the lock are unsupported; macOS is
+//! untested. The tests kill processes, fail writes and syncs, interrupt
+//! checkpoints and model lost unsynced data at file level. That a sync
+//! reaches stable media under real power loss, and that an interrupted write
+//! leaves a prefix of its bytes, are assumptions that no test has verified.
+//! After a failed sync, check the device before reopening.
+//!
+//! The on-disk formats and every crash and sync boundary are specified in
+//! the source, in `src/engine/checkpoint.rs` and `src/engine/wal.rs`.
 
 mod checkpoint;
 mod group;
@@ -320,9 +364,10 @@ pub use worker::{BackgroundError, BackgroundStatus};
 
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
+use crate::run::CompactError;
 pub use crate::run::{
-    CompactError, CompactStats, ConflictingCopies, CorruptRun, DictionaryChoice, LiveRecord,
-    LiveValue, MergeWorkspace, ReadError, RunCorruption,
+    CompactStats, ConflictingCopies, CorruptRun, DictionaryChoice, LiveRecord, LiveValue,
+    MergeWorkspace, ReadError, RunCorruption,
 };
 
 use std::fmt;
@@ -803,7 +848,7 @@ pub enum UpdateError {
     /// by the run limits, now or since they or the runs last changed.
     /// Compaction or [`Engine::set_run_limits`] can make room, after which
     /// the write can be retried.
-    FlushRefused(FlushError),
+    FlushRefused(RunLimitError),
     /// Every sequence number has been used, which only an engine started
     /// near `u64::MAX` ([`EngineOptions::last_seq`]) can reach.
     SequencesExhausted,
@@ -811,7 +856,7 @@ pub enum UpdateError {
     /// its batch panicked: [`std::io::ErrorKind::Other`]), so it was not
     /// applied, but its record may survive and be recovered: its outcome is
     /// uncertain until the database is reopened. The log is now closed. See
-    /// "Durable writes" in `src/engine/wal.rs`.
+    /// [Durability](self#durability).
     LogFailed(std::io::ErrorKind),
     /// An earlier log failure closed the log: nothing was logged. Reopen the
     /// database to write again.
@@ -854,10 +899,12 @@ impl fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
-/// Publishing a flush would exceed the run limits. Its frozen table remains
-/// readable, and a later flush retries it.
+/// Publishing would exceed the run limits ([`EngineOptions::max_runs`] and
+/// [`EngineOptions::max_run_bytes`]). A refused flush keeps its frozen table
+/// readable, and a later flush retries it; a refused compaction publishes
+/// nothing. Compaction or [`Engine::set_run_limits`] makes room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FlushError {
+pub struct RunLimitError {
     /// Runs that would be published.
     pub runs: usize,
     /// The run count limit.
@@ -868,17 +915,17 @@ pub struct FlushError {
     pub max_run_bytes: usize,
 }
 
-impl fmt::Display for FlushError {
+impl fmt::Display for RunLimitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "flush would publish {} runs of {} bytes, over the limits of {} runs and {} bytes",
+            "publishing would leave {} runs of {} bytes, over the limits of {} runs and {} bytes",
             self.runs, self.run_bytes, self.max_runs, self.max_run_bytes
         )
     }
 }
 
-impl std::error::Error for FlushError {}
+impl std::error::Error for RunLimitError {}
 
 /// What a flush published.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -977,7 +1024,7 @@ struct State {
     /// The last flush's refusal, until a flush or compaction publishes or
     /// the run limits change: the same flush would be refused again, so a
     /// write needing room does not build it.
-    refused: Option<FlushError>,
+    refused: Option<RunLimitError>,
     /// Flushes published, and their stored bytes.
     flushes: u64,
     flushed_bytes: u64,
@@ -1234,10 +1281,10 @@ impl Engine {
     /// and published in place of them. Waits for any flush in progress. An
     /// engine with nothing in memory does nothing.
     ///
-    /// Writes never need this to make room. Refused with a [`FlushError`],
+    /// Writes never need this to make room. Refused with a [`RunLimitError`],
     /// leaving the tables frozen and readable, if publishing would exceed
     /// the run limits.
-    pub fn flush(&self) -> Result<FlushReport, FlushError> {
+    pub fn flush(&self) -> Result<FlushReport, RunLimitError> {
         self.core.flush()
     }
 
@@ -1416,7 +1463,7 @@ impl Core {
     /// returning the flush of every frozen table, which its batch's leader
     /// publishes after committing the batch. See
     /// [Automatic flushing](self#automatic-flushing).
-    fn freeze_for_room(&self) -> Result<Option<FlushJob<'_>>, FlushError> {
+    fn freeze_for_room(&self) -> Result<Option<FlushJob<'_>>, RunLimitError> {
         let serial = self.serialize_flush();
         self.begin_making_room(serial, &mut self.write_state())
     }
@@ -1435,7 +1482,7 @@ impl Core {
         &'e self,
         serial: MutexGuard<'e, ()>,
         state: &mut State,
-    ) -> Result<Option<FlushJob<'e>>, FlushError> {
+    ) -> Result<Option<FlushJob<'e>>, RunLimitError> {
         if let Some(refused) = state.refused {
             return Err(refused);
         }
@@ -1602,7 +1649,7 @@ impl Core {
         })
     }
 
-    fn flush(&self) -> Result<FlushReport, FlushError> {
+    fn flush(&self) -> Result<FlushReport, RunLimitError> {
         match self.begin_flush() {
             Some(job) => job.build().publish(),
             None => Ok(FlushReport::default()),
@@ -1888,9 +1935,9 @@ struct BuiltFlush<'e> {
 impl BuiltFlush<'_> {
     /// Publishes the runs and removes the frozen tables in one step.
     ///
-    /// On a [`FlushError`] the built runs are dropped and the tables stay
+    /// On a [`RunLimitError`] the built runs are dropped and the tables stay
     /// frozen and readable.
-    fn publish(self) -> Result<FlushReport, FlushError> {
+    fn publish(self) -> Result<FlushReport, RunLimitError> {
         let Self { job, runs } = self;
         let report = FlushReport {
             tables: job.tables.len(),
@@ -1904,7 +1951,7 @@ impl BuiltFlush<'_> {
         let total_runs = state.runs.len() + report.runs;
         let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
         if total_runs > state.max_runs || total_bytes > state.max_run_bytes {
-            let error = FlushError {
+            let error = RunLimitError {
                 runs: total_runs,
                 max_runs: state.max_runs,
                 run_bytes: total_bytes,
@@ -2057,11 +2104,30 @@ pub enum CompactionError {
         /// The limit.
         max_input_bytes: usize,
     },
-    /// Merging failed or would exceed a limit. See [`CompactError`].
-    Compact(CompactError),
+    /// The output would exceed [`CompactionOptions::max_output_bytes`].
+    /// Nothing was published; a larger limit or fewer inputs (a lower
+    /// [`CompactionOptions::max_input_bytes`]) lets it proceed.
+    OutputLimit {
+        /// Bytes of output, stored and filters, when the limit was crossed.
+        output_bytes: usize,
+        /// The limit.
+        max_output_bytes: usize,
+    },
+    /// The merge's workspace estimate exceeds
+    /// [`CompactionOptions::max_workspace_bytes`]. Nothing was decoded.
+    WorkspaceLimit {
+        /// The estimate.
+        workspace_bytes: usize,
+        /// The limit.
+        max_workspace_bytes: usize,
+    },
+    /// An input run is damaged, or two runs disagree about one update. The
+    /// runs are unchanged; this is corruption, not a limit, and retrying
+    /// meets it again.
+    Read(ReadError),
     /// Publishing would leave more runs or run bytes than both the engine's
     /// limit and what is published now.
-    RunLimit(FlushError),
+    RunLimit(RunLimitError),
     /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`], so
     /// the output could only add to it. Dropping snapshots lifts this.
     Retained {
@@ -2076,7 +2142,23 @@ pub enum CompactionError {
 
 impl From<CompactError> for CompactionError {
     fn from(error: CompactError) -> Self {
-        Self::Compact(error)
+        match error {
+            CompactError::Read(error) => Self::Read(error),
+            CompactError::OutputLimit {
+                output_bytes,
+                max_output_bytes,
+            } => Self::OutputLimit {
+                output_bytes,
+                max_output_bytes,
+            },
+            CompactError::WorkspaceLimit {
+                workspace_bytes,
+                max_workspace_bytes,
+            } => Self::WorkspaceLimit {
+                workspace_bytes,
+                max_workspace_bytes,
+            },
+        }
     }
 }
 
@@ -2090,7 +2172,21 @@ impl fmt::Display for CompactionError {
                 f,
                 "compaction needs {input_bytes} input bytes, over the limit of {max_input_bytes}"
             ),
-            Self::Compact(error) => error.fmt(f),
+            Self::OutputLimit {
+                output_bytes,
+                max_output_bytes,
+            } => write!(
+                f,
+                "compaction output reached {output_bytes} bytes, over the limit of {max_output_bytes}"
+            ),
+            Self::WorkspaceLimit {
+                workspace_bytes,
+                max_workspace_bytes,
+            } => write!(
+                f,
+                "compaction needs {workspace_bytes} workspace bytes, over the limit of {max_workspace_bytes}"
+            ),
+            Self::Read(error) => error.fmt(f),
             Self::RunLimit(error) => error.fmt(f),
             Self::Retained { bytes, max } => write!(
                 f,
@@ -2378,7 +2474,7 @@ impl BuiltCompaction<'_> {
         let grows_runs = total_runs > state.max_runs.max(state.runs.len());
         let grows_bytes = total_bytes > state.max_run_bytes.max(published_bytes);
         if grows_runs || grows_bytes {
-            return Err(CompactionError::RunLimit(FlushError {
+            return Err(CompactionError::RunLimit(RunLimitError {
                 runs: total_runs,
                 max_runs: state.max_runs,
                 run_bytes: total_bytes,
@@ -2442,7 +2538,37 @@ impl EngineWorkspace {
     }
 }
 
-/// A stable view of an [`Engine`], holding its lock shared.
+/// A stable view of an [`Engine`], holding its state lock shared until it
+/// is dropped, from [`Engine::read`].
+///
+/// Every read through it sees one state, and it copies and retains nothing.
+/// In exchange, **writers, flushes and compaction publication wait while it
+/// is held**, and a waiting writer holds back new readers. Keep it to a few
+/// reads that must agree, and drop it promptly. For a long scan, or a view
+/// kept while writes continue, take a [`Snapshot`]: it holds no lock, at the
+/// cost of retaining what the engine releases while it lives.
+///
+/// Do not call [`Engine`] methods on a thread that holds a guard: a write
+/// would deadlock. The guard borrows the engine, so the engine cannot be
+/// closed while it is held.
+///
+/// ```
+/// use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
+///
+/// let engine = Engine::new(EngineOptions::default())?;
+/// engine.put(b"from", b"10")?;
+/// engine.put(b"to", b"5")?;
+/// let mut workspace = EngineWorkspace::new();
+/// let (from, to) = {
+///     let guard = engine.read();
+///     let from = guard.get(b"from", &mut workspace)?.map(|v| v.value.to_vec());
+///     let to = guard.get(b"to", &mut workspace)?.map(|v| v.value.to_vec());
+///     (from, to)
+/// }; // Writers wait until the guard is dropped here.
+/// assert_eq!((from.as_deref(), to.as_deref()), (Some(&b"10"[..]), Some(&b"5"[..])));
+/// engine.close()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct ReadGuard<'e>(RwLockReadGuard<'e, State>);
 
 impl ReadGuard<'_> {
@@ -2493,7 +2619,8 @@ impl fmt::Debug for ReadGuard<'_> {
 /// is freed when neither the engine nor any snapshot holds it.
 ///
 /// A snapshot is `Send` and `Sync`, may be read from several threads with a
-/// workspace each, and may outlive its engine. It cannot be refreshed: take a
+/// workspace each, and may outlive its engine: it stays readable after
+/// [`Engine::close`]. It cannot be refreshed: take a
 /// new one to see later writes. While it lives it keeps whatever the engine
 /// releases from its view, and the memtable history later writes copy away
 /// from it, reported in [`EngineStats::retained_bytes`], so drop it once read.
@@ -3484,7 +3611,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                BackgroundError::Failed(CompactionError::Compact(CompactError::OutputLimit { .. }))
+                BackgroundError::Failed(CompactionError::OutputLimit { .. })
             ),
             "{error:?}"
         );

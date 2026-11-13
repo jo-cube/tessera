@@ -60,3 +60,9 @@ mod run;
 
 #[cfg(test)]
 mod limits_tests;
+
+/// The README's Rust examples, compiled and run as documentation tests so
+/// that they keep matching the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

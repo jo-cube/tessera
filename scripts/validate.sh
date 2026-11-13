@@ -3,9 +3,12 @@
 #
 #   scripts/validate.sh image              build the toolchain image (online)
 #   scripts/validate.sh deps               resolve and fetch crates (online)
-#   scripts/validate.sh [check]            fmt, Clippy, tests and docs (default)
+#   scripts/validate.sh [check]            fmt, Clippy, tests, docs and a release
+#                                          build (default)
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
+#   scripts/validate.sh msrv-image         add the minimum Rust toolchain (online)
+#   scripts/validate.sh msrv               check and Clippy on that toolchain
 #   scripts/validate.sh bench [MODE…]      the benchmark suite, or some of its modes:
 #                                          memtable lookups scans readers density
 #                                          maintenance snapshots ingest mixed
@@ -34,6 +37,10 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${TESSERA_SOURCE:-$repo}"
 image="${TESSERA_IMAGE:-tessera-validate:1.98.1}"
+# The minimum supported Rust version, from Cargo.toml, as a full toolchain.
+msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$repo/Cargo.toml")"
+case "$msrv" in *.*.*) ;; *) msrv="$msrv.0" ;; esac
+msrv_image="$image-msrv$msrv"
 docker=(docker --context "${TESSERA_DOCKER_CONTEXT:-colima}")
 
 # Cargo fingerprints by path and mtime, and every source mounts at /work, so a
@@ -152,6 +159,20 @@ check() {
   bounded build-tests 300 cargo test --locked --no-run
   bounded test 300 cargo test --locked
   bounded doc 120 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+  # The library and examples as an application builds them. The benchmark
+  # suite's release build is the same cache entry, so this relinks nothing
+  # it has built.
+  bounded release 300 cargo build --locked --release --lib --examples
+}
+
+# The minimum Rust version is a compile contract: every target type-checks and
+# passes Clippy on it with the locked crates. Its artifacts live apart from
+# the main toolchain's, and `check` writes metadata only, not binaries.
+msrv_check() {
+  image="$msrv_image"
+  require_image
+  bounded msrv-check 300 env CARGO_TARGET_DIR=/cache/msrv cargo "+$msrv" check --locked --all-targets --all-features
+  bounded msrv-clippy 300 env CARGO_TARGET_DIR=/cache/msrv cargo "+$msrv" clippy --locked --all-targets --all-features -- -D warnings
 }
 
 limits() {
@@ -220,9 +241,15 @@ verify() {
 preflight
 command="${1:-check}"
 [ $# -eq 0 ] || shift
-[ "$command" = image ] || require_image
+case "$command" in image | msrv-image | msrv) ;; *) require_image ;; esac
 case "$command" in
   image) build_image ;;
+  msrv-image)
+    require_image
+    "${docker[@]}" build --pull=false --tag "$msrv_image" \
+      --build-arg BASE="$image" --build-arg TOOLCHAIN="$msrv" - < "$repo/scripts/msrv.Dockerfile"
+    ;;
+  msrv) msrv_check ;;
   deps) fetch_crates ;;
   check) check ;;
   limits) limits ;;

@@ -134,7 +134,8 @@ use crate::run::{
 };
 
 use super::{
-    Core, Engine, EngineOptions, EngineWorkspace, FlushError, SnapshotError, WriteError, published,
+    Core, Engine, EngineOptions, EngineWorkspace, RunLimitError, SnapshotError, WriteError,
+    published,
 };
 
 pub(super) const LOCK: &str = "LOCK";
@@ -214,7 +215,8 @@ pub enum CheckpointError {
     /// The directory holds a write-ahead log, so it belongs to a durable
     /// database, which only its own engine checkpoints.
     HasLog(PathBuf),
-    /// [`Engine::durable_checkpoint`] on an engine without a log.
+    /// [`Engine::durable_checkpoint`] was called on a RAM-only engine, which
+    /// has no directory of its own: give [`Engine::checkpoint`] one instead.
     NotDurable,
     /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
     DiskLimit {
@@ -369,7 +371,7 @@ pub enum OpenError {
         damage: Damage,
     },
     /// The checkpoint holds more runs or bytes than the options allow.
-    RunLimit(FlushError),
+    RunLimit(RunLimitError),
     /// The engine or log options were refused before anything was started or
     /// the directory touched.
     Config(super::ConfigError),
@@ -782,8 +784,9 @@ fn write_runs(
 
 impl Engine {
     /// Writes the current state to `dir` as a new checkpoint and commits it,
-    /// then removes older ones. The contract, layout and filesystem
-    /// assumptions are documented at the top of `src/engine/checkpoint.rs`.
+    /// then removes older ones. See [Checkpoints](crate::engine#checkpoints)
+    /// for the guarantees; the layout and protocol are specified in the
+    /// source of `src/engine/checkpoint.rs`.
     ///
     /// Writes continue throughout: the checkpoint holds the state at the
     /// snapshot it takes, and holds the state lock only to take it. Flushes
@@ -1142,7 +1145,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
         // before reading any. Filters are added to the bytes once rebuilt.
         let listed: u64 = manifest.runs.iter().map(|&(len, _)| len).sum();
         if manifest.runs.len() > options.max_runs || listed > options.max_run_bytes as u64 {
-            return Err(OpenError::RunLimit(FlushError {
+            return Err(OpenError::RunLimit(RunLimitError {
                 runs: manifest.runs.len(),
                 max_runs: options.max_runs,
                 run_bytes: usize::try_from(listed).unwrap_or(usize::MAX),
@@ -1207,7 +1210,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
         let run_bytes: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
         let held_bytes: usize = runs.iter().map(Run::held_bytes).sum();
         if runs.len() > options.max_runs || run_bytes + held_bytes > options.max_run_bytes {
-            return Err(OpenError::RunLimit(FlushError {
+            return Err(OpenError::RunLimit(RunLimitError {
                 runs: runs.len(),
                 max_runs: options.max_runs,
                 run_bytes: run_bytes + held_bytes,

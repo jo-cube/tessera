@@ -11,10 +11,12 @@ fit in memory once compressed.
 
 ## Status
 
-Prerelease and unpublished; not production-ready. The engine, its
-checkpoints and its write-ahead log are implemented and tested, and their
-durability rests on filesystem assumptions that have not been verified under
-real power loss (see [Durability](#durability)). The API may still change.
+Private alpha (`0.1.0-alpha.1`), unpublished and not production-ready. The
+engine, its checkpoints and its write-ahead log are implemented and tested
+on Linux aarch64 only (see [Platform](#platform)), and their durability
+rests on filesystem assumptions that have not been verified under real power
+loss (see [Durability](#durability)). The API may still change before a
+stable release. Release steps are in [`docs/release.md`](docs/release.md).
 
 ## Modes
 
@@ -22,11 +24,13 @@ Every engine keeps its whole dataset in memory: memtables and compressed
 runs. Persistence is opt-in and explicit.
 
 - **RAM-only**, the default: `Engine::new(options)`. No file is ever read or
-  written.
+  written, and every write is lost when the engine is closed or dropped or
+  the process ends.
 - **Checkpoints**: `Engine::checkpoint(dir, options)` writes one consistent
   snapshot of the state to a directory while writes continue, and
   `Engine::recover(dir, options)` restores it into a new RAM-only engine.
-  Writes after the checkpoint are not kept.
+  Writes after the latest checkpoint are lost. Checkpoints are never taken
+  automatically.
 - **Durable**: `Engine::create(dir, ..)` starts a database and
   `Engine::open(dir, ..)` reopens one. Every write is appended to a
   write-ahead log and synced before it becomes visible or is acknowledged,
@@ -40,30 +44,45 @@ so the guarantees of the two never mix.
 
 ## Using it
 
+Tessera is not on crates.io. Depend on it by path or by Git revision:
+
+```toml
+[dependencies]
+tessera = { git = "https://github.com/jo-cube/tessera", rev = "<commit>" }
+```
+
 Everything public lives in `tessera::engine`:
 
 ```rust
-use tessera::engine::{DurableOptions, Engine, EngineOptions, EngineWorkspace};
+use tessera::engine::{CheckpointOptions, DurableOptions, Engine, EngineOptions, EngineWorkspace};
 
-let dir = std::env::temp_dir().join("tessera-readme");
-let engine = Engine::create(&dir, EngineOptions::default(), DurableOptions::default())?;
-engine.put(b"user/1", b"ada")?;
-engine.put(b"user/2", b"grace")?;
-engine.delete(b"user/1")?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("tessera-readme-{}", std::process::id()));
+    let engine = Engine::create(&dir, EngineOptions::default(), DurableOptions::default())?;
+    engine.put(b"user/1", b"ada")?;
+    engine.put(b"user/2", b"grace")?;
+    engine.delete(b"user/1")?;
 
-// One workspace per reading thread, reused across reads.
-let mut workspace = EngineWorkspace::new();
-assert!(engine.get(b"user/1", &mut workspace)?.is_none());
+    // One workspace per reading thread, reused across reads.
+    let mut workspace = EngineWorkspace::new();
+    assert!(engine.get(b"user/1", &mut workspace)?.is_none());
 
-// A snapshot holds no lock; writes, flushes and compactions continue.
-let snapshot = engine.snapshot()?;
-let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
-while let Some(record) = scan.next_record()? {
-    println!("{:?} = {:?}", record.key, record.value);
+    // A snapshot holds no lock; writes, flushes and compactions continue.
+    let snapshot = engine.snapshot()?;
+    let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
+    while let Some(record) = scan.next_record()? {
+        println!("{:?} = {:?}", record.key, record.value);
+    }
+    drop(scan);
+
+    // Bound the log: checkpoint, then drop the segments it covers.
+    engine.durable_checkpoint(CheckpointOptions::default())?;
+    // Stop the background worker and release the directory lock.
+    engine.close()?;
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
 }
-
-// Bound the log: checkpoint, then drop the segments it covers.
-engine.durable_checkpoint(Default::default())?;
 ```
 
 `Engine::new(options)` makes a RAM-only engine with the same reads and
@@ -84,7 +103,11 @@ The defaults suit general use:
 ```rust
 use tessera::engine::{Engine, EngineOptions};
 
-let engine = Engine::new(EngineOptions::default())?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::new(EngineOptions::default())?;
+    engine.close()?;
+    Ok(())
+}
 ```
 
 That is 64 MiB memtables, at most 64 runs and 4 GiB of runs, background
@@ -100,11 +123,15 @@ in `docs/benchmarks.md`:
 ```rust
 use tessera::engine::{Compression, Engine, EngineOptions};
 
-let engine = Engine::new(EngineOptions {
-    compression: Compression::ZstdDictionary,
-    target_block_len: 4 << 10,
-    ..EngineOptions::default()
-})?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::new(EngineOptions {
+        compression: Compression::ZstdDictionary,
+        target_block_len: 4 << 10,
+        ..EngineOptions::default()
+    })?;
+    engine.close()?;
+    Ok(())
+}
 ```
 
 Ranges, all inclusive:
@@ -170,14 +197,23 @@ checkpoint and log, and `recover` continues after the larger.
 ```rust
 use tessera::engine::{DurableOptions, Engine, EngineOptions, OpenError};
 
-let engine = match Engine::open(&dir, EngineOptions::default(), DurableOptions::default()) {
-    Ok((engine, _report)) => engine,
-    Err(OpenError::Config(error)) => panic!("fix the options: {error}"),
-    Err(error) => return Err(error.into()),
-};
-engine.put(b"k", b"v")?;
-// Before exiting: stop the worker and release the directory lock.
-engine.close()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("tessera-lifecycle-{}", std::process::id()));
+    let (options, durable) = (EngineOptions::default(), DurableOptions::default());
+    let engine = match Engine::open(&dir, options, durable) {
+        Ok((engine, _report)) => engine,
+        // Never an empty database in place of a missing one: create it explicitly.
+        Err(OpenError::NoCheckpoint(_)) => Engine::create(&dir, options, durable)?,
+        Err(OpenError::Config(error)) => panic!("fix the options: {error}"),
+        Err(error) => return Err(error.into()),
+    };
+    engine.put(b"k", b"v")?;
+    // Before exiting: stop the worker and release the directory lock.
+    engine.close()?;
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
 ```
 
 Constructors fail with `OpenError` before anything is exposed: `Config` for
@@ -212,6 +248,14 @@ linearizable; there are no multi-key transactions.
 `get` holds the lock only to search the memtables and take the run list, and
 decodes blocks after releasing it. A writer waiting for the lock holds back
 new readers, so readers cannot starve it.
+
+**Read guards and snapshots.** `Engine::read` returns a `ReadGuard` for a
+few reads that must see one state: it copies nothing, but writers, flushes
+and compaction publication wait until it is dropped, and calling the engine
+from the thread holding it can deadlock. A `Snapshot` is for anything
+longer, such as a scan while writes continue: it holds no lock, but keeps
+whatever the engine releases from its view alive until it is dropped. Prefer
+a snapshot unless the guard's few reads are all there is.
 
 **Snapshots.** `Engine::snapshot` takes, in constant time per source, a
 copy-on-write snapshot of the active memtable and shared references to the
@@ -345,29 +389,63 @@ it.
 
 ## Durability
 
+What survives, by mode:
+
+| mode | survives a crash or exit | lost |
+|---|---|---|
+| RAM-only (`new`) | nothing | every write |
+| checkpoints (`checkpoint`, `recover`) | the latest committed checkpoint | every write after it |
+| durable (`create`, `open`) | every acknowledged write | at most the writes whose call had not returned or failed with `LogFailed` |
+
+A durable write is acknowledged, its sequence number returned, only after
+its record is synced, and `open` recovers it from the checkpoint and the
+log. A write whose call failed with `LogFailed`, or had not returned when
+the process died, may or may not be recovered: read the key back after
+reopening. Recovery never applies a write in part or without the writes
+before it. `close` adds nothing to any of this: it does not flush, sync or
+checkpoint.
+
 The supported environment is a local Linux filesystem such as ext4 or XFS,
 where `fsync` makes data durable, a directory sync makes entries durable and
 `rename` is atomic. Network filesystems and devices that acknowledge `fsync`
-without persisting are unsupported; macOS is not part of the tested
-contract. Tests cover killed processes, failed writes and syncs, interrupted
-checkpoints and rotations, damage and a file-level model of lost unsynced
-data. Real power loss, and how a device orders the pages of one write, have
-not been tested. After a failed sync, check the device before reopening.
+without persisting are unsupported; macOS is untested. Tests cover killed
+processes, failed writes and syncs, interrupted checkpoints and rotations,
+damage and a file-level model of lost unsynced data. **Real power loss, and
+how a device orders the pages of one write, have not been tested**: the
+guarantees above assume that a completed sync reached stable media. After a
+failed sync, check the device before reopening.
 
 ## Platform
 
-- Built and tested only with Rust 1.98.1 (edition 2024) on Linux aarch64, in
-  the container described under [Validate](#validate). No minimum supported
-  Rust version is declared yet. Other targets, including x86-64, macOS and
-  Windows, are untested.
-- RAM-only engines touch no files and need no platform support beyond
-  threads. Checkpoints and the log need a filesystem with the guarantees under
-  [Durability](#durability), and use advisory file locks (`File::try_lock`).
-- Zstandard is C code: `zstd-safe` builds the bundled libzstd 1.5.7
-  (`vendored`, with its dictionary trainer), so building needs a C compiler
-  but no system library. LZ4 and CRC-32 are pure Rust. `Cargo.lock` pins every dependency; build with
-  `--locked`.
-- `unsafe` is forbidden in the crate itself.
+| target | status |
+|---|---|
+| Linux aarch64 (`aarch64-unknown-linux-gnu`) | tested: the full validation below, Rust 1.98.1 |
+| Linux x86-64 (`x86_64-unknown-linux-gnu`) | expected to work, untested; in the CI workflow, not yet run |
+| macOS arm64 (`aarch64-apple-darwin`) | expected to build, untested; in the CI workflow, not yet run; durability not part of the contract |
+| Windows and others | untested; not supported in this alpha |
+
+"Expected" means the code has nothing specific to the target, not that it
+has been run there.
+
+**Build requirements:**
+
+- Rust 1.89 or later (`rust-version` in `Cargo.toml`): 1.89 stabilised the
+  file locks the engine uses, and edition 2024 and the locked dependencies
+  need 1.85. Every target passes `cargo check` and strict Clippy on 1.89.0;
+  tests run on 1.98.1.
+- A C compiler and archiver for the target, found by the `cc` crate (`cc`
+  and `ar`, or `CC` and `AR`): on Debian and Ubuntu `build-essential`, on
+  macOS the Xcode command-line tools. Zstandard is C: `zstd-safe` builds the
+  bundled libzstd 1.5.7 (`vendored`, with its dictionary trainer), so no
+  system library, `pkg-config` or CMake is needed. LZ4 and CRC-32 are pure
+  Rust.
+- `Cargo.lock` is committed and pins every dependency; build with
+  `--locked`. The crate has no Cargo features.
+
+RAM-only engines touch no files and need no platform support beyond
+threads. Checkpoints and the log need a filesystem with the guarantees under
+[Durability](#durability), and use advisory file locks (`File::try_lock`).
+`unsafe` is forbidden in the crate itself.
 
 ## Performance
 
@@ -384,6 +462,18 @@ with caller-driven flushing, and several writers share one flush per full
 table. Methods, workloads and full results are in
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
+Against RocksDB 7.8.3 (a 2022 distribution build, its files in memory) on
+the same data in the same VM, with matched 4 KiB blocks and dictionaries at
+equal density, Tessera's `ZstdDictionary` runs gave 1.7–2.1× faster
+uniform point lookups and 1.3–2.2× faster short scans, with cheaper puts
+and lower peak memory. RocksDB was faster for skewed lookups served from
+its block cache (6–7×) and filtered misses, and after sustained writes
+Tessera held 14–19% more resident memory, the versions that the default
+overlap allowance (`max_overlap` 4) leaves in exchange for less rewriting; `max_overlap` 2 cuts run
+memory and speeds scans at about 2.75 times the bytes rewritten. With plain
+Zstandard both engines cost the same where decoding a block dominates. These
+are results for that version and configuration only, not a general ranking.
+
 ## Validate
 
 Validation runs offline in a Linux container with hard limits, using a Colima
@@ -391,16 +481,26 @@ VM (2 CPUs, 4 GiB) and an image built once from a pinned Rust base:
 
 ```sh
 colima start
-scripts/validate.sh image    # once, adds rustfmt and Clippy (uses the network)
-scripts/validate.sh deps     # once, fetches pinned crates (uses the network)
-scripts/validate.sh verify   # prove the limits are enforced
-scripts/validate.sh          # fmt, Clippy, tests and docs
-scripts/validate.sh full     # also the large-allocation boundary tests
-scripts/validate.sh bench    # the benchmark suite, or e.g. `bench durable`
+scripts/validate.sh image       # once, adds rustfmt and Clippy (uses the network)
+scripts/validate.sh deps        # once, fetches pinned crates (uses the network)
+scripts/validate.sh msrv-image  # once, adds the minimum Rust toolchain (uses the network)
+scripts/validate.sh verify      # prove the limits are enforced
+scripts/validate.sh             # fmt, Clippy, tests, doctests, docs and a release build
+scripts/validate.sh full        # also the large-allocation boundary tests
+scripts/validate.sh msrv        # check and Clippy on the minimum Rust version
+scripts/validate.sh bench       # the benchmark suite, or e.g. `bench durable`
 ```
 
-The benchmarks, `examples/bench.rs`, use only the public API and keep their
-files on tmpfs.
+`check` covers formatting, Clippy with warnings denied on every target,
+unit, integration and documentation tests (including this README's
+examples), example compilation, rustdoc with warnings denied and a release
+build of the library and examples. The benchmarks, `examples/bench.rs`, use
+only the public API, keep their files on tmpfs and are never part of
+`check`; neither is the RocksDB comparison in `tools/compare`.
+
+`.github/workflows/ci.yml` runs the same checks without the container on
+Linux x86-64, Linux arm64 and macOS arm64, and the minimum-version check on
+Linux; it has not yet run.
 
 Each step gets a 3 GiB cgroup with no swap, 2 CPUs, 256 processes, 2 build jobs,
 2 test threads, a 512 MiB tmpfs at `/tmp` for test databases, and a timeout,

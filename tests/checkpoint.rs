@@ -515,7 +515,10 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     let error = engine
         .compact(refused, &mut MergeWorkspace::new())
         .unwrap_err();
-    assert!(matches!(error, CompactionError::Compact(_)), "{error:?}");
+    assert!(
+        matches!(error, CompactionError::OutputLimit { .. }),
+        "{error:?}"
+    );
     let after = engine.stats();
     assert_eq!(
         (after.runs, after.run_bytes),

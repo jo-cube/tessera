@@ -109,7 +109,7 @@ use std::sync::{MutexGuard, PoisonError};
 use crate::memtable::ENTRY_OVERHEAD;
 
 use super::wal::{Durable, Unsealed, encode, encoded_len};
-use super::{Core, FlushError, FlushJob, UpdateError};
+use super::{Core, FlushJob, RunLimitError, UpdateError};
 use super::{Refusal, WriteError};
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 
@@ -407,7 +407,7 @@ impl Core {
         // room, so the flush is left until the batch is committed.
         let mut frozen: Option<FlushJob<'_>> = None;
         // The refusal of the flush published since a write was last accepted.
-        let mut refused: Option<FlushError> = None;
+        let mut refused: Option<RunLimitError> = None;
         loop {
             let round = self.commit(durable, batch, &mut outcomes);
             if round.closed || round.deferred.is_empty() {

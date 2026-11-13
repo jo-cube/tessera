@@ -99,7 +99,10 @@ impl Compressor {
     /// the Rust heap.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
+        allow(
+            dead_code,
+            reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+        )
     )]
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)

@@ -412,7 +412,10 @@ impl<'a> RunCursor<'a> {
     /// later seek succeeds.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
+        allow(
+            dead_code,
+            reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+        )
     )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.workspace.prefix.clear();

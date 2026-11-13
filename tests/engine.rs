@@ -11,7 +11,7 @@ use std::thread;
 
 use tessera::engine::{
     CompactionError, CompactionOptions, Compression, ENTRY_OVERHEAD, Engine, EngineOptions,
-    EngineStats, EngineWorkspace, FlushError, MAX_KEY_LEN, MergeWorkspace, OpenError, ReadGuard,
+    EngineStats, EngineWorkspace, MAX_KEY_LEN, MergeWorkspace, OpenError, ReadGuard, RunLimitError,
     SnapshotLimits, UpdateError, WriteError,
 };
 
@@ -374,7 +374,7 @@ fn run_bytes_are_limited_inclusively() {
     short.put(b"a", b"v").unwrap();
     assert_eq!(
         short.flush().unwrap_err(),
-        FlushError {
+        RunLimitError {
             runs: 1,
             max_runs: usize::MAX,
             run_bytes: size,
@@ -568,7 +568,7 @@ fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
     assert!(
         matches!(
             refused,
-            UpdateError::FlushRefused(FlushError { max_runs: 2, .. })
+            UpdateError::FlushRefused(RunLimitError { max_runs: 2, .. })
         ),
         "{refused}"
     );

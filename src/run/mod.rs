@@ -134,9 +134,8 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
-pub use compact::{
-    CompactError, CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, compact,
-};
+pub(crate) use compact::CompactError;
+pub use compact::{CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, compact};
 pub(crate) use dictionary::choose as choose_dictionary;
 pub use dictionary::{
     DICTIONARY_LEN, DICTIONARY_WORKSPACE, DictionaryChoice, MIN_DICTIONARY_INPUT,

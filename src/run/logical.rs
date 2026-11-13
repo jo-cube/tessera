@@ -23,7 +23,10 @@ use super::reader::{RunView, excluded};
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
+    allow(
+        dead_code,
+        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+    )
 )]
 pub struct RunSet<'a> {
     runs: &'a [RunView<'a>],

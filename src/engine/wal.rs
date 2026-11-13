@@ -1418,11 +1418,12 @@ impl Engine {
 
     /// Opens the durable database in `dir`: loads its committed checkpoint,
     /// replays the log after it, and returns an engine that logs every write,
-    /// holding `dir`'s lock until it is dropped. The sequence continues after
+    /// holding `dir`'s lock until it is closed or dropped. The sequence continues after
     /// the last record recovered; [`EngineOptions::last_seq`] is ignored.
     ///
-    /// Everything is checked before the engine is returned; see the module
-    /// source `src/engine/wal.rs` for the rules. Only then are a torn tail
+    /// Everything is checked before the engine is returned; see
+    /// [Durability](crate::engine#durability), and the source of
+    /// `src/engine/wal.rs` for the exact rules. Only then are a torn tail
     /// truncated and an interrupted segment removed, and a new segment
     /// started. A directory without `CURRENT` is
     /// [`OpenError::NoCheckpoint`], never a new empty database.
@@ -1506,8 +1507,11 @@ impl Engine {
 
     /// Commits a checkpoint into this durable engine's directory while writes
     /// continue, then prunes the log segments it covers. See
-    /// [`Engine::checkpoint`] for the checkpoint and `src/engine/wal.rs` for
-    /// pruning; a checkpoint that fails or is not committed prunes nothing.
+    /// [`Engine::checkpoint`] for the checkpoint and
+    /// [Durability](crate::engine#durability) for the log; a checkpoint that
+    /// fails or is not committed prunes nothing. Fails with
+    /// [`CheckpointError::NotDurable`] on a RAM-only engine, which
+    /// checkpoints with [`Engine::checkpoint`] instead.
     pub fn durable_checkpoint(
         &self,
         options: CheckpointOptions,

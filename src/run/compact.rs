@@ -112,9 +112,10 @@ pub struct Compacted {
     pub stats: CompactStats,
 }
 
-/// Why a compaction produced nothing.
+/// Why a compaction produced nothing. The engine reports it as the
+/// matching [`CompactionError`](crate::engine::CompactionError) variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompactError {
+pub(crate) enum CompactError {
     /// An input is damaged, or two inputs hold different records under one
     /// internal key, at any version.
     Read(ReadError),

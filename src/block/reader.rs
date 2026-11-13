@@ -20,7 +20,10 @@ use super::{
 #[derive(Clone, Debug)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
+    allow(
+        dead_code,
+        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+    )
 )]
 pub struct Block<B> {
     data: B,
@@ -84,7 +87,10 @@ impl<B: AsRef<[u8]>> Block<B> {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
+    allow(
+        dead_code,
+        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+    )
 )]
 const VALIDATED: &str = "block bytes were validated by Block::new";
 
@@ -116,7 +122,10 @@ pub struct Version<'a> {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
+    allow(
+        dead_code,
+        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
+    )
 )]
 pub struct Cursor<'a> {
     view: BlockView<'a>,
