@@ -162,21 +162,21 @@ stop reports it: run limits and the level-0 stop refuse flushes
 (`UpdateError::FlushRefused`), the log limit refuses writes
 (`UpdateError::LogFull`), snapshot limits refuse snapshots and
 compactions, and compaction limits refuse a job
-(`CompactionError::JobLimit`, only for runs longer than `target_run_len`,
-such as a single record longer than it, or blocks longer than
-`target_block_len`). None of these is a configuration error.
+(`CompactionError::JobLimit`, only for runs stored longer than
+`target_run_len`, such as a single record longer than it, uncompressed
+runs with their index and filter, or blocks longer than
+`target_block_len`; `OutputLimit` when a merge's output outgrows its input,
+as after reopening under a less dense codec). None of these is a
+configuration error.
 
-**Settings that changed meaning with leveled compaction.** `max_runs` was
-the capacity ceiling (64 by default) and is now a safety valve on run
-metadata (65,536 by default, one per 64 KiB of the default
-`max_run_bytes`; scale it with `max_run_bytes`). `max_run_bytes` is the
-physical limit. `CompactionOptions::max_overlap` bounded every key's
-overlap and now is the number of flushes at which level 0 is compacted
-(same default, 4; 1 compacts every flush). `disjoint_runs_above` was
-removed: two small adjacent runs are merged whatever their number.
-`max_inputs` defaults to 32 instead of 8. `max_input_bytes` and
+`max_run_bytes` is the physical limit on runs; `max_runs` is a safety
+valve on run metadata (65,536 by default, one per 64 KiB of the default
+`max_run_bytes`; scale it with `max_run_bytes`).
+`CompactionOptions::max_overlap` is the number of flushes at which level 0
+is compacted (1 compacts every flush). `max_input_bytes` and
 `max_output_bytes` count held bytes (filters and dictionaries) as well as
-stored bytes and must admit two full runs.
+stored bytes and must admit two full runs; four runs (the defaults'
+proportion) leave room for output growth.
 
 **Compression and blocks.** `compression` (`Zstd`, `Lz4`, `Uncompressed` or
 `ZstdDictionary`) and `target_block_len` decide only how new runs are
@@ -321,13 +321,11 @@ reports failures. A job is formed only if its inputs leave a thirty-second
 of `max_output_bytes` free for what its output runs add. Output can still
 outgrow that (after reopening with another codec, say): a job that fails
 at the output limit is not chosen again as it was; jobs from its source
-take half as much each time, and are refused with `OutputLimit` before
-reading anything once none fits.
-`docs/capacity-design.md` describes the design, and its
-section 16 what was built and measured: at 200,000 writes and 64 KiB runs
-(a reduced scale), write amplification fell 1.4–3.7× against the old
-selector without its run limit, at up to 1.37× space amplification on
-overwrites.
+take half as much each time, but never less than the source with the
+largest run below it, and once that job has failed too the source is
+refused with `OutputLimit` before reading anything, until the runs below
+it change, while other levels go on. `docs/capacity-design.md` describes
+the design, and its section 18 the measured operating envelope.
 
 **Durable writes** are committed by bounded group commit: the first writer
 in the queue leads a batch of those behind it, appends it, syncs once and
@@ -445,17 +443,29 @@ it.
   and the engine keeps working without the worker.
 - How much data fits is decided by `max_run_bytes`, which is memory, and
   by how much of the data is overwritten or deleted versions not yet
-  compacted away (space amplification, about 1.3 under uniform
-  overwrites in reduced-scale measurements). Once `max_run_bytes` holds
+  compacted away (space amplification up to 1.42 while writing and 1.22
+  once compaction caught up, under uniform overwrites and deletes, in the
+  alpha measurements). Once `max_run_bytes` holds
   only live data, flushes and then writes, deletes included, stay refused
   until `set_run_limits` raises it. The run count is no longer a capacity
   limit. Refusals that recover by themselves: the level-0 stop (as
   compaction drains level 0), `Retained` (once snapshots are dropped), and
   `max_run_bytes` while compaction can still reclaim versions. Refusals that
   need action: `max_run_bytes` full of live data, `max_runs` if reached,
-  and `CompactionError::JobLimit` (raise the compaction limits).
-- Every checkpoint rewrites all live data, so at large sizes checkpoints,
-  not compaction, dominate the bytes written. Reduced-scale measurements do
+  `CompactionError::JobLimit`, and an `OutputLimit` refusal that stands
+  (raise the compaction limits; background limits are set when the engine
+  is opened).
+- Flushing is synchronous and compaction has one worker. A flush runs on
+  the write that needs room: about 0.1–0.2 s for a 64 MiB memtable in the
+  alpha measurements, and up to 1.3 s when it also waits for level 0.
+  Sustained writes are paced to the worker (about 60 MiB/s of compressed
+  text and 250–330 MiB/s of incompressible 100-byte values, on one core,
+  in the alpha measurements): level 0 sat at its stop
+  in up to half the samples of the heaviest incompressible runs.
+- Every checkpoint rewrites all live data (about 60 MiB/s of output on
+  tmpfs, 1.2 s for 75 MiB in the alpha measurements), so at large sizes
+  checkpoints, not compaction, dominate the bytes written, and a small
+  change costs a full checkpoint. Measurements up to 16 million writes do
   not establish behaviour at hundreds of millions of records.
 - The dataset must fit in memory: there is no disk tiering.
 - Process memory exceeds the run and memtable accounting by the table
@@ -550,17 +560,23 @@ with caller-driven flushing, and several writers share one flush per full
 table. Methods, workloads and full results are in
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
+Under sustained writes with background leveled compaction (up to 16
+million writes, 1.75 GiB logical, in a 3 GiB container), write
+amplification after compaction caught up was 3.5–9.7 for random inserts,
+overwrites and deletes at 8 and 64 MiB runs (1.0 for ascending keys) and
+14.6 for incompressible inserts at 1 MiB runs (four levels), space
+amplification at most 1.42, and
+peak resident memory 1.43 GiB; `docs/capacity-design.md`, section 18, has
+the tables and what they leave unmeasured.
+
 Against RocksDB 7.8.3 (a 2022 distribution build, its files in memory) on
 the same data in the same VM, with matched 4 KiB blocks and dictionaries at
 equal density, Tessera's `ZstdDictionary` runs gave 1.7–2.1× faster
 uniform point lookups and 1.3–2.2× faster short scans, with cheaper puts
 and lower peak memory. RocksDB was faster for skewed lookups served from
 its block cache (6–7×) and filtered misses, and after sustained writes
-Tessera held 14–19% more resident memory, the versions that the flat
-compaction policy of that time left with its default overlap allowance
-(`max_overlap` 4) in exchange for less rewriting; `max_overlap` 2 cut run
-memory and sped scans at about 2.75 times the bytes rewritten. That
-comparison predates leveled compaction and was not repeated. With plain
+Tessera held 14–19% more resident memory. That comparison predates leveled
+compaction, whose memory and rewriting differ, and was not repeated. With plain
 Zstandard both engines cost the same where decoding a block dominates. These
 are results for that version and configuration only, not a general ranking.
 

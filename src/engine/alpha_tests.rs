@@ -119,7 +119,7 @@ fn live_stored(engine: &Engine, options: &EngineOptions) -> usize {
     let mut scan = snapshot.scan(&mut read);
     let (mut total, mut input, mut seq) = (0, 0, 0);
     let mut builder = None::<crate::run::RunBuilder>;
-    let mut finish = |builder: crate::run::RunBuilder| {
+    let finish = |builder: crate::run::RunBuilder| {
         let run = builder.finish();
         run.as_bytes().len() + run.held_bytes()
     };
@@ -137,7 +137,7 @@ fn live_stored(engine: &Engine, options: &EngineOptions) -> usize {
             input = 0;
         }
     }
-    total + builder.map_or(0, &mut finish)
+    total + builder.map_or(0, finish)
 }
 
 /// Nanosecond samples in buckets of an eighth of a power of two: within

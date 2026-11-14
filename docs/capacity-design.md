@@ -1055,7 +1055,8 @@ with section 17.
 
 The single worker is the throughput limit, not a scheduling defect: busy
 76–100% of the time, at 55–66 MiB/s of input on text (Zstandard
-compression) and 250–330 MiB/s incompressible. Writers are paced to it by
+compression) and 250–330 MiB/s on incompressible 100-byte values (about
+1.1 GiB/s at 1,000 bytes). Writers are paced to it by
 the level-0 stop: where level 0 sat at its stop in a third to a half of
 the samples, the writer waited 5–15 s of a 10–18 s run. At the operating
 endpoint of the 64 MiB incompressible run, level 0 held 36 runs and
@@ -1149,6 +1150,9 @@ drained. The floor (section 17) prevents that:
 | 3 runs | Zstd to uncompressed, backlog | 86, 44.72, no | 32, 10.42, yes |
 | 2 runs | Zstd to LZ4, backlog | 1, 7.58, yes | unchanged |
 | 3 runs | Zstd to uncompressed, worker | 0, 14.61, yes | 2, 14.24, yes |
+
+WA here counts published output only: each failed merge also built up to
+`max_output_bytes` (512–768 KiB) before it was discarded.
 
 `an_outgrown_source_keeps_a_job_that_can_progress` fails with halving
 alone (8 overflows, then a standing refusal) and passes with the floor;

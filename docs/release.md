@@ -104,9 +104,16 @@ with their environment, and only against the configurations measured.
   tiering: the dataset must fit in memory. Checkpoints are full, never
   incremental, and never automatic.
 - Process memory is not bounded: the limits are admission checks on
-  estimated bytes. Freed memory can stay in the allocator's heap, and after
-  sustained writes the default overlap allowance keeps more resident memory
-  than RocksDB 7.8.3 did in the comparison.
+  estimated bytes. Peak resident memory ran up to 546 MiB above the
+  accounted bytes with the default 64 MiB memtables and 256 MiB jobs, and
+  freed memory can stay in the allocator's heap.
+- Flushes run on the writing thread (about 0.1–0.2 s per 64 MiB memtable),
+  and one background worker compacts, so sustained writes are paced to it.
+- Reopening under a less dense codec with compaction limits under four
+  runs can waste merges at the output limit or refuse jobs; keep the
+  defaults' proportion.
+- Measured up to 16 million writes and 1.43 GiB resident in a 3 GiB
+  container, not beyond.
 - A `ReadGuard` blocks writers while held.
 - A worker panic stops background compaction for the engine's lifetime.
 - The API and on-disk formats may change before a stable release, without
