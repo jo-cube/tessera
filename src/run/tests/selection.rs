@@ -172,7 +172,7 @@ fn legal(shapes: &[RunShape], options: CompactionOptions) -> Vec<Vec<usize>> {
                 }
             }
         }
-    } else if shapes.len() > options.disjoint_runs_above {
+    } else if shapes.len() > crate::engine::FLAT_DISJOINT_RUNS_ABOVE {
         let mut order: Vec<usize> = (0..shapes.len()).collect();
         order.sort_by(|&a, &b| shapes[a].min.cmp(&shapes[b].min));
         for stretch in order.split(|&index| !shapes[index].tail) {

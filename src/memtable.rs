@@ -970,21 +970,46 @@ fn input_len(record: &Record<'_>) -> usize {
     record.key.len() + value_len + RECORD_INPUT_OVERHEAD
 }
 
+/// Where a flush ends runs early, beside the target length: before the
+/// first record at or above each of `at`, as long as the run would hold at
+/// least `min_piece` bytes of input and the rest of the flush would too,
+/// and one target length of input is cut into at most `max_pieces` runs.
+/// Cuts change only how records are grouped into runs, never which records
+/// are written, so any keys are correct, current or stale.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FlushCuts {
+    /// Ascending keys.
+    pub(crate) at: Vec<Vec<u8>>,
+    pub(crate) min_piece: usize,
+    pub(crate) max_pieces: usize,
+}
+
 /// Builds runs from several frozen tables as if they were one, splitting
-/// them as [`FrozenMemtable::flush_with`] does. `tables` is ordered oldest
-/// first, and where tables share a key the newest update is the one written.
+/// them as [`FrozenMemtable::flush_with`] does and at `cuts`. `tables` is
+/// ordered oldest first, and where tables share a key the newest update is
+/// the one written.
 pub(crate) fn flush_merged(
     tables: &[&FrozenMemtable],
     target_run_len: usize,
     codec: Codec,
     target_block_len: usize,
+    cuts: &FlushCuts,
 ) -> Vec<Run<Vec<u8>>> {
-    if let [table] = tables {
+    if let ([table], []) = (tables, cuts.at.as_slice()) {
         return table
             .flush_with(target_run_len, codec, target_block_len)
             .collect();
     }
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
+    // Input still to come, for the rule that a cut leaves a piece after it:
+    // exact for one table, an overestimate where tables share keys.
+    let mut rest: usize = tables
+        .iter()
+        .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
+        .sum();
+    let mut next_cut = cuts.at.iter().peekable();
+    // Input in the run being built, and runs begun in this target length.
+    let (mut piece, mut pieces) = (0, 1);
     let mut heads: Vec<_> = tables.iter().map(|table| table.iter().peekable()).collect();
     let (mut runs, mut builder, mut input) = (Vec::new(), None::<RunBuilder>, 0);
     loop {
@@ -1004,14 +1029,30 @@ pub(crate) fn flush_merged(
         for head in &mut heads {
             head.next_if(|other| other.key == key);
         }
+        let mut cut = false;
+        while next_cut.next_if(|at| at.as_slice() <= key).is_some() {
+            cut = true;
+        }
+        if cut
+            && builder.is_some()
+            && piece >= cuts.min_piece
+            && rest >= cuts.min_piece
+            && pieces < cuts.max_pieces
+        {
+            runs.extend(builder.take().map(RunBuilder::finish));
+            piece = 0;
+            pieces += 1;
+        }
         builder
             .get_or_insert_with(|| RunBuilder::with_target_block_len(codec, target_block_len))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
-        input += input_len(&record);
+        let len = input_len(&record);
+        (input, piece, rest) = (input + len, piece + len, rest.saturating_sub(len));
         if input >= target {
+            // A full run starts the next target length with its own pieces.
             runs.extend(builder.take().map(RunBuilder::finish));
-            input = 0;
+            (input, piece, pieces) = (0, 0, 1);
         }
     }
     runs.extend(builder.map(RunBuilder::finish));

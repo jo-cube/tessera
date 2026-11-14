@@ -108,11 +108,21 @@
 //! everything written before it on demand, for example before a checkpoint
 //! or to bound what the memtables hold. Either way a flush has three stages:
 //!
-//! 1. The active memtable is frozen and replaced, under the lock.
+//! 1. The active memtable is frozen and replaced, under the lock. If level
+//!    0 is at its stop, the flush first waits for the background worker;
+//!    see [Memory](self#memory).
 //! 2. Runs are built from every frozen table without the lock, so reads and
 //!    writes that fit continue.
 //! 3. The runs are published and the tables they came from are removed in one
 //!    step under the lock.
+//!
+//! A flush's runs end at the run length and also at the smallest keys of
+//! level 1's runs, taken in stage 1, so that each later level-0 job meets
+//! fewer of them: a run ends there only if it holds an eighth of a run
+//! length of input and the rest of the flush does too, and one run length
+//! is cut into at most eight runs. Level 0 may hold any overlap, so cuts
+//! that compaction has made stale by stage 3 cost nothing but fit; they
+//! change how records are grouped, never which are written.
 //!
 //! Frozen tables stay readable throughout, and no reader sees their runs
 //! until they replace them. Flushes run one at a time. A flush refused by the
@@ -142,9 +152,12 @@
 //!
 //! A refused flush (see [Memory](self#memory)) is remembered until a flush
 //! or compaction publishes or the run limits change, which is when it could
-//! succeed; until then a write needing room fails at once with
+//! succeed (for a refusal at the level-0 stop alone, until level 0 has
+//! room); until then a write needing room fails at once with
 //! [`UpdateError::FlushRefused`] instead of building the same flush again.
-//! Writes are not held waiting for compaction: the caller can
+//! The one wait is for level 0: with a running worker, a write needing room
+//! while level 0 is at its stop waits for the worker as a flush does (see
+//! [Memory](self#memory)) before it is refused. Otherwise the caller can
 //! [`Engine::wait_for_compaction`] or [`Engine::compact`] and retry. A record
 //! larger than a whole budget ([`WriteError::RecordExceedsBudget`]) and every
 //! other refusal are returned as they are.
@@ -174,14 +187,17 @@
 //! to a quarter of the next, from the last level's size, and empty levels are
 //! added under level 0 as the data grows. One step is the first that applies:
 //!
-//! - **Level 0**, once it holds runs of
-//!   [`CompactionOptions::max_overlap`] flushes: its oldest run, with the other
-//!   level-0 runs that overlap the job while it fits, merged with the level-1
-//!   runs they overlap.
 //! - **A level over its size**, the most over first: the run after the
 //!   level's last job, in key order, merged with the runs of the next level
 //!   it overlaps, found by binary search. Outputs are cut at the run length
 //!   and where they would overlap more than four runs of the level below.
+//! - **Level 0**, once it holds runs of
+//!   [`CompactionOptions::max_overlap`] flushes and no deeper level is over
+//!   its size: its oldest run, with the other level-0 runs that overlap the
+//!   job while it fits, merged with the level-1 runs they overlap. However
+//!   many flushes level 0 holds, a deeper level over its size goes first:
+//!   level 0 waiting lets each of its jobs take more flushes at once, while
+//!   a level 1 left over its size makes every one of them rewrite more.
 //! - A run that overlaps nothing in the next level **moves** there: nothing
 //!   is read or written.
 //! - A job that does not fit the [`CompactionOptions`] limits **splits** its
@@ -337,13 +353,40 @@
 //! what is published, the one that reclaims space, is never blocked by the
 //! limit that refuses a flush.
 //!
-//! When flushes outpace compaction, level 0 reaches its stop, flushes are
-//! rejected, the memtables fill and writes are rejected with
-//! [`UpdateError::FlushRefused`]. No write waits for compaction on its own:
-//! a refused flush asks the worker for a pass, and a caller can
-//! [`Engine::wait_for_compaction`] and retry. Flushes themselves still run
+//! When flushes outpace compaction, level 0 reaches its stop. A flush, or a
+//! write needing room, then waits for the background worker before building
+//! anything: it asks for a pass and sleeps, holding no lock that reads,
+//! fitting writes or compaction need, until a step the worker publishes
+//! leaves level 0 room, the pass ends, or the worker stops. It waits for
+//! that one pass at most. A pass ends only when nothing is due or a step is
+//! refused, and level 0 at its stop is always due, so a pass that leaves no
+//! room was refused, and waiting longer would not help:
+//!
+//! - **A backlog**: the worker drains level 0 and the flush goes on. This
+//!   is the only case that waits, and it is the common one.
+//! - **Snapshots retaining too much**: merges are refused
+//!   ([`CompactionError::Retained`]) while moves go on. The flush is refused
+//!   with [`UpdateError::FlushRefused`] at the stop; once the snapshots are
+//!   dropped, the next write needing room waits for a pass that succeeds.
+//! - **A job over the [`CompactionOptions`] limits**
+//!   ([`CompactionError::JobLimit`], or [`CompactionError::OutputLimit`]
+//!   when an output outgrows its estimate, as a change of codec can make
+//!   it): refused the same way, and again on every retry until the limits
+//!   are raised. Each refused write asks for one pass, never more.
+//! - **The byte or run limit** ([`EngineOptions::max_run_bytes`],
+//!   [`EngineOptions::max_runs`]): refused at once, without waiting, and the
+//!   worker is asked for a pass in case compaction can reclaim space.
+//! - **A stopped worker** (it panicked): nothing waits; flushes at the stop
+//!   are refused until [`Engine::compact`] drains level 0.
+//!
+//! A refusal at the stop carries why the pass it waited for made no room,
+//! in [`RunLimitError::background`]: the pass's failure, which says whether
+//! anything but a change of snapshots or limits will lift it, or the
+//! worker's panic. [`Engine::background_status`] reports the latest pass,
+//! which may be a later one. Without a worker there is no stop and nothing
+//! waits. Flushes themselves still run
 //! on the writer that needs room, so a write that fills the memtable stalls
-//! for the flush.
+//! for the flush, and for level 0 as above.
 //!
 //! Snapshots keep memory in two ways, both reported as
 //! [`EngineStats::retained_bytes`]: the history pinned in the engine's
@@ -356,9 +399,10 @@
 //! state it saw, so the total depends on what is flushed and compacted while
 //! it lives. While it exceeds [`SnapshotLimits::max_retained_bytes`], new
 //! snapshots are refused and so are compactions, whose output would be held
-//! beside inputs that snapshots keep. That is the backpressure: runs then
-//! accumulate in level 0 until its stop refuses flushes and so writes,
-//! until snapshots are dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
+//! beside inputs that snapshots keep (a move, which retires nothing, still
+//! goes on). That is the backpressure: runs then accumulate in level 0
+//! until its stop refuses flushes and so writes, until snapshots are
+//! dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
 //! point lookups and, for scans, one per group of key-disjoint runs it has
 //! read (see [Reading runs](self#reading-runs)).
 //!
@@ -471,7 +515,7 @@ use std::sync::{
 
 use crate::block::{Record, Value, Version};
 use crate::memtable::{
-    FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
+    FlushCuts, FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
     Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
@@ -963,7 +1007,7 @@ impl std::error::Error for WriteError {}
 /// - **Terminal for this engine**: [`Self::LogFailed`] and [`Self::LogClosed`]
 ///   (reopen the database) and [`Self::SequencesExhausted`]. Reads keep
 ///   working.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateError {
     /// The write can never be applied: its key or value is too long, or its
     /// record exceeds a whole memtable budget.
@@ -1035,7 +1079,7 @@ impl std::error::Error for UpdateError {}
 /// database of live data at `max_run_bytes` needs
 /// [`Engine::set_run_limits`]. `max_runs` is a safety valve on run metadata,
 /// not a capacity limit: see [`EngineOptions::max_runs`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunLimitError {
     /// Runs that would be published.
     pub runs: usize,
@@ -1050,17 +1094,37 @@ pub struct RunLimitError {
     /// The level-0 stop: 12 with a background worker, `usize::MAX`
     /// without.
     pub max_level0_flushes: usize,
+    /// At the level-0 stop, why the worker could not make room while the
+    /// flush waited for it: the failure that ended the pass it waited for
+    /// ([`BackgroundError::Failed`]), which retrying meets again until what
+    /// it names changes (snapshots dropped, limits raised), or the worker's
+    /// panic ([`BackgroundError::Panicked`]), after which only
+    /// [`Engine::compact`] makes room. `None` for any other refusal.
+    pub background: Option<Box<BackgroundError>>,
+}
+
+impl RunLimitError {
+    /// Whether only the level-0 stop refused, which the worker lifts by
+    /// itself unless its compactions are refused.
+    fn level0_only(&self) -> bool {
+        self.level0_flushes > self.max_level0_flushes
+            && self.runs <= self.max_runs
+            && self.run_bytes <= self.max_run_bytes
+    }
 }
 
 impl fmt::Display for RunLimitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.level0_flushes > self.max_level0_flushes {
-            return write!(
+            write!(
                 f,
-                "publishing would leave {} flushes in level 0, over the stop of {}; \
-                 compaction drains it",
+                "publishing would leave {} flushes in level 0, over the stop of {}",
                 self.level0_flushes, self.max_level0_flushes
-            );
+            )?;
+            return match &self.background {
+                Some(error) => write!(f, ", and {error}"),
+                None => f.write_str("; compaction drains it"),
+            };
         }
         write!(
             f,
@@ -1173,6 +1237,10 @@ struct State {
     /// Level 0 flushes beyond which a flush is refused: [`LEVEL0_STOP`]
     /// with a background worker, otherwise unlimited; tests may change it.
     level0_stop: usize,
+    /// Whether flushes are split at level 1's boundaries; tests turn it off
+    /// to compare.
+    #[cfg(test)]
+    split_flushes: bool,
     max_runs: usize,
     max_run_bytes: usize,
     /// Sources removed from the state, kept track of until no snapshot holds
@@ -1186,6 +1254,9 @@ struct State {
     /// the run limits change: the same flush would be refused again, so a
     /// write needing room does not build it.
     refused: Option<RunLimitError>,
+    /// Why the last wait at the level-0 stop ended without room, until
+    /// level 0 has room: the cause a refusal at the stop reports.
+    blocked: Option<BackgroundError>,
     /// Flushes published, and their stored bytes.
     flushes: u64,
     flushed_bytes: u64,
@@ -1219,6 +1290,15 @@ impl State {
         }
     }
 
+    /// Where a flush beginning now splits its runs.
+    fn flush_cuts(&self, target_run_len: usize) -> FlushCuts {
+        #[cfg(test)]
+        if !self.split_flushes {
+            return FlushCuts::default();
+        }
+        self.levels.flush_cuts(target_run_len)
+    }
+
     /// The refusal of anything that would leave `runs` runs of `bytes`
     /// bytes and `flushes` level-0 flushes.
     fn run_limit(&self, runs: usize, bytes: usize, flushes: usize) -> RunLimitError {
@@ -1229,6 +1309,9 @@ impl State {
             max_run_bytes: self.max_run_bytes,
             level0_flushes: flushes,
             max_level0_flushes: self.level0_stop,
+            background: (flushes > self.level0_stop)
+                .then(|| self.blocked.clone().map(Box::new))
+                .flatten(),
         }
     }
 
@@ -1319,9 +1402,50 @@ struct Core {
     /// Makes the worker panic at the start of its next pass.
     #[cfg(test)]
     panic_worker: std::sync::atomic::AtomicBool,
+    /// Makes the next compaction panic once it holds the compaction lock,
+    /// before it takes the state lock.
+    #[cfg(test)]
+    panic_step: std::sync::atomic::AtomicBool,
+    /// Flushes that have waited for level 0, so that tests can tell when a
+    /// writer is blocked.
+    #[cfg(test)]
+    level0_waits: std::sync::atomic::AtomicUsize,
+    /// Nanoseconds those flushes waited.
+    #[cfg(test)]
+    level0_wait_nanos: std::sync::atomic::AtomicU64,
     /// Runs between building a compaction and returning it.
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Every compaction step's outcome, while `Some`: for measurements.
+    #[cfg(test)]
+    step_log: Mutex<Option<Vec<StepRecord>>>,
+    /// Merges that failed at the output limit after reading their inputs.
+    #[cfg(test)]
+    overflows: std::sync::atomic::AtomicUsize,
+}
+
+/// One compaction step as [`Core::compact`] saw it, for measurements.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct StepRecord {
+    pub(crate) kind: Option<CompactionKind>,
+    pub(crate) level: usize,
+    /// Inputs taken from level 0, and from the level below the source.
+    pub(crate) level0_inputs: usize,
+    pub(crate) lower_inputs: usize,
+    /// Stored bytes of the inputs from the level below the source.
+    pub(crate) lower_bytes: usize,
+    pub(crate) input_bytes: usize,
+    pub(crate) output_bytes: usize,
+    /// Filter and dictionary bytes of the inputs and of the output.
+    pub(crate) input_held: usize,
+    pub(crate) output_held: usize,
+    /// Level-0 runs overlapping the inputs that the job left out.
+    pub(crate) level0_left: usize,
+    /// Level-0 flushes, and each level's (runs, bytes), before the step.
+    pub(crate) level0_flushes: usize,
+    pub(crate) shape: Vec<(usize, usize)>,
+    pub(crate) error: Option<CompactionError>,
 }
 
 /// A key-value engine. See the [module documentation](self) for its
@@ -1488,7 +1612,7 @@ impl Engine {
     /// Refused with [`CompactionError::JobLimit`] if a level needs a job
     /// that no split brings within the limits, which only larger limits
     /// resolve; with [`CompactionError::Retained`] while snapshots retain
-    /// too much, which dropping them resolves.
+    /// too much, which dropping them resolves (a move still goes on).
     pub fn compact(
         &self,
         options: CompactionOptions,
@@ -1556,11 +1680,14 @@ impl Core {
                 } else {
                     usize::MAX
                 },
+                #[cfg(test)]
+                split_flushes: true,
                 max_runs: options.max_runs,
                 max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
                 last_view: None,
                 refused: None,
+                blocked: None,
                 flushes: 0,
                 flushed_bytes: 0,
             }),
@@ -1580,7 +1707,17 @@ impl Core {
             #[cfg(test)]
             panic_worker: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            panic_step: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            level0_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            level0_wait_nanos: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             after_build: Mutex::new(None),
+            #[cfg(test)]
+            step_log: Mutex::new(None),
+            #[cfg(test)]
+            overflows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1616,6 +1753,9 @@ impl Core {
                 Err(Refusal::Full) => {}
                 written => return written.map_err(Refusal::into_error),
             }
+            // Only flushes, which `serial` holds off, make room in the
+            // memtables, so waiting cannot make this write fit.
+            let mut state = self.wait_for_level0(state);
             let job = match self.begin_making_room(serial, &mut state) {
                 Ok(Some(job)) => job,
                 Ok(None) => {
@@ -1641,7 +1781,92 @@ impl Core {
     /// [Automatic flushing](self#automatic-flushing).
     fn freeze_for_room(&self) -> Result<Option<FlushJob<'_>>, RunLimitError> {
         let serial = self.serialize_flush();
-        self.begin_making_room(serial, &mut self.write_state())
+        let mut state = self.wait_for_level0(self.write_state());
+        self.begin_making_room(serial, &mut state)
+    }
+
+    /// The level-0 backpressure, before a flush is built: while level 0 is
+    /// at its stop and a running worker can drain it, waits for the worker
+    /// without the state lock, holding only the caller's flush guard, until
+    /// a step it publishes leaves room or a pass begun after this call ends.
+    /// One pass is all it waits for: a pass ends only once nothing is due or
+    /// a step is refused, and level 0 at its stop is always due, so a pass
+    /// that leaves no room ended on a refusal (snapshots retaining too much,
+    /// a job over the limits) that waiting longer would not lift. That
+    /// failure, or the worker's panic, is kept in `State::blocked` for the
+    /// refusal at publication to carry. Flushes are serialized, so nothing
+    /// fills level 0 while this waits.
+    ///
+    /// A refusal at the level-0 stop is forgotten once level 0 has room
+    /// again, so the next write needing room tries a flush; any other
+    /// standing refusal is returned at once by the caller, without waiting.
+    fn wait_for_level0<'s>(
+        &'s self,
+        state: RwLockWriteGuard<'s, State>,
+    ) -> RwLockWriteGuard<'s, State> {
+        let full = |state: &State| state.levels.level0_flushes() >= state.level0_stop;
+        let lift = |mut state: RwLockWriteGuard<'s, State>| {
+            if !full(&state) {
+                state.blocked = None;
+                if state
+                    .refused
+                    .as_ref()
+                    .is_some_and(RunLimitError::level0_only)
+                {
+                    state.refused = None;
+                }
+            }
+            state
+        };
+        let Some(signal) = &self.background else {
+            return lift(state);
+        };
+        if !full(&state)
+            || state
+                .refused
+                .as_ref()
+                .is_some_and(|refused| !refused.level0_only())
+        {
+            return lift(state);
+        }
+        drop(state);
+        #[cfg(test)]
+        self.level0_waits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        let start = std::time::Instant::now();
+        let waited = signal.wait_for(|| !full(&self.read_state()));
+        #[cfg(test)]
+        self.level0_wait_nanos.fetch_add(
+            start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        #[cfg(test)]
+        if waited != Ok(true)
+            && let Some(log) = self.step_log.lock().unwrap().as_mut()
+        {
+            let shape = self.read_state().levels.shape();
+            log.push(StepRecord {
+                kind: None,
+                level: usize::MAX,
+                level0_inputs: 0,
+                lower_inputs: 0,
+                lower_bytes: 0,
+                input_bytes: 0,
+                output_bytes: 0,
+                input_held: 0,
+                output_held: 0,
+                level0_left: 0,
+                level0_flushes: self.read_state().levels.level0_flushes(),
+                shape,
+                error: signal.status().last_failure,
+            });
+        }
+        let mut state = self.write_state();
+        if full(&state) {
+            state.blocked = waited.err();
+        }
+        lift(state)
     }
 
     /// Waits for any flush in progress and holds off others until the guard
@@ -1659,7 +1884,12 @@ impl Core {
         serial: MutexGuard<'e, ()>,
         state: &mut State,
     ) -> Result<Option<FlushJob<'e>>, RunLimitError> {
-        if let Some(refused) = state.refused {
+        if let Some(refused) = &state.refused {
+            // A refusal at the stop reports why this write's wait ended.
+            let mut refused = refused.clone();
+            if refused.level0_only() {
+                refused.background = state.blocked.clone().map(Box::new);
+            }
             return Err(refused);
         }
         if !state.active.is_empty() {
@@ -1669,6 +1899,7 @@ impl Core {
             engine: self,
             _serial: serial,
             tables: state.frozen.clone(),
+            cuts: state.flush_cuts(self.target_run_len),
         }))
     }
 
@@ -1823,7 +2054,7 @@ impl Core {
     /// every frozen table. Returns `None` if there is nothing to flush.
     fn begin_flush(&self) -> Option<FlushJob<'_>> {
         let serial = self.serialize_flush();
-        let mut state = self.write_state();
+        let mut state = self.wait_for_level0(self.write_state());
         if !state.active.is_empty() {
             self.freeze_active(&mut state);
         }
@@ -1831,11 +2062,13 @@ impl Core {
             return None;
         }
         let tables = state.frozen.clone();
+        let cuts = state.flush_cuts(self.target_run_len);
         drop(state);
         Some(FlushJob {
             engine: self,
             _serial: serial,
             tables,
+            cuts,
         })
     }
 
@@ -1847,11 +2080,90 @@ impl Core {
         options
             .validate(self.target_run_len, self.target_block_len)
             .map_err(CompactionError::Config)?;
+        #[cfg(test)]
+        if self.step_log.lock().unwrap().is_some() {
+            return self.compact_logged(options, workspace);
+        }
         match self.begin_compaction(options)? {
             Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
         }
+    }
+
+    /// [`Core::compact`], recording the step in `step_log`.
+    #[cfg(test)]
+    fn compact_logged(
+        &self,
+        options: CompactionOptions,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        let (level0_flushes, shape) = {
+            let state = self.read_state();
+            (state.levels.level0_flushes(), state.levels.shape())
+        };
+        let mut record = StepRecord {
+            kind: None,
+            level: 0,
+            level0_inputs: 0,
+            lower_inputs: 0,
+            lower_bytes: 0,
+            input_bytes: 0,
+            output_bytes: 0,
+            input_held: 0,
+            output_held: 0,
+            level0_left: 0,
+            level0_flushes,
+            shape,
+            error: None,
+        };
+        let result = match self.begin_compaction(options) {
+            Ok(Some(Begun::Job(job))) => {
+                {
+                    let state = self.read_state();
+                    let level_of = |run: &SharedRun| state.levels.level_of(run);
+                    record.level0_inputs = job
+                        .inputs
+                        .iter()
+                        .filter(|run| level_of(run) == Some(0))
+                        .count();
+                    let lower = job
+                        .inputs
+                        .iter()
+                        .filter(|run| level_of(run) == Some(job.level + 1));
+                    record.lower_inputs = lower.clone().count();
+                    record.lower_bytes = lower.map(|run| run.run.as_bytes().len()).sum();
+                    record.level0_left = job
+                        .others
+                        .iter()
+                        .filter(|run| level_of(run) == Some(0))
+                        .count();
+                }
+                record.level = job.level;
+                record.input_bytes = job.input_bytes;
+                job.build(workspace)
+                    .and_then(BuiltCompaction::publish)
+                    .map(Some)
+            }
+            Ok(Some(Begun::Done(report))) => Ok(Some(report)),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        match &result {
+            Ok(Some(report)) => {
+                record.kind = Some(report.kind);
+                record.level = report.level;
+                record.output_bytes = report.output_bytes;
+                record.input_held = report.input_held_bytes;
+                record.output_held = report.output_held_bytes;
+            }
+            Ok(None) => return result,
+            Err(error) => record.error = Some(error.clone()),
+        }
+        if let Some(log) = self.step_log.lock().unwrap().as_mut() {
+            log.push(record);
+        }
+        result
     }
 
     /// Chooses the next step from the levels, under the exclusive lock
@@ -1867,25 +2179,44 @@ impl Core {
             .compacting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        if self
+            .panic_step
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected compaction failure");
+        }
         let mut state = self.write_state();
         let bytes = state.retained().bytes;
         let max = self.snapshot_limits.max_retained_bytes;
-        if bytes > max {
+        let fit = options.fit(self.target_run_len, state.level0_stop);
+        state.levels.insert_levels(&fit);
+        let plan = state.levels.plan(&fit);
+        // Snapshots retaining too much refuse every step that would retire
+        // runs they hold. A move retires nothing, so it goes on, and can
+        // drain level 0 while the snapshots last.
+        if bytes > max && !matches!(plan, Plan::Idle | Plan::Move { .. }) {
             return Err(CompactionError::Retained { bytes, max });
         }
-        let fit = options.fit(self.target_run_len);
-        state.levels.insert_levels(&fit);
-        let refusal = |refusal: levels::Refusal| CompactionError::JobLimit {
-            level: refusal.level,
-            inputs: refusal.inputs,
-            input_bytes: refusal.bytes,
-            workspace_bytes: refusal.workspace_bytes,
-            max_inputs: options.max_inputs,
-            max_input_bytes: options.max_input_bytes,
-            max_output_bytes: options.max_output_bytes,
-            max_workspace_bytes: options.max_workspace_bytes,
+        let refusal = |refusal: levels::Refusal| match refusal.outgrown {
+            // Refused under a source's allowance: what stops it is the
+            // output limit, which an earlier job from it reached.
+            Some(output_bytes) => CompactionError::OutputLimit {
+                output_bytes,
+                max_output_bytes: options.max_output_bytes,
+            },
+            None => CompactionError::JobLimit {
+                level: refusal.level,
+                inputs: refusal.inputs,
+                input_bytes: refusal.bytes,
+                workspace_bytes: refusal.workspace_bytes,
+                max_inputs: options.max_inputs,
+                max_input_bytes: options.max_input_bytes,
+                max_output_bytes: options.max_output_bytes,
+                max_workspace_bytes: options.max_workspace_bytes,
+            },
         };
-        let (kind, level, inputs, dest, cuts, cursor, split) = match state.levels.plan(&fit) {
+        let (kind, level, inputs, dest, cuts, cursor, split) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Refuse(refused) => return Err(refusal(refused)),
             Plan::Move { level, run } => {
@@ -1893,8 +2224,15 @@ impl Core {
                     return Err(CompactionError::Stale);
                 }
                 // A move from level 0 can lift the level-0 stop, so a flush
-                // refused for it may succeed now, as after any publication.
-                state.refused = None;
+                // refused only for it may succeed now. It changes no run
+                // count or byte, so any other refusal stands.
+                if state
+                    .refused
+                    .as_ref()
+                    .is_some_and(RunLimitError::level0_only)
+                {
+                    state.refused = None;
+                }
                 if cfg!(any(test, debug_assertions)) {
                     state.levels.check(&state.runs);
                 }
@@ -2146,7 +2484,7 @@ impl Core {
 }
 
 /// Why a write did not land.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Refusal {
     /// The memtables have no room for the record until a flush makes some.
     /// Never returned to a caller.
@@ -2230,6 +2568,10 @@ struct FlushJob<'e> {
     /// Oldest first: a prefix of the state's frozen tables, since only
     /// flushes, one at a time, add or remove them.
     tables: Vec<Arc<FrozenMemtable>>,
+    /// Where to split the runs, from level 1 when the flush began. Level 1
+    /// may change before the flush publishes; level 0 allows any overlap,
+    /// so stale cuts change only how well the runs fit, never a read.
+    cuts: FlushCuts,
 }
 
 impl<'e> FlushJob<'e> {
@@ -2242,6 +2584,7 @@ impl<'e> FlushJob<'e> {
             self.engine.target_run_len,
             self.engine.codec,
             self.engine.target_block_len,
+            &self.cuts,
         );
         BuiltFlush { job: self, runs }
     }
@@ -2291,11 +2634,16 @@ impl BuiltFlush<'_> {
             || flushes > state.level0_stop
         {
             let error = state.run_limit(total_runs, total_bytes, flushes);
-            state.refused = Some(error);
+            state.refused = Some(error.clone());
             drop(state);
             // Compaction is what makes room. A pass that failed earlier, say
             // while snapshots retained too much, is otherwise not retried.
-            job.engine.notify_worker();
+            // At the level-0 stop alone, this flush has just waited for a
+            // whole pass and nothing has flushed since, so another would
+            // only repeat the refused job.
+            if !error.level0_only() {
+                job.engine.notify_worker();
+            }
             return Err(error);
         }
         let flushed = job.tables.len();
@@ -2370,7 +2718,10 @@ pub struct CompactionOptions {
     /// built and held until publication, as for
     /// [`EngineOptions::max_run_bytes`]; at least twice
     /// [`EngineOptions::target_run_len`]. A job's output is estimated by its
-    /// input before it starts, and checked as it is written. It counts bytes
+    /// input before it starts, and checked as it is written; a job is formed
+    /// only if its input leaves a thirty-second of this limit free for what
+    /// output runs add (footers, filters, blocks packed differently), so
+    /// that a job chosen is not refused here and then chosen again. It counts bytes
     /// written, not allocated: the run being built grows its buffer by
     /// doubling, so it may hold up to its own size again in unused capacity
     /// until it is finished.
@@ -2396,10 +2747,6 @@ pub struct CompactionOptions {
     /// 0's flushes are what remains of that overlap, and the default is the
     /// same.
     pub max_overlap: usize,
-    /// Ignored: leveled compaction merges small runs whenever two adjacent
-    /// ones are below half a run's length. Kept so that existing
-    /// configurations build; it will be removed.
-    pub disjoint_runs_above: usize,
 }
 
 impl Default for CompactionOptions {
@@ -2415,10 +2762,17 @@ impl Default for CompactionOptions {
             max_output_bytes: 256 << 20,
             max_workspace_bytes: 64 << 20,
             max_overlap: 4,
-            disjoint_runs_above: 16,
         }
     }
 }
+
+/// The share of [`CompactionOptions::max_output_bytes`] that selection keeps
+/// free, as one part in this many, for what a merge's output adds to its
+/// inputs' bytes: run footers, filters and blocks packed differently.
+/// Measured growth is at most about a kilobyte for jobs of tens to
+/// hundreds of kilobytes; a change of codec or dictionary can add more, and
+/// then the merge fails at the output limit as before.
+const OUTPUT_HEADROOM: usize = 32;
 
 impl CompactionOptions {
     /// The one check of these options, made when an engine is built with
@@ -2461,12 +2815,15 @@ impl CompactionOptions {
         )
     }
 
-    fn fit(&self, target_run_len: usize) -> Fit {
+    fn fit(&self, target_run_len: usize, level0_stop: usize) -> Fit {
         Fit {
             max_inputs: self.max_inputs,
-            max_bytes: self.max_input_bytes.min(self.max_output_bytes),
+            max_bytes: self
+                .max_input_bytes
+                .min(self.max_output_bytes - self.max_output_bytes / OUTPUT_HEADROOM),
             max_workspace_bytes: self.max_workspace_bytes,
             trigger: self.max_overlap,
+            level0_stop,
             target_run_len,
         }
     }
@@ -2502,8 +2859,16 @@ pub enum CompactionError {
         /// [`CompactionOptions::max_workspace_bytes`].
         max_workspace_bytes: usize,
     },
-    /// The output would exceed [`CompactionOptions::max_output_bytes`].
-    /// Nothing was published; a larger limit lets it proceed.
+    /// The output would exceed [`CompactionOptions::max_output_bytes`],
+    /// the limit on all of one job's output runs together. Nothing was
+    /// published; a larger limit lets it proceed. A job is admitted by its
+    /// inputs' bytes, so this follows output that outgrew them by more than
+    /// the limit's headroom, as a change of codec or dictionary can make it.
+    /// Selection then halves what a job from the same source may take, each
+    /// time this happens to it, and splits the source if need be; once no
+    /// job from it fits, the step is refused with this error before
+    /// anything is read, naming the output that crossed the limit, and
+    /// other levels go on.
     OutputLimit {
         /// Bytes of output, stored and filters, when the limit was crossed.
         output_bytes: usize,
@@ -2526,7 +2891,8 @@ pub enum CompactionError {
     /// limit and what is published now.
     RunLimit(RunLimitError),
     /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`], so
-    /// the output could only add to it. Dropping snapshots lifts this.
+    /// the output could only add to it. Dropping snapshots lifts this. Moves,
+    /// which write and retire nothing, are not refused.
     Retained {
         /// Bytes retained.
         bytes: usize,
@@ -2685,14 +3051,30 @@ fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
         .collect()
 }
 
+/// The disjoint runs above which the flat selector merged adjacent tails:
+/// its old `disjoint_runs_above` default.
+#[cfg(test)]
+pub(crate) const FLAT_DISJOINT_RUNS_ABOVE: usize = 16;
+
 /// Chooses run indices to compact as the engine did before levels (5AT):
 /// the most deeply overlapped runs while any key is in more than
 /// `max_overlap`, then windows of adjacent tails beyond
-/// `disjoint_runs_above` disjoint runs. Quadratic in the number of runs.
+/// [`FLAT_DISJOINT_RUNS_ABOVE`] disjoint runs. Quadratic in the number of
+/// runs.
 #[cfg(test)]
 fn select(
     runs: &[Candidate<'_>],
     options: CompactionOptions,
+) -> Result<Option<Vec<usize>>, CompactionError> {
+    select_with(runs, options, FLAT_DISJOINT_RUNS_ABOVE)
+}
+
+/// [`select`], merging tails beyond `disjoint_above` disjoint runs.
+#[cfg(test)]
+fn select_with(
+    runs: &[Candidate<'_>],
+    options: CompactionOptions,
+    disjoint_above: usize,
 ) -> Result<Option<Vec<usize>>, CompactionError> {
     let bytes = |set: &[usize]| set.iter().map(|&index| runs[index].bytes).sum::<usize>();
     // The deepest overlap is at some run's smallest key, so the stacks of runs
@@ -2738,7 +3120,7 @@ fn select(
         }
         return Err(input_limit(smallest_pair, options));
     }
-    if deepest > 1 || runs.len() <= options.disjoint_runs_above {
+    if deepest > 1 || runs.len() <= disjoint_above {
         return Ok(None);
     }
 
@@ -2877,7 +3259,21 @@ impl<'e> CompactionJob<'e> {
             target_block_len: self.engine.target_block_len,
             dictionary: self.engine.dictionary,
         };
-        let output = compact_with(&views, keep_tombstone, limits, &self.cuts, workspace)?;
+        let output = match compact_with(&views, keep_tombstone, limits, &self.cuts, workspace) {
+            Ok(output) => output,
+            Err(error) => {
+                if let CompactError::OutputLimit { output_bytes, .. } = error {
+                    // So that selection does not choose this job again.
+                    #[cfg(test)]
+                    self.engine
+                        .overflows
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut state = self.engine.write_state();
+                    state.levels.outgrown(&self.inputs, output_bytes);
+                }
+                return Err(error.into());
+            }
+        };
         #[cfg(test)]
         {
             let hook = self.engine.after_build.lock().unwrap().clone();
@@ -3441,6 +3837,11 @@ impl Engine {
         self.core.write_state().level0_stop = stop;
     }
 
+    /// Turns flush splitting on or off, to compare.
+    pub(crate) fn set_split_flushes(&self, split: bool) {
+        self.core.write_state().split_flushes = split;
+    }
+
     /// Builds the merge of `picks` as [`Engine::compact_picked`] would, and
     /// abandons it.
     pub(crate) fn dry_compact(
@@ -3569,7 +3970,6 @@ mod tests {
             max_inputs,
             max_input_bytes,
             max_overlap: 1,
-            disjoint_runs_above: 2,
             ..CompactionOptions::default()
         }
     }
@@ -3642,15 +4042,18 @@ mod tests {
             candidate("e", "f", 1),
             candidate("g", "h", 1),
         ];
-        assert_eq!(select(&runs[..2], options(8, 100)), Ok(None));
-        assert_eq!(select(&runs, options(8, 100)), Ok(Some(vec![0, 1, 2, 3])));
+        assert_eq!(select_with(&runs[..2], options(8, 100), 2), Ok(None));
+        assert_eq!(
+            select_with(&runs, options(8, 100), 2),
+            Ok(Some(vec![0, 1, 2, 3]))
+        );
         // Prefer more runs, then fewer bytes.
-        assert_eq!(select(&runs, options(2, 100)), Ok(Some(vec![1, 2])));
+        assert_eq!(select_with(&runs, options(2, 100), 2), Ok(Some(vec![1, 2])));
         // A full run separates tails, and is never rewritten.
         runs[2].tail = false;
-        assert_eq!(select(&runs, options(8, 100)), Ok(Some(vec![0, 1])));
+        assert_eq!(select_with(&runs, options(8, 100), 2), Ok(Some(vec![0, 1])));
         runs[0].tail = false;
-        assert_eq!(select(&runs, options(8, 100)), Ok(None));
+        assert_eq!(select_with(&runs, options(8, 100), 2), Ok(None));
         // Any overlap within the allowance disables tail merging.
         runs[0].tail = true;
         runs[2] = candidate("a", "a", 1);
@@ -3658,8 +4061,8 @@ mod tests {
             max_overlap: 2,
             ..options(8, 100)
         };
-        assert_eq!(select(&runs, tolerant), Ok(None));
-        assert_eq!(select(&runs[..1], options(8, 100)), Ok(None));
+        assert_eq!(select_with(&runs, tolerant, 2), Ok(None));
+        assert_eq!(select_with(&runs[..1], options(8, 100), 2), Ok(None));
     }
 
     fn overlapping_runs(engine: &Engine) {

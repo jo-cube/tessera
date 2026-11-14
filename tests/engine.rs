@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CompactionError, CompactionOptions, Compression, ENTRY_OVERHEAD, Engine, EngineOptions,
-    EngineStats, EngineWorkspace, MAX_KEY_LEN, MergeWorkspace, OpenError, ReadGuard, RunLimitError,
-    SnapshotLimits, UpdateError, WriteError,
+    CompactionError, CompactionKind, CompactionOptions, Compression, ENTRY_OVERHEAD, Engine,
+    EngineOptions, EngineStats, EngineWorkspace, MAX_KEY_LEN, MergeWorkspace, OpenError, ReadGuard,
+    RunLimitError, SnapshotLimits, UpdateError, WriteError,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -381,6 +381,7 @@ fn run_bytes_are_limited_inclusively() {
             max_run_bytes: size - 1,
             level0_flushes: 1,
             max_level0_flushes: usize::MAX,
+            background: None,
         }
     );
 }
@@ -576,14 +577,20 @@ fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
     );
     let before = engine.stats();
     assert_eq!(before.runs, 2);
-    assert_eq!(engine.put(b"late", &[1; 100]), Err(refused));
+    assert_eq!(engine.put(b"late", &[1; 100]), Err(refused.clone()));
     assert_eq!(engine.stats(), before);
     let merge_all = CompactionOptions {
         max_overlap: 1,
         ..CompactionOptions::default()
     };
     let mut workspace = MergeWorkspace::new();
-    let blocked = engine.compact(merge_all, &mut workspace);
+    // Moves retire nothing and go on; the merge after them is refused.
+    let blocked = loop {
+        match engine.compact(merge_all, &mut workspace) {
+            Ok(Some(report)) => assert_eq!(report.kind, CompactionKind::Move),
+            other => break other,
+        }
+    };
     assert!(
         matches!(blocked, Err(CompactionError::Retained { .. })),
         "{blocked:?}"
@@ -1315,7 +1322,6 @@ fn each_setting_out_of_range_is_refused_by_name() {
         compaction(|c| c.max_inputs = 2),
         compaction(|c| c.max_input_bytes = 128 << 20),
         compaction(|c| c.max_workspace_bytes = 3_211_264),
-        compaction(|c| c.disjoint_runs_above = 0),
     ];
     for options in accepted {
         Engine::new(options).unwrap();

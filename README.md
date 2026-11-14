@@ -147,7 +147,6 @@ Ranges, all inclusive:
 | `CompactionOptions::max_input_bytes`, `max_output_bytes` | at least twice `target_run_len` |
 | `CompactionOptions::max_workspace_bytes` | at least the estimate for two inputs of `target_block_len` blocks (about 3.1 MiB at 16 KiB) |
 | `CompactionOptions::max_overlap` | at least 1 |
-| `CompactionOptions::disjoint_runs_above` | any; ignored |
 | `SnapshotLimits::max_live`, `max_retained_bytes` | any; 0 refuses snapshots |
 | `DurableOptions::segment_bytes`, `max_batch_bytes`, `max_queue_bytes` | at least 1 |
 | `DurableOptions::max_log_bytes` | more than `segment_bytes` plus a segment header |
@@ -173,7 +172,8 @@ metadata (65,536 by default, one per 64 KiB of the default
 `max_run_bytes`; scale it with `max_run_bytes`). `max_run_bytes` is the
 physical limit. `CompactionOptions::max_overlap` bounded every key's
 overlap and now is the number of flushes at which level 0 is compacted
-(same default, 4; 1 compacts every flush). `disjoint_runs_above` is ignored and will be removed.
+(same default, 4; 1 compacts every flush). `disjoint_runs_above` was
+removed: two small adjacent runs are merged whatever their number.
 `max_inputs` defaults to 32 instead of 8. `max_input_bytes` and
 `max_output_bytes` count held bytes (filters and dictionaries) as well as
 stored bytes and must admit two full runs.
@@ -293,9 +293,12 @@ its tables frozen and readable, and the next flush takes them with the
 active table. `Engine::flush` flushes everything written before the call,
 which is only needed to bound what the memtables hold or to measure a
 flush; it is not needed before a checkpoint, which includes the memtables.
-If the run limits refuse the flush, writes that need room fail with
-`UpdateError::FlushRefused` until compaction or `set_run_limits` makes room;
-the refusal is kept, not rebuilt for every write.
+A flush also ends its runs at level 1's run boundaries, in pieces of at
+least an eighth of a run length and at most eight per run length, so that
+later level-0 compactions stay range-local. If the run limits refuse the
+flush, writes that need room fail with `UpdateError::FlushRefused` until
+compaction or `set_run_limits` makes room; the refusal is kept, not rebuilt
+for every write.
 
 **Compaction** is leveled, with a size ratio of 4. Level 0 holds recent
 flushes, which may overlap; every deeper level is sorted and its runs are
@@ -303,9 +306,10 @@ disjoint, and each is a quarter the size of the next, sized from the last.
 Levels exist only in memory as compaction's bookkeeping: reads never
 consult them, nothing about them is persisted, and recovery puts a
 checkpoint's runs in one level. `Engine::compact` takes one step, or
-returns `None` when nothing is due: it merges level 0's oldest run (with
-the other level-0 runs it overlaps) into level 1, or the next run of the
-level most over its size into the level below, relabels a run that
+returns `None` when nothing is due: it merges the next run of the level
+most over its size into the level below, or, once no deeper level is over
+its size, level 0's oldest run (with the other level-0 runs it overlaps)
+into level 1; it relabels a run that
 overlaps nothing below (a move, writing nothing), splits a run whose job
 exceeds the limits into pieces whose jobs fit, or merges two small
 adjacent runs. It chooses from level sizes and key ranges only, merges
@@ -313,7 +317,13 @@ without the lock and replaces exactly its inputs, so reads, writes and
 flushes continue. Afterwards a lookup visits at most one run per level and
 one per level-0 flush. The background worker (on by default) compacts after
 each flush; `wait_for_compaction` waits for a pass and `background_status`
-reports failures. `docs/capacity-design.md` describes the design, and its
+reports failures. A job is formed only if its inputs leave a thirty-second
+of `max_output_bytes` free for what its output runs add. Output can still
+outgrow that (after reopening with another codec, say): a job that fails
+at the output limit is not chosen again as it was; jobs from its source
+take half as much each time, and are refused with `OutputLimit` before
+reading anything once none fits.
+`docs/capacity-design.md` describes the design, and its
 section 16 what was built and measured: at 200,000 writes and 64 KiB runs
 (a reduced scale), write amplification fell 1.4–3.7× against the old
 selector without its run limit, at up to 1.37× space amplification on
@@ -374,8 +384,10 @@ bound on process memory:
   snapshots pin;
 - runs: a byte total of stored bytes and filters (`max_run_bytes`), the
   physical limit, and a count (`max_runs`), a safety valve; a flush beyond
-  either, or, with background compaction, one that would leave level 0
-  with more than 12 flushes, is refused; a compaction may pass them only by shrinking what is published;
+  either is refused; with background compaction, one that would leave
+  level 0 with more than 12 flushes first waits for one compaction pass,
+  then is refused if level 0 still has no room; a compaction may pass the
+  limits only by shrinking what is published;
 - snapshots: live count and retained bytes (`SnapshotLimits`), beyond which
   snapshots and compactions are refused;
 - compaction: inputs, input and output bytes, and workspace
@@ -398,11 +410,19 @@ it.
   `LogFailed`, `LogClosed` and `SequencesExhausted` are terminal for the open
   engine.
 - Writes wait for flushes when the memtables are full: a flush runs on the
-  writer that needs room, so that write stalls for it. Writes are refused
-  with `FlushRefused` when level 0 reaches its stop (compaction behind) or
-  the run limits are reached, until compaction makes room; with background
-  compaction turned off, call `compact`. A caller that wants to wait can
-  call `wait_for_compaction` or `compact` and retry.
+  writer that needs room, so that write stalls for it. When level 0 is at
+  its stop (compaction behind), that flush also waits for the background
+  worker, without holding locks that readers, fitting writes or compaction
+  need, until a compaction step leaves room or one pass ends. Only a pass
+  that was refused ends without room, so the flush and the write are then
+  refused with `FlushRefused`, whose `RunLimitError::background` says why
+  that pass made no room: snapshots retaining too much (recovers once they
+  are dropped, on the next write needing room), a job over the
+  `CompactionOptions` limits (raise them), or a panicked worker (call
+  `compact`). `background_status` reports the latest pass, which may be a
+  later one. Writes at the run limits are refused
+  without waiting. With background compaction turned off nothing waits:
+  call `compact`.
 - A durable log grows until `durable_checkpoint` is called; writes past
   `max_log_bytes` are refused with `LogFull`. Checkpoints are never taken
   automatically, and cannot prune the active segment, so `max_log_bytes`
@@ -413,9 +433,10 @@ it.
   every later durable write `LogClosed`. Reopen the database to continue.
   Reads keep working.
 - While snapshots retain more than `SnapshotLimits::max_retained_bytes`, new
-  snapshots and compactions are refused, so flushes accumulate in level 0
-  until its stop refuses flushes, and then writes. Dropping snapshots lifts
-  this; compaction then drains level 0 by itself.
+  snapshots and compactions (other than moves, which write nothing) are
+  refused, so flushes accumulate in level 0 until its stop refuses flushes,
+  and then writes. Dropping snapshots lifts this: the next write that needs
+  room waits for a compaction pass that drains level 0.
 - A `ReadGuard` blocks writers, flushes and compaction publication while
   held; keep it short. Do not call engine methods while holding one; use the
   guard's own reads. A `Snapshot` holds no lock.

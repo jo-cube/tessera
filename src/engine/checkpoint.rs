@@ -1161,6 +1161,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 max_run_bytes: options.max_run_bytes,
                 level0_flushes: 0,
                 max_level0_flushes: LEVEL0_STOP,
+                background: None,
             }));
         }
         let mut runs: Vec<Run<Vec<u8>>> = Vec::with_capacity(manifest.runs.len());
@@ -1224,6 +1225,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 max_run_bytes: options.max_run_bytes,
                 level0_flushes: 0,
                 max_level0_flushes: LEVEL0_STOP,
+                background: None,
             }));
         }
 

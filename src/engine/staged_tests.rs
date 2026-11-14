@@ -352,7 +352,6 @@ mod compaction {
         CompactionOptions {
             max_inputs,
             max_overlap: 1,
-            disjoint_runs_above: 0,
             ..CompactionOptions::default()
         }
     }
@@ -553,7 +552,6 @@ mod compaction {
                         let options = CompactionOptions {
                             max_inputs: 2 + rng.below(4),
                             max_overlap: 1 + rng.below(3),
-                            disjoint_runs_above: rng.below(4),
                             ..CompactionOptions::default()
                         };
                         stage = match stage {

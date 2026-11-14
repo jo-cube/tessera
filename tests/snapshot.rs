@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tessera::engine::{
-    BackgroundError, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
-    MergeWorkspace, Snapshot, SnapshotError, SnapshotLimits,
+    BackgroundError, CompactionError, CompactionKind, CompactionOptions, Engine, EngineOptions,
+    EngineWorkspace, MergeWorkspace, Snapshot, SnapshotError, SnapshotLimits,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -310,10 +310,14 @@ fn each_limit_refuses_with_its_own_error_and_changes_nothing() {
         }
     );
     assert!(refused.to_string().contains("retain"));
-    // Compaction waits too, since snapshots could hold its inputs.
-    let refused = engine
-        .compact(merge_all(), &mut MergeWorkspace::new())
-        .unwrap_err();
+    // Compaction waits too, since snapshots could hold its inputs; only
+    // moves, which retire nothing, go on.
+    let refused = loop {
+        match engine.compact(merge_all(), &mut MergeWorkspace::new()) {
+            Ok(Some(report)) => assert_eq!(report.kind, CompactionKind::Move),
+            other => break other.unwrap_err(),
+        }
+    };
     assert_eq!(
         refused,
         CompactionError::Retained {
@@ -321,7 +325,12 @@ fn each_limit_refuses_with_its_own_error_and_changes_nothing() {
             max: 0
         }
     );
-    assert_eq!(engine.stats(), before);
+    let after = engine.stats();
+    let published = |stats: &tessera::engine::EngineStats| {
+        let runs = (stats.runs, stats.run_bytes, stats.held_bytes);
+        (runs, stats.retained_bytes, stats.last_seq)
+    };
+    assert_eq!(published(&after), published(&before));
 
     drop(first);
     assert_eq!(engine.stats().retained_bytes, 0);

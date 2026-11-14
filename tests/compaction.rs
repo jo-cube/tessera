@@ -30,7 +30,6 @@ fn options(max_inputs: usize) -> CompactionOptions {
     CompactionOptions {
         max_inputs,
         max_overlap: 1,
-        disjoint_runs_above: 0,
         ..CompactionOptions::default()
     }
 }

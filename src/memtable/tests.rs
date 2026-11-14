@@ -7,11 +7,12 @@ use std::collections::HashMap;
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::memtable::{
-    ENTRY_OVERHEAD, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable, TARGET_RUN_LEN,
-    TableError,
+    ENTRY_OVERHEAD, FlushCuts, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable,
+    TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
-    LogicalWorkspace, MergeCursor, MergeWorkspace, ReadWorkspace, Run, RunBuilder, RunSet, RunView,
+    Codec, LogicalWorkspace, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD, ReadWorkspace,
+    Run, RunBuilder, RunSet, RunView, TARGET_BLOCK_LEN,
 };
 
 type Entry = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -1162,4 +1163,123 @@ fn a_snapshot_pins_only_what_later_writes_replace() {
     drop(snapshot);
     assert_eq!(table.memory().pinned, 0);
     assert_eq!(table.memory().charged, charged);
+}
+
+// Flush splitting.
+
+/// Flushes `tables` with `cuts` and returns each run's records, checking
+/// that together they are the merged tables' newest records in order.
+fn split_flush(tables: &[&FrozenMemtable], target: usize, cuts: &FlushCuts) -> Vec<Vec<Entry>> {
+    let runs = flush_merged(tables, target, Codec::None, TARGET_BLOCK_LEN, cuts);
+    let pieces: Vec<Vec<Entry>> = runs.iter().map(run_contents).collect();
+    let mut newest: std::collections::BTreeMap<Vec<u8>, Entry> = Default::default();
+    for table in tables {
+        for entry in frozen_contents(table) {
+            newest.insert(entry.0.clone(), entry);
+        }
+    }
+    let flat: Vec<Entry> = pieces.iter().flatten().cloned().collect();
+    assert_eq!(
+        flat,
+        newest.into_values().collect::<Vec<_>>(),
+        "nothing lost or doubled"
+    );
+    assert!(pieces.iter().all(|piece| !piece.is_empty()), "no empty run");
+    pieces
+}
+
+fn cuts_at(keys: &[&[u8]], min_piece: usize, max_pieces: usize) -> FlushCuts {
+    FlushCuts {
+        at: keys.iter().map(|key| key.to_vec()).collect(),
+        min_piece,
+        max_pieces,
+    }
+}
+
+fn counts(pieces: &[Vec<Entry>]) -> Vec<usize> {
+    pieces.iter().map(Vec::len).collect()
+}
+
+/// Pieces end before the first key at or above a cut, only while the piece
+/// and the rest of the flush both hold the least piece size, and a run
+/// length of input is cut into at most `max_pieces` runs.
+#[test]
+fn a_flush_is_cut_at_given_keys_into_bounded_pieces() {
+    let frozen = numbered(100, 100);
+    let record = 8 + 100 + RECORD_INPUT_OVERHEAD;
+    let tens: Vec<String> = (1..10).map(|i| format!("key{:05}", i * 10)).collect();
+    let tens: Vec<&[u8]> = tens.iter().map(|key| key.as_bytes()).collect();
+    let big = 1 << 20;
+    let pieces = |min: usize, max: usize, target: usize| {
+        counts(&split_flush(&[&frozen], target, &cuts_at(&tens, min, max)))
+    };
+    assert_eq!(pieces(1, 100, big), [10; 10]);
+    // At most eight pieces: the rest of the cuts are passed over.
+    assert_eq!(pieces(1, 8, big), [10, 10, 10, 10, 10, 10, 10, 30]);
+    // A piece of at least 15 records: every other cut.
+    assert_eq!(pieces(15 * record, 8, big), [20, 20, 20, 20, 20]);
+    // ... and 25 after it: no cut leaves fewer at the end.
+    assert_eq!(pieces(25 * record, 8, big), [30, 30, 40]);
+    // Each run length of input starts its own count of pieces.
+    assert_eq!(pieces(1, 2, 50 * record), [10, 40, 10, 40]);
+    // Cuts between keys that are not in the table, before and after them.
+    let around: [&[u8]; 3] = [b"a", b"key00042x", b"zz"];
+    let pieces = split_flush(&[&frozen], big, &cuts_at(&around, 1, 8));
+    assert_eq!(counts(&pieces), [43, 57]);
+}
+
+/// Binary keys: the empty key, keys ending in 0xFF and a cut equal to a key
+/// all split where byte order says, and a record longer than a run length
+/// is a run of its own between cuts.
+#[test]
+fn flush_cuts_follow_byte_order_and_keep_large_records_whole() {
+    let mut table = table();
+    let keys: [&[u8]; 6] = [b"", b"a", b"a\xff", b"a\xff\xff", b"b", b"\xff"];
+    for (seq, key) in keys.iter().enumerate() {
+        table.put(key, seq as u64 + 1, b"v").unwrap();
+    }
+    let frozen = table.freeze();
+    let cuts = cuts_at(&[b"a\xff", b"a\xff\x00", b"\xff"], 1, 8);
+    let pieces = split_flush(&[&frozen], 1 << 20, &cuts);
+    let firsts: Vec<&[u8]> = pieces.iter().map(|piece| piece[0].0.as_slice()).collect();
+    assert_eq!(firsts, [&b""[..], b"a\xff", b"a\xff\xff", b"\xff"]);
+
+    let mut large = self::table();
+    large.put(b"a", 1, b"small").unwrap();
+    large.put(b"m", 2, &[7; 3_000]).unwrap();
+    large.put(b"z", 3, b"small").unwrap();
+    let frozen = large.freeze();
+    let pieces = split_flush(&[&frozen], 1_000, &cuts_at(&[b"b", b"n"], 1, 8));
+    assert_eq!(counts(&pieces), [1, 1, 1]);
+}
+
+/// Tables merged in one flush, sharing keys and tombstones: the newest
+/// update of each key is written once, wherever the cuts fall.
+#[test]
+fn split_flushes_of_several_tables_keep_each_newest_update_once() {
+    let mut older = table();
+    for i in 0..40u32 {
+        older
+            .put(format!("k{i:02}").as_bytes(), u64::from(i) + 1, b"old")
+            .unwrap();
+    }
+    let older = older.freeze();
+    let mut newer = Memtable::new(ROOMY, Some(40));
+    for i in (0..40u32).step_by(3) {
+        let key = format!("k{i:02}");
+        if i % 2 == 0 {
+            newer.delete(key.as_bytes(), u64::from(i) + 100).unwrap();
+        } else {
+            newer
+                .put(key.as_bytes(), u64::from(i) + 100, b"new")
+                .unwrap();
+        }
+    }
+    let newer = newer.freeze();
+    let cuts = cuts_at(&[b"k05", b"k12", b"k12", b"k30"], 1, 8);
+    let pieces = split_flush(&[&older, &newer], 1 << 20, &cuts);
+    let firsts: Vec<&[u8]> = pieces.iter().map(|piece| piece[0].0.as_slice()).collect();
+    assert_eq!(firsts, [&b"k00"[..], b"k05", b"k12", b"k30"]);
+    let k12 = pieces[2].iter().find(|entry| entry.0 == b"k12").unwrap();
+    assert_eq!(k12, &del(b"k12", 112));
 }

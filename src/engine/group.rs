@@ -275,7 +275,7 @@ impl Drop for Leading<'_> {
         // like a failed sync's.
         let uncertain = UpdateError::LogFailed(std::io::ErrorKind::Other);
         for ticket in self.tickets.clone().filter(|&ticket| ticket != self.mine) {
-            group.outcomes.insert(ticket, Err(uncertain));
+            group.outcomes.insert(ticket, Err(uncertain.clone()));
         }
         group.close();
         self.durable.wake(group);
@@ -438,7 +438,11 @@ impl Core {
                 },
             };
             let error = UpdateError::FlushRefused(refused);
-            outcomes.extend(batch.iter().map(|request| (request.ticket, Err(error))));
+            outcomes.extend(
+                batch
+                    .iter()
+                    .map(|request| (request.ticket, Err(error.clone()))),
+            );
             return (outcomes, false, frozen);
         }
     }

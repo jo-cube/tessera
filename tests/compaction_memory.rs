@@ -1,8 +1,8 @@
-//! What a compaction of 8, 16 and 32 inputs allocates on the Rust heap,
-//! against its workspace estimate and output (5AT). Each input has blocks of
-//! the largest length the engine builds, 64 KiB, and the output is
-//! compressed with a trained dictionary when that saves enough: the worst
-//! case the default limits admit.
+//! What one compaction of up to 32 inputs allocates on the Rust heap and in
+//! native decoder contexts, against its workspace estimate and output,
+//! under each codec, compressible and incompressible values, records much
+//! larger than a block, and inputs of mixed codecs (5AT, 5AU). Blocks are
+//! of the largest length the engine builds, 64 KiB, where records allow.
 //!
 //! Zstandard's contexts are allocated through `malloc`, not the Rust
 //! allocator: they are reported by the workspace's `context_bytes` (the
@@ -17,7 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tessera::engine::{
-    CompactionKind, CompactionOptions, Compression, DictionaryChoice, Engine, EngineOptions,
+    CheckpointOptions, CompactionKind, CompactionOptions, Compression, Engine, EngineOptions,
     MergeWorkspace,
 };
 
@@ -58,7 +58,7 @@ static ALLOCATOR: Counting = Counting;
 
 /// Text-like values of about 600 bytes from a small vocabulary, with a
 /// varying number, so that blocks compress and a dictionary can help.
-fn value(seed: u64) -> Vec<u8> {
+fn text(seed: u64) -> Vec<u8> {
     const WORDS: [&str; 12] = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
         "juliet", "kilo", "lima",
@@ -76,99 +76,241 @@ fn value(seed: u64) -> Vec<u8> {
     out.into_bytes()
 }
 
-#[test]
-fn a_merge_of_up_to_32_inputs_stays_within_its_estimate_and_output() {
-    println!(
-        "MERGE MEMORY | inputs | input MiB | output MiB (stored + held) | workspace estimate MiB \
-         | dictionary | peak Rust heap above the baseline MiB | that minus the output MiB \
-         | decompression contexts MiB |"
-    );
-    for inputs in [8u64, 16, 32] {
-        let engine = Engine::new(EngineOptions {
-            memtable_budget: 2 << 20,
-            target_run_len: 2 << 20,
-            target_block_len: 64 << 10,
-            compression: Compression::ZstdDictionary,
-            background_compaction: None,
-            ..EngineOptions::default()
+/// `len` pseudo-random bytes, which no codec shrinks.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
         })
-        .unwrap();
-        // Disjoint flushes, one run each, which move into level 1; then
-        // flushes over the whole key range, at most 11 (level 0 stops at 12),
-        // so that one level-0 job takes them all with every level-1 run.
-        let keys = 2_400;
-        let level0 = (inputs / 2).min(11);
-        let level1 = inputs - level0;
-        let mut workspace = MergeWorkspace::new();
-        let options = CompactionOptions {
-            max_inputs: 32,
-            max_overlap: 1,
-            ..CompactionOptions::default()
-        };
-        for flush in 0..level1 {
-            for index in 0..keys {
-                let key = format!("key/{:08}", (flush * keys + index) * 16);
-                engine
-                    .put(key.as_bytes(), &value(flush * keys + index))
-                    .unwrap();
-            }
-            engine.flush().unwrap();
-            while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
-                assert_eq!(report.kind, CompactionKind::Move);
-            }
+        .collect()
+}
+
+struct Case {
+    name: &'static str,
+    compression: Compression,
+    /// Recover the level-1 runs from a checkpoint under this setting
+    /// before level 0 is flushed, so that the job mixes codecs.
+    recovered_as: Option<Compression>,
+    inputs: u64,
+    /// Records per flush, about 1.4 MiB of input.
+    keys: u64,
+    value: fn(u64) -> Vec<u8>,
+}
+
+fn engine_options(compression: Compression) -> EngineOptions {
+    EngineOptions {
+        memtable_budget: 2 << 20,
+        target_run_len: 2 << 20,
+        target_block_len: 64 << 10,
+        compression,
+        background_compaction: None,
+        ..EngineOptions::default()
+    }
+}
+
+/// Builds level 1 from disjoint flushes (moves) and level 0 from at most 11
+/// small flushes over the whole key range, then measures the one merge of
+/// them all and prints its row.
+fn measure(case: &Case) {
+    let mut engine = Engine::new(engine_options(case.compression)).unwrap();
+    let level0 = (case.inputs / 2).min(11);
+    let level1 = case.inputs - level0;
+    let keys = case.keys;
+    let mut workspace = MergeWorkspace::new();
+    let options = CompactionOptions {
+        max_overlap: 1,
+        ..CompactionOptions::default()
+    };
+    for flush in 0..level1 {
+        for index in 0..keys {
+            let key = format!("key/{:08}", (flush * keys + index) * 16);
+            engine
+                .put(key.as_bytes(), &(case.value)(flush * keys + index))
+                .unwrap();
         }
-        for flush in 0..level0 {
-            for index in 0..keys {
-                let key = format!("key/{:08}", index * level1 * 16 + flush + 1);
-                engine.put(key.as_bytes(), &value(index + flush)).unwrap();
-            }
-            engine.flush().unwrap();
+        engine.flush().unwrap();
+        while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
+            assert_eq!(report.kind, CompactionKind::Move, "{}", case.name);
         }
-        let stats = engine.stats();
-        assert_eq!(
-            (stats.level0_flushes as u64, stats.runs as u64),
-            (level0, inputs)
-        );
-        let baseline = LIVE.load(Ordering::Relaxed);
-        PEAK.store(baseline, Ordering::Relaxed);
-        let report = engine.compact(options, &mut workspace).unwrap().unwrap();
-        let peak = PEAK.load(Ordering::Relaxed) - baseline;
-        assert_eq!(report.kind, CompactionKind::Merge);
-        assert_eq!(report.inputs as u64, inputs);
-        let output = report.output_bytes + report.output_held_bytes;
-        let mib = |bytes: usize| bytes as f64 / (1 << 20) as f64;
-        println!(
-            "MERGE MEMORY | {} | {:.1} | {:.1} | {:.1} | {:?} | {:.1} | {:.1} | {:.1} |",
-            report.inputs,
-            mib(report.input_bytes + report.input_held_bytes),
-            mib(output),
-            mib(report.workspace_bytes),
-            report.stats.dictionary,
-            mib(peak),
-            mib(peak.saturating_sub(output)),
-            mib(workspace.context_bytes()),
-        );
-        assert!(
-            matches!(
-                report.stats.dictionary,
-                DictionaryChoice::Used { .. } | DictionaryChoice::NotBeneficial { .. }
-            ),
-            "{:?}",
-            report.stats.dictionary
-        );
-        // Within the workspace limit, and the Rust heap beside the output
-        // (whose buffers may double) within the estimate.
-        assert!(report.workspace_bytes <= options.max_workspace_bytes);
-        assert!(
-            peak <= 2 * output + report.workspace_bytes,
-            "peak {peak}, output {output}, estimate {}",
-            report.workspace_bytes
-        );
-        assert!(
-            workspace.context_bytes() <= report.inputs * (1 << 20),
-            "{}",
-            workspace.context_bytes()
-        );
+    }
+    if let Some(later) = case.recovered_as {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-compaction-memory-{}-{}",
+            std::process::id(),
+            case.name.replace(' ', "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
         engine.close().unwrap();
+        engine = Engine::recover(&dir, engine_options(later)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    // Level-0 flushes under two eighths of a run length of input are not
+    // split at level 1's boundaries, so that each spans the whole range and
+    // one job takes every run: the largest merge the limits admit.
+    // With records much larger than that, two small ones at the ends.
+    let (level0_keys, level0_value): (u64, fn(u64) -> Vec<u8>) = if keys < 100 {
+        (2, text)
+    } else {
+        (100, case.value)
+    };
+    let stride = level1 * keys * 16 / (level0_keys - 1);
+    for flush in 0..level0 {
+        for index in 0..level0_keys {
+            let key = format!("key/{:08}", index * stride + flush + 1);
+            engine
+                .put(key.as_bytes(), &level0_value(index + flush))
+                .unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    let runs = engine.stats().runs;
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+    let peak = PEAK.load(Ordering::Relaxed) - baseline;
+    assert_eq!(report.kind, CompactionKind::Merge, "{}", case.name);
+    assert_eq!(report.inputs, runs, "{}: one job of every run", case.name);
+    let output = report.output_bytes + report.output_held_bytes;
+    let mib = |bytes: usize| bytes as f64 / (1 << 20) as f64;
+    println!(
+        "MERGE MEMORY | {} | {} | {:.1} | {:.1} | {:.1} | {:?} | {:.1} | {:.1} | {:.1} |",
+        case.name,
+        report.inputs,
+        mib(report.input_bytes + report.input_held_bytes),
+        mib(output),
+        mib(report.workspace_bytes),
+        report.stats.dictionary,
+        mib(peak),
+        mib(peak.saturating_sub(output)),
+        mib(workspace.context_bytes()),
+    );
+    // Within the workspace limit, and the Rust heap beside the output
+    // (whose buffers may double) within the estimate.
+    assert!(report.workspace_bytes <= options.max_workspace_bytes);
+    assert!(
+        peak <= 2 * output + report.workspace_bytes,
+        "{}: peak {peak}, output {output}, estimate {}",
+        case.name,
+        report.workspace_bytes
+    );
+    // Native decompression contexts, outside the Rust heap: within the
+    // estimate's allowance of 1 MiB per input.
+    assert!(
+        workspace.context_bytes() <= report.inputs * (1 << 20),
+        "{}: {}",
+        case.name,
+        workspace.context_bytes()
+    );
+    engine.close().unwrap();
+}
+
+#[test]
+fn merges_stay_within_their_estimate_and_output() {
+    println!(
+        "MERGE MEMORY | case | inputs | input MiB | output MiB (stored + held) \
+         | workspace estimate MiB | dictionary | peak Rust heap above the baseline MiB \
+         | that minus the output MiB | native decompression contexts MiB |"
+    );
+    let large = |seed: u64| noise(seed, 512 << 10);
+    let cases = [
+        (
+            "dictionary, text",
+            Compression::ZstdDictionary,
+            None,
+            8,
+            2_400,
+            text as fn(u64) -> Vec<u8>,
+        ),
+        (
+            "dictionary, text",
+            Compression::ZstdDictionary,
+            None,
+            16,
+            2_400,
+            text,
+        ),
+        (
+            "dictionary, text",
+            Compression::ZstdDictionary,
+            None,
+            32,
+            2_400,
+            text,
+        ),
+        ("zstd, text", Compression::Zstd, None, 32, 2_400, text),
+        ("lz4, text", Compression::Lz4, None, 32, 2_400, text),
+        (
+            "uncompressed, text",
+            Compression::Uncompressed,
+            None,
+            32,
+            2_400,
+            text,
+        ),
+        (
+            "zstd, incompressible",
+            Compression::Zstd,
+            None,
+            32,
+            2_400,
+            |seed| noise(seed, 600),
+        ),
+        (
+            "dictionary, incompressible",
+            Compression::ZstdDictionary,
+            None,
+            32,
+            2_400,
+            |seed| noise(seed, 600),
+        ),
+        (
+            "lz4, incompressible",
+            Compression::Lz4,
+            None,
+            32,
+            2_400,
+            |seed| noise(seed, 600),
+        ),
+        (
+            "zstd, 512 KiB records",
+            Compression::Zstd,
+            None,
+            16,
+            3,
+            large,
+        ),
+        (
+            "zstd runs recovered as lz4",
+            Compression::Zstd,
+            Some(Compression::Lz4),
+            16,
+            2_400,
+            text,
+        ),
+        (
+            "dictionary runs recovered as uncompressed",
+            Compression::ZstdDictionary,
+            Some(Compression::Uncompressed),
+            16,
+            2_400,
+            text,
+        ),
+    ];
+    for (name, compression, recovered_as, inputs, keys, value) in cases {
+        measure(&Case {
+            name,
+            compression,
+            recovered_as,
+            inputs,
+            keys,
+            value,
+        });
     }
 }

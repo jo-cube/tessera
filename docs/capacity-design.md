@@ -1,7 +1,8 @@
-# Scalable capacity and range-local compaction (design 5AR–5AS, implemented 5AT)
+# Scalable capacity and range-local compaction (design 5AR–5AS, implemented 5AT–5AU)
 
-Status: implemented in 5AT without flush splitting; section 16 records
-what was built, how it differs from this design, and what was measured.
+Status: implemented in 5AT; 5AU added flush splitting, the level-0 wait
+and removed `disjoint_runs_above`. Section 16 records what 5AT built and
+measured, section 17 what 5AU changed and measured.
 Sections 1–3 are 5AR's analysis of the flat policy that 5AT replaced
 (kept for its measurements; the 64-run ceiling they describe no longer
 exists). Sections 4–15 are the design as 5AS validated and corrected it,
@@ -29,7 +30,8 @@ thousands of runs cheap) but the interaction of three rules:
    most one segment.
 2. The selector only merges a stack deeper than `max_overlap`, or, when
    nothing overlaps, neighbouring *tail* runs (shorter than a segment) once
-   there are more than `disjoint_runs_above` runs.
+   there are more than `disjoint_runs_above` runs (an option removed in
+   5AU).
 3. A flush is refused when it would publish more than `max_runs` (64) runs.
 
 Merging two full, key-disjoint runs produces two segments of output, cut
@@ -74,7 +76,7 @@ a larger limit.
 | `max_inputs`, `max_input_bytes`, `max_output_bytes` | 8, 256 MiB, 256 MiB | algorithmic safeguards that bound a job's temporary memory | unchanged; the selector must bound each job by its actual stored bytes: at the defaults, six segments fit only if they compress to under 43 MiB each (section 8) |
 | `max_workspace_bytes` | 64 MiB | physical resource (decoders, contexts, dictionary training) | unchanged |
 | `max_overlap` | 4 | algorithmic safeguard (read fan-in) | replaced by level 0's group limit |
-| `disjoint_runs_above` | 16 | flat-run artifact | replaced by the small-neighbour rule (section 4) |
+| `disjoint_runs_above` | 16 | flat-run artifact | replaced by the small-neighbour rule (section 4); removed in 5AU |
 | `SnapshotLimits::max_live`, `max_retained_bytes` | 16, 1 GiB | physical resource | unchanged; bound snapshot exposure |
 | Directory and run metadata | 8 B a run, 24 B a group, about 112 B of run structure (struct size, heap excluded) | bounded auxiliary overhead | uncharged, proportional to segments (section 7) |
 
@@ -539,8 +541,13 @@ reads, no new persistent state.
 - Deletes at `max_run_bytes` are refused like any write.
 - Checkpoints rewrite every live key; at tens of GiB that dominates writes.
 - Ascending inserts keep about two runs per segment.
-- Foreground flushes stall writers; nothing here prevents a flush worker
+- Foreground flushes stall writers, and since 5AU a writer at the level-0
+  stop also waits for the worker; nothing here prevents a flush worker
   (flush splitting tolerates stale boundaries).
+- With the background worker, level 0 runs at its stop under sustained
+  random writes, so writers stall for compaction (0.3–0.8 s per 200,000
+  writes here); WA is then at or below the synchronous figure (section
+  17).
 - Directory rebuild is linear under the write lock.
 
 ## 15. Implementation plan
@@ -562,8 +569,8 @@ Steps, and what must land together:
 5. **Resource admission**: level-0 stop; reserve; validation rule;
    `max_runs` as a valve; `max_inputs` default 32.
 6. **Retirement**: `select` and its quadratic stacks, `max_overlap` and
-   `disjoint_runs_above` (accepted and ignored for one release, then
-   removed).
+   `disjoint_runs_above` (accepted and ignored in 5AT, removed in 5AU
+   without an alias).
 
 Steps 1–4 and the level-0 stop and `max_runs` default of step 5 must land
 in one change: the old selector's outputs cannot keep levels disjoint, and
@@ -716,9 +723,273 @@ Ascending inserts keep about two runs per segment, as the model predicts.
 ### Not done in 5AT
 
 - Flush splitting, and a stall (rather than a refusal) at the level-0
-  stop. Flushes still run on the writer that needs room.
-- Removal of `disjoint_runs_above`, accepted and ignored.
+  stop (both done in 5AU). Flushes still run on the writer that needs room.
+- Removal of `disjoint_runs_above`, accepted and ignored (removed in 5AU).
 - Checkpoints still rewrite every live key.
 - No measurement beyond 200,000 writes at 64 KiB runs: nothing here
   verifies hundreds of millions of records.
 
+
+## 17. Stabilization (5AU)
+
+### Flush splitting (implemented)
+
+The policy is section 8's: a flush is cut before the first record whose
+key is at or after one of level 1's smallest keys, only when the piece so
+far holds at least `target_run_len / 8` of estimated input, at least as
+much remains, and the flushed segment has fewer than 8 pieces. Cuts fall
+between keys in byte order (empty keys and `0xFF` keys included); a record
+is never divided, so a record larger than a segment is one piece.
+
+The boundaries are copied under the state lock when the flush begins
+(`FlushCuts`), and the lock is released before encoding. A boundary that
+moves before publication cannot harm correctness: level 0 accepts any
+overlap, reads resolve by sequence number, and the publication path is the
+unsplit one. A stale boundary only makes a piece overlap two level-1 runs.
+No metadata is persisted: pieces are ordinary level-0 runs with one flush
+tag, and recovery places runs as before.
+
+The remaining-bytes estimate is exact for one memtable; for several it
+counts every version, so it may overestimate what remains after
+deduplication and let a cut leave a slightly short last piece.
+
+### Level-0 backpressure (implemented)
+
+A flush that would make level 0 hold more than its stop (12 flushes) is
+handled by cause:
+
+| Cause | What a writer sees |
+|---|---|
+| Temporary backlog, background worker running | waits, without the state lock, for the worker's pass; re-checks after each published step and resumes as soon as level 0 has room |
+| Snapshots retain too much (`Retained`) | trivial moves still run (they retain nothing); merges wait for snapshots; a flush that still finds level 0 full is refused (`FlushRefused`, `RunLimitError::background` = `Failed(Retained)`) |
+| Job cannot fit (`JobLimit`; `OutputLimit` if an output outgrows its estimate beyond the headroom, as a codec change can make it) | the pass fails; the waiting writer is woken and refused, `background` = `Failed(..)` naming the limit |
+| `max_runs` / `max_run_bytes` exhausted | refused without waiting (a stored non-level-0 refusal skips the wait); `background` is `None` |
+| Worker panicked or stopped | the waiter is woken (the worker notifies on exit) and refused, `background` = `Panicked(message)` |
+| Manual mode (no worker) | no stop; only the run limits refuse; `Engine::compact` makes room |
+
+The wait is one requested pass bounded by the worker's own progress: it
+ends when level 0 has room, the requested pass finishes, or the worker is
+no longer running. It is a condition-variable wait on the counters the
+worker already maintains, with no timeouts or polling. A refused level-0
+flush does not request another pass (the wait already did), so an
+impossible job runs at most once per refused flush. A stored level-0
+refusal is lifted as soon as level 0 has room, including after a move.
+
+The refusal carries its cause: `RunLimitError::background:
+Option<Box<BackgroundError>>`, set at the stop from the outcome of the
+pass the flush waited for, read under the worker's lock in the same step
+that ended the wait (`State::blocked`, cleared once level 0 has room). A
+stored refusal returned to a later write carries that write's own wait.
+`background_status` alone could not serve: its `last_failure` is the
+latest pass's, which a pass started by another request may already have
+replaced, so a caller could not tell a refusal that will repeat from one
+that will not. With the cause: `Failed(Retained)` lifts when snapshots are
+dropped, `Failed(JobLimit | OutputLimit)` only when limits change,
+`Panicked` never (only `Engine::compact` drains level 0), and `None` at the
+stop does not occur (a pass ends early only on a failure). `RunLimitError`
+and `UpdateError` are no longer `Copy` (the cause holds a
+`CompactionError`, boxed because a `CompactionError` can hold a
+`RunLimitError`).
+
+### Level priority and the job budget (implemented)
+
+Two corrections to selection, both found by attributing the background
+measurement below:
+
+- **Level 0 is scored 1 once due**, however many flushes it holds, so any
+  deeper level over its target goes first. Scored by its flushes (up to
+  12/4 = 3), a level-0 backlog let level 1 reach about three times its
+  target before a level-1 job outranked level 0; each level-0 job, held to
+  the byte budget, then took about one level-0 run with four or five
+  level-1 runs. Synchronous compaction never lets level 0 pass its
+  trigger, so its order is unchanged (its measurements were identical).
+- **A job is formed only within 31/32 of `max_output_bytes`**
+  (`OUTPUT_HEADROOM`). A merge's output, stored bytes and filters, can
+  exceed its inputs' (up to 1,022 B a job measured, mostly filter and
+  footer bytes of more output runs). A job admitted with its inputs at
+  the limit then failed with `OutputLimit` before publishing, and the next
+  selection, which reads the same state, chose it again: at the level-0
+  stop, flushes were refused for good.
+  `a_merge_at_the_byte_limits_is_not_admitted_to_overflow` reproduces it
+  deterministically without the headroom (a 29,581-byte merge refused at a
+  29,581-byte limit, three times in a row) and passes with it. The headroom
+  is empirical, not a proof: a change of codec or dictionary between input
+  and output grows output by far more (merge memory, below).
+- **A source whose job outgrew the output limit gets a smaller allowance.**
+  `max_output_bytes` limits all of one job's output runs together, so
+  cutting the output into more runs cannot help; a smaller job can, and
+  level 0 and every deeper level accept a job that takes fewer runs or
+  splits its source at the boundaries below (the existing split, which
+  keeps versions of a key together and levels disjoint). After such a
+  failure, `Levels::outgrown` records the job's source (by weak
+  reference, dropped once the run is retired) with half the job's input
+  bytes as the most a job from it may take. Selection applies it to that
+  source only: fewer joined runs, a split, or, once even the source with
+  one run below exceeds it, a refusal before anything is read, reported
+  as `OutputLimit` with the output that crossed the limit. Each failure
+  halves the allowance, so a source fails at most about log2(limit / its
+  size) times; a refusal at selection lets the other levels proceed in
+  the same pass, where a failed build ends the pass. A single record
+  whose output alone exceeds the limit (possible only across a codec
+  change, since output keeps one version a key) is refused this way, for
+  good, until the limit is raised.
+  `output_growth_past_the_headroom_does_not_repeat_a_job` (Zstandard runs
+  recovered uncompressed, limits at their minimum of two runs): without
+  the allowance the same job failed 9,971 times in a row with 29 steps
+  done; with it, 21 merges failed in all, 1,195 steps published, and
+  compaction settled on a selection-time refusal with every record
+  intact.
+
+### Removed configuration
+
+`CompactionOptions::disjoint_runs_above` is removed (no alias). The flat
+selector survives only as a test reference with its old threshold. The
+other limits stay: `max_overlap` is level 0's trigger; `max_inputs`,
+`max_input_bytes`, `max_output_bytes`, `max_workspace_bytes`, `max_runs`,
+`max_run_bytes` and the snapshot limits bound resources.
+
+### Merge memory (measured)
+
+`merges_stay_within_their_estimate_and_output` (release, 64 KiB blocks,
+2 MiB segments, level-0 flushes small enough not to split). Peak Rust heap
+during a level-0 merge, and native decoder contexts counted separately:
+
+| Case | Inputs | Estimate MiB | Peak heap MiB | Peak − output MiB | Native contexts MiB |
+|---|---|---|---|---|---|
+| dictionary, text | 32 | 56.2 | 7.7 | 2.3 | 2.9 |
+| zstd, text | 32 | 35.1 | 7.7 | 2.3 | 2.9 |
+| lz4, text | 32 | 35.1 | 16.0 | 2.3 | 0 |
+| uncompressed, text | 32 | 35.1 | 31.3 | 1.1 | 0 |
+| zstd, incompressible | 32 | 35.1 | 32.4 | 2.4 | 2.9 |
+| dictionary, incompressible | 32 | 56.2 | 32.4 | 2.4 | 2.9 |
+| lz4, incompressible | 32 | 35.1 | 32.6 | 2.5 | 0 |
+| zstd, 512 KiB records | 16 | 22.0 | 17.5 | 5.5 | 1.5 |
+| zstd recovered as lz4 | 14 | 16.0 | 6.6 | 1.3 | 0.5 |
+| dictionary recovered as uncompressed | 14 | 16.0 | 12.2 | 0.5 | 0.5 |
+
+Working memory beside the output stays within the estimate in every case;
+the output itself is bounded by `max_output_bytes`, not the workspace.
+This holds at 64 KiB blocks for these record sizes; it is not a bound for
+other block sizes or for records larger than a block, which the estimate
+charges separately.
+
+### Paired measurement (measured, reduced scale)
+
+`split_flushes_compared` (ignored test; 200,000 writes, 64 KiB segments,
+`max_input_bytes = max_output_bytes = 4` segments, release, 2 CPUs).
+"Unsplit" and "Split" compact synchronously to idle after every flush;
+"Background" uses the worker and the level-0 wait, then drains with
+`wait_for_compaction`. Every policy sees the same seeded history, codec
+and limits; WA is (flushed + compaction output bytes) / flushed bytes for
+all three, counted from each step's report. "Before" is 5AU without the
+two corrections above; "after" is with them (one run each; three runs of
+the background rows after vary by at most 4%).
+
+| Workload | Values | Unsplit before / after | Split before / after | Background before / after |
+|---|---|---|---|---|
+| ascending | both | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 / 1.00 |
+| uniform insert | text | 11.42 / 11.42 | 11.11 / 11.11 | 11.40 / 8.31 |
+| uniform insert | incompressible | 24.37 / 24.74 | 16.28 / 16.79 | 45.15 / 14.82 |
+| uniform overwrite | text | 7.37 / 7.37 | 7.11 / 7.11 | 7.84 / 5.78 |
+| uniform overwrite | incompressible | 14.76 / 14.81 | 8.02 / 8.22 | 20.40 / 7.08 |
+| hot range | text | 1.68 / 1.68 | 1.68 / 1.68 | 1.68 / 1.68 |
+| hot range | incompressible | 1.67 / 1.67 | 1.66 / 1.66 | 1.67 / 1.67 |
+| mixed with deletes | text | 9.05 / 9.25 | 8.80 / 8.88 | 12.92 / 6.85 |
+| mixed with deletes | incompressible | 20.98 / 21.03 | 13.32 / 13.65 | 39.25 / 12.37 |
+
+The synchronous "after" figures rise by up to 3% (incompressible values),
+the cost of the headroom: jobs are at most 31/32 as large.
+
+Background attribution (step log, uniform insert, incompressible):
+
+| | Before | After |
+|---|---|---|
+| Level-0 merges | 4,375 | 931 |
+| Level-0 / level-1 inputs per level-0 merge | 1.2 / 4.8 | 2.9 / 4.6 |
+| Level-1 bytes rewritten per level-0 byte | 37.3 | 7.1 |
+| Level 1 when a level-0 merge starts | 1,557 KiB | 651 KiB |
+| Level-0 flushes when a level-0 merge starts | 11.9 | 11.6 |
+| Level-0 merges leaving overlapping level-0 runs out (budget-bound) | 100% | 99% |
+| Operating endpoint (before the drain): WA, levels (runs:KiB) | 43.72; 47:350/59:2001/165:7981/210:11163 | 14.72; 29:291/7:241/22:992/82:4064/300:15903 |
+| Drained endpoint WA | 45.15 | 14.82 |
+| Writer waits at the stop (total) | 675 (2.81 s) | 418 (0.83 s) |
+| Foreground time | 2.94 s | 0.96 s |
+
+Synchronous Split, for comparison: 2.3 / 4.2 inputs, 8.2 level-1 bytes per
+level-0 byte, level 1 at 611 KiB. Before the correction the operating
+endpoint was not representative: data sat in level 0 and an oversized
+level 1, one level shallower than after draining. After it, the two
+endpoints differ by under 3% WA in every workload.
+
+Other measured columns:
+
+- Pieces per flush (synchronous Split): mean 2.7–4.1, max 5; unsplit 2 (a
+  memtable spans two segments here). Ascending inserts are never split.
+- Merge-time splits with incompressible values, Unsplit → Split: 637 →
+  379 (uniform insert), 582 → 36 (overwrite), 584 → 264 (mixed).
+- Level 0: at most 4 flushes synchronously; 12 in background random
+  workloads (the stop), 4 for hot ranges and 3 for ascending inserts.
+- Space amplification: unchanged by either correction (1.00–1.39).
+- Short prefix scans, Split vs Unsplit, uniform insert of text: 36 → 56 µs
+  at the benchmark's endpoint, identical over three runs (deterministic):
+  3.25 → 5.95 blocks per scan, 4 → 7 directory groups, because Unsplit
+  ends just after a level-0 merge emptied level 0 and Split ends with
+  three flushes' pieces there. Range-local level-0 jobs stop once level 0
+  is below its trigger, leaving pieces of other flushes behind, so split
+  level 0 sits nearer its trigger. Measured over the next four flush
+  phases instead (new random keys, compacted after each): 36.3 → 42.1 µs
+  and 3.27 → 3.82 blocks per scan on average; equal for overwrites and
+  hot ranges, 3–13% faster for mixed deletes. A read cost of up to about
+  16% on short scans against the WA reduction above; splitting is
+  unchanged.
+- Point reads (after): within ±5% across policies, except mixed deletes
+  with incompressible values (1.40–1.64 µs). Short prefix scans: Split vs
+  Unsplit 36 → 56 µs for uniform inserts of text (more level-0 runs at
+  the end), elsewhere within noise (a hot-range gain in one run, 22 → 13
+  µs, did not recur); background after differs from
+  synchronous Split by −28% to +59% (3–56 µs). Long scans within ±10%.
+  One run each: timing noise of this size is not separated.
+- Compaction CPU tracks WA; whole-run flush time is 0.08–0.11 s for every
+  policy, so the cost of cutting flushes is not separable at this scale.
+
+### The unexplained refusal
+
+One 5AU run of the background policy ended with a refused final flush
+(`level0_flushes 13 > 12`); the run counted earlier write refusals without
+printing them, and had no step log. The cause was not observed directly.
+What the protocol allows: the waiting flush holds only the flush guard,
+flushes are serialized, and the worker only lowers level 0's flush count,
+so 13 at publication means the wait ended with level 0 at 12, which needs
+a pass that ended without room. A pass ends early only on a failure (level
+0 at its stop is always due), and in that configuration the only failure
+found possible is the output-limit admission defect above: `JobLimit`
+cannot arise (two segments fit four), `Retained` needs snapshots, `Stale`
+publication needs a second compactor. The background policy then formed
+10–36 jobs per run within 1 KiB of the limit, and the deterministic test
+shows such a job failing repeatedly. That is a supported hypothesis, not
+an observation: 4 more full runs, 8 runs of that configuration and 30
+runs under CPU contention with the step log (errors and failed waits
+recorded) did not reproduce the refusal, and in the measured runs no job
+within 1 KiB of the limit grew. Ruled out by construction and test: lost
+wakeups (the wait re-reads progress and level 0 after every step under
+the worker's lock), waits holding locks the worker needs, and stranded
+waiters at shutdown or panic (`a_worker_panic_ends_a_wait_for_level_0`).
+
+### Against the model (derived)
+
+The model (section 8) predicted splitting is negligible for compressible
+values and helps where a job budget binds (8.9 vs 15.4). The engine agrees
+in direction: text changes by 0.1–0.3 WA, incompressible values by 6–8.
+The engine's incompressible WA is higher than the model's in both
+policies. The model compacts synchronously and has no backlog, so it could
+not show the level-0 priority defect.
+
+### Not done in 5AU
+
+- Asynchronous flushing: flushes still run on the writer.
+- The refusal in one early run is explained by a demonstrated defect, not
+  observed (above).
+- No bound on output growth across a change of codec or dictionary: such
+  merges fail at the output limit a bounded number of times per source,
+  then are refused at selection until the limit is raised.
+- No measurement beyond 200,000 writes at 64 KiB segments.

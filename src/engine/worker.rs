@@ -49,7 +49,8 @@ pub enum BackgroundError {
     /// The worker panicked and has stopped for good, with this message.
     Panicked(String),
     /// The pass waited for ended on this failure. Nothing is retried until
-    /// the next flush, refused flush, limit change or wait.
+    /// the next flush, write waiting at the level-0 stop, refusal at a run
+    /// limit, limit change or wait.
     Failed(CompactionError),
 }
 
@@ -115,6 +116,59 @@ impl Signal {
     #[cfg(test)]
     pub(super) fn stop_requested(&self) -> bool {
         self.lock().stop
+    }
+
+    /// Requests a pass and waits until `room` holds, a pass started after
+    /// the request has finished, or the worker has stopped, returning
+    /// `room`'s last answer. `room` is asked first, after every step the
+    /// worker publishes, and once more after the pass, each time without
+    /// this signal's lock, so it may take the engine's: a step published
+    /// between two answers is seen by the next, never missed.
+    ///
+    /// Without room at the end, the error is why, read with the end it
+    /// explains: the worker's panic, or the failure of the pass that
+    /// ended the wait. A pass that ended with nothing due leaves `Ok(false)`.
+    pub(super) fn wait_for(&self, mut room: impl FnMut() -> bool) -> Result<bool, BackgroundError> {
+        let ended = |progress: &Progress| match &progress.status.panic {
+            _ if progress.status.running => progress
+                .status
+                .last_failure
+                .clone()
+                .map(BackgroundError::Failed),
+            Some(message) => Some(BackgroundError::Panicked(message.clone())),
+            None => Some(BackgroundError::Panicked(String::new())),
+        };
+        let stopped = {
+            let progress = self.lock();
+            (!progress.status.running)
+                .then(|| ended(&progress))
+                .flatten()
+        };
+        if let Some(error) = stopped {
+            return if room() { Ok(true) } else { Err(error) };
+        }
+        let target = self.request();
+        loop {
+            let (steps, over) = {
+                let progress = self.lock();
+                let over = (!progress.status.running || progress.finished >= target)
+                    .then(|| ended(&progress));
+                (progress.status.compactions, over)
+            };
+            if room() {
+                return Ok(true);
+            }
+            if let Some(ended) = over {
+                return ended.map_or(Ok(false), Err);
+            }
+            let mut progress = self.lock();
+            while progress.status.running
+                && progress.finished < target
+                && progress.status.compactions == steps
+            {
+                progress = self.wait_on(progress);
+            }
+        }
     }
 
     /// Requests a pass and waits until one started after the request has
@@ -251,6 +305,8 @@ fn pass(
         progress.status.compactions += 1;
         progress.status.input_bytes += report.input_bytes as u64;
         progress.status.output_bytes += report.output_bytes as u64;
+        // A writer waiting for level 0 checks again after every step.
+        signal.changed.notify_all();
     }
     Ok(())
 }
