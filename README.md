@@ -399,6 +399,8 @@ it.
   reduced-scale measurements with default settings it came after roughly 60
   run lengths of written data (`docs/benchmarks.md`). The run directory makes
   reading many runs cheaper; it does not change these limits.
+  `docs/capacity-design.md` is the planned design that removes the run
+  count ceiling (not implemented).
 - The dataset must fit in memory: there is no disk tiering.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.

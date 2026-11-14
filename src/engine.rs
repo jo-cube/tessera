@@ -387,6 +387,8 @@ mod wal;
 mod worker;
 
 #[cfg(test)]
+mod capacity_tests;
+#[cfg(test)]
 mod directory_tests;
 #[cfg(test)]
 mod staged_tests;

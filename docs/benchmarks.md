@@ -4163,6 +4163,49 @@ scripts/validate.sh exec 3500 env DIRECTORY_SCALE=400 cargo test --locked --rele
   --skip concatenating --skip snapshot_reads --skip run_limit
 ```
 
+## Capacity and compaction organization (5AR)
+
+Research for `docs/capacity-design.md`, in `src/engine/capacity_tests.rs`
+(ignored tests, release build, bounded container). Reduced scale: 64 KiB
+memtables and runs, compaction byte limits scaled to four run lengths, no
+run limit, compaction run to completion after every flush.
+
+The current policy without a run limit (`write_amplification_without_a_run_limit`,
+`CAPACITY_WRITES=200`, peak 525 MiB):
+
+| History | Write amplification | Compactions | Runs | One selection |
+|---|---|---|---|---|
+| Ascending inserts | 2.91 | 720 | 400 | 363 µs |
+| Uniform inserts | 42.65 | 3,714 | 404 | 531 µs |
+| Uniform updates | 26.66 | 2,633 | 210 | 140 µs |
+
+A simulation of whole runs as key intervals with piecewise-uniform density,
+driving the production `select`, reproduces these within 6% (2.90, 44.84,
+26.88; jobs 727, 3,919, 2,671; selection 141 µs against 140 µs), and then
+projects the policies to 6,400 run lengths (`policies_as_the_database_grows`,
+`MODEL_RUNS=6400`, peak 481 MiB, 113 s); the table is in the design
+document. In short: the current policy's WA grows linearly (uniform updates
+21 → 122 from 100 to 800 run lengths), leveling's logarithmically (ratio 4
+with split flushes: 5.1 → 9.8 for updates, 6.1 → 13.1 for inserts, 1.0 for
+ascending keys, largest job 6 run lengths).
+
+Directory and selection at thousands of runs
+(`metadata_and_selection_at_thousands_of_runs`, tiny two-record runs, one
+disjoint level or four levels sized 1 : 4 : 16 : 64):
+
+| Runs | Levels | Directory build | Directory bytes | Present lookup | Missing lookup | `select` |
+|---|---|---|---|---|---|---|
+| 1,024 | 1 / 4 | 35 / 44 µs | 8.2 KiB | 182 / 244 ns | 91 / 275 ns | 2.5 / 2.6 ms |
+| 4,096 | 1 / 4 | 60 / 170 µs | 32 KiB | 199 / 311 ns | 111 / 428 ns | 41 / 41 ms |
+| 16,384 | 1 / 4 | 269 / 716 µs | 128 KiB | 331 / 427 ns | 221 / 718 ns | 665 / 680 ms |
+| 65,536 | 1 / 4 | 2.1 / 4.0 ms | 512 KiB | 712 / 805 ns | 458 / 1,249 ns | not run |
+
+`a_range_local_replacement_leaves_other_runs_shared` (not ignored) checks on
+the production job that a compaction of one update and the runs a binary
+search finds under it leaves every other run the same shared run, keeps a
+snapshot's view, and counts the replaced runs as retained until the snapshot
+is dropped.
+
 ## Historical results
 
 Everything below was measured with the former suite, `examples/block_bench.rs`
