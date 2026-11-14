@@ -121,6 +121,7 @@ mod compact;
 mod dictionary;
 mod filter;
 mod frame;
+mod group;
 mod logical;
 mod merge;
 mod reader;
@@ -141,10 +142,13 @@ pub use dictionary::{
     DICTIONARY_LEN, DICTIONARY_WORKSPACE, DictionaryChoice, MIN_DICTIONARY_INPUT,
     MIN_SAVING_PERCENT,
 };
+pub(crate) use group::RunList;
+#[cfg(test)]
 pub(crate) use logical::latest_in;
 pub use logical::{
     ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError,
 };
+pub(crate) use logical::{LookupSource, latest_from};
 pub use merge::{MergeCursor, MergeWorkspace};
 pub use reader::{Run, RunView};
 

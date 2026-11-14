@@ -707,7 +707,12 @@ fn write_runs(
         dictionary: DictionaryChoice::Off,
     };
     let trained = if core.dictionary {
-        let views: Vec<RunView<'_>> = snapshot.runs.iter().map(|run| run.run.view()).collect();
+        let views: Vec<RunView<'_>> = snapshot
+            .runs
+            .runs()
+            .iter()
+            .map(|run| run.run.view())
+            .collect();
         let choice = choose_dictionary(&views, core.target_block_len, DICTIONARY_WORKSPACE)
             .map_err(|error| CheckpointError::Read(ReadError::Corrupt(error)))?;
         written.dictionary = choice.outcome;

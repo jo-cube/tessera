@@ -21,9 +21,11 @@
 //!   overlap the first's. In the overlapping layout both phases write in a
 //!   fixed permutation, so every run spans the whole key space and only the
 //!   filters and sequence bounds separate them.
-//! - Probes are generated before timing. Each figure is the median, over
+//! - Probes are generated before timing. The mean is the median, over
 //!   batches of 500 probes, of the mean time per probe in a batch. Timing a
-//!   batch keeps the clock's own cost out of sub-microsecond figures.
+//!   batch keeps the clock's own cost out of sub-microsecond figures. The
+//!   p50 and p99 time each probe on its own, once, so they include the
+//!   clock's cost and resolution.
 //! - The workspace is warmed with one pass over every probe class before
 //!   anything is timed or counted. Rust heap allocations are counted during
 //!   the timed batches only.
@@ -294,7 +296,7 @@ fn run_counts() -> Vec<u64> {
         .map(|arg| arg.parse().expect("a run count"))
         .collect();
     if given.is_empty() {
-        vec![4, 64, 256, 2048]
+        vec![4, 64, 256, 1024, 2048]
     } else {
         given
     }
@@ -317,6 +319,20 @@ fn time(batches: usize, per_batch: usize, mut call: impl FnMut(usize)) -> (f64, 
     (median(means), allocations)
 }
 
+/// Times each of `calls` calls of `call` on its own and returns the p50 and
+/// p99 in nanoseconds. The clock's resolution limits sub-microsecond figures.
+fn percentiles(calls: usize, mut call: impl FnMut(usize)) -> (f64, f64) {
+    let mut samples = Vec::with_capacity(calls);
+    for index in 0..calls {
+        let start = Instant::now();
+        call(index);
+        samples.push(start.elapsed().as_nanos() as f64);
+    }
+    samples.sort_by(f64::total_cmp);
+    let at = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];
+    (at(0.5), at(0.99))
+}
+
 /// Runs `pass` on a fresh workspace and returns it with the memory the pass
 /// left it holding, in KiB: decoded blocks, Rust heap and native memory.
 fn measured(pass: impl FnOnce(&mut EngineWorkspace)) -> (EngineWorkspace, [i64; 3]) {
@@ -331,7 +347,7 @@ fn measured(pass: impl FnOnce(&mut EngineWorkspace)) -> (EngineWorkspace, [i64; 
 
 fn lookups_mode() {
     println!(
-        "| layout | runs | present ns | overwritten ns | deleted ns | missing ns | allocations per lookup | snapshot ns | allocations per snapshot | decoded KiB | heap KiB | native KiB |"
+        "| layout | runs | present ns mean / p50 / p99 | overwritten | deleted | missing | allocations per lookup | snapshot ns | allocations per snapshot | decoded KiB | heap KiB | native KiB |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     let classes = probes(7);
@@ -350,9 +366,17 @@ fn lookups_mode() {
                 }
             });
 
-            let mut times = [0.0; 4];
+            let mut times = [(0.0, 0.0, 0.0); 4];
             let mut lookup_allocations = 0.0;
             for (class, time_ns) in classes.iter().zip(&mut times) {
+                let (p50, p99) = percentiles(class.keys.len(), |index| {
+                    black_box(
+                        engine
+                            .get(&class.keys[index], &mut workspace)
+                            .unwrap()
+                            .is_some(),
+                    );
+                });
                 let (ns, allocations) = time(BATCHES, BATCH, |index| {
                     black_box(
                         engine
@@ -361,7 +385,7 @@ fn lookups_mode() {
                             .is_some(),
                     );
                 });
-                *time_ns = ns;
+                *time_ns = (ns, p50, p99);
                 lookup_allocations += allocations / classes.len() as f64;
             }
             let (snapshot_ns, snapshot_allocations) = time(BATCHES, BATCH, |_| {
@@ -369,12 +393,12 @@ fn lookups_mode() {
             });
 
             println!(
-                "| {} | {runs} | {:.0} | {:.0} | {:.0} | {:.0} | {lookup_allocations} | {snapshot_ns:.0} | {snapshot_allocations} | {} | {} | {} |",
+                "| {} | {runs} | {} | {} | {} | {} | {lookup_allocations} | {snapshot_ns:.0} | {snapshot_allocations} | {} | {} | {} |",
                 shape.name(),
-                times[0],
-                times[1],
-                times[2],
-                times[3],
+                triple(times[0]),
+                triple(times[1]),
+                triple(times[2]),
+                triple(times[3]),
                 memory[0],
                 memory[1],
                 memory[2],
@@ -382,6 +406,10 @@ fn lookups_mode() {
             engine.close().unwrap();
         }
     }
+}
+
+fn triple((mean, p50, p99): (f64, f64, f64)) -> String {
+    format!("{mean:.0} / {p50:.0} / {p99:.0}")
 }
 
 fn scans_mode() {

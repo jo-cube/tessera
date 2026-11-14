@@ -1,8 +1,10 @@
 use std::fmt;
+use std::ops::Range;
 
 use crate::block::Value;
 
 use super::CorruptRun;
+use super::group::RunList;
 use super::merge::{MergeCursor, MergeWorkspace};
 use super::reader::{Found, LookupWorkspace, Run, RunView};
 
@@ -210,12 +212,29 @@ where
     I: IntoIterator<Item: LookupInput<'a>>,
     'a: 'r,
 {
+    latest_from(InOrder(runs.into_iter().enumerate()), key, workspace)
+}
+
+/// [`latest_in`] over the runs `source` offers, each with its position, which
+/// a conflict reports. The source is told the sequence number of the newest
+/// version found so far, and may stop offering runs once none it has left can
+/// hold a version at or above it; one that does can still be checked for a
+/// conflicting copy.
+pub(crate) fn latest_from<'a, 'r, S>(
+    mut source: S,
+    key: &[u8],
+    workspace: &'r mut LogicalWorkspace,
+) -> Result<Option<LiveValue<'r>>, ReadError>
+where
+    S: LookupSource<'a>,
+    'a: 'r,
+{
     let lookup = &mut workspace.lookup;
     let mut newest = None;
     let mut hash = None;
     // Held until every run is read: a later run may supersede both copies.
     let mut disagreement = None;
-    for (input, run) in runs.into_iter().enumerate() {
+    while let Some((input, run)) = source.next_run(key, newest.map(|(_, seq, _)| seq)) {
         if newest.is_some_and(|(_, seq, _)| run.max_seq() < seq) {
             continue;
         }
@@ -250,6 +269,33 @@ where
             Value::Tombstone => None,
         }),
     )
+}
+
+/// The runs a lookup reads, offered one at a time.
+pub(crate) trait LookupSource<'a> {
+    type Run: LookupInput<'a>;
+
+    /// Returns the next run that may hold a version of `key`, with its
+    /// position, or `None` when none is left. With `floor`, the sequence
+    /// number of the newest version found, a source may end early once every
+    /// run it has left holds only older versions; it must still offer a run
+    /// that may hold a version with exactly that sequence number.
+    fn next_run(&mut self, key: &[u8], floor: Option<u64>) -> Option<(usize, Self::Run)>;
+}
+
+/// Every run, in the order given; positions count from 0.
+struct InOrder<I>(I);
+
+impl<'a, R, I> LookupSource<'a> for InOrder<I>
+where
+    R: LookupInput<'a>,
+    I: Iterator<Item = (usize, R)>,
+{
+    type Run = R;
+
+    fn next_run(&mut self, _: &[u8], _: Option<u64>) -> Option<(usize, R)> {
+        self.0.next()
+    }
 }
 
 /// A run as [`latest_in`] reads it: what rules it out without opening it,
@@ -320,8 +366,27 @@ impl<'r> LogicalCursor<'r> {
         I::IntoIter: ExactSizeIterator,
     {
         let LogicalWorkspace { merge, key, .. } = workspace;
+        Self::merging(MergeCursor::new(runs, merge), key)
+    }
+
+    /// Creates a cursor over groups of key-disjoint runs, as
+    /// [`MergeCursor::grouped`] reads them: one decoding buffer per group.
+    pub(crate) fn grouped<I>(
+        runs: &'r dyn RunList,
+        groups: I,
+        workspace: &'r mut LogicalWorkspace,
+    ) -> Self
+    where
+        I: IntoIterator<Item = Range<usize>>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let LogicalWorkspace { merge, key, .. } = workspace;
+        Self::merging(MergeCursor::grouped(runs, groups, merge), key)
+    }
+
+    fn merging(merge: MergeCursor<'r>, key: &'r mut Vec<u8>) -> Self {
         Self {
-            merge: MergeCursor::new(runs, merge),
+            merge,
             key,
             has_key: false,
             failure: None,

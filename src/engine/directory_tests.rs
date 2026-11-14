@@ -1,11 +1,13 @@
-//! Research (5AP): could the published runs be indexed as groups of mutually
-//! disjoint key ranges, without changing how runs are built or compacted?
+//! Research (5AP, extended in 5AQ): the published runs indexed as groups of
+//! mutually disjoint key ranges.
 //!
-//! Everything here is experimental and test-only. The engine's lookup path,
-//! publication and compaction are unchanged: the directory is built beside
-//! them from the published lookup order, and its lookups are compared with
-//! the engine's own (`latest_in` over every run, as `Engine::get` reads the
-//! runs) on the same runs, in the same process, alternating.
+//! Everything here is test-only. Each measured state is read through the
+//! production directory (`super::directory`) and through the flat lookup the
+//! engine used before 5AQ (`latest_in` over every run, newest bound first),
+//! and scanned through the grouped merge and through the merge of every run
+//! as its own input, on the same runs, in the same process, alternating, with
+//! their results asserted equal. Grouping itself is tested deterministically
+//! in `super::directory`.
 //!
 //! The tests are ignored. Run them with a release build:
 //!
@@ -20,161 +22,20 @@
 
 use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::*;
-use crate::run::{CorruptRun, KeyRange, LookupInput, ReadWorkspace, RunBuilder, RunCursor};
+use crate::run::{KeyRange, LookupInput, LookupSource, latest_in};
 
-// The directory.
-
-/// One run as the directory holds it: its key range, sequence bound and run,
-/// all borrowed from the published run.
-#[derive(Clone, Copy)]
-struct Entry<'a> {
-    min: &'a [u8],
-    max: &'a [u8],
-    max_seq: u64,
-    run: &'a Run<Vec<u8>>,
+/// The runs newest bound first: the flat lookup order before 5AQ.
+pub(super) fn flat_order(runs: &[SharedRun]) -> Vec<SharedRun> {
+    let mut order = runs.to_vec();
+    order.sort_by_key(|run| Reverse(run.run.max_seq()));
+    order
 }
 
-/// Runs whose inclusive key ranges are pairwise disjoint, in key order.
-struct Group<'a> {
-    entries: Vec<Entry<'a>>,
-    /// The largest sequence bound of any member.
-    max_seq: u64,
-}
-
-/// The published runs partitioned into groups, ordered by their sequence
-/// bounds, largest first.
-struct Directory<'a> {
-    groups: Vec<Group<'a>>,
-    /// Peak temporary bytes the build held: its sort order and heap.
-    build_bytes: usize,
-}
-
-/// Whether a run starting at `min` may follow one ending at `last` in a
-/// group. Ranges include both bounds, so equal endpoints overlap; `touching`
-/// admits them, for measuring what that would save, never for lookups.
-fn follows(last: &[u8], min: &[u8], touching: bool) -> bool {
-    if touching { last <= min } else { last < min }
-}
-
-impl<'a> Directory<'a> {
-    /// Interval partitioning: runs in order of their smallest key (then
-    /// largest key, then position), each into the group whose last run ends
-    /// earliest if it ends before the run starts, else into a new group. This
-    /// is deterministic and uses the fewest groups possible, which is the
-    /// deepest overlap.
-    fn build(runs: &'a [SharedRun], touching: bool) -> Self {
-        let entries: Vec<Entry<'a>> = runs
-            .iter()
-            .map(|published| {
-                let range = published.run.key_range().expect(NOT_EMPTY);
-                Entry {
-                    min: range.min,
-                    max: range.max,
-                    max_seq: published.run.max_seq(),
-                    run: &published.run,
-                }
-            })
-            .collect();
-        let mut order: Vec<usize> = (0..entries.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (x, y) = (&entries[a], &entries[b]);
-            (x.min, x.max, a).cmp(&(y.min, y.max, b))
-        });
-        let mut ends: BinaryHeap<Reverse<(&[u8], usize)>> = BinaryHeap::new();
-        let mut groups: Vec<Group<'a>> = Vec::new();
-        for &index in &order {
-            let entry = entries[index];
-            let group = match ends.peek() {
-                Some(&Reverse((last, group))) if follows(last, entry.min, touching) => {
-                    ends.pop();
-                    group
-                }
-                _ => {
-                    groups.push(Group {
-                        entries: Vec::new(),
-                        max_seq: 0,
-                    });
-                    groups.len() - 1
-                }
-            };
-            groups[group].entries.push(entry);
-            groups[group].max_seq = groups[group].max_seq.max(entry.max_seq);
-            ends.push(Reverse((entry.max, group)));
-        }
-        let build_bytes = entries.capacity() * size_of::<Entry<'_>>()
-            + order.capacity() * size_of::<usize>()
-            + ends.capacity() * size_of::<Reverse<(&[u8], usize)>>();
-        for group in &mut groups {
-            group.entries.shrink_to_fit();
-        }
-        groups.sort_by_key(|group| (Reverse(group.max_seq), group.entries[0].min));
-        Self {
-            groups,
-            build_bytes,
-        }
-    }
-
-    /// The bytes the directory keeps: groups and entries, not the runs.
-    fn bytes(&self) -> usize {
-        self.groups.capacity() * size_of::<Group<'_>>()
-            + self
-                .groups
-                .iter()
-                .map(|group| group.entries.capacity() * size_of::<Entry<'_>>())
-                .sum::<usize>()
-    }
-
-    /// Collects the run of each group whose range holds `key`, at most one a
-    /// group, as (sequence bound, group, position). `exact` orders them by
-    /// their own sequence bounds, as the engine visits runs; otherwise they
-    /// stay in group order, which is by the groups' coarser bounds.
-    fn candidates(&self, key: &[u8], exact: bool, out: &mut Vec<(u64, u32, u32)>) {
-        out.clear();
-        for (index, group) in self.groups.iter().enumerate() {
-            let position = group.entries.partition_point(|entry| entry.max < key);
-            if let Some(entry) = group.entries.get(position)
-                && entry.min <= key
-            {
-                out.push((entry.max_seq, index as u32, position as u32));
-            }
-        }
-        if exact {
-            out.sort_unstable_by_key(|&(max_seq, ..)| Reverse(max_seq));
-        }
-    }
-
-    fn entry(&self, (_, group, position): (u64, u32, u32)) -> Entry<'a> {
-        self.groups[group as usize].entries[position as usize]
-    }
-
-    /// Point lookup through the directory: the candidates, read by the
-    /// engine's own lookup routine.
-    fn get<'r>(
-        &self,
-        key: &[u8],
-        exact: bool,
-        candidates: &mut Vec<(u64, u32, u32)>,
-        logical: &'r mut LogicalWorkspace,
-    ) -> Result<Option<LiveValue<'r>>, ReadError>
-    where
-        'a: 'r,
-    {
-        self.candidates(key, exact, candidates);
-        latest_in(
-            candidates
-                .iter()
-                .map(|&candidate| self.entry(candidate).run),
-            key,
-            logical,
-        )
-    }
-}
-
-/// The engine's lookup over the runs, without the memtables.
+/// The flat lookup over the runs, without the memtables.
 fn flat_get<'a, 'r>(
     runs: &'a [SharedRun],
     key: &[u8],
@@ -412,52 +273,6 @@ fn touching_pairs(runs: &[SharedRun]) -> usize {
         .sum()
 }
 
-/// Checks the directory against brute force: every run in exactly one group,
-/// each group sorted and strictly disjoint, the fewest groups, and for each
-/// probe exactly the runs whose ranges hold it.
-fn check_directory(runs: &[SharedRun], directory: &Directory<'_>, probes: &[Probes]) {
-    let mut seen: Vec<*const Run<Vec<u8>>> = Vec::new();
-    for group in &directory.groups {
-        for pair in group.entries.windows(2) {
-            assert!(pair[0].max < pair[1].min, "a group's ranges overlap");
-        }
-        assert_eq!(
-            group.max_seq,
-            group.entries.iter().map(|e| e.max_seq).max().unwrap()
-        );
-        seen.extend(group.entries.iter().map(|entry| entry.run as *const _));
-    }
-    let mut published: Vec<*const Run<Vec<u8>>> =
-        runs.iter().map(|run| &run.run as *const _).collect();
-    seen.sort();
-    published.sort();
-    assert_eq!(seen, published, "every run once");
-    assert_eq!(
-        directory.groups.len(),
-        deepest_overlap(runs),
-        "fewest groups"
-    );
-    let mut candidates = Vec::new();
-    for probe in probes.iter().flat_map(|class| &class.keys).step_by(7) {
-        directory.candidates(probe, true, &mut candidates);
-        let mut found: Vec<*const Run<Vec<u8>>> = candidates
-            .iter()
-            .map(|&candidate| directory.entry(candidate).run as *const _)
-            .collect();
-        let mut want: Vec<*const Run<Vec<u8>>> = runs
-            .iter()
-            .filter(|run| {
-                let range = run.run.key_range().expect(NOT_EMPTY);
-                range.min <= probe.as_slice() && probe.as_slice() <= range.max
-            })
-            .map(|run| &run.run as *const _)
-            .collect();
-        found.sort();
-        want.sort();
-        assert_eq!(found, want, "candidates of {probe:02x?}");
-    }
-}
-
 fn owned(
     found: Result<Option<LiveValue<'_>>, ReadError>,
 ) -> Result<Option<(u64, Vec<u8>)>, ReadError> {
@@ -481,11 +296,44 @@ fn timed(keys: &[Vec<u8>], mut get: impl FnMut(&[u8]) -> bool, rounds: usize) ->
     samples
 }
 
-/// Measures one published state: topology, directory costs, and lookups
-/// through both paths, with their results checked against each other.
+/// The production directory's lookup, counting what it asks of each run.
+struct CountedSource<'a> {
+    inner: super::directory::Lookup<'a>,
+    counts: &'a Cell<Counts>,
+}
+
+impl<'a> LookupSource<'a> for CountedSource<'a> {
+    type Run = Counted<'a>;
+
+    fn next_run(&mut self, key: &[u8], floor: Option<u64>) -> Option<(usize, Counted<'a>)> {
+        let counts = self.counts;
+        self.inner
+            .next_run(key, floor)
+            .map(|(position, run)| (position, Counted { run, counts }))
+    }
+}
+
+/// Reads every live key with `prefix` through `cursor`, returning the count.
+fn drain(cursor: &mut LogicalCursor<'_>, prefix: &[u8]) -> usize {
+    cursor.seek_prefix(prefix).unwrap();
+    let mut count = 0;
+    while let Some(record) = cursor.next_record().unwrap() {
+        std::hint::black_box(record);
+        count += 1;
+    }
+    count
+}
+
+/// Measures one published state: topology, directory costs, and lookups and
+/// scans through the flat order of 5AO and the production directory,
+/// alternating, with their results checked against each other.
 fn measure(label: &str, engine: &Engine, model: &Model, probe_count: usize) {
-    // Nothing writes meanwhile, so the two reads see one state.
-    let runs = Arc::clone(&engine.core.read_state().lookup_order);
+    // Nothing writes meanwhile, so the reads see one state.
+    let (published, production) = {
+        let state = engine.core.read_state();
+        (state.runs.clone(), Arc::clone(&state.directory))
+    };
+    let runs = flat_order(&published);
     let stats = engine.stats();
     let probes = probes(model, probe_count, 17);
 
@@ -500,57 +348,42 @@ fn measure(label: &str, engine: &Engine, model: &Model, probe_count: usize) {
             .fold(f64::INFINITY, f64::min)
     };
     let build_us = best(&mut || {
-        std::hint::black_box(Directory::build(&runs, false));
+        std::hint::black_box(super::directory::RunDirectory::build(&published));
     });
     let order_us = best(&mut || {
-        let mut order: Vec<SharedRun> = runs.to_vec();
-        order.sort_by_key(|run| Reverse(run.run.max_seq()));
-        std::hint::black_box(Arc::<[SharedRun]>::from(order));
+        std::hint::black_box(Arc::<[SharedRun]>::from(flat_order(&published)));
     });
     let select_us = best(&mut || {
         let _ = std::hint::black_box(select(&candidates(&runs), CompactionOptions::default()));
     });
-    let directory = Directory::build(&runs, false);
-    let touching = Directory::build(&runs, true);
-    check_directory(&runs, &directory, &probes);
-    let sizes: Vec<usize> = directory.groups.iter().map(|g| g.entries.len()).collect();
+    assert_eq!(production.group_count(), deepest_overlap(&runs));
+    let sizes: Vec<usize> = production.groups().map(|group| group.len()).collect();
 
     println!(
-        "TOPOLOGY | {label} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.0} | {:.0} | {:.0} | {} | {} | {} |",
+        "TOPOLOGY | {label} | {} | {} | {} | {} | {} | {:.1} | {} | {:.0} | {:.0} | {:.0} | {} | {} |",
         runs.len(),
         stats.max_overlap,
         isolated(&runs),
-        directory.groups.len(),
+        production.group_count(),
         sizes.iter().max().unwrap_or(&0),
-        runs.len() as f64 / directory.groups.len().max(1) as f64,
-        touching.groups.len(),
+        runs.len() as f64 / production.group_count().max(1) as f64,
         touching_pairs(&runs),
         build_us,
         order_us,
         select_us,
-        directory.bytes(),
-        directory.build_bytes,
+        production.heap_bytes(),
         runs.len() * size_of::<SharedRun>(),
     );
 
     let mut flat_ws = LogicalWorkspace::default();
-    let mut grouped_ws = LogicalWorkspace::default();
-    let mut coarse_ws = LogicalWorkspace::default();
-    let mut candidates = Vec::with_capacity(directory.groups.len());
+    let mut directory_ws = LogicalWorkspace::default();
     for class in &probes {
-        // Correctness: the three paths agree on every probe, and the exact
-        // order decodes exactly the blocks the engine's order does.
+        // Correctness: both paths agree on every probe.
         let counts = Cell::new(Counts::default());
-        let grouped_counts = Cell::new(Counts::default());
-        let mut blocks = [0u64; 3];
-        let mut candidate_total = 0usize;
-        let mut candidate_max = 0usize;
+        let directory_counts = Cell::new(Counts::default());
+        let mut blocks = [0u64; 2];
         for probe in &class.keys {
-            let before = [
-                flat_ws.blocks_loaded(),
-                grouped_ws.blocks_loaded(),
-                coarse_ws.blocks_loaded(),
-            ];
+            let before = [flat_ws.blocks_loaded(), directory_ws.blocks_loaded()];
             let flat = owned(latest_in(
                 runs.iter().map(|run| Counted {
                     run: &run.run,
@@ -559,136 +392,154 @@ fn measure(label: &str, engine: &Engine, model: &Model, probe_count: usize) {
                 probe,
                 &mut flat_ws,
             ));
-            directory.candidates(probe, true, &mut candidates);
-            candidate_total += candidates.len();
-            candidate_max = candidate_max.max(candidates.len());
-            let grouped = owned(latest_in(
-                candidates.iter().map(|&candidate| Counted {
-                    run: directory.entry(candidate).run,
-                    counts: &grouped_counts,
-                }),
-                probe,
-                &mut grouped_ws,
-            ));
-            let coarse = owned(directory.get(probe, false, &mut candidates, &mut coarse_ws));
+            let source = CountedSource {
+                inner: production.lookup(),
+                counts: &directory_counts,
+            };
+            let grouped = owned(latest_from(source, probe, &mut directory_ws));
             assert_eq!(flat, grouped, "{label} {} {probe:02x?}", class.name);
-            assert_eq!(flat, coarse, "{label} {} {probe:02x?}", class.name);
             assert_eq!(
                 flat.as_ref().unwrap().is_some(),
                 class.found,
                 "{label} {}",
                 class.name
             );
-            for (total, (ws, before)) in blocks
-                .iter_mut()
-                .zip([&flat_ws, &grouped_ws, &coarse_ws].into_iter().zip(before))
-            {
-                *total += ws.blocks_loaded() - before;
-            }
+            blocks[0] += flat_ws.blocks_loaded() - before[0];
+            blocks[1] += directory_ws.blocks_loaded() - before[1];
         }
-        assert_eq!(
-            blocks[0], blocks[1],
-            "{label} {}: exact order decodes alike",
-            class.name
-        );
-        let warm = candidates.capacity();
 
-        // Timing: the engine's path and the directory's, alternating.
+        // Timing: per call and over whole passes, alternating.
         let n = class.keys.len() as f64;
         let mut flat_samples = Vec::new();
-        let mut grouped_samples = Vec::new();
-        let mut coarse_samples = Vec::new();
+        let mut directory_samples = Vec::new();
+        let mut means = [0.0f64; 2];
         for _ in 0..2 {
             flat_samples.extend(timed(
                 &class.keys,
                 |key| flat_get(&runs, key, &mut flat_ws).unwrap().is_some(),
                 1,
             ));
-            grouped_samples.extend(timed(
+            directory_samples.extend(timed(
                 &class.keys,
                 |key| {
-                    directory
-                        .get(key, true, &mut candidates, &mut grouped_ws)
+                    latest_from(production.lookup(), key, &mut directory_ws)
                         .unwrap()
                         .is_some()
                 },
                 1,
             ));
-            coarse_samples.extend(timed(
-                &class.keys,
-                |key| {
-                    directory
-                        .get(key, false, &mut candidates, &mut coarse_ws)
-                        .unwrap()
-                        .is_some()
-                },
-                1,
-            ));
-        }
-        // Means over whole passes, free of the clock's resolution (about
-        // 42 ns here), alternating as above.
-        let mut means = [0.0f64; 3];
-        for _ in 0..2 {
             let start = Instant::now();
             for key in &class.keys {
                 std::hint::black_box(flat_get(&runs, key, &mut flat_ws).unwrap().is_some());
             }
             means[0] += start.elapsed().as_nanos() as f64 / n / 2.0;
-            for (slot, exact, ws) in [(1, true, &mut grouped_ws), (2, false, &mut coarse_ws)] {
-                let start = Instant::now();
-                for key in &class.keys {
-                    std::hint::black_box(
-                        directory
-                            .get(key, exact, &mut candidates, ws)
-                            .unwrap()
-                            .is_some(),
-                    );
-                }
-                means[slot] += start.elapsed().as_nanos() as f64 / n / 2.0;
+            let start = Instant::now();
+            for key in &class.keys {
+                std::hint::black_box(
+                    latest_from(production.lookup(), key, &mut directory_ws)
+                        .unwrap()
+                        .is_some(),
+                );
             }
+            means[1] += start.elapsed().as_nanos() as f64 / n / 2.0;
         }
-        assert_eq!(
-            candidates.capacity(),
-            warm,
-            "the candidate buffer did not grow"
-        );
-        for samples in [&mut flat_samples, &mut grouped_samples, &mut coarse_samples] {
-            samples.sort_by(f64::total_cmp);
-        }
-        let (flat, grouped) = (counts.get(), grouped_counts.get());
+        flat_samples.sort_by(f64::total_cmp);
+        directory_samples.sort_by(f64::total_cmp);
+        let (flat, grouped) = (counts.get(), directory_counts.get());
         println!(
-            "LOOKUP | {label} | {} | {} | {:.0} / {:.0} / {:.0} | {:.0} / {:.0} / {:.0} | {:.0} / {:.0} / {:.0} | {:.1} | {:.2} / {} | {:.2} / {:.2} | {:.2} / {:.2} | {:.3} / {:.3} / {:.3} |",
+            "LOOKUP | {label} | {} | {} | {:.0} / {:.0} / {:.0} | {:.0} / {:.0} / {:.0} | {:.1} / {:.1} | {:.2} / {:.2} | {:.2} / {:.2} | {:.3} / {:.3} |",
             runs.len(),
             class.name,
             means[0],
             percentile(&flat_samples, 0.5),
             percentile(&flat_samples, 0.99),
             means[1],
-            percentile(&grouped_samples, 0.5),
-            percentile(&grouped_samples, 0.99),
-            means[2],
-            percentile(&coarse_samples, 0.5),
-            percentile(&coarse_samples, 0.99),
+            percentile(&directory_samples, 0.5),
+            percentile(&directory_samples, 0.99),
             flat.range as f64 / n,
-            candidate_total as f64 / n,
-            candidate_max,
+            grouped.range as f64 / n,
             flat.filter as f64 / n,
             grouped.filter as f64 / n,
             flat.opened as f64 / n,
             grouped.opened as f64 / n,
             blocks[0] as f64 / n,
             blocks[1] as f64 / n,
-            blocks[2] as f64 / n,
+        );
+    }
+
+    // Scans: short prefixes (5 keys written), long ones (500), each through a
+    // fresh workspace first for its memory, then timed alternating.
+    let mut rng = Rng(23);
+    let keys = model.fates.len() as u64;
+    for (name, len, count) in [("short", 14, 200), ("long", 12, 20)] {
+        let prefixes: Vec<Vec<u8>> = (0..count)
+            .map(|_| key(rng.below(keys))[..len].to_vec())
+            .collect();
+        let mut flat_ws = LogicalWorkspace::default();
+        let mut directory_ws = LogicalWorkspace::default();
+        let mut found = [0usize; 2];
+        let mut blocks = [0u64; 2];
+        let mut means = [0.0f64; 2];
+        for round in 0..3 {
+            let before = [flat_ws.blocks_loaded(), directory_ws.blocks_loaded()];
+            let start = Instant::now();
+            let mut cursor =
+                LogicalCursor::over(runs.iter().map(|run| run.run.view()), &mut flat_ws);
+            let flat: usize = prefixes
+                .iter()
+                .map(|prefix| drain(&mut cursor, prefix))
+                .sum();
+            drop(cursor);
+            let flat_ns = start.elapsed().as_nanos() as f64;
+            let start = Instant::now();
+            let mut cursor =
+                LogicalCursor::grouped(&*production, production.groups(), &mut directory_ws);
+            let grouped: usize = prefixes
+                .iter()
+                .map(|prefix| drain(&mut cursor, prefix))
+                .sum();
+            drop(cursor);
+            let directory_ns = start.elapsed().as_nanos() as f64;
+            assert_eq!(flat, grouped, "{label} {name} scans agree");
+            if round == 0 {
+                found = [flat, grouped];
+                blocks = [
+                    flat_ws.blocks_loaded() - before[0],
+                    directory_ws.blocks_loaded() - before[1],
+                ];
+            } else {
+                means[0] += flat_ns / count as f64 / 2.0;
+                means[1] += directory_ns / count as f64 / 2.0;
+            }
+        }
+        // Per scan, a cursor is made once per batch here, as a scan makes one
+        // per call; the per-call cost of making it is in the public A/B.
+        println!(
+            "SCAN | {label} | {} | {name} | {:.1} | {:.2} / {:.2} | {:.1} / {:.1} | {} / {} | {} / {} | {} |",
+            runs.len(),
+            found[0] as f64 / count as f64,
+            means[0] / 1e3,
+            means[1] / 1e3,
+            blocks[0] as f64 / count as f64,
+            blocks[1] as f64 / count as f64,
+            flat_ws.context_bytes() >> 10,
+            directory_ws.context_bytes() >> 10,
+            flat_ws.capacity() >> 10,
+            directory_ws.capacity() >> 10,
+            production.group_count(),
         );
     }
 }
 
 fn print_headers() {
     println!(
-        "TOPOLOGY | history | runs | max_overlap | isolated runs | groups | largest group | mean group | groups if equal ends touched | touching pairs | build µs | lookup order µs | select µs | directory bytes | build temp bytes | lookup order bytes |"
+        "TOPOLOGY | history | runs | max_overlap | isolated runs | groups | largest group | mean group | touching pairs | directory build µs | 5AO lookup order µs | select µs | directory bytes | 5AO lookup order bytes |"
     );
     println!(
-        "LOOKUP | history | runs | class | engine mean / p50 / p99 ns | grouped mean / p50 / p99 ns | group-order mean / p50 / p99 ns | engine range checks | candidates mean / max | filter probes engine / grouped | runs opened engine / grouped | blocks engine / grouped / group-order |"
+        "LOOKUP | history | runs | class | 5AO flat mean / p50 / p99 ns | directory mean / p50 / p99 ns | range checks flat / directory | filter probes flat / directory | runs opened flat / directory | blocks flat / directory |"
+    );
+    println!(
+        "SCAN | history | runs | length | keys per scan | flat / grouped µs per scan | blocks per scan flat / grouped | context KiB flat / grouped | decoded KiB flat / grouped | groups |"
     );
 }
 
@@ -871,264 +722,6 @@ fn grouped_directory_against_the_flat_lookup_order() {
     }
 }
 
-// Snapshots: a directory over a snapshot's runs reads what the snapshot does.
-
-#[test]
-#[ignore = "research: run with --release --ignored --nocapture"]
-fn a_directory_over_a_snapshot_reads_what_the_snapshot_reads() {
-    let engine = Engine::new(scaled(16 << 10)).unwrap();
-    let values = values();
-    let mut workspace = MergeWorkspace::new();
-    let mut rng = Rng(5);
-    for write in 0..20_000u64 {
-        let index = rng.below(4_000);
-        engine
-            .put(&key(index), &values[(write % 1024) as usize])
-            .unwrap();
-    }
-    engine.flush().unwrap();
-    settle(&engine, &mut workspace);
-    let snapshot = engine.snapshot().unwrap();
-    // Later writes, deletes, flushes and compactions the snapshot must not see.
-    for write in 0..20_000u64 {
-        let index = rng.below(4_000);
-        if write % 3 == 0 {
-            engine.delete(&key(index)).unwrap();
-        } else {
-            engine
-                .put(&key(index), &values[(write % 7) as usize])
-                .unwrap();
-        }
-    }
-    engine.flush().unwrap();
-    settle(&engine, &mut workspace);
-    let directory = Directory::build(&snapshot.runs, false);
-    let mut engine_ws = EngineWorkspace::new();
-    let mut logical = LogicalWorkspace::default();
-    let mut candidates = Vec::new();
-    let mut differ = 0;
-    for index in 0..4_000 {
-        for probe in [key(index), missing_key(index)] {
-            let want = owned(snapshot.get(&probe, &mut engine_ws));
-            let found = owned(directory.get(&probe, true, &mut candidates, &mut logical));
-            assert_eq!(found, want, "{probe:02x?}");
-            let now = owned(engine.get(&probe, &mut engine_ws));
-            differ += usize::from(now != want);
-        }
-    }
-    assert!(differ > 0, "the later writes changed what the engine sees");
-    println!(
-        "snapshot: {} runs in {} groups; {differ} keys differ from the live engine",
-        snapshot.runs.len(),
-        directory.groups.len()
-    );
-}
-
-// Scans: a concatenating cursor over one group's runs.
-
-/// A cursor over runs with pairwise disjoint key ranges, in key order, that
-/// reads them one after another through a single workspace: one decoded
-/// block and one decompression context however many runs it crosses.
-struct Concat<'r> {
-    runs: &'r [Run<Vec<u8>>],
-    index: usize,
-    cursor: Option<RunCursor<'r>>,
-    spare: Option<&'r mut ReadWorkspace>,
-    prefix: Option<Vec<u8>>,
-}
-
-impl<'r> Concat<'r> {
-    fn new(runs: &'r [Run<Vec<u8>>], workspace: &'r mut ReadWorkspace) -> Self {
-        let mut concat = Self {
-            runs,
-            index: 0,
-            cursor: None,
-            spare: Some(workspace),
-            prefix: None,
-        };
-        concat.retarget(0);
-        concat
-    }
-
-    /// Moves the workspace to the run at `index`, positioned before its first
-    /// record, or parks it past the last run.
-    fn retarget(&mut self, index: usize) {
-        let workspace = match self.cursor.take() {
-            Some(cursor) => cursor.into_workspace(),
-            None => self.spare.take().expect("the workspace is parked"),
-        };
-        self.index = index;
-        match self.runs.get(index) {
-            Some(run) => self.cursor = Some(run.cursor(workspace)),
-            None => self.spare = Some(workspace),
-        }
-    }
-
-    /// Binary-searches for the first run that can hold `target`.
-    fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
-        self.prefix = None;
-        let index = self
-            .runs
-            .partition_point(|run| run.key_range().expect(NOT_EMPTY).max < target);
-        self.retarget(index);
-        self.cursor
-            .as_mut()
-            .map_or(Ok(()), |cursor| cursor.seek(target))
-    }
-
-    fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
-        let index = self
-            .runs
-            .partition_point(|run| run.key_range().expect(NOT_EMPTY).max < prefix);
-        self.prefix = Some(prefix.to_vec());
-        self.retarget(index);
-        self.cursor
-            .as_mut()
-            .map_or(Ok(()), |cursor| cursor.seek_prefix(prefix))
-    }
-
-    fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
-        loop {
-            let Some(cursor) = self.cursor.as_mut() else {
-                return Ok(None);
-            };
-            if cursor.peek()?.is_some() {
-                break;
-            }
-            // This run is done. The next one starts above every key so far,
-            // so under a prefix it continues the scan only if its first key
-            // has the prefix.
-            let Some(next) = self.runs.get(self.index + 1) else {
-                return Ok(None);
-            };
-            if let Some(prefix) = &self.prefix
-                && !next.key_range().expect(NOT_EMPTY).min.starts_with(prefix)
-            {
-                return Ok(None);
-            }
-            self.retarget(self.index + 1);
-            if let Some(prefix) = self.prefix.clone() {
-                self.cursor
-                    .as_mut()
-                    .expect("retargeted")
-                    .seek_prefix(&prefix)?;
-            }
-        }
-        self.cursor.as_mut().expect("peeked").next_record()
-    }
-}
-
-type Owned = (Vec<u8>, u64, Option<Vec<u8>>);
-
-/// A record's payload in the model: bytes, or `None` for a tombstone.
-type Payload = Option<Vec<u8>>;
-
-fn own(record: Record<'_>) -> Owned {
-    let value = match record.value {
-        Value::Bytes(value) => Some(value.to_vec()),
-        Value::Tombstone => None,
-    };
-    (record.key.to_vec(), record.seq, value)
-}
-
-#[test]
-#[ignore = "research: run with --release --ignored --nocapture"]
-fn a_concatenating_cursor_reads_a_group_like_its_records_in_order() {
-    const ALPHABET: [u8; 5] = [0x00, 0x01, b'a', 0xFE, 0xFF];
-    for seed in 0..40 {
-        let mut rng = Rng(900 + seed);
-        let mut records: BTreeMap<(Vec<u8>, Reverse<u64>), Payload> = BTreeMap::new();
-        while records.len() < 600 {
-            let key: Vec<u8> = (0..rng.below(6))
-                .map(|_| ALPHABET[rng.below(5) as usize])
-                .collect();
-            for _ in 0..=rng.below(3) {
-                let seq = rng.below(1_000);
-                let value = (rng.below(5) != 0).then(|| vec![seq as u8; rng.below(40) as usize]);
-                records.insert((key.clone(), Reverse(seq)), value);
-            }
-        }
-        let all: Vec<Owned> = records
-            .into_iter()
-            .map(|((key, Reverse(seq)), value)| (key, seq, value))
-            .collect();
-        // Cut between user keys, so that ranges are strictly disjoint.
-        let mut runs = Vec::new();
-        let mut start = 0;
-        while start < all.len() {
-            let mut end = (start + 1 + rng.below(120) as usize).min(all.len());
-            while end < all.len() && all[end].0 == all[end - 1].0 {
-                end += 1;
-            }
-            let codec = [Codec::None, Codec::Lz4, Codec::Zstd][rng.below(3) as usize];
-            let mut builder = RunBuilder::with_target_block_len(codec, 256);
-            for (key, seq, value) in &all[start..end] {
-                let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
-                builder.add(key, *seq, value).unwrap();
-            }
-            runs.push(builder.finish());
-            start = end;
-        }
-        let mut workspace = ReadWorkspace::new();
-        let mut concat = Concat::new(&runs, &mut workspace);
-        let mut probes: Vec<Vec<u8>> = runs
-            .iter()
-            .flat_map(|run| {
-                let range = run.key_range().unwrap();
-                [range.min.to_vec(), range.max.to_vec()]
-            })
-            .collect();
-        probes.extend((0..60).map(|_| {
-            (0..rng.below(5))
-                .map(|_| ALPHABET[rng.below(5) as usize])
-                .collect::<Vec<u8>>()
-        }));
-        probes.push(Vec::new());
-        probes.push(vec![0xFF]);
-        for probe in &probes {
-            for prefix in [false, true] {
-                let want: Vec<&Owned> = all
-                    .iter()
-                    .filter(|record| {
-                        if prefix {
-                            record.0.starts_with(probe)
-                        } else {
-                            record.0 >= *probe
-                        }
-                    })
-                    .collect();
-                if prefix {
-                    concat.seek_prefix(probe).unwrap();
-                } else {
-                    concat.seek(probe).unwrap();
-                }
-                let mut got = Vec::new();
-                while let Some(record) = concat.next_record().unwrap() {
-                    got.push(own(record));
-                }
-                let got: Vec<&Owned> = got.iter().collect();
-                assert_eq!(got, want, "seed {seed} probe {probe:02x?} prefix {prefix}");
-            }
-        }
-        drop(concat);
-        if seed == 0 {
-            let mut merge = MergeWorkspace::new();
-            let views: Vec<RunView<'_>> = runs.iter().map(Run::view).collect();
-            let mut cursor = crate::run::MergeCursor::new(views.iter().copied(), &mut merge);
-            while cursor.next_record().unwrap().is_some() {}
-            drop(cursor);
-            println!(
-                "concat over {} runs: {} decoded bytes, {} context bytes; a merge over them: {} and {}",
-                runs.len(),
-                workspace.capacity(),
-                workspace.context_bytes(),
-                merge.capacity(),
-                merge.context_bytes()
-            );
-        }
-    }
-}
-
 // Capacity: where the default run limit stops writes, at a reduced scale.
 
 #[test]
@@ -1209,6 +802,7 @@ fn overlap_exceeds_the_allowance_while_compaction_is_refused() {
     let mut snapshot = None;
     let mut deepest = 0;
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
+    let mut model = Model::new(20_000);
     for write in 0..60_000u64 {
         if write == 10_000 {
             snapshot = Some(engine.snapshot().unwrap());
@@ -1217,6 +811,7 @@ fn overlap_exceeds_the_allowance_while_compaction_is_refused() {
         engine
             .put(&key(index), &values[(write % 1024) as usize])
             .unwrap();
+        model.put(index);
         if engine.stats().flushes != flushes {
             flushes = engine.stats().flushes;
             if let Some(error) = settle(&engine, &mut workspace) {
@@ -1229,6 +824,11 @@ fn overlap_exceeds_the_allowance_while_compaction_is_refused() {
         }
     }
     let held = engine.stats();
+    // Reads while the overlap is far above the allowance.
+    engine.flush().unwrap();
+    let probe_count = env_or("DIRECTORY_PROBES", 2_000);
+    print_headers();
+    measure("refused, snapshot held", &engine, &model, probe_count);
     drop(snapshot);
     let relief = settle(&engine, &mut workspace);
     println!(

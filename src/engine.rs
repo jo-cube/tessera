@@ -171,6 +171,32 @@
 //! Publication checks that every input is still published, and a compaction
 //! that fails at any stage changes nothing.
 //!
+//! # Reading runs
+//!
+//! Every publication of runs, by a flush, a compaction or recovery, also
+//! publishes a directory of them in the same step under the exclusive lock.
+//! It partitions the runs into the fewest groups whose key ranges are
+//! strictly disjoint, which is as many groups as the most runs whose
+//! inclusive ranges share a key ([`EngineStats::max_overlap`]). The directory
+//! is immutable: a lookup or scan reads one directory from start to finish,
+//! and a snapshot keeps the one published when it was taken.
+//!
+//! A point lookup not decided by the memtables visits the groups in
+//! descending order of the largest sequence number any of their runs holds.
+//! In each it binary-searches for the one run whose range could hold the key,
+//! and skips it without decoding anything if the key is outside its range,
+//! its Bloom filter rules the key out, or it holds only versions older than
+//! one already found. It stops once no group left holds a version as new.
+//! When runs overlap heavily, groups are single runs and this is the order
+//! of the runs' own sequence bounds.
+//!
+//! A scan merges one input per group: each reads its runs in key order
+//! through one decoded block and one decompression context, after a binary
+//! search for where to start. The memory a scan holds therefore grows with
+//! the overlap, not with the number of runs. How much a directory saves
+//! depends on how the runs were written and compacted: see
+//! `docs/benchmarks.md`.
+//!
 //! # Background compaction
 //!
 //! With [`EngineOptions::background_compaction`] set, the engine owns one
@@ -282,8 +308,13 @@
 //! snapshots are refused and so are compactions, whose output would be held
 //! beside inputs that snapshots keep. That is the backpressure: runs then
 //! accumulate until flushes and so writes are refused, until snapshots
-//! are dropped. Each reader's [`EngineWorkspace`] adds one decoded block per
-//! run it reads.
+//! are dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
+//! point lookups and, for scans, one per group of key-disjoint runs it has
+//! read (see [Reading runs](self#reading-runs)).
+//!
+//! The run directory is not charged against any limit. It holds a pointer per
+//! run and a few words per group, and a snapshot or a lookup in progress keeps
+//! the directory it read, with the runs in it, until it is dropped.
 //!
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
@@ -350,6 +381,7 @@
 //! the source, in `src/engine/checkpoint.rs` and `src/engine/wal.rs`.
 
 mod checkpoint;
+mod directory;
 mod group;
 mod wal;
 mod worker;
@@ -385,8 +417,10 @@ use crate::memtable::{
 use crate::run::{
     Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
     MAX_ENGINE_BLOCK_LEN, MAX_TARGET_RUN_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, Run,
-    RunView, TARGET_BLOCK_LEN, compact, latest_in,
+    RunView, TARGET_BLOCK_LEN, compact, latest_from,
 };
+
+use directory::RunDirectory;
 
 type SharedRun = Arc<Published>;
 
@@ -971,7 +1005,8 @@ pub struct EngineStats {
     /// memory held by one dictionary (about 43 KiB) per such run.
     pub held_bytes: usize,
     /// The most published runs whose key ranges share one key: the most
-    /// blocks a point read of a key absent from the memtables decodes.
+    /// blocks a point read of a key absent from the memtables decodes, and
+    /// the number of groups in the run directory, each one input of a scan.
     pub max_overlap: usize,
     /// Live snapshots.
     pub snapshots: usize,
@@ -1007,13 +1042,13 @@ struct State {
     /// Shared so that a compaction can read its inputs without the lock while
     /// flushes publish beside them.
     runs: Vec<SharedRun>,
-    /// The same runs in the order lookups read them: largest sequence number
-    /// first, so that a version found early lets `latest_in` skip the runs
-    /// holding only older ones. Rebuilt by [`State::order_runs`] whenever
-    /// `runs` changes; `runs` keeps publication order, which compaction
-    /// selection uses to break ties. Immutable once built, so a lookup or a
-    /// snapshot shares it with one reference count.
-    lookup_order: Arc<[SharedRun]>,
+    /// The same runs, indexed for reading: grouped into key-disjoint runs,
+    /// newest group first. Rebuilt by [`State::order_runs`] in the same write
+    /// section as every change to `runs`, so readers only ever see the two
+    /// agree; `runs` keeps publication order, which compaction selection uses
+    /// to break ties. Immutable once built, so a lookup, a scan or a snapshot
+    /// shares it with one reference count.
+    directory: Arc<RunDirectory>,
     run_bytes: usize,
     held_bytes: usize,
     max_runs: usize,
@@ -1052,13 +1087,11 @@ struct Retained {
 }
 
 impl State {
-    /// Rebuilds `lookup_order` from `runs`. Publication is rare, so this
-    /// sorts a fresh copy rather than maintaining one, and lookups and
-    /// snapshots holding the previous order keep it.
+    /// Rebuilds the directory from `runs`. Publication is rare, so this
+    /// builds a fresh one rather than maintaining one, in O(n log n) for n
+    /// runs, and readers holding the previous directory keep it.
     fn order_runs(&mut self) {
-        let mut order = self.runs.clone();
-        order.sort_by_key(|run| std::cmp::Reverse(run.run.max_seq()));
-        self.lookup_order = order.into();
+        self.directory = Arc::new(RunDirectory::build(&self.runs));
     }
 
     /// `held_bytes` is `Some` for a run.
@@ -1383,7 +1416,7 @@ impl Core {
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
                 frozen: Vec::new(),
                 runs: Vec::new(),
-                lookup_order: Arc::new([]),
+                directory: Arc::new(RunDirectory::empty()),
                 run_bytes: 0,
                 held_bytes: 0,
                 max_runs: options.max_runs,
@@ -1582,9 +1615,9 @@ impl Core {
         // The runs are immutable and shared, so they are read after the lock
         // is released: the result is the state at the lock, and a writer or
         // publication waits only for the memtable lookup, not for decoding.
-        let runs = Arc::clone(&state.lookup_order);
+        let directory = Arc::clone(&state.directory);
         drop(state);
-        let found = latest_in(runs.iter().map(|run| &run.run), key, logical)?;
+        let found = latest_from(directory.lookup(), key, logical)?;
         Ok(found.map(|found| {
             value.clear();
             value.extend_from_slice(found.value);
@@ -1636,7 +1669,7 @@ impl Core {
         tables.extend(state.frozen.iter().rev().cloned());
         Ok(Snapshot {
             tables,
-            runs: Arc::clone(&state.lookup_order),
+            runs: Arc::clone(&state.directory),
             last_seq: state.last_seq,
             _live: Arc::clone(&self.snapshots),
         })
@@ -1777,7 +1810,7 @@ impl Core {
             runs: state.runs.len(),
             run_bytes: state.run_bytes,
             held_bytes: state.held_bytes,
-            max_overlap: deepest_overlap(&state.runs),
+            max_overlap: state.directory.group_count(),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
             retained_bytes: retained.bytes,
@@ -1830,7 +1863,9 @@ impl From<UpdateError> for Refusal {
     }
 }
 
-/// Returns the most runs whose inclusive key ranges share a key.
+/// Returns the most runs whose inclusive key ranges share a key, which the
+/// directory's group count equals; kept to check that.
+#[cfg(test)]
 fn deepest_overlap(runs: &[SharedRun]) -> usize {
     let mut bounds: Vec<(&[u8], bool)> = runs
         .iter()
@@ -2519,14 +2554,15 @@ impl EngineWorkspace {
     /// Returns the decoded-block bytes retained across all runs.
     ///
     /// Point lookups keep two blocks whatever the number of runs. Scans keep
-    /// one per run they have merged.
+    /// one per group of key-disjoint runs they have merged, at most the
+    /// largest [`EngineStats::max_overlap`] they have read.
     pub fn capacity(&self) -> usize {
         self.logical.capacity()
     }
 
     /// Returns the bytes held by Zstandard decompression contexts, as
     /// Zstandard reports them: one context for point lookups, and one per
-    /// run a scan has decoded Zstandard blocks from. A context is created on
+    /// group of runs a scan has decoded Zstandard blocks from. A context is created on
     /// first use and kept for the workspace's lifetime.
     ///
     /// These bytes are allocated outside the Rust heap, are not part of
@@ -2604,7 +2640,7 @@ impl ReadGuard<'_> {
                 .rev()
                 .map(|table| table.iter_from(prefix)),
         );
-        Scan::new(tables, &state.runs, prefix, workspace)
+        Scan::new(tables, &state.directory, prefix, workspace)
     }
 }
 
@@ -2641,7 +2677,7 @@ impl fmt::Debug for ReadGuard<'_> {
 pub struct Snapshot {
     /// Newest first.
     tables: Vec<Arc<FrozenMemtable>>,
-    runs: Arc<[SharedRun]>,
+    runs: Arc<RunDirectory>,
     last_seq: u64,
     _live: Arc<()>,
 }
@@ -2702,13 +2738,13 @@ fn lookup_state<'r>(
         .active
         .get(key)
         .or_else(|| state.frozen.iter().rev().find_map(|table| table.get(key)));
-    resolve(in_memory, &state.lookup_order, key, logical)
+    resolve(in_memory, &state.directory, key, logical)
 }
 
 /// Decides `key` from the newest table update, or else from the runs.
 fn resolve<'r>(
     in_memory: Option<Version<'r>>,
-    runs: &'r [SharedRun],
+    runs: &'r RunDirectory,
     key: &[u8],
     logical: &'r mut LogicalWorkspace,
 ) -> Result<Option<LiveValue<'r>>, ReadError> {
@@ -2718,7 +2754,7 @@ fn resolve<'r>(
             value: Value::Bytes(value),
         }) => Ok(Some(LiveValue { seq, value })),
         Some(_) => Ok(None),
-        None => latest_in(runs.iter().map(|run| &run.run), key, logical),
+        None => latest_from(runs.lookup(), key, logical),
     }
 }
 
@@ -2747,7 +2783,7 @@ impl<'r> Scan<'r> {
     /// `prefix`, over `runs`.
     fn new(
         tables: impl Iterator<Item = Records<'r>>,
-        runs: &'r [SharedRun],
+        runs: &'r RunDirectory,
         prefix: &[u8],
         workspace: &'r mut EngineWorkspace,
     ) -> Self {
@@ -2760,7 +2796,7 @@ impl<'r> Scan<'r> {
         bound.extend_from_slice(prefix);
         let prefix: &'r [u8] = bound;
 
-        let mut cursor = LogicalCursor::over(runs.iter().map(|run| run.run.view()), logical);
+        let mut cursor = LogicalCursor::grouped(runs, runs.groups(), logical);
         // A failed seek is repeated by the first read of the cursor.
         let _ = cursor.seek_prefix(prefix);
         let tables = tables

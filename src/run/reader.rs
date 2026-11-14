@@ -148,6 +148,22 @@ impl<B: AsRef<[u8]>> Run<B> {
         self.dictionary.as_deref().map_or(0, RunDictionary::bytes)
     }
 
+    /// The run with one stored byte inverted and everything found at
+    /// validation kept, as memory damaged after a run was published would
+    /// read.
+    #[cfg(test)]
+    pub(crate) fn damaged_at(&self, offset: usize) -> Run<Vec<u8>> {
+        let mut data = self.data.as_ref().to_vec();
+        data[offset] ^= 0xFF;
+        Run {
+            data,
+            filter: self.filter.clone(),
+            max_seq: self.max_seq,
+            dictionary: self.dictionary.clone(),
+            bounds: self.bounds.clone(),
+        }
+    }
+
     /// The run's stored dictionary and its prepared form, for the tests'
     /// dictionary experiments.
     #[cfg(test)]
@@ -550,13 +566,6 @@ struct LoadedBlock<'a> {
 }
 
 impl<'a> RunCursor<'a> {
-    /// Ends the cursor and returns its workspace, for a cursor that moves on
-    /// to another run (research, 5AP).
-    #[cfg(test)]
-    pub(crate) fn into_workspace(self) -> &'a mut ReadWorkspace {
-        self.workspace
-    }
-
     /// Moves before the first record whose user key is at or above `target`,
     /// which is the newest version of that key, and iterates without a bound.
     ///
@@ -636,6 +645,23 @@ impl<'a> RunCursor<'a> {
             .position
             .seek(view, target)
             .map_err(|error| block.frame.block_error(error))
+    }
+
+    /// Moves to before the first record of `view`, reusing the workspace and
+    /// keeping the prefix bound, for a group cursor that has finished one run
+    /// and continues into the next in key order. Decodes nothing.
+    pub(super) fn continue_into(&mut self, view: RunView<'a>) {
+        self.view = view;
+        self.next_block = 0;
+        self.loaded = None;
+        self.failure = None;
+        self.head = None;
+        self.workspace.position.reset();
+    }
+
+    /// Returns the prefix the cursor iterates within, empty for none.
+    pub(super) fn prefix(&self) -> &[u8] {
+        &self.workspace.prefix
     }
 
     /// Moves past the last record of the run.

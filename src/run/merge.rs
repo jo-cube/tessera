@@ -1,10 +1,14 @@
+use std::ops::Range;
+
 use crate::block::{Record, cmp_internal};
 
 use super::CorruptRun;
-use super::reader::{ReadWorkspace, RunCursor, RunView};
+use super::group::{GroupCursor, RunList};
+use super::reader::{ReadWorkspace, RunView};
 
 /// Reusable storage for merging runs: a decoding buffer per input and the
-/// merge order. It retains the largest fan-in it has served.
+/// merge order. It retains the largest fan-in it has served. A group of
+/// key-disjoint runs is one input.
 #[derive(Debug, Default)]
 pub struct MergeWorkspace {
     runs: Vec<ReadWorkspace>,
@@ -60,14 +64,14 @@ impl MergeWorkspace {
 /// conflicting ones. A caller writing a merged stream to a new run must
 /// resolve duplicates first, because a run rejects them.
 ///
-/// This is a lending cursor like [`RunCursor`]. Each input holds its head, the
-/// next record it would yield, decoded in its own workspace, and the merge
-/// compares heads in place. So state is one cursor and at most one decoded block
+/// This is a lending cursor like [`RunCursor`](super::reader::RunCursor).
+/// Each input holds its head, the next record it would yield, decoded in its
+/// own workspace, and the merge compares heads in place. So state is one cursor and at most one decoded block
 /// per input, and values are never copied. Records need no allocation; creating
 /// a cursor makes one, and [`seek`](Self::seek) makes none on a warm workspace.
 #[derive(Debug)]
 pub struct MergeCursor<'a> {
-    cursors: Vec<RunCursor<'a>>,
+    cursors: Vec<GroupCursor<'a>>,
     /// A binary min-heap of input positions holding a head. Heads live in the
     /// cursors, so the heap holds no keys of its own.
     heap: &'a mut Vec<usize>,
@@ -97,11 +101,50 @@ impl<'a> MergeCursor<'a> {
             heap,
             pending,
         } = workspace;
+        let cursors = runs
+            .zip(workspaces.iter_mut())
+            .enumerate()
+            .map(|(input, (run, workspace))| GroupCursor::one(run.cursor(workspace), input))
+            .collect();
+        Self::from_cursors(cursors, heap, pending)
+    }
+
+    /// Creates a cursor over groups of runs, each a range of positions in
+    /// `runs` read as one input with one decoding buffer.
+    ///
+    /// Each group's runs must have strictly disjoint key ranges, in key order,
+    /// and no group may be empty. Ranges must ascend, because a conflict
+    /// between copies reports the positions of the two runs, lower first.
+    pub(crate) fn grouped<I>(
+        runs: &'a dyn RunList,
+        groups: I,
+        workspace: &'a mut MergeWorkspace,
+    ) -> Self
+    where
+        I: IntoIterator<Item = Range<usize>>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let groups = groups.into_iter();
+        workspace.reads(groups.len());
+        let MergeWorkspace {
+            runs: workspaces,
+            heap,
+            pending,
+        } = workspace;
+        let cursors = groups
+            .zip(workspaces.iter_mut())
+            .map(|(members, workspace)| GroupCursor::many(runs, members, workspace))
+            .collect();
+        Self::from_cursors(cursors, heap, pending)
+    }
+
+    fn from_cursors(
+        cursors: Vec<GroupCursor<'a>>,
+        heap: &'a mut Vec<usize>,
+        pending: &'a mut Vec<usize>,
+    ) -> Self {
         Self {
-            cursors: runs
-                .zip(workspaces.iter_mut())
-                .map(|(run, workspace)| run.cursor(workspace))
-                .collect(),
+            cursors,
             heap,
             pending,
             positioned: false,
@@ -131,14 +174,15 @@ impl<'a> MergeCursor<'a> {
 
     /// Moves to the first record whose user key starts with `prefix` and
     /// iterates only while keys do, with the behavior of
-    /// [`RunCursor::seek_prefix`] applied to every input.
+    /// [`RunCursor::seek_prefix`](super::reader::RunCursor::seek_prefix)
+    /// applied to every input.
     pub fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
         self.reposition(|cursor| cursor.seek_prefix(prefix))
     }
 
     fn reposition(
         &mut self,
-        mut seek: impl FnMut(&mut RunCursor<'a>) -> Result<(), CorruptRun>,
+        mut seek: impl FnMut(&mut GroupCursor<'a>) -> Result<(), CorruptRun>,
     ) -> Result<(), CorruptRun> {
         self.failure = None;
         self.yielded = false;
@@ -193,12 +237,12 @@ impl<'a> MergeCursor<'a> {
     }
 
     /// Returns the current record and the copy at heap position `at`, each
-    /// with its input position.
+    /// with the position of the run holding it.
     pub(super) fn copies(&self, at: usize) -> Option<[(usize, Record<'_>); 2]> {
-        let [first, other] = [self.heap[0], self.heap[at]];
+        let [first, other] = [&self.cursors[self.heap[0]], &self.cursors[self.heap[at]]];
         Some([
-            (first, self.cursors[first].head_record()?),
-            (other, self.cursors[other].head_record()?),
+            (first.position(), first.head_record()?),
+            (other.position(), other.head_record()?),
         ])
     }
 
@@ -281,7 +325,7 @@ impl<'a> MergeCursor<'a> {
 }
 
 /// Restores the heap above `at`. Every entry must hold a head.
-fn sift_up(heap: &mut [usize], cursors: &[RunCursor<'_>], mut at: usize) {
+fn sift_up(heap: &mut [usize], cursors: &[GroupCursor<'_>], mut at: usize) {
     while at > 0 {
         let parent = (at - 1) / 2;
         if !precedes(cursors, heap[at], heap[parent]) {
@@ -293,7 +337,7 @@ fn sift_up(heap: &mut [usize], cursors: &[RunCursor<'_>], mut at: usize) {
 }
 
 /// Restores the heap below `at`. Every entry must hold a head.
-fn sift_down(heap: &mut [usize], cursors: &[RunCursor<'_>], mut at: usize) {
+fn sift_down(heap: &mut [usize], cursors: &[GroupCursor<'_>], mut at: usize) {
     loop {
         let mut first = at;
         for child in [2 * at + 1, 2 * at + 2] {
@@ -310,7 +354,7 @@ fn sift_down(heap: &mut [usize], cursors: &[RunCursor<'_>], mut at: usize) {
 }
 
 /// Internal order, then input position, so identical keys have one order.
-fn precedes(cursors: &[RunCursor<'_>], a: usize, b: usize) -> bool {
+fn precedes(cursors: &[GroupCursor<'_>], a: usize, b: usize) -> bool {
     let (a_key, a_seq) = cursors[a].head_key().expect("heap entries hold a head");
     let (b_key, b_seq) = cursors[b].head_key().expect("heap entries hold a head");
     cmp_internal(a_key, a_seq, b_key, b_seq)

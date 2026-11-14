@@ -3884,7 +3884,10 @@ cache before the change and copied its binary aside.
 
 ## Indexed run groups: feasibility (5AP)
 
-*Measurement and design; production code is unchanged.* Could the published
+*Measurement and design; production code is unchanged. 5AQ replaced the
+research directory, its concatenating cursor and its snapshot test with the
+production directory and its tests, so commands below that name them no
+longer apply; the measured figures stand.* Could the published
 runs be indexed as groups of pairwise disjoint key ranges, binary-searched
 per group, without changing how runs are built, compacted or published?
 Labels: **M** measured, **D** derived from measurements or code, **H**
@@ -4025,6 +4028,139 @@ logical input (D), whatever the key order; grouping changes none of it.
 ```sh
 scripts/validate.sh exec 3000 env DIRECTORY_SCALE=400 cargo test --locked --release --lib \
   engine::directory_tests -- --ignored --nocapture --test-threads=1
+```
+
+## Production run directory (5AQ)
+
+Lookups, scans and snapshots read one immutable run directory, published with
+every change to the run set (see "Reading runs" in the engine documentation).
+Labels: **M** measured, **D** derived from measurements or code.
+
+### Method
+
+- **Public A/B** (`examples/read_path.rs`, unchanged method, now with 1,024
+  runs and per-call p50/p99): the 5AO engine (`3f7d403`, whose engine is
+  `3ca2586`'s) built from a `git archive` in `target/`, and the working
+  tree, both in one bounded container, run alternately: 5AO, 5AQ, 5AO, 5AQ
+  for lookups, then the same for scans. The two passes agreed; pass 2 is
+  quoted unless stated. Layouts: 200,000 keys flushed into exactly N runs
+  with no compaction, written in key order (disjoint) or in a permutation
+  (overlapping: every run spans the key space, so groups = runs).
+- **In-process pairs** (`src/engine/directory_tests.rs`, ignored): each state
+  read through the 5AO flat lookup (`latest_in` over every run, newest bound
+  first) and through the production directory, and scanned through the merge
+  of every run as its own input and through the grouped merge, alternating,
+  with results asserted equal. Histories at `DIRECTORY_SCALE=400` (64 KiB
+  runs, compaction after every flush): ascending, uniform, hot; the
+  synthetic layouts above; and heavy overlap under compaction refusal (a
+  held snapshot with 128 KiB retention). Release build, 2 CPUs, 3 GiB.
+
+### Lookups (M, public A/B, mean / p50 / p99 ns)
+
+| layout | runs | class | 5AO | 5AQ |
+|---|---|---|---|---|
+| disjoint | 4 | present | 12,667 / 12,584 / 21,752 | 12,528 / 12,376 / 26,377 |
+| disjoint | 1,024 | present | 15,367 / 15,251 / 27,960 | 12,900 / 12,917 / 26,585 |
+| disjoint | 2,048 | present | 17,848 / 17,876 / 30,335 | 12,785 / 12,876 / 24,918 |
+| disjoint | 2,048 | overwritten | 14,175 / 14,334 / 18,501 | 12,294 / 12,417 / 16,418 |
+| disjoint | 1,024 | missing | 4,587 / 4,417 / 17,001 | 568 / 333 / 13,126 |
+| disjoint | 2,048 | missing | 11,054 / 10,793 / 24,043 | 612 / 375 / 12,543 |
+| overlapping | 1,024 | present | 84,232 / 79,754 / 199,845 | 86,245 / 78,880 / 194,720 |
+| overlapping | 2,048 | present | 137,539 / 128,549 / 299,101 | 139,734 / 130,283 / 300,397 |
+| overlapping | 2,048 | missing | 218,303 / 205,303 / 521,989 | 218,991 / 212,320 / 389,226 |
+
+Warm lookups made no allocations in either build; snapshot acquisition was
+9–10 ns in both, with no allocation. Lookup workspace memory was unchanged
+(16 KiB decoded, 17 KiB heap, 93 KiB Zstandard context).
+
+### Lookup work (M, in-process, per lookup: flat / directory)
+
+| history | runs | class | mean ns | range checks | filter probes | blocks |
+|---|---|---|---|---|---|---|
+| ascending end | 2,326 | present | 20,082 / 14,099 | 1,165 / 1.0 | 1.00 / 1.00 | 1.000 / 1.000 |
+| ascending end | 2,326 | missing | 18,497 / 372 | 2,326 / 1.0 | 1.00 / 1.00 | 0.007 / 0.007 |
+| uniform end | 1,681 | present | 26,480 / 12,735 | 1,680 / 4.0 | 2.61 / 2.61 | 1.012 / 1.012 |
+| uniform end | 1,681 | overwritten | 25,469 / 12,781 | 1,589 / 4.0 | 2.51 / 2.53 | 1.008 / 1.023 |
+| uniform end | 1,681 | deleted | 15,500 / 1,401 | 1,651 / 4.0 | 2.58 / 2.60 | 0.051 / 0.067 |
+| hot end | 1,747 | overwritten | 12,152 / 11,689 | 30 / 3.8 | 2.29 / 2.34 | 1.013 / 1.050 |
+| hot end | 1,747 | deleted | 9,219 / 2,195 | 1,526 / 3.8 | 2.33 / 2.38 | 0.151 / 0.183 |
+| hot end | 1,747 | missing | 9,453 / 567 | 1,747 / 4.0 | 2.01 / 2.01 | 0.015 / 0.015 |
+| overlapping | 2,048 | present | 123,875 / 127,402 | 1,193 / 1,193 | 1,170 / 1,170 | 9.40 / 9.40 |
+| overlapping | 2,048 | missing | 194,379 / 201,662 | 2,048 / 2,048 | 2,012 / 2,012 | 14.51 / 14.51 |
+| refused, snapshot held | 429 (381 groups) | present | 37,315 / 37,846 | 224 / 217 | 214 / 214 | 2.851 / 2.852 |
+| refused, snapshot held | 429 (381 groups) | missing | 40,058 / 41,426 | 429 / 381 | 373 / 373 | 2.807 / 2.807 |
+
+The selector histories ended with 1–4 groups, so a lookup made 1–4 range
+checks instead of one per run. Visiting groups by their bound rather than
+each run's own costs extra decodes where an older group's candidate is read
+before a newer one: up to +3.7% blocks for overwritten keys in the hot
+history and +0.03 blocks per deleted key (D: still far faster, because the
+range checks it saves cost more). Filter probes and blocks are otherwise
+identical. Where groups ≈ runs (overlapping, refused) the work is identical
+and the time is 1–4% higher (in-process means; public A/B 0.1–3.6%): the
+cost of walking groups and of the lookup source over iterating a slice. No
+fallback was added; this is reported as a regression.
+
+### Scans (M)
+
+Public A/B, pass 2, µs per scan (keys), then scan workspace memory:
+
+| layout | runs | short 5AO / 5AQ | long 5AO / 5AQ | empty probe 5AO / 5AQ | decoded KiB 5AO / 5AQ | native KiB 5AO / 5AQ |
+|---|---|---|---|---|---|---|
+| disjoint | 4 | 25.36 / 25.12 | 153.8 / 154.5 | 0.20 / 0.12 | 64 / 32 | 375 / 187 |
+| disjoint | 256 | 46.78 / 37.36 | 179.5 / 169.3 | 9.88 / 0.17 | 3,894 / 48 | 22,790 / 280 |
+| disjoint | 2,048 | 105.35 / 36.60 | 246.0 / 171.1 | 69.56 / 0.17 | 13,996 / 48 | 84,806 / 280 |
+| overlapping | 256 | 3,342 / 3,344 | 3,552 / 3,532 | 10.04 / 9.45 | 4,132 / 4,132 | 24,009 / 24,009 |
+| overlapping | 2,048 | 26,027 / 25,995 | 26,682 / 26,674 | 76.36 / 69.44 | 32,691 / 32,691 | 192,075 / 192,075 |
+
+Each scan made one allocation in both builds (its cursor). In-process, the
+grouped merge decoded exactly the blocks the flat merge did in every state,
+and held one decoded block and one context per group: 16 KiB and 93 KiB per
+group (1–4 groups) against 3.0–5.1 MiB decoded and 18–31 MiB of contexts
+for the flat merge of the selector histories' 1,681–2,326 runs, at
+48–71% lower short-scan and 15–24% lower long-scan time at their final
+states. Under refusal (381 groups for 429 runs) memory fell only by the
+runs that shared a group (39,833 → 35,709 KiB of contexts) and time was level:
+**scan workspace memory grows with the overlap**, about 109 KiB per group
+(D), and nothing bounds the overlap while compaction is refused.
+
+### Construction and memory (M, best of five)
+
+| state | runs | groups | directory build µs | 5AO order µs | selection µs | directory bytes | 5AO order bytes |
+|---|---|---|---|---|---|---|---|
+| disjoint | 2,048 | 3 | 97 | 7 | 13,399 | 16,456 | 16,384 |
+| overlapping | 2,048 | 2,048 | 235 | 7 | 38,554 | 65,536 | 16,384 |
+| ascending end | 2,326 | 1 | 47 | 9 | 19,058 | 18,632 | 18,608 |
+| uniform end | 1,681 | 4 | 128 | 16 | 12,430 | 13,544 | 13,448 |
+| refused | 429 | 381 | 42 | 2 | 1,344 | 12,576 | 3,432 |
+
+The directory is built under the exclusive lock at each publication, so
+publication holds that lock about 40–240 µs longer than 5AO at 400–2,300
+runs (D), against a flush or compaction that builds megabytes of runs and,
+in these states, a compaction selection that takes 1–39 ms under the
+shared lock. It holds 8 bytes per run and 24 per group, and a reader or
+snapshot holding an old directory keeps it and its runs.
+
+### Not changed
+
+Run limits, `target_run_len`, `max_overlap`, compaction selection and its
+limits, and the checkpoint and log formats. The capacity limit measured in
+5AP (writes refused for good after about 61 run lengths of input once 64
+full-length disjoint runs are published) is untouched; it depends on the
+workload (D), and the directory does not move it.
+
+### Reproduction
+
+```sh
+# Public A/B: extract the baseline and copy the current harness into it,
+#   git archive 3f7d403 | tar -x -C target/ab-5ao
+#   cp examples/read_path.rs target/ab-5ao/examples/
+# then, in one `scripts/validate.sh exec` container, build both
+# (`--manifest-path target/ab-5ao/Cargo.toml --target-dir /cache/target-ab-5ao`)
+# and run `read_path lookups` and `read_path scans` alternately, twice.
+scripts/validate.sh exec 3500 env DIRECTORY_SCALE=400 cargo test --locked --release --lib \
+  engine::directory_tests:: -- --ignored --nocapture --test-threads=1 \
+  --skip concatenating --skip snapshot_reads --skip run_limit
 ```
 
 ## Historical results

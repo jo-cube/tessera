@@ -319,11 +319,16 @@ that all its blocks share (format version 4; other runs stay version 3),
 and holds it prepared for decoding beside its bytes. Runs the engine builds
 carry an in-memory Bloom filter (10 bits a key), so lookups of absent keys usually decode nothing; filters are rebuilt
 on recovery, not stored. Reads merge the memtables and overlapping runs into
-the latest state of each key. Each run's largest sequence number is derived
-from its records when it is built or loaded, so a point lookup visits runs
-in descending order of it and stops once no remaining run can hold a newer
-version: an updated or deleted key usually decodes one block however many
-older runs hold it.
+the latest state of each key. Each publication of runs also publishes an
+immutable **run directory**: the runs partitioned into the fewest groups of
+strictly key-disjoint runs, as many as the deepest overlap. A point lookup
+visits the groups newest first, binary-searches each for the one run that
+could hold the key, and stops once no group left can hold a newer version
+than one found: an updated or deleted key usually decodes one block however
+many older runs hold it. A scan merges one input per group, each reading
+its runs in key order through one decoded block, so its memory grows with
+the overlap rather than the run count. Snapshots keep the directory they
+were taken with.
 
 A **memtable** holds the latest update of each key in a copy-on-write B+
 tree under a memory budget, so snapshots are constant-time.
@@ -383,6 +388,17 @@ it.
 - A panic in the background worker stops it for good; `background_status`
   and `wait_for_compaction` report it with its message, `close` returns it,
   and the engine keeps working without the worker.
+- How much data fits depends on the workload, not only on memory. The run
+  limits (`max_runs`, `max_run_bytes`) bound the published runs, and
+  compaction merges overlapping runs and short tails but never rewrites
+  runs that are already full-length and disjoint. Once the run count limit
+  is reached by such runs, nothing compaction can do relieves it, so flushes
+  and then writes stay refused with `FlushRefused` until `set_run_limits`
+  raises the limits. When that happens depends on compression, key order,
+  and how much of the input overwrites or deletes earlier keys; in
+  reduced-scale measurements with default settings it came after roughly 60
+  run lengths of written data (`docs/benchmarks.md`). The run directory makes
+  reading many runs cheaper; it does not change these limits.
 - The dataset must fit in memory: there is no disk tiering.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.
