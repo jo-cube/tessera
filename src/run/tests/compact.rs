@@ -4,8 +4,8 @@
 use crate::block::Value;
 use crate::run::{
     CONTEXT_ALLOWANCE, Codec, CompactError, CompactLimits, Compacted, ConflictingCopies,
-    MAX_ENGINE_BLOCK_LEN, MergeWorkspace, ReadError, ReadWorkspace, Run, RunBuilder,
-    TARGET_BLOCK_LEN, compact,
+    MAX_ENGINE_BLOCK_LEN, MergeWorkspace, OutputCuts, RECORD_INPUT_OVERHEAD, ReadError,
+    ReadWorkspace, Run, RunBuilder, TARGET_BLOCK_LEN, compact, compact_with,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -244,4 +244,169 @@ fn measured_codec_contexts_fit_their_allowance() {
         assert!(workspace.context_bytes() > 0);
         assert!(workspace.context_bytes() <= CONTEXT_ALLOWANCE);
     }
+}
+
+/// Output runs end before the record that would take them past the target
+/// (5AT), so a run is at most the target unless it holds one record longer
+/// than the target, which is a run of its own. No run is empty, and every
+/// record survives in order.
+#[test]
+fn outputs_end_before_a_record_that_overshoots() {
+    let charge = |key: &str, value: usize| key.len() + value + RECORD_INPUT_OVERHEAD;
+    let target = 1_000;
+    // Values sized so that the third record of each run would overshoot,
+    // one record alone over the target, and incompressible bytes.
+    let mut noise = 0x2545_f491_4f6c_dd1d_u64;
+    let mut bytes = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                char::from(b'!' + (noise % 90) as u8)
+            })
+            .collect()
+    };
+    let lens = [400, 400, 400, 2_500, 10, 990, 400, 400, 1];
+    let values: Vec<String> = lens.iter().map(|&len| bytes(len)).collect();
+    let keys: Vec<String> = (0..lens.len()).map(|i| format!("k{i}")).collect();
+    let written: Vec<(&str, u64, Option<&str>)> = keys
+        .iter()
+        .zip(&values)
+        .enumerate()
+        .map(|(i, (key, value))| (key.as_str(), i as u64 + 1, Some(value.as_str())))
+        .collect();
+    let input = run(&written);
+    let limits = CompactLimits {
+        target_run_len: target,
+        codec: Codec::None,
+        ..UNLIMITED
+    };
+    let out = merge(&[&input], |_| true, limits).unwrap();
+    let sizes: Vec<usize> = out
+        .runs
+        .iter()
+        .map(|run| {
+            records(run)
+                .iter()
+                .map(|(key, _, value)| {
+                    charge(
+                        std::str::from_utf8(key).unwrap(),
+                        value.as_ref().unwrap().len(),
+                    )
+                })
+                .sum()
+        })
+        .collect();
+    let counts: Vec<usize> = out.runs.iter().map(|run| records(run).len()).collect();
+    // Charges 418 each for 400 bytes: [418, 418] then 418 would reach 1254;
+    // [418] then 2518; [2518] alone; [28] then 1008; [1008] alone, at the
+    // target; [418, 418, 19].
+    assert_eq!(counts, [2, 1, 1, 1, 1, 3], "{sizes:?}");
+    for (size, count) in sizes.iter().zip(&counts) {
+        assert!(*size <= target || *count == 1, "{sizes:?}");
+    }
+    assert_eq!(merged(&out), records(&input));
+}
+
+/// Cuts at given keys fall between keys, including the empty key and keys
+/// ending in 0xFF, and never make an empty run: a cut with no record
+/// before it, or several cuts between two records, start one run.
+#[test]
+fn outputs_end_at_the_given_cuts_between_keys() {
+    let keys: [&[u8]; 6] = [b"", b"a", b"a\xff", b"a\xff\xff", b"b", b"\xff"];
+    let mut builder = RunBuilder::default();
+    for (seq, key) in keys.iter().enumerate() {
+        builder
+            .add(key, seq as u64 + 1, Value::Bytes(b"v"))
+            .unwrap();
+    }
+    let input = builder.finish();
+    let cuts = OutputCuts {
+        // Before everything (no run yet), then two cuts between "a\xff" and
+        // "a\xff\xff", then one at "b" exactly, then one past the end.
+        at: vec![
+            Vec::new(),
+            b"a\xff\x00".to_vec(),
+            b"a\xff\xff".to_vec(),
+            b"b".to_vec(),
+            b"\xff\xff".to_vec(),
+        ],
+        ..OutputCuts::default()
+    };
+    let views = [input.view()];
+    let out = compact_with(
+        &views,
+        |_| true,
+        UNLIMITED,
+        &cuts,
+        &mut MergeWorkspace::new(),
+    )
+    .unwrap();
+    let firsts: Vec<Vec<u8>> = out
+        .runs
+        .iter()
+        .map(|run| records(run)[0].0.clone())
+        .collect();
+    assert_eq!(firsts, [b"".to_vec(), b"a\xff\xff".to_vec(), b"b".to_vec()]);
+    assert_eq!(merged(&out), records(&input));
+
+    // One run whatever the target, for merging small neighbours.
+    let single = OutputCuts {
+        single: true,
+        ..OutputCuts::default()
+    };
+    let limits = CompactLimits {
+        target_run_len: 1,
+        ..UNLIMITED
+    };
+    let out = compact_with(
+        &views,
+        |_| true,
+        limits,
+        &single,
+        &mut MergeWorkspace::new(),
+    )
+    .unwrap();
+    assert_eq!(out.runs.len(), 1);
+}
+
+/// A run being built ends once it would reach more than `max_overlapped`
+/// runs of the level below, counted by their smallest keys.
+#[test]
+fn outputs_end_where_they_would_overlap_too_many_runs_below() {
+    let keys: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
+    let written: Vec<(&str, u64, Option<&str>)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (key.as_str(), i as u64 + 1, Some("v")))
+        .collect();
+    let input = run(&written);
+    // Runs below start at k00, k03, k06, ... k18.
+    let overlapped: Vec<Vec<u8>> = (0..20)
+        .step_by(3)
+        .map(|i| format!("k{i:02}").into_bytes())
+        .collect();
+    let cuts = OutputCuts {
+        overlapped,
+        max_overlapped: 1,
+        ..OutputCuts::default()
+    };
+    let views = [input.view()];
+    let out = compact_with(
+        &views,
+        |_| true,
+        UNLIMITED,
+        &cuts,
+        &mut MergeWorkspace::new(),
+    )
+    .unwrap();
+    let firsts: Vec<String> = out
+        .runs
+        .iter()
+        .map(|run| String::from_utf8(records(run)[0].0.clone()).unwrap())
+        .collect();
+    // Each run reaches its first run below and one more start.
+    assert_eq!(firsts, ["k00", "k06", "k12", "k18"]);
+    assert_eq!(merged(&out), records(&input));
 }

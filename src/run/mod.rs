@@ -136,7 +136,10 @@ use crate::block::Corruption;
 pub use builder::RunBuilder;
 pub use codec::Codec;
 pub(crate) use compact::CompactError;
-pub use compact::{CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, compact};
+pub use compact::{
+    CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, OutputCuts, compact_with,
+    workspace_estimate,
+};
 pub(crate) use dictionary::choose as choose_dictionary;
 pub use dictionary::{
     DICTIONARY_LEN, DICTIONARY_WORKSPACE, DictionaryChoice, MIN_DICTIONARY_INPUT,
@@ -154,7 +157,7 @@ pub use reader::{Run, RunView};
 
 // Used beyond this module only by its tests.
 #[cfg(test)]
-pub use compact::CONTEXT_ALLOWANCE;
+pub use compact::{CONTEXT_ALLOWANCE, compact};
 #[cfg(test)]
 pub(crate) use logical::LookupInput;
 #[cfg(test)]

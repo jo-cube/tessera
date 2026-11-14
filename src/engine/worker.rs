@@ -25,7 +25,7 @@ pub struct BackgroundStatus {
     /// Passes finished. A pass compacts until nothing is eligible, a
     /// compaction fails, or the engine is closed or dropped.
     pub passes: u64,
-    /// Compactions published.
+    /// Compaction steps published, moves included.
     pub compactions: u64,
     /// Stored bytes of the runs those compactions replaced.
     pub input_bytes: u64,
@@ -230,9 +230,11 @@ fn run(core: &Core, options: CompactionOptions) {
 }
 
 /// Compacts until nothing is eligible, a compaction fails, or the worker is
-/// told to stop. Each compaction lowers a count that only new flushes raise,
-/// so without them the pass ends; with them it ends once flushes stop, which
-/// the run limits force if compaction falls behind.
+/// told to stop. Each step lowers a level's excess, moves data down or lowers
+/// the run count, which only new flushes undo, so without them the pass
+/// ends; with them it ends once flushes stop, which the level-0 stop forces
+/// if compaction falls behind. A refused step ends the pass, so a refusal
+/// is not retried in a loop: the next flush or request tries again.
 fn pass(
     core: &Core,
     signal: &Signal,

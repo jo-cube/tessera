@@ -64,14 +64,48 @@ pub const MAX_ENGINE_BLOCK_LEN: usize = 64 << 10;
 /// larger than the largest of them. Retained capacity from earlier use of a
 /// workspace is not counted.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
+    let blocks = inputs
+        .iter()
+        .map(|input| input.largest_block_len())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(workspace_estimate(blocks))
+}
+
+/// [`workspace_bytes`] from each input's largest decoded block length, which
+/// the engine keeps for every published run so that it can size a job
+/// before reading any of it.
+pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> usize {
     let mut total = CONTEXT_ALLOWANCE;
     let mut largest = 0;
-    for input in inputs {
-        let block = input.largest_block_len()?;
+    for block in largest_blocks {
         largest = largest.max(block);
-        total = total.saturating_add(block + CONTEXT_ALLOWANCE);
+        total = total.saturating_add(block.saturating_add(CONTEXT_ALLOWANCE));
     }
-    Ok(total.saturating_add(2 * largest))
+    total.saturating_add(largest.saturating_mul(2))
+}
+
+/// Where a compaction's output runs end, beside the target length.
+///
+/// Every cut falls between two user keys: an output holds one version per
+/// key, so no key's versions are ever split across runs, and an empty run
+/// is never written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputCuts {
+    /// Keys, ascending, at which a new output run starts: the first record
+    /// whose key is at least a cut starts a new run unless the run being
+    /// built is empty.
+    pub at: Vec<Vec<u8>>,
+    /// The smallest keys of the runs one level below the output's level,
+    /// ascending. A run being built ends before a record once its range has
+    /// reached more than `max_overlapped` of them, so that its own next
+    /// merge stays bounded.
+    pub overlapped: Vec<Vec<u8>>,
+    /// How many of `overlapped` one output run may reach; ignored if
+    /// `overlapped` is empty.
+    pub max_overlapped: usize,
+    /// Write one run whatever its length: for merging two small runs into
+    /// one, which must lower the run count to be worth doing.
+    pub single: bool,
 }
 
 /// What a compaction read and wrote.
@@ -193,11 +227,30 @@ impl std::error::Error for CompactError {}
 /// the merge, and is never revisited: a run that would not benefit, or a
 /// workspace limit without room for [`DICTIONARY_WORKSPACE`](dictionary::DICTIONARY_WORKSPACE)
 /// beside the merge, gets plain Zstandard. Each output run stores its own
-/// copy of the dictionary.
+/// copy of the dictionary. Output runs end before a record that would
+/// take them past the target length, unless they hold no record yet.
+#[cfg(test)]
 pub fn compact<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    workspace: &'a mut MergeWorkspace,
+) -> Result<Compacted, CompactError> {
+    compact_with(
+        inputs,
+        keep_tombstone,
+        limits,
+        &OutputCuts::default(),
+        workspace,
+    )
+}
+
+/// [`compact`], with output runs also cut as `cuts` asks.
+pub fn compact_with<'a>(
     inputs: &[RunView<'a>],
     mut keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
+    cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
 ) -> Result<Compacted, CompactError> {
     let needed = workspace_bytes(inputs)?;
@@ -215,7 +268,12 @@ pub fn compact<'a>(
     };
     let needed = needed + choice.workspace_bytes;
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
-    let mut output = Output::new(limits, limits.max_workspace_bytes - needed, choice.trained);
+    let mut output = Output::new(
+        limits,
+        limits.max_workspace_bytes - needed,
+        choice.trained,
+        cuts,
+    );
     let mut stats = CompactStats {
         dictionary: choice.outcome,
         dictionary_time: choice.time,
@@ -277,8 +335,15 @@ fn collapse_copies(
     Ok(())
 }
 
-struct Output {
+struct Output<'c> {
     limits: CompactLimits,
+    cuts: &'c OutputCuts,
+    /// The next of `cuts.at` not yet passed.
+    next_cut: usize,
+    /// The next of `cuts.overlapped` not yet passed, and how many of them
+    /// the run being built has reached past its first record.
+    next_overlapped: usize,
+    overlapped: usize,
     /// The most bytes the open builder may hold for key hashes.
     hash_bytes: usize,
     /// The dictionary every output run is compressed with, if any.
@@ -291,13 +356,27 @@ struct Output {
     held_bytes: usize,
 }
 
-impl Output {
-    fn new(limits: CompactLimits, hash_bytes: usize, dictionary: Option<Arc<Trained>>) -> Self {
+impl<'c> Output<'c> {
+    fn new(
+        limits: CompactLimits,
+        hash_bytes: usize,
+        dictionary: Option<Arc<Trained>>,
+        cuts: &'c OutputCuts,
+    ) -> Self {
+        let target_run_len = if cuts.single {
+            MAX_TARGET_RUN_LEN
+        } else {
+            limits.target_run_len.min(MAX_TARGET_RUN_LEN)
+        };
         Self {
             limits: CompactLimits {
-                target_run_len: limits.target_run_len.min(MAX_TARGET_RUN_LEN),
+                target_run_len,
                 ..limits
             },
+            cuts,
+            next_cut: 0,
+            next_overlapped: 0,
+            overlapped: 0,
             hash_bytes,
             dictionary,
             builder: None,
@@ -308,7 +387,41 @@ impl Output {
         }
     }
 
+    /// Adds `record`, first ending the run being built if `record` would
+    /// take it past the target length, past a cut or over too many runs
+    /// below. A run with no record yet takes any record, however long, so
+    /// that a record longer than the target is a run of its own and every
+    /// run has a record.
     fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
+        let value_len = match record.value {
+            Value::Bytes(bytes) => bytes.len(),
+            Value::Tombstone => 0,
+        };
+        let len = record.key.len() + value_len + RECORD_INPUT_OVERHEAD;
+        let mut cut = false;
+        while let Some(at) = self.cuts.at.get(self.next_cut)
+            && at.as_slice() <= record.key
+        {
+            self.next_cut += 1;
+            cut = true;
+        }
+        while let Some(start) = self.cuts.overlapped.get(self.next_overlapped)
+            && start.as_slice() <= record.key
+        {
+            self.next_overlapped += 1;
+            self.overlapped += 1;
+        }
+        let over = !self.cuts.single
+            && ((!self.cuts.overlapped.is_empty() && self.overlapped > self.cuts.max_overlapped)
+                || self.input + len > self.limits.target_run_len);
+        if self.builder.is_some() && !self.cuts.single && (cut || over) {
+            self.finish_run()?;
+        }
+        if self.builder.is_none() {
+            // The run starts here: only the runs below it from this key on
+            // count against it.
+            self.overlapped = 0;
+        }
         let builder = self.builder.get_or_insert_with(|| {
             let target = self.limits.target_block_len;
             let mut builder = match &self.dictionary {
@@ -322,11 +435,7 @@ impl Output {
             .add(record.key, record.seq, record.value)
             .expect(BUILDABLE);
         let stored = builder.stored_len();
-        let value_len = match record.value {
-            Value::Bytes(bytes) => bytes.len(),
-            Value::Tombstone => 0,
-        };
-        self.input += record.key.len() + value_len + RECORD_INPUT_OVERHEAD;
+        self.input += len;
         self.check(self.bytes + stored)?;
         if self.input >= self.limits.target_run_len {
             self.finish_run()?;

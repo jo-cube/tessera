@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace, UpdateError,
+    CompactionKind, CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
+    UpdateError,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -66,8 +67,9 @@ fn compact_fully(engine: &Engine) {
     while engine.compact(options, &mut workspace).unwrap().is_some() {}
 }
 
-/// The resurrection hazard: a tombstone merged without the older run holding
-/// the value it hides must be kept, and may go only once that run is merged.
+/// The resurrection hazard: a tombstone merged without a run that could
+/// hold the value it hides must be kept, and may go only once no such run is
+/// left outside the merge.
 #[test]
 fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     let engine = Engine::new(manual()).unwrap();
@@ -82,22 +84,24 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     engine.put(b"k151", b"new").unwrap();
     engine.flush().unwrap();
 
-    // k100 lies in all three runs. The two small ones are chosen; the large
-    // one, left out, holds k100's value.
-    let report = engine
-        .compact(options(2), &mut MergeWorkspace::new())
-        .unwrap()
-        .unwrap();
+    // The large run moves to level 1, writing nothing. With two inputs a
+    // job, the tombstone's run merges with it, and the newest run, which
+    // also covers k100, is left out.
+    let mut workspace = MergeWorkspace::new();
+    let report = engine.compact(options(2), &mut workspace).unwrap().unwrap();
+    assert_eq!(
+        (report.kind, report.output_bytes),
+        (CompactionKind::Move, 0)
+    );
+    let report = engine.compact(options(2), &mut workspace).unwrap().unwrap();
+    assert_eq!(report.kind, CompactionKind::Merge);
     assert_eq!((report.inputs, report.outputs), (2, 1));
     assert!(!report.complete);
     assert_eq!(report.stats.tombstones_dropped, 0);
     assert_eq!(get(&engine, b"k100"), None);
     assert_eq!(engine.stats().runs, 2);
 
-    let report = engine
-        .compact(options(8), &mut MergeWorkspace::new())
-        .unwrap()
-        .unwrap();
+    let report = engine.compact(options(8), &mut workspace).unwrap().unwrap();
     assert!(report.complete);
     assert_eq!(report.stats.tombstones_dropped, 1);
     assert_eq!(get(&engine, b"k100"), None);
@@ -105,35 +109,52 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert_eq!(get(&engine, b"k151").unwrap(), b"new");
     assert_eq!(everything(&engine).len(), 499);
     assert_eq!(engine.stats().runs, 1);
+    assert!(
+        engine
+            .compact(options(8), &mut workspace)
+            .unwrap()
+            .is_none()
+    );
 }
 
-/// The waste the size rule removes: a large run covering the same keys as a
-/// few small ones is left in place rather than rewritten to absorb them.
+/// Level 0 waits for its trigger: small flushes over a large run are left
+/// alone until there are `max_overlap` of them, and are then merged into it
+/// together, so the large run is rewritten once for all of them.
 #[test]
-fn small_runs_are_merged_without_rewriting_a_large_run_over_them() {
+fn level_0_is_compacted_at_its_trigger_in_one_job() {
     let engine = Engine::new(manual()).unwrap();
     for i in 0..2_000 {
         engine.put(format!("k{i:04}").as_bytes(), b"base").unwrap();
     }
     engine.flush().unwrap();
+    let mut workspace = MergeWorkspace::new();
+    let options = CompactionOptions::default();
+    // Alone in level 0, below the trigger: nothing is due.
+    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
     let base = engine.stats().run_bytes;
-    for round in 0..4 {
+    for round in 0..3 {
         engine.put(b"k0000", format!("{round}").as_bytes()).unwrap();
         engine.put(b"k1999", format!("{round}").as_bytes()).unwrap();
         engine.flush().unwrap();
     }
-    assert_eq!(engine.stats().max_overlap, 5);
-
-    let mut workspace = MergeWorkspace::new();
-    let options = CompactionOptions::default();
+    assert_eq!(engine.stats().max_overlap, 4);
     let report = engine.compact(options, &mut workspace).unwrap().unwrap();
-    assert_eq!(report.inputs, 4);
-    assert!(report.input_bytes < base / 10);
-    assert!(!report.complete);
-    // Nothing more is eligible, so compacting again rewrites nothing.
+    // The oldest, the large run, moves to the empty level 1.
+    assert_eq!(report.kind, CompactionKind::Move);
+    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
+    engine.put(b"k0000", b"3").unwrap();
+    engine.put(b"k1999", b"3").unwrap();
+    engine.flush().unwrap();
+    let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+    assert_eq!((report.kind, report.inputs), (CompactionKind::Merge, 5));
+    assert!(report.input_bytes > base);
+    assert!(report.complete);
     assert!(engine.compact(options, &mut workspace).unwrap().is_none());
     let stats = engine.stats();
-    assert_eq!((stats.runs, stats.max_overlap), (2, 2));
+    assert_eq!(
+        (stats.runs, stats.max_overlap, stats.level0_flushes),
+        (1, 1, 0)
+    );
     assert_eq!(get(&engine, b"k0000").unwrap(), b"3");
     assert_eq!(get(&engine, b"k1999").unwrap(), b"3");
     assert_eq!(get(&engine, b"k1000").unwrap(), b"base");
@@ -216,8 +237,9 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     );
 }
 
-/// Every limit refuses before anything changes, and the same compaction
-/// succeeds once the limit allows it.
+/// Limits below what a job of two runs needs are refused before anything
+/// changes, and compaction proceeds within valid ones, even over lowered run
+/// limits as long as it shrinks what is published.
 #[test]
 fn a_compaction_over_any_limit_changes_nothing() {
     let engine = Engine::new(EngineOptions {
@@ -261,14 +283,32 @@ fn a_compaction_over_any_limit_changes_nothing() {
     // Over lowered run limits, a compaction that shrinks storage is still
     // allowed, so that it can make room for flushes.
     engine.set_run_limits(1, stats.run_bytes / 2).unwrap();
-    let report = engine.compact(options(8), &mut workspace).unwrap().unwrap();
-    assert!(report.complete);
+    let wide = CompactionOptions {
+        max_inputs: 64,
+        ..options(8)
+    };
+    while engine.compact(wide, &mut workspace).unwrap().is_some() {}
+    assert!(engine.stats().run_bytes < stats.run_bytes);
     assert_eq!(everything(&engine), contents);
 }
 
 /// Writers, a flusher, a manual compactor and the background worker run
 /// beside a reader. Each key's value only moves forward, a deleted key never
 /// returns, and the final state is exactly what was written.
+/// Flushes, waiting for the worker whenever level 0 is at its stop.
+fn flush_waiting(engine: &Engine) {
+    for _ in 0..1_000 {
+        match engine.flush() {
+            Ok(_) => return,
+            Err(refused) if refused.level0_flushes > refused.max_level0_flushes => {
+                engine.wait_for_compaction().unwrap();
+            }
+            Err(refused) => panic!("{refused}"),
+        }
+    }
+    panic!("level 0 never drained");
+}
+
 #[test]
 fn concurrent_compaction_loses_and_resurrects_nothing() {
     const WRITERS: usize = 2;
@@ -299,17 +339,34 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
                     barrier.wait();
                     for round in 1..=ROUNDS {
                         for i in 0..KEYS {
-                            let result = if round == ROUNDS && i % 2 == 1 {
-                                engine.delete(&key(writer, i))
-                            } else {
-                                engine.put(&key(writer, i), &round.to_be_bytes())
-                            };
-                            assert!(!matches!(result, Err(UpdateError::SequencesExhausted)));
-                            result.unwrap();
+                            // Level 0 at its stop refuses the update's flush
+                            // and changes nothing: the worker catches up and
+                            // the update is retried.
+                            for attempt in 0.. {
+                                assert!(attempt < 1_000, "level 0 never drained");
+                                let result = if round == ROUNDS && i % 2 == 1 {
+                                    engine.delete(&key(writer, i))
+                                } else {
+                                    engine.put(&key(writer, i), &round.to_be_bytes())
+                                };
+                                match result {
+                                    Err(UpdateError::FlushRefused(_)) => {
+                                        engine.wait_for_compaction().unwrap();
+                                    }
+                                    result => {
+                                        assert!(!matches!(
+                                            result,
+                                            Err(UpdateError::SequencesExhausted)
+                                        ));
+                                        result.unwrap();
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         // Overlapping runs accumulate while writing goes on.
                         if round % 10 == 0 {
-                            engine.flush().unwrap();
+                            flush_waiting(engine);
                         }
                     }
                 })
@@ -318,7 +375,7 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
         scope.spawn(|| {
             barrier.wait();
             while writing.load(Ordering::Acquire) {
-                engine.flush().unwrap();
+                flush_waiting(&engine);
             }
         });
         scope.spawn(|| {
@@ -360,13 +417,16 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
                 }
             }
         });
-        for writer in writers {
-            writer.join().unwrap();
-        }
+        // Every writer is joined before any failure is raised, so that the
+        // other threads stop rather than spin on.
+        let joined: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
         writing.store(false, Ordering::Release);
+        for result in joined {
+            result.unwrap();
+        }
     });
 
-    engine.flush().unwrap();
+    flush_waiting(&engine);
     engine.wait_for_compaction().unwrap();
     assert!(engine.stats().max_overlap <= 2);
     assert!(engine.background_status().unwrap().compactions > 0);

@@ -413,7 +413,8 @@ fn profile(index: u32, version: u32) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Compacts until one run covers each key, returning every report.
+/// Compacts until one run covers each key, returning the report of every
+/// job that rewrote runs (moves rewrite nothing and are left out).
 fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
     let options = CompactionOptions {
         max_overlap: 1,
@@ -422,7 +423,9 @@ fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
     let mut workspace = MergeWorkspace::new();
     let mut reports = Vec::new();
     while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
-        reports.push(report);
+        if report.kind != tessera::engine::CompactionKind::Move {
+            reports.push(report);
+        }
     }
     reports
 }
@@ -453,7 +456,7 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 /// structured values and reads equal the model; a checkpoint writes them
 /// (version 4) and they recover under every compression setting, beside
 /// newer plain runs; a snapshot keeps reading dictionary runs that a later
-/// compaction replaced; and a compaction refused by its output limit
+/// compaction replaced; and a compaction refused by its job limits
 /// publishes nothing.
 #[test]
 fn dictionary_runs_recover_mix_and_are_rewritten() {
@@ -501,22 +504,37 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     assert_eq!(stats.held_bytes, reports[0].output_held_bytes);
     assert!(stats.run_bytes < plain_stats.run_bytes);
 
-    // A refused compaction publishes nothing and keeps every read.
+    // A refused compaction publishes nothing and keeps every read. A record
+    // eight blocks long gets a block of its own, so the job over its flush
+    // needs more workspace than the smallest limit allowed, which admits
+    // two runs of `target_block_len` blocks.
     for i in (0..14_000).step_by(5) {
         put(&engine, &mut model, i, 2);
     }
+    let large = vec![b'x'; 32 << 10];
+    engine.put(b"user/large", &large).unwrap();
+    model.insert(b"user/large".to_vec(), large);
     engine.flush().unwrap();
     let before = engine.stats();
-    let refused = CompactionOptions {
+    let narrowest = CompactionOptions {
         max_overlap: 1,
-        max_output_bytes: 1 << 20,
+        max_workspace_bytes: 0,
         ..CompactionOptions::default()
+    };
+    let Err(CompactionError::Config(config)) =
+        engine.compact(narrowest, &mut MergeWorkspace::new())
+    else {
+        panic!("a workspace limit of 0 is refused");
+    };
+    let refused = CompactionOptions {
+        max_workspace_bytes: config.min as usize,
+        ..narrowest
     };
     let error = engine
         .compact(refused, &mut MergeWorkspace::new())
         .unwrap_err();
     assert!(
-        matches!(error, CompactionError::OutputLimit { .. }),
+        matches!(error, CompactionError::JobLimit { inputs: 2, .. }),
         "{error:?}"
     );
     let after = engine.stats();

@@ -133,6 +133,7 @@ use crate::run::{
     ReadError, Run, RunBuilder, RunView, choose_dictionary,
 };
 
+use super::levels::{LEVEL0_STOP, Levels};
 use super::{
     Core, Engine, EngineOptions, EngineWorkspace, RunLimitError, SnapshotError, WriteError,
     published,
@@ -1008,6 +1009,9 @@ impl Loaded {
         {
             let mut state = core.write_state();
             state.runs.extend(published(self.runs));
+            // A checkpoint is one sorted scan, so its runs are disjoint: the
+            // last level. Compaction inserts levels above it as it needs.
+            state.levels = Levels::recovered(&state.runs);
             state.order_runs();
             state.run_bytes = self.run_bytes;
             state.held_bytes = self.held_bytes;
@@ -1155,6 +1159,8 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 max_runs: options.max_runs,
                 run_bytes: usize::try_from(listed).unwrap_or(usize::MAX),
                 max_run_bytes: options.max_run_bytes,
+                level0_flushes: 0,
+                max_level0_flushes: LEVEL0_STOP,
             }));
         }
         let mut runs: Vec<Run<Vec<u8>>> = Vec::with_capacity(manifest.runs.len());
@@ -1216,6 +1222,8 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 max_runs: options.max_runs,
                 run_bytes: run_bytes + held_bytes,
                 max_run_bytes: options.max_run_bytes,
+                level0_flushes: 0,
+                max_level0_flushes: LEVEL0_STOP,
             }));
         }
 

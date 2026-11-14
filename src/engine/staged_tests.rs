@@ -328,7 +328,7 @@ mod snapshot {
             built.publish().unwrap();
             take(&engine, &expected);
         }
-        let job = engine.core.begin_compaction(merge_all()).unwrap().unwrap();
+        let job = engine.core.begin_job(merge_all()).unwrap().unwrap();
         take(&engine, &expected);
         let built = job.build(&mut MergeWorkspace::new()).unwrap();
         take(&engine, &expected);
@@ -423,7 +423,7 @@ mod compaction {
             engine.put(b"b", b"b").unwrap();
             engine.flush().unwrap();
         }
-        let job = engine.core.begin_compaction(options(8)).unwrap().unwrap();
+        let job = engine.core.begin_job(options(8)).unwrap().unwrap();
         engine.delete(b"a").unwrap();
         engine.flush().unwrap();
         let built = job.build(&mut MergeWorkspace::new()).unwrap();
@@ -558,8 +558,9 @@ mod compaction {
                         };
                         stage = match stage {
                             Stage::Idle => match engine.core.begin_compaction(options).unwrap() {
-                                Some(job) => Stage::Begun(job),
-                                None => Stage::Idle,
+                                Some(Begun::Job(job)) => Stage::Begun(job),
+                                // A move publishes as it is chosen.
+                                Some(Begun::Done(_)) | None => Stage::Idle,
                             },
                             Stage::Begun(job) => Stage::Built(job.build(&mut workspace).unwrap()),
                             Stage::Built(built) => {

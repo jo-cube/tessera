@@ -378,7 +378,9 @@ fn run_bytes_are_limited_inclusively() {
             runs: 1,
             max_runs: usize::MAX,
             run_bytes: size,
-            max_run_bytes: size - 1
+            max_run_bytes: size - 1,
+            level0_flushes: 1,
+            max_level0_flushes: usize::MAX,
         }
     );
 }
@@ -589,7 +591,8 @@ fn writes_refused_while_a_snapshot_blocks_compaction_resume_after_it() {
     assert_eq!(engine.put(b"late", &[1; 100]), Err(refused));
 
     drop(snapshot);
-    engine.compact(merge_all, &mut workspace).unwrap().unwrap();
+    // The oldest run moves to level 1, then the other merges with it.
+    while engine.compact(merge_all, &mut workspace).unwrap().is_some() {}
     let seq = engine.put(b"late", &[1; 100]).unwrap();
     assert_eq!(seq, before.last_seq + 1);
     let stats = engine.stats();
@@ -1254,24 +1257,26 @@ fn each_setting_out_of_range_is_refused_by_name() {
             u64::MAX,
         ),
         (
-            compaction(|c| c.max_input_bytes = 0),
+            compaction(|c| c.max_input_bytes = (128 << 20) - 1),
             "CompactionOptions::max_input_bytes",
-            0,
-            1,
+            (128 << 20) - 1,
+            128 << 20,
             u64::MAX,
         ),
         (
-            compaction(|c| c.max_output_bytes = 0),
+            compaction(|c| c.max_output_bytes = (128 << 20) - 1),
             "CompactionOptions::max_output_bytes",
-            0,
-            1,
+            (128 << 20) - 1,
+            128 << 20,
             u64::MAX,
         ),
         (
-            compaction(|c| c.max_workspace_bytes = 0),
+            compaction(|c| c.max_workspace_bytes = 3_211_263),
             "CompactionOptions::max_workspace_bytes",
-            0,
-            1,
+            3_211_263,
+            // Two inputs of 16 KiB blocks: a context and a block each, and
+            // a context and two blocks for the output.
+            3_211_264,
             u64::MAX,
         ),
     ];
@@ -1291,7 +1296,10 @@ fn each_setting_out_of_range_is_refused_by_name() {
     let accepted = [
         engine(|o| o.memtable_budget = ENTRY_OVERHEAD),
         engine(|o| o.target_run_len = 1),
-        engine(|o| o.target_run_len = 1 << 30),
+        engine(|o| {
+            o.target_run_len = 1 << 30;
+            o.background_compaction = None;
+        }),
         engine(|o| o.max_runs = 1),
         engine(|o| o.max_run_bytes = 1),
         engine(|o| o.target_block_len = 1),
@@ -1305,6 +1313,8 @@ fn each_setting_out_of_range_is_refused_by_name() {
         }),
         compaction(|c| c.max_overlap = 1),
         compaction(|c| c.max_inputs = 2),
+        compaction(|c| c.max_input_bytes = 128 << 20),
+        compaction(|c| c.max_workspace_bytes = 3_211_264),
         compaction(|c| c.disjoint_runs_above = 0),
     ];
     for options in accepted {

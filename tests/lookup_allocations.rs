@@ -115,7 +115,10 @@ fn consolidated(compression: Compression) -> (Engine, Vec<DictionaryChoice>) {
     let mut workspace = MergeWorkspace::new();
     let mut choices = Vec::new();
     while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
-        choices.push(report.stats.dictionary);
+        // A move rewrites nothing and so chooses no dictionary.
+        if report.kind != tessera::engine::CompactionKind::Move {
+            choices.push(report.stats.dictionary);
+        }
     }
     (engine, choices)
 }

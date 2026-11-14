@@ -944,6 +944,7 @@ fn metadata_and_selection_at_thousands_of_runs() {
                     runs.push(Arc::new(Published {
                         run: builder.finish(),
                         tail: false,
+                        largest_block: 0,
                     }));
                 }
             }

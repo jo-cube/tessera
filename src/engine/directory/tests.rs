@@ -38,6 +38,7 @@ fn run(records: &[Record]) -> SharedRun {
     Arc::new(Published {
         run: builder.finish(),
         tail: false,
+        largest_block: 0,
     })
 }
 
@@ -431,6 +432,7 @@ fn damage_is_reported_only_where_a_read_must_open_the_run() {
     let damaged = Arc::new(Published {
         run: damaged_source.run.damaged_at(DAMAGE_AT),
         tail: false,
+        largest_block: 0,
     });
     let right = run(&[put(b"p", 5, b"-"), put(b"q", 6, b"-")]);
     let runs = vec![newest, left, Arc::clone(&damaged), right];

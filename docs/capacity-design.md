@@ -1,13 +1,12 @@
-# Scalable capacity and range-local compaction (design, 5AR–5AS)
+# Scalable capacity and range-local compaction (design 5AR–5AS, implemented 5AT)
 
-Status: design, with research measurements. Nothing here is implemented
-beyond test-only research: `src/engine/capacity_tests.rs` (5AR: the
-current policy, a continuum model, directory costs) and
-`src/engine/leveling_tests.rs` (5AS: a discrete model of the leveled
-policy with exact keys, versions, tombstones, snapshots and byte limits,
-and engine tests over real runs). Sections 1–3 are 5AR's analysis;
-sections 4 onward are the design as 5AS validated and corrected it. The
-implementation plan is the last section.
+Status: implemented in 5AT without flush splitting; section 16 records
+what was built, how it differs from this design, and what was measured.
+Sections 1–3 are 5AR's analysis of the flat policy that 5AT replaced
+(kept for its measurements; the 64-run ceiling they describe no longer
+exists). Sections 4–15 are the design as 5AS validated and corrected it,
+with its research in `src/engine/capacity_tests.rs` (5AR) and
+`src/engine/leveling_tests.rs` (5AS, a discrete model of the policy).
 
 Every number is marked as one of:
 
@@ -21,7 +20,7 @@ Every number is marked as one of:
 Sizes are in *segments*: one `target_run_len` of logical input (key, value
 and 16 bytes a record), 64 MiB by default.
 
-## 1. Why the engine stops growing
+## 1. Why the flat policy stopped growing (before 5AT)
 
 The ceiling is not the run directory (5AQ made lookups and scans over
 thousands of runs cheap) but the interaction of three rules:
@@ -535,8 +534,8 @@ reads, no new persistent state.
 
 ## 14. Remaining risks
 
-- The WA and space figures are a model, calibrated against the engine only
-  for the current policy; leveled WA has not been measured on the engine.
+- Leveled WA is measured on the engine only at reduced scale (200,000
+  writes, 64 KiB runs; section 16); larger figures are the model's.
 - Deletes at `max_run_bytes` are refused like any write.
 - Checkpoints rewrite every live key; at tens of GiB that dominates writes.
 - Ascending inserts keep about two runs per segment.
@@ -581,3 +580,145 @@ shuffled; recovery into one level; the progress scenarios of section 6 on
 the engine at reduced scale; WA at reduced scale against this model
 (within its calibration error). Then 5AU: flush splitting, the reserve,
 removal of the obsolete options, and reduced-scale benchmarks.
+
+## 16. Implementation (5AT)
+
+### What was built
+
+- **Levels** (`src/engine/levels.rs`): in memory beside the run directory,
+  rebuilt on recovery (every checkpointed run into level 1) and never
+  persisted. Level 0 is in publication order and may overlap; deeper levels
+  are sorted and disjoint. Reads still go through the run directory by
+  sequence, so level tags cannot change a result. Every publication in a
+  test or debug build checks membership, order, disjointness and byte
+  totals (`Levels::check`).
+- **Selection**: dynamic level sizing, insertion of a level while the last
+  exceeds its target, scores compared as exact fractions with ties to the
+  shallower level, round-robin cursors, binary-search overlap. A level-0
+  job takes level-0 runs oldest first while the job fits, with the level-1
+  runs they overlap. A level-`i` job takes one run and its overlap below.
+  Then, in order: a trivial move when nothing below overlaps; a split of
+  the source at the boundaries of the level below when the job would not
+  fit; a merge of two small adjacent runs; otherwise a refusal naming the
+  job (`CompactionError::JobLimit`).
+- **Outputs** (`run::compact_with`): cut before a record that would
+  overshoot the target (a record larger than the target gets a run of its
+  own), at given keys (splits), and where the run would overlap more than
+  `RATIO - 1` runs two levels down. A neighbour merge writes one run.
+- **Publication**: unchanged admission (growth measured on the built
+  output; shrinking always allowed), then `Levels::replace` validates
+  every input's place before changing anything (`CompactionError::Stale`
+  otherwise). Moves are applied as they are chosen, under the write lock.
+- **Tombstones**: the "others" a tombstone must be kept for are found per
+  level, level 0 by scan and deeper levels by binary search, instead of
+  scanning every run. The rule itself is unchanged.
+- **Limits**: `max_runs` is a safety valve (default 65,536); `max_run_bytes`
+  is the physical limit. With a background worker, a flush is refused while
+  level 0 holds 12 flushes (`RunLimitError::max_level0_flushes`). `max_inputs`
+  defaults to 32; inputs, bytes and workspace are checked separately before
+  anything is allocated. Validation requires byte limits of two runs and a
+  workspace of two runs' blocks, so every job can be formed.
+
+### Differences from the design and the model
+
+| Item | Design / model | 5AT |
+|---|---|---|
+| Flush splitting | pieces at level-1 boundaries | not built: a flush is one or more target-length runs |
+| Level-0 trigger | more than `max_overlap` flushes | at least `max_overlap` (1 now drains level 0 every flush) |
+| Level-0 stop | always | only with a background worker; a manual engine is bounded by the run limits and the caller |
+| Segment estimate (sizing, "small") | runs' stored length | `target_run_len` × the stored/logical ratio of flushes so far; after recovery, the largest run |
+| Split estimate | each piece's own bytes | the whole source per piece: conservative, may refuse a split that would fit |
+| Grandparent cut | by bytes overlapped | by runs overlapped (more than 3) |
+| A split that drops nothing | n/a | refused when it would write one unchanged run; published when it dropped records, which is progress |
+| Level-0 stop refusal | stall | `UpdateError::FlushRefused`; the caller waits for the worker and retries |
+
+### Merge memory (measured)
+
+`tests/compaction_memory.rs`, release, one merge of 8, 16 and 32 inputs
+with 64 KiB blocks and `ZstdDictionary` (the trial chose plain blocks,
+`NotBeneficial`, on these values). Rust heap counted by a global allocator;
+Zstandard's decompression contexts are allocated by `malloc` and reported
+by `MergeWorkspace::context_bytes`.
+
+| Inputs | Input MiB | Output MiB | Estimate MiB | Peak heap MiB | Peak − output MiB | Contexts MiB |
+|---|---|---|---|---|---|---|
+| 8 | 2.0 | 1.6 | 30.8 | 2.6 | 1.0 | 0.7 |
+| 16 | 4.1 | 3.2 | 39.3 | 4.5 | 1.3 | 1.5 |
+| 32 | 8.2 | 7.0 | 56.3 | 9.4 | 2.4 | 2.9 |
+
+The estimate for 32 inputs (56.3 MiB) is within the default workspace
+limit (64 MiB), so the default of 32 needed no budget raised; the
+estimate's per-input context allowance dominates it and is far above what
+these merges used. These are single runs, not a bound on process RSS.
+
+### Production comparison (measured, reduced scale)
+
+`leveled_tests::production_policies_compared`, release, in the bounded
+container: 200,000 writes of 15-byte keys and 100-byte text values,
+64 KiB memtables and runs, limits of four runs in and out, every
+compaction synchronous after each flush (so its time is the worker's CPU).
+"Flat(64)" is the old selector with its old 64-run limit, "flat
+unlimited" the same without a limit, "leveled" 5AT with its defaults so
+scaled. WA = (flushed + compacted) / flushed; latencies are in-process
+point lookups and prefix scans after the load.
+
+| Workload | Policy | Writes done | WA | Stored written / logical | Space amp. | Runs | Levels | Compaction s | Point µs | Prefix µs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ascending | flat(64) | 32,280 (refused) | 2.75 | 0.546 | 0.98 | 64 | 1 | 0.0 | 1.9 | 2.2 |
+| ascending | flat unlimited | 200,000 | 2.91 | 0.594 | 1.00 | 400 | 1 | 0.3 | 11.3 | 12.5 |
+| ascending | leveled | 200,000 | 1.00 | 0.204 | 1.00 | 744 | 4 | 0.0 | 11.2 | 12.5 |
+| uniform insert | flat(64) | 31,473 (refused) | 9.09 | 1.967 | 1.01 | 64 | 1 | 0.1 | 11.2 | 29.3 |
+| uniform insert | flat unlimited | 200,000 | 42.12 | 9.392 | 1.05 | 404 | 1 | 4.3 | 11.6 | 32.8 |
+| uniform insert | leveled | 200,000 | 11.42 | 2.547 | 1.05 | 414 | 4 | 0.8 | 11.5 | 36.1 |
+| uniform overwrite | flat(64) | 32,280 (refused) | 2.75 | 0.546 | 0.98 | 64 | 1 | 0.0 | 7.1 | 8.1 |
+| uniform overwrite | flat unlimited | 200,000 | 22.80 | 4.915 | 1.10 | 109 | 1 | 1.8 | 11.5 | 29.7 |
+| uniform overwrite | leveled | 200,000 | 7.37 | 1.588 | 1.37 | 141 | 3 | 0.5 | 13.0 | 42.9 |
+| hot range | flat(64) | 32,280 (refused) | 2.75 | 0.546 | 0.98 | 64 | 1 | 0.0 | 7.1 | 8.1 |
+| hot range | flat unlimited | 200,000 | 2.33 | 0.432 | 1.01 | 108 | 1 | 0.1 | 11.3 | 23.7 |
+| hot range | leveled | 200,000 | 1.68 | 0.312 | 1.04 | 187 | 3 | 0.1 | 11.2 | 13.6 |
+| mixed with deletes | flat(64) | 99,522 (refused) | 10.93 | 2.828 | 1.09 | 64 | 1 | 0.4 | 11.5 | 30.5 |
+| mixed with deletes | flat unlimited | 200,000 | 18.14 | 4.758 | 1.06 | 126 | 1 | 1.3 | 11.6 | 32.1 |
+| mixed with deletes | leveled | 200,000 | 9.05 | 2.373 | 1.27 | 159 | 3 | 0.6 | 12.3 | 38.8 |
+
+No compaction or flush was refused under leveling; level 0 never held
+more than 4 flushes. Peak published runs and filters were 0.7–4.9 MiB and
+the test process's RSS 8–19 MiB in every row. The flat(64) rows stop where the old
+ceiling refused a flush, which is why their lookups look cheap: they hold
+a fraction of the data.
+
+Against the unlimited flat policy, leveling cut WA 2.9× (ascending),
+3.7× (uniform insert), 3.1× (overwrite), 1.4× (hot range) and 2.0×
+(mixed). It costs space on overwrites and deletes (1.37 against 1.10;
+1.27 against 1.06), since older versions wait in deeper levels. Prefix
+scans over the whole range are 10–44% slower for uniform inserts,
+overwrites and mixed writes (more levels to merge) and faster for the hot
+range; point lookups are within 13%.
+
+### Against the model (derived)
+
+The model at the same 200,000 writes (`leveling_tests::workloads_under_leveling`,
+`LEVELING_WRITES=200`, policy "leveled 4, no flush split"):
+
+| Workload | Model WA | Engine WA | Model space amp. | Engine space amp. | Model runs | Engine runs |
+|---|---|---|---|---|---|---|
+| ascending | 1.00 | 1.00 | 1.01 | 1.00 | 752 | 744 |
+| uniform insert | 10.41 | 11.42 | 1.01 | 1.05 | 463 | 414 |
+| uniform overwrite | 6.76 | 7.37 | 1.33 | 1.37 | 156 | 141 |
+| hot range | 1.55 | 1.68 | 1.03 | 1.04 | 187 | 187 |
+| mixed with deletes | 8.45 | 9.05 | 1.23 | 1.27 | 177 | 159 |
+
+The engine writes 7–10% more than the model wherever compaction rewrites
+anything. Likely causes, not separated: the grandparent cut by count
+rather than bytes, the conservative segment estimate, the `>=` level-0
+trigger, and the model's fixed compression ratio against real blocks.
+Ascending inserts keep about two runs per segment, as the model predicts.
+
+### Not done in 5AT
+
+- Flush splitting, and a stall (rather than a refusal) at the level-0
+  stop. Flushes still run on the writer that needs room.
+- Removal of `disjoint_runs_above`, accepted and ignored.
+- Checkpoints still rewrite every live key.
+- No measurement beyond 200,000 writes at 64 KiB runs: nothing here
+  verifies hundreds of millions of records.
+

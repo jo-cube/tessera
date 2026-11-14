@@ -157,19 +157,55 @@
 //!
 //! [Background compaction](self#background-compaction) is on by default;
 //! with [`EngineOptions::background_compaction`] set to `None`, compaction is
-//! explicit. [`Engine::compact`] does one in three stages, like a flush: inputs are selected under the
-//! shared lock, merged without any lock, and replaced by the output in one
-//! step under the exclusive lock. Readers see either all of the inputs or all
-//! of the output. Compactions run one at a time; flushes, reads and writes
-//! continue beside them.
+//! explicit. [`Engine::compact`] takes one step in three stages, like a
+//! flush: inputs are selected under the lock, merged without any lock, and
+//! replaced by the output in one step under the exclusive lock. Readers see
+//! either all of the inputs or all of the output. Compactions run one at a
+//! time; flushes, reads and writes continue beside them.
+//!
+//! Compaction is leveled. Every published run belongs to one level. Level 0
+//! holds the runs of recent flushes in publication order, and they may
+//! overlap; each deeper level is sorted by key and its runs are strictly
+//! disjoint. Levels are compaction's bookkeeping only: they are kept in
+//! memory, never persisted, and never consulted by reads, which go by
+//! sequence number through the [run directory](self#reading-runs), so a run
+//! returns the same answers whatever its level. Recovery puts a checkpoint's
+//! runs, which are disjoint, in the last level. Each level below 0 is sized
+//! to a quarter of the next, from the last level's size, and empty levels are
+//! added under level 0 as the data grows. One step is the first that applies:
+//!
+//! - **Level 0**, once it holds runs of
+//!   [`CompactionOptions::max_overlap`] flushes: its oldest run, with the other
+//!   level-0 runs that overlap the job while it fits, merged with the level-1
+//!   runs they overlap.
+//! - **A level over its size**, the most over first: the run after the
+//!   level's last job, in key order, merged with the runs of the next level
+//!   it overlaps, found by binary search. Outputs are cut at the run length
+//!   and where they would overlap more than four runs of the level below.
+//! - A run that overlaps nothing in the next level **moves** there: nothing
+//!   is read or written.
+//! - A job that does not fit the [`CompactionOptions`] limits **splits** its
+//!   first run, rewriting it alone at the boundaries of the runs below it, if
+//!   that leaves at least two pieces whose own jobs fit; the next job from
+//!   that level takes the first piece. Otherwise the step is refused with
+//!   [`CompactionError::JobLimit`], before anything is read.
+//! - Two adjacent runs of one level, both under half a full run, are merged
+//!   into one, if the merged range overlaps at most four full runs' bytes
+//!   in the next level.
+//!
+//! Each step either lowers a level's excess, moves data down, or lowers the
+//! run count, so repeated compaction without new flushes stops. A step reads
+//! level sizes and key ranges only, never the runs' contents, and no step
+//! compares every pair of runs.
 //!
 //! Only the newest version of each key is kept, which is correct because no
 //! reader can ask for an older one. A tombstone is dropped only if no run
-//! outside the inputs could hold an older value under its key. Runs published
-//! after selection come from flushes and are newer than every input, and the
-//! memtables are newer still, so neither can be harmed by the replacement.
-//! Publication checks that every input is still published, and a compaction
-//! that fails at any stage changes nothing.
+//! outside the inputs, in any level, overlaps its key and so could hold an
+//! older value under it. Runs published after selection come from flushes
+//! and are newer than every input, and the memtables are newer still, so
+//! neither can be harmed by the replacement. Publication checks that every
+//! input is still published where selection found it and that the output
+//! fits its level, and a compaction that fails at any stage changes nothing.
 //!
 //! # Reading runs
 //!
@@ -255,7 +291,7 @@
 //! flushes ([`UpdateError::FlushRefused`]), log limits refuse writes
 //! ([`UpdateError::LogFull`]), snapshot limits refuse snapshots and
 //! compactions, and compaction limits refuse a merge
-//! ([`CompactionError::InputLimit`] and its neighbours).
+//! ([`CompactionError::JobLimit`] and its neighbours).
 //!
 //! Compression and block length choose how new runs are built, nothing
 //! else. Every run records its own codec, block lengths and dictionary, so
@@ -274,10 +310,18 @@
 //! with the history their snapshots pin, and a long-lived snapshot makes
 //! flushes come sooner rather than letting memory grow.
 //!
-//! Published runs are limited by a count and a byte total. Once a flush would
-//! exceed either limit it is rejected, and writes needing room fail with
-//! [`UpdateError::FlushRefused`]. Compaction can make room, and
-//! [`Engine::set_run_limits`] raises the limits.
+//! Published runs are limited by a byte total, [`EngineOptions::max_run_bytes`],
+//! the physical limit on what the engine holds, and by a count,
+//! [`EngineOptions::max_runs`], a safety valve on their metadata. With a
+//! background worker, a flush is also refused while level 0 holds runs of
+//! 12 flushes (the level-0 stop), so that lookups stay bounded when the
+//! worker falls behind; without one, the application compacts when it
+//! chooses and only the run limits bound level 0. Once a flush
+//! would pass any of these it is rejected, and writes needing room fail with
+//! [`UpdateError::FlushRefused`]. Compaction lifts the level-0 stop by
+//! itself, and the byte limit when the runs hold overwritten or deleted
+//! versions it can drop; a database of live data at the byte limit needs
+//! [`Engine::set_run_limits`] (deletes are writes, and are refused too).
 //!
 //! A compaction adds, until it publishes, its output and workspace, each
 //! limited by [`CompactionOptions`]. Only one compaction builds at a time,
@@ -288,12 +332,18 @@
 //! decoding, and until then they count as retained. Run bytes can therefore
 //! briefly be the published total plus one output, beside two memtable
 //! budgets and one workspace. A compaction is refused only if it would leave
-//! more runs or bytes than both the limits, or what it replaces.
+//! more runs or bytes than both the limits and what is published now: its
+//! growth is measured on its built output, so a compaction that shrinks
+//! what is published, the one that reclaims space, is never blocked by the
+//! limit that refuses a flush.
 //!
-//! When flushes outpace compaction, the run limits reject flushes, the
-//! memtables fill and writes are rejected with [`UpdateError::FlushRefused`].
-//! No write waits for compaction on its own: a refused flush asks the worker
-//! for a pass, and a caller can [`Engine::wait_for_compaction`] and retry.
+//! When flushes outpace compaction, level 0 reaches its stop, flushes are
+//! rejected, the memtables fill and writes are rejected with
+//! [`UpdateError::FlushRefused`]. No write waits for compaction on its own:
+//! a refused flush asks the worker for a pass, and a caller can
+//! [`Engine::wait_for_compaction`] and retry. Flushes themselves still run
+//! on the writer that needs room, so a write that fills the memtable stalls
+//! for the flush.
 //!
 //! Snapshots keep memory in two ways, both reported as
 //! [`EngineStats::retained_bytes`]: the history pinned in the engine's
@@ -307,14 +357,16 @@
 //! it lives. While it exceeds [`SnapshotLimits::max_retained_bytes`], new
 //! snapshots are refused and so are compactions, whose output would be held
 //! beside inputs that snapshots keep. That is the backpressure: runs then
-//! accumulate until flushes and so writes are refused, until snapshots
-//! are dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
+//! accumulate in level 0 until its stop refuses flushes and so writes,
+//! until snapshots are dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
 //! point lookups and, for scans, one per group of key-disjoint runs it has
 //! read (see [Reading runs](self#reading-runs)).
 //!
-//! The run directory is not charged against any limit. It holds a pointer per
-//! run and a few words per group, and a snapshot or a lookup in progress keeps
-//! the directory it read, with the runs in it, until it is dropped.
+//! The run directory and the levels are not charged against any limit. The
+//! directory holds a pointer per run and a few words per group, the levels a
+//! pointer per run and a key per level, and a snapshot or a lookup in
+//! progress keeps the directory it read, with the runs in it, until it is
+//! dropped. [`EngineOptions::max_runs`] bounds both.
 //!
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
@@ -383,6 +435,7 @@
 mod checkpoint;
 mod directory;
 mod group;
+mod levels;
 mod wal;
 mod worker;
 
@@ -390,6 +443,8 @@ mod worker;
 mod capacity_tests;
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod leveled_tests;
 #[cfg(test)]
 mod leveling_tests;
 #[cfg(test)]
@@ -420,11 +475,12 @@ use crate::memtable::{
 };
 use crate::run::{
     Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
-    MAX_ENGINE_BLOCK_LEN, MAX_TARGET_RUN_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, Run,
-    RunView, TARGET_BLOCK_LEN, compact, latest_from,
+    MAX_ENGINE_BLOCK_LEN, MAX_TARGET_RUN_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, OutputCuts,
+    RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_LEN, compact_with, latest_from,
 };
 
 use directory::RunDirectory;
+use levels::{Dest, Fit, LEVEL0_STOP, Levels, Plan};
 
 type SharedRun = Arc<Published>;
 
@@ -433,17 +489,29 @@ type SharedRun = Arc<Published>;
 struct Published {
     run: Run<Vec<u8>>,
     /// Whether this was the last run of its flush or compaction, the only one
-    /// that can be below the target length.
+    /// that can be below the target length. Only the flat selector that
+    /// preceded levels, kept for tests, reads it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the tests' flat selector")
+    )]
     tail: bool,
+    /// The decoded length of its largest block, for sizing a compaction's
+    /// workspace before reading anything.
+    largest_block: usize,
 }
 
 /// Wraps the runs of one flush or compaction, in key order, for publication.
 fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
     let last = runs.len().saturating_sub(1);
     runs.into_iter().enumerate().map(move |(index, run)| {
+        // A run that cannot report its blocks is damaged, which the merge
+        // that reads it reports; until then it is sized as one empty block.
+        let largest_block = run.view().largest_block_len().unwrap_or(0);
         Arc::new(Published {
             run,
             tail: index == last,
+            largest_block,
         })
     })
 }
@@ -466,13 +534,21 @@ pub struct EngineOptions {
     /// flush writes several runs with disjoint key ranges: from 1 to 1 GiB.
     /// A run holds at least one record.
     pub target_run_len: usize,
-    /// The most runs that may be published, at least 1. A flush that would
-    /// exceed it is refused, and the writes waiting for it with
-    /// [`UpdateError::FlushRefused`], until compaction makes room.
+    /// The most runs that may be published, at least 1: a safety valve on
+    /// the metadata runs need (a few hundred bytes each, not charged
+    /// against `max_run_bytes`), not a capacity limit. Leveled compaction
+    /// keeps runs at about the target length, so the run count grows with
+    /// the data and `max_run_bytes` decides how much fits. A flush that
+    /// would exceed it is refused, and the writes waiting for it with
+    /// [`UpdateError::FlushRefused`], until compaction merges small runs or
+    /// the limit is raised. The default, 65,536, is the default
+    /// `max_run_bytes` over 64 KiB; scale it with `max_run_bytes`.
     pub max_runs: usize,
     /// The most bytes of published runs, at least 1: their stored bytes, key
-    /// filters and prepared dictionaries together. Exceeding it refuses
-    /// flushes as for `max_runs`.
+    /// filters and prepared dictionaries together. This is the physical
+    /// limit on how much the engine holds. Exceeding it refuses flushes as
+    /// for `max_runs`; a compaction may exceed it only by publishing less
+    /// than it replaces.
     pub max_run_bytes: usize,
     /// The sequence number a new engine continues after: the first write
     /// uses the next. [`Engine::new`] and [`Engine::create`] use it;
@@ -513,7 +589,8 @@ pub struct EngineOptions {
 }
 
 impl Default for EngineOptions {
-    /// 64 MiB memtables, 64 runs and 4 GiB of runs, background compaction
+    /// 64 MiB memtables, 4 GiB of runs (and at most 65,536 of them),
+    /// background compaction
     /// with [`CompactionOptions::default`], the default snapshot limits, and
     /// plain Zstandard in 16 KiB blocks: a general-purpose default that
     /// favours density and scans. See [`Compression`] for the
@@ -522,8 +599,8 @@ impl Default for EngineOptions {
         Self {
             memtable_budget: 64 << 20,
             target_run_len: TARGET_RUN_LEN,
-            max_runs: 64,
-            max_run_bytes: 4 << 30,
+            max_runs: DEFAULT_MAX_RUNS,
+            max_run_bytes: DEFAULT_MAX_RUN_BYTES,
             last_seq: 0,
             background_compaction: Some(CompactionOptions::default()),
             snapshots: SnapshotLimits::default(),
@@ -532,6 +609,12 @@ impl Default for EngineOptions {
         }
     }
 }
+
+/// The default [`EngineOptions::max_run_bytes`].
+const DEFAULT_MAX_RUN_BYTES: usize = 4 << 30;
+/// The default [`EngineOptions::max_runs`]: one run per 64 KiB of the
+/// default `max_run_bytes`.
+const DEFAULT_MAX_RUNS: usize = DEFAULT_MAX_RUN_BYTES / (64 << 10);
 
 impl EngineOptions {
     /// The one check of these options, made before an engine starts a
@@ -560,7 +643,7 @@ impl EngineOptions {
             "the compaction workspace estimate covers blocks of up to 64 KiB",
         )?;
         if let Some(compaction) = &self.background_compaction {
-            compaction.validate()?;
+            compaction.validate(self.target_run_len, self.target_block_len)?;
         }
         Ok(())
     }
@@ -573,7 +656,7 @@ impl EngineOptions {
 /// Every setting is checked, and none is adjusted: a value is accepted as
 /// given or refused here. Settings that are valid can still meet runtime
 /// limits, which are reported by the operation they stop, such as
-/// [`UpdateError::FlushRefused`] or [`CompactionError::InputLimit`].
+/// [`UpdateError::FlushRefused`] or [`CompactionError::JobLimit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConfigError {
@@ -941,9 +1024,17 @@ impl fmt::Display for UpdateError {
 impl std::error::Error for UpdateError {}
 
 /// Publishing would exceed the run limits ([`EngineOptions::max_runs`] and
-/// [`EngineOptions::max_run_bytes`]). A refused flush keeps its frozen table
-/// readable, and a later flush retries it; a refused compaction publishes
-/// nothing. Compaction or [`Engine::set_run_limits`] makes room.
+/// [`EngineOptions::max_run_bytes`]), or a flush would leave level 0 with
+/// more flushes than the background worker lets it hold (the level-0 stop,
+/// 12; unlimited without a worker). A
+/// refused flush keeps its frozen table readable, and a later flush retries
+/// it; a refused compaction publishes nothing.
+///
+/// Compaction lifts a refusal at the level-0 stop by itself, and one at
+/// `max_run_bytes` when it can reclaim overwritten or deleted versions; a
+/// database of live data at `max_run_bytes` needs
+/// [`Engine::set_run_limits`]. `max_runs` is a safety valve on run metadata,
+/// not a capacity limit: see [`EngineOptions::max_runs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunLimitError {
     /// Runs that would be published.
@@ -954,10 +1045,23 @@ pub struct RunLimitError {
     pub run_bytes: usize,
     /// The limit on those bytes.
     pub max_run_bytes: usize,
+    /// Flushes level 0 would hold.
+    pub level0_flushes: usize,
+    /// The level-0 stop: 12 with a background worker, `usize::MAX`
+    /// without.
+    pub max_level0_flushes: usize,
 }
 
 impl fmt::Display for RunLimitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.level0_flushes > self.max_level0_flushes {
+            return write!(
+                f,
+                "publishing would leave {} flushes in level 0, over the stop of {}; \
+                 compaction drains it",
+                self.level0_flushes, self.max_level0_flushes
+            );
+        }
         write!(
             f,
             "publishing would leave {} runs of {} bytes, over the limits of {} runs and {} bytes",
@@ -1028,6 +1132,14 @@ pub struct EngineStats {
     /// The part of `retained_bytes` that is those runs' filters and prepared
     /// dictionaries.
     pub retained_held_bytes: usize,
+    /// Flushes whose runs level 0 holds: at most 12, the level-0 stop, with
+    /// a background worker.
+    pub level0_flushes: usize,
+    /// Runs in level 0.
+    pub level0_runs: usize,
+    /// Levels below level 0, including empty ones, which compaction adds
+    /// as the data grows.
+    pub levels: usize,
     /// Flushes published since the engine started, whether a write or the
     /// caller started them.
     pub flushes: u64,
@@ -1055,6 +1167,12 @@ struct State {
     directory: Arc<RunDirectory>,
     run_bytes: usize,
     held_bytes: usize,
+    /// The same runs as compaction sees them, in levels. Changed in the same
+    /// write section as `runs`, and never read by lookups or scans.
+    levels: Levels,
+    /// Level 0 flushes beyond which a flush is refused: [`LEVEL0_STOP`]
+    /// with a background worker, otherwise unlimited; tests may change it.
+    level0_stop: usize,
     max_runs: usize,
     max_run_bytes: usize,
     /// Sources removed from the state, kept track of until no snapshot holds
@@ -1096,6 +1214,22 @@ impl State {
     /// runs, and readers holding the previous directory keep it.
     fn order_runs(&mut self) {
         self.directory = Arc::new(RunDirectory::build(&self.runs));
+        if cfg!(any(test, debug_assertions)) {
+            self.levels.check(&self.runs);
+        }
+    }
+
+    /// The refusal of anything that would leave `runs` runs of `bytes`
+    /// bytes and `flushes` level-0 flushes.
+    fn run_limit(&self, runs: usize, bytes: usize, flushes: usize) -> RunLimitError {
+        RunLimitError {
+            runs,
+            max_runs: self.max_runs,
+            run_bytes: bytes,
+            max_run_bytes: self.max_run_bytes,
+            level0_flushes: flushes,
+            max_level0_flushes: self.level0_stop,
+        }
     }
 
     /// `held_bytes` is `Some` for a run.
@@ -1331,40 +1465,30 @@ impl Engine {
         self.core.flush()
     }
 
-    /// Compacts once, building in `workspace`, or returns `None` if nothing
-    /// needs it. Waits for any compaction in progress, including the
-    /// background worker's.
+    /// Takes one compaction step, building in `workspace`, or returns `None`
+    /// if nothing is due. Waits for any compaction in progress, including
+    /// the background worker's.
     ///
-    /// If some key lies in the ranges of more than
-    /// [`CompactionOptions::max_overlap`] runs, the runs covering the most
-    /// deeply covered key are the candidates. The fewest smallest of them
-    /// that bring the overlap there within the allowance are taken, then each
-    /// next smallest no larger than all taken so far, within the input limits.
-    /// A large run is so rewritten only once comparable data has accumulated
-    /// over it, not each time a small run arrives. The runs taken all share
-    /// that key, so the merge lowers the overlap there and, since its output
-    /// is disjoint and stays within their combined range, raises it nowhere.
+    /// The step is the first of those described under
+    /// [Compaction](self#compaction) that applies: a merge of level 0 into
+    /// level 1, a merge from the level most over its size into the next, a
+    /// move, a split, or a merge of two small neighbours. A move or a level
+    /// insertion changes only levels, which reads never consult, and returns
+    /// a [`CompactionKind::Move`] report with nothing read or written.
     ///
-    /// If no two runs overlap and there are more than
-    /// [`CompactionOptions::disjoint_runs_above`], neighbouring tails are
-    /// merged instead: a tail is the last run of a flush or compaction, the
-    /// only kind that can be below the target length. The window of adjacent
-    /// tails with the most runs that fits, then the fewest bytes, is taken.
-    /// It leaves one tail in place of several. Full-length disjoint runs are
-    /// never rewritten.
-    ///
-    /// Each kind of merge reduces a count that the other cannot raise, so
-    /// compacting repeatedly with the same options and no new flushes stops.
+    /// Each step lowers a level's excess, moves data down or lowers the run
+    /// count, so compacting repeatedly with the same options and no new
+    /// flushes stops. Afterwards a lookup visits at most one run per level
+    /// and one per level-0 flush ([`EngineStats::max_overlap`]).
     ///
     /// The merge runs without the state lock: reads, writes and flushes
     /// proceed beside it, and its output is published in one step. Inputs a
     /// snapshot holds stay allocated until it is dropped.
     ///
-    /// Repeated until `None` with a [`CompactionOptions::max_overlap`] of 1,
-    /// this consolidates after ingestion slows: then no key lies in more than
-    /// one run and a lookup reads at most one run block, within the same input
-    /// limits (a merge beyond them fails instead). Runs that overlap no other
-    /// are rewritten only by the disjoint-tail rule.
+    /// Refused with [`CompactionError::JobLimit`] if a level needs a job
+    /// that no split brings within the limits, which only larger limits
+    /// resolve; with [`CompactionError::Retained`] while snapshots retain
+    /// too much, which dropping them resolves.
     pub fn compact(
         &self,
         options: CompactionOptions,
@@ -1423,6 +1547,15 @@ impl Core {
                 directory: Arc::new(RunDirectory::empty()),
                 run_bytes: 0,
                 held_bytes: 0,
+                levels: Levels::new(),
+                // The stop is the worker's backpressure. Without one, the
+                // application compacts when it chooses, and only the run
+                // limits bound level 0.
+                level0_stop: if options.background_compaction.is_some() {
+                    LEVEL0_STOP
+                } else {
+                    usize::MAX
+                },
                 max_runs: options.max_runs,
                 max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
@@ -1711,71 +1844,239 @@ impl Core {
         options: CompactionOptions,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        options.validate().map_err(CompactionError::Config)?;
+        options
+            .validate(self.target_run_len, self.target_block_len)
+            .map_err(CompactionError::Config)?;
         match self.begin_compaction(options)? {
-            Some(job) => job.build(workspace)?.publish().map(Some),
+            Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
+            Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
         }
     }
 
+    /// Chooses the next step from the levels, under the exclusive lock
+    /// briefly, so that level insertions and moves, which change only
+    /// levels, are done in the same section. Selection reads metadata only:
+    /// level sizes, key ranges by binary search and the runs of level 0.
     fn begin_compaction(
         &self,
         options: CompactionOptions,
-    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
-        self.begin_compaction_with(options, select)
-    }
-
-    /// Begins a compaction of the runs that `choose` picks, which must be at
-    /// least two that share a key or, if none overlap, adjacent tails.
-    fn begin_compaction_with(
-        &self,
-        options: CompactionOptions,
-        choose: impl FnOnce(
-            &[Candidate<'_>],
-            CompactionOptions,
-        ) -> Result<Option<Vec<usize>>, CompactionError>,
-    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
+    ) -> Result<Option<Begun<'_>>, CompactionError> {
         // As for flushing, this mutex guards no data.
         let serial = self
             .compacting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let state = self.read_state();
+        let mut state = self.write_state();
         let bytes = state.retained().bytes;
         let max = self.snapshot_limits.max_retained_bytes;
         if bytes > max {
             return Err(CompactionError::Retained { bytes, max });
         }
-        let candidates = candidates(&state.runs);
-        let Some(selected) = choose(&candidates, options)? else {
-            return Ok(None);
+        let fit = options.fit(self.target_run_len);
+        state.levels.insert_levels(&fit);
+        let refusal = |refusal: levels::Refusal| CompactionError::JobLimit {
+            level: refusal.level,
+            inputs: refusal.inputs,
+            input_bytes: refusal.bytes,
+            workspace_bytes: refusal.workspace_bytes,
+            max_inputs: options.max_inputs,
+            max_input_bytes: options.max_input_bytes,
+            max_output_bytes: options.max_output_bytes,
+            max_workspace_bytes: options.max_workspace_bytes,
         };
-        let min = selected.iter().map(|&index| candidates[index].min).min();
-        let max = selected.iter().map(|&index| candidates[index].max).max();
-        let (min, max) = (min.expect("two inputs"), max.expect("two inputs"));
-        let inputs: Vec<SharedRun> = selected
-            .iter()
-            .map(|&index| Arc::clone(&state.runs[index]))
-            .collect();
-        let others = state
-            .runs
-            .iter()
-            .zip(&candidates)
-            .enumerate()
-            .filter(|(index, (_, candidate))| {
-                !selected.contains(index) && candidate.min <= max && candidate.max >= min
-            })
-            .map(|(_, (run, _))| Arc::clone(run))
-            .collect();
+        let (kind, level, inputs, dest, cuts, cursor, split) = match state.levels.plan(&fit) {
+            Plan::Idle => return Ok(None),
+            Plan::Refuse(refused) => return Err(refusal(refused)),
+            Plan::Move { level, run } => {
+                if state.levels.move_down(level, &run).is_err() {
+                    return Err(CompactionError::Stale);
+                }
+                // A move from level 0 can lift the level-0 stop, so a flush
+                // refused for it may succeed now, as after any publication.
+                state.refused = None;
+                if cfg!(any(test, debug_assertions)) {
+                    state.levels.check(&state.runs);
+                }
+                return Ok(Some(Begun::Done(CompactionReport {
+                    kind: CompactionKind::Move,
+                    level,
+                    inputs: 0,
+                    input_bytes: 0,
+                    input_held_bytes: 0,
+                    outputs: 0,
+                    output_bytes: 0,
+                    output_held_bytes: 0,
+                    filter_build_bytes: 0,
+                    complete: false,
+                    stats: CompactStats::default(),
+                    workspace_bytes: 0,
+                })));
+            }
+            Plan::Merge {
+                level,
+                sources,
+                dests,
+                below,
+            } => {
+                let cursor =
+                    Cursor::After(sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
+                let cuts = OutputCuts {
+                    overlapped: below,
+                    // A run reaching `RATIO` runs below has crossed the
+                    // starts of all but the first.
+                    max_overlapped: levels::RATIO - 1,
+                    ..OutputCuts::default()
+                };
+                let inputs = sources.into_iter().chain(dests).collect();
+                let dest = Dest::Level(level + 1);
+                (
+                    CompactionKind::Merge,
+                    level,
+                    inputs,
+                    dest,
+                    cuts,
+                    Some(cursor),
+                    None,
+                )
+            }
+            Plan::Split {
+                level,
+                source,
+                cuts,
+                refused,
+            } => {
+                let cursor = Cursor::At(source.run.key_range().expect(NOT_EMPTY).min.to_vec());
+                let dest = if level == 0 {
+                    Dest::InPlace
+                } else {
+                    Dest::Level(level)
+                };
+                let cuts = OutputCuts {
+                    at: cuts,
+                    ..OutputCuts::default()
+                };
+                let split = Some(refusal(refused));
+                (
+                    CompactionKind::Split,
+                    level,
+                    vec![source],
+                    dest,
+                    cuts,
+                    Some(cursor),
+                    split,
+                )
+            }
+            Plan::Neighbours { level, runs } => {
+                let cuts = OutputCuts {
+                    single: true,
+                    ..OutputCuts::default()
+                };
+                let inputs = runs.into_iter().collect();
+                (
+                    CompactionKind::Neighbours,
+                    level,
+                    inputs,
+                    Dest::Level(level),
+                    cuts,
+                    None,
+                    None,
+                )
+            }
+        };
+        let others = Self::others(&state, &inputs);
         drop(state);
-        Ok(Some(CompactionJob {
+        Ok(Some(Begun::Job(CompactionJob {
             engine: self,
             _serial: serial,
             input_bytes: inputs.iter().map(|run| run.run.as_bytes().len()).sum(),
             inputs,
             others,
             options,
-        }))
+            kind,
+            level,
+            dest,
+            cuts,
+            cursor,
+            refusal: split,
+        })))
+    }
+
+    /// Begins the next compaction that reads and writes, taking any moves
+    /// before it: for tests that stage one merge.
+    #[cfg(test)]
+    fn begin_job(
+        &self,
+        options: CompactionOptions,
+    ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
+        loop {
+            match self.begin_compaction(options)? {
+                Some(Begun::Job(job)) => return Ok(Some(job)),
+                Some(Begun::Done(_)) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The runs outside `inputs` that overlap their span, for the
+    /// tombstone rule.
+    fn others(state: &State, inputs: &[SharedRun]) -> Vec<SharedRun> {
+        let ranges = inputs
+            .iter()
+            .map(|run| run.run.key_range().expect(NOT_EMPTY));
+        let min = ranges.clone().map(|range| range.min).min();
+        let max = ranges.map(|range| range.max).max();
+        match (min, max) {
+            (Some(min), Some(max)) => state.levels.others(inputs, min, max),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Begins a compaction of the runs `picks` names, by index into the run
+    /// list, whatever their levels: the tests' arbitrary merges. The output
+    /// goes into the deepest level of the inputs if it fits there, and
+    /// otherwise into level 0 as a new flush.
+    #[cfg(test)]
+    fn begin_picked(
+        &self,
+        options: CompactionOptions,
+        picks: Vec<usize>,
+    ) -> Result<CompactionJob<'_>, CompactionError> {
+        let serial = self
+            .compacting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let state = self.write_state();
+        let bytes = state.retained().bytes;
+        let max = self.snapshot_limits.max_retained_bytes;
+        if bytes > max {
+            return Err(CompactionError::Retained { bytes, max });
+        }
+        let inputs: Vec<SharedRun> = picks
+            .iter()
+            .map(|&index| Arc::clone(&state.runs[index]))
+            .collect();
+        let deepest = inputs
+            .iter()
+            .filter_map(|run| state.levels.level_of(run))
+            .max()
+            .unwrap_or(0);
+        let others = Self::others(&state, &inputs);
+        drop(state);
+        Ok(CompactionJob {
+            engine: self,
+            _serial: serial,
+            input_bytes: inputs.iter().map(|run| run.run.as_bytes().len()).sum(),
+            inputs,
+            others,
+            options,
+            kind: CompactionKind::Merge,
+            level: deepest,
+            dest: Dest::Anywhere(deepest),
+            cuts: OutputCuts::default(),
+            cursor: None,
+            refusal: None,
+        })
     }
 
     fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
@@ -1820,6 +2121,9 @@ impl Core {
             retained_bytes: retained.bytes,
             retained_run_bytes: retained.run_bytes,
             retained_held_bytes: retained.held_bytes,
+            level0_flushes: state.levels.level0_flushes(),
+            level0_runs: state.levels.shape()[0].0,
+            levels: state.levels.depth(),
             flushes: state.flushes,
             flushed_bytes: state.flushed_bytes,
         }
@@ -1981,13 +2285,12 @@ impl BuiltFlush<'_> {
         let mut state = job.engine.write_state();
         let total_runs = state.runs.len() + report.runs;
         let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
-        if total_runs > state.max_runs || total_bytes > state.max_run_bytes {
-            let error = RunLimitError {
-                runs: total_runs,
-                max_runs: state.max_runs,
-                run_bytes: total_bytes,
-                max_run_bytes: state.max_run_bytes,
-            };
+        let flushes = state.levels.level0_flushes() + 1;
+        if total_runs > state.max_runs
+            || total_bytes > state.max_run_bytes
+            || flushes > state.level0_stop
+        {
+            let error = state.run_limit(total_runs, total_bytes, flushes);
             state.refused = Some(error);
             drop(state);
             // Compaction is what makes room. A pass that failed earlier, say
@@ -2003,7 +2306,14 @@ impl BuiltFlush<'_> {
                 .all(|(held, flushed)| Arc::ptr_eq(held, flushed)),
             "a flush's tables are the oldest frozen ones"
         );
-        state.runs.extend(published(runs));
+        let runs: Vec<SharedRun> = published(runs).collect();
+        let logical = job
+            .tables
+            .iter()
+            .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
+            .sum();
+        state.levels.push_flush(&runs, logical);
+        state.runs.extend(runs);
         state.order_runs();
         state.run_bytes += report.run_bytes;
         state.held_bytes += report.held_bytes;
@@ -2041,44 +2351,66 @@ impl fmt::Debug for BuiltFlush<'_> {
 }
 
 /// Bounds and policy for one compaction. See [`Engine::compact`].
+///
+/// Each limit is checked against a job before anything is read: a job that
+/// would exceed one is not formed. Every option is checked on its own, as
+/// below, and the byte and workspace limits also against the engine's
+/// [`EngineOptions::target_run_len`] and
+/// [`EngineOptions::target_block_len`], so that a job of two full runs
+/// always fits (a [`ConfigError`] otherwise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
     /// The most runs merged at once, at least 2.
     pub max_inputs: usize,
-    /// The most stored bytes of input runs, at least 1.
+    /// The most bytes of input runs, stored bytes and what they hold beside
+    /// them (key filters and prepared dictionaries), at least twice
+    /// [`EngineOptions::target_run_len`].
     pub max_input_bytes: usize,
     /// The most bytes of output, stored bytes and key filters together,
     /// built and held until publication, as for
-    /// [`EngineOptions::max_run_bytes`]; at least 1. It counts bytes written, not
-    /// allocated: the run being built grows its buffer by doubling, so it may
-    /// hold up to its own size again in unused capacity until it is finished.
+    /// [`EngineOptions::max_run_bytes`]; at least twice
+    /// [`EngineOptions::target_run_len`]. A job's output is estimated by its
+    /// input before it starts, and checked as it is written. It counts bytes
+    /// written, not allocated: the run being built grows its buffer by
+    /// doubling, so it may hold up to its own size again in unused capacity
+    /// until it is finished.
     pub max_output_bytes: usize,
     /// The most estimated workspace bytes: per input, a decoded copy of its
     /// largest block and a decompression context, and for the output, two
-    /// copies of the largest block and a compression context. A merge whose
-    /// estimate exceeds it fails before decoding anything. What the estimate
-    /// leaves bounds the buffer of key hashes for the output's key filter;
-    /// an output run that would need more is published without a filter.
-    /// At least 1.
+    /// copies of the largest block and a compression context. A job whose
+    /// estimate exceeds it is not formed, and a merge whose estimate exceeds
+    /// it fails before decoding anything. What the estimate leaves bounds
+    /// the buffer of key hashes for the output's key filter, and a
+    /// dictionary's training, which is skipped if it does not fit; an output
+    /// run that would need more for its filter is published without one. At
+    /// least the estimate for two inputs of
+    /// [`EngineOptions::target_block_len`] blocks.
     pub max_workspace_bytes: usize,
-    /// The most runs whose key ranges may share a key. A point read decodes
-    /// at most this many blocks once compaction has caught up. At least 1,
-    /// which merges any overlap.
+    /// Level 0 is compacted once it holds runs of this many flushes, at
+    /// least 1, which compacts every flush (level 0 is compacted at 12
+    /// whatever this is). After compaction a point read of a key absent
+    /// from the memtables visits at most one run per flush left in level 0,
+    /// fewer than this, and one per level below it.
+    ///
+    /// Before leveled compaction this bounded every key's overlap; level
+    /// 0's flushes are what remains of that overlap, and the default is the
+    /// same.
     pub max_overlap: usize,
-    /// How many runs are tolerated, when none overlap, before neighbouring
-    /// tails are merged. Any value is valid; 0 merges neighbouring tails
-    /// whenever there are two.
+    /// Ignored: leveled compaction merges small runs whenever two adjacent
+    /// ones are below half a run's length. Kept so that existing
+    /// configurations build; it will be removed.
     pub disjoint_runs_above: usize,
 }
 
 impl Default for CompactionOptions {
-    /// 8 inputs, 256 MiB in and out, 64 MiB of workspace (room for a
-    /// dictionary's training beside the merge), an overlap of 4, and up to
-    /// 16 disjoint runs. The overlap trades rewriting against run memory and
-    /// scans; `docs/benchmarks.md` measures 2 to 4.
+    /// 32 inputs, 256 MiB in and out, 64 MiB of workspace (room for a
+    /// dictionary's training beside a merge of 32 inputs), and level 0
+    /// compacted at 4 flushes. `docs/capacity-design.md` derives the
+    /// input count; fewer inputs make level-0 jobs rewrite level 1 more
+    /// often.
     fn default() -> Self {
         Self {
-            max_inputs: 8,
+            max_inputs: 32,
             max_input_bytes: 256 << 20,
             max_output_bytes: 256 << 20,
             max_workspace_bytes: 64 << 20,
@@ -2090,8 +2422,9 @@ impl Default for CompactionOptions {
 
 impl CompactionOptions {
     /// The one check of these options, made when an engine is built with
-    /// them for its worker and by every [`Engine::compact`].
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// them for its worker and by every [`Engine::compact`], against the
+    /// engine's run and block lengths.
+    fn validate(&self, target_run_len: usize, target_block_len: usize) -> Result<(), ConfigError> {
         ConfigError::check(
             "CompactionOptions::max_inputs",
             self.max_inputs as u64,
@@ -2099,45 +2432,78 @@ impl CompactionOptions {
             usize::MAX as u64,
             "a merge takes at least two runs",
         )?;
+        let two_runs = target_run_len.saturating_mul(2);
         for (setting, value) in [
             ("CompactionOptions::max_input_bytes", self.max_input_bytes),
             ("CompactionOptions::max_output_bytes", self.max_output_bytes),
-            (
-                "CompactionOptions::max_workspace_bytes",
-                self.max_workspace_bytes,
-            ),
         ] {
             ConfigError::check(
                 setting,
                 value as u64,
-                1,
+                two_runs as u64,
                 usize::MAX as u64,
-                "no merge fits in nothing",
+                "a job of two full runs must fit, twice EngineOptions::target_run_len",
             )?;
         }
+        ConfigError::check(
+            "CompactionOptions::max_workspace_bytes",
+            self.max_workspace_bytes as u64,
+            crate::run::workspace_estimate([target_block_len; 2]) as u64,
+            usize::MAX as u64,
+            "a merge of two runs of EngineOptions::target_block_len blocks must fit",
+        )?;
         ConfigError::check(
             "CompactionOptions::max_overlap",
             self.max_overlap as u64,
             1,
             usize::MAX as u64,
-            "every key lies in at least one run; 1 merges any overlap",
+            "level 0 holds at least one flush",
         )
+    }
+
+    fn fit(&self, target_run_len: usize) -> Fit {
+        Fit {
+            max_inputs: self.max_inputs,
+            max_bytes: self.max_input_bytes.min(self.max_output_bytes),
+            max_workspace_bytes: self.max_workspace_bytes,
+            trigger: self.max_overlap,
+            target_run_len,
+        }
     }
 }
 
 /// Why a compaction changed nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionError {
-    /// Runs need compacting, but no two fit in the input limits.
-    InputLimit {
-        /// Stored bytes of the two smallest runs that would be merged.
+    /// A level needs compacting, but the smallest job that would make
+    /// progress there exceeds a limit: its inputs, their bytes (as input,
+    /// and as the estimate of its output), or its workspace estimate.
+    /// Nothing was read. Every job of two full runs fits the limits
+    /// [`CompactionOptions`] accepts, so this follows runs longer than
+    /// [`EngineOptions::target_run_len`] (a single record longer than it,
+    /// or runs built under a larger setting) or blocks longer than
+    /// [`EngineOptions::target_block_len`]; raising the limit named lets it
+    /// proceed, and retrying unchanged meets it again.
+    JobLimit {
+        /// The level whose job it is.
+        level: usize,
+        /// Runs the job would merge.
+        inputs: usize,
+        /// Their stored and held bytes.
         input_bytes: usize,
-        /// The limit.
+        /// The job's workspace estimate.
+        workspace_bytes: usize,
+        /// [`CompactionOptions::max_inputs`].
+        max_inputs: usize,
+        /// [`CompactionOptions::max_input_bytes`].
         max_input_bytes: usize,
+        /// [`CompactionOptions::max_output_bytes`].
+        max_output_bytes: usize,
+        /// [`CompactionOptions::max_workspace_bytes`].
+        max_workspace_bytes: usize,
     },
     /// The output would exceed [`CompactionOptions::max_output_bytes`].
-    /// Nothing was published; a larger limit or fewer inputs (a lower
-    /// [`CompactionOptions::max_input_bytes`]) lets it proceed.
+    /// Nothing was published; a larger limit lets it proceed.
     OutputLimit {
         /// Bytes of output, stored and filters, when the limit was crossed.
         output_bytes: usize,
@@ -2167,6 +2533,10 @@ pub enum CompactionError {
         /// The limit.
         max: usize,
     },
+    /// The runs the job chose were no longer where it found them when it
+    /// was to publish. Nothing was published; compactions are serialized,
+    /// so this is a defect, reported rather than published.
+    Stale,
     /// The options were refused before anything was selected.
     Config(ConfigError),
 }
@@ -2196,12 +2566,21 @@ impl From<CompactError> for CompactionError {
 impl fmt::Display for CompactionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InputLimit {
+            Self::JobLimit {
+                level,
+                inputs,
                 input_bytes,
+                workspace_bytes,
+                max_inputs,
                 max_input_bytes,
+                max_output_bytes,
+                max_workspace_bytes,
             } => write!(
                 f,
-                "compaction needs {input_bytes} input bytes, over the limit of {max_input_bytes}"
+                "level {level} needs a compaction of {inputs} runs, {input_bytes} bytes and \
+                 {workspace_bytes} workspace bytes, over the limits of {max_inputs} runs, \
+                 {max_input_bytes} bytes in, {max_output_bytes} bytes out and \
+                 {max_workspace_bytes} workspace bytes; raise them to proceed"
             ),
             Self::OutputLimit {
                 output_bytes,
@@ -2223,6 +2602,7 @@ impl fmt::Display for CompactionError {
                 f,
                 "snapshots retain {bytes} bytes, over the limit of {max}; compaction waits"
             ),
+            Self::Stale => f.write_str("compaction found its runs moved and published nothing"),
             Self::Config(error) => error.fmt(f),
         }
     }
@@ -2230,9 +2610,31 @@ impl fmt::Display for CompactionError {
 
 impl std::error::Error for CompactionError {}
 
+/// What kind of step a compaction took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompactionKind {
+    /// Runs of one level merged with the runs of the next that they
+    /// overlap, into the next.
+    Merge,
+    /// A run relabelled to the next level, which it overlaps nowhere:
+    /// nothing was read or written.
+    Move,
+    /// A run rewritten alone, in its level, in pieces whose own merges fit
+    /// the limits where its whole merge did not.
+    Split,
+    /// Two adjacent small runs of one level merged into one.
+    Neighbours,
+}
+
 /// What a compaction replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionReport {
+    /// What kind of step it was. A move replaces nothing, and every count
+    /// below is 0.
+    pub kind: CompactionKind,
+    /// The level the step took its runs from.
+    pub level: usize,
     /// Runs removed.
     pub inputs: usize,
     /// Their stored bytes.
@@ -2257,6 +2659,9 @@ pub struct CompactionReport {
     pub workspace_bytes: usize,
 }
 
+/// A run as the flat selector that preceded levels saw it. That selector
+/// is kept, for tests only, to measure against.
+#[cfg(test)]
 struct Candidate<'a> {
     min: &'a [u8],
     max: &'a [u8],
@@ -2265,6 +2670,7 @@ struct Candidate<'a> {
 }
 
 /// Each published run as the selector sees it, in the same order.
+#[cfg(test)]
 fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
     runs.iter()
         .map(|run| {
@@ -2279,8 +2685,11 @@ fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
         .collect()
 }
 
-/// Chooses run indices to compact, as documented on
-/// [`Engine::compact`]. Quadratic in the number of runs.
+/// Chooses run indices to compact as the engine did before levels (5AT):
+/// the most deeply overlapped runs while any key is in more than
+/// `max_overlap`, then windows of adjacent tails beyond
+/// `disjoint_runs_above` disjoint runs. Quadratic in the number of runs.
+#[cfg(test)]
 fn select(
     runs: &[Candidate<'_>],
     options: CompactionOptions,
@@ -2361,6 +2770,7 @@ fn select(
 }
 
 /// Takes runs from the front of `candidates` while they fit the limits.
+#[cfg(test)]
 fn fill(candidates: &[usize], runs: &[Candidate<'_>], options: CompactionOptions) -> Vec<usize> {
     let mut picked = Vec::new();
     let mut total = 0;
@@ -2375,10 +2785,17 @@ fn fill(candidates: &[usize], runs: &[Candidate<'_>], options: CompactionOptions
     picked
 }
 
+#[cfg(test)]
 fn input_limit(input_bytes: usize, options: CompactionOptions) -> CompactionError {
-    CompactionError::InputLimit {
+    CompactionError::JobLimit {
+        level: 0,
+        inputs: 2,
         input_bytes,
+        workspace_bytes: 0,
+        max_inputs: options.max_inputs,
         max_input_bytes: options.max_input_bytes,
+        max_output_bytes: options.max_output_bytes,
+        max_workspace_bytes: options.max_workspace_bytes,
     }
 }
 
@@ -2398,6 +2815,33 @@ struct CompactionJob<'e> {
     others: Vec<SharedRun>,
     input_bytes: usize,
     options: CompactionOptions,
+    kind: CompactionKind,
+    level: usize,
+    /// Where the output goes.
+    dest: Dest,
+    cuts: OutputCuts,
+    /// Where the source level's next job starts once this publishes.
+    cursor: Option<Cursor>,
+    /// For a split, the job it stands in for: refused if the split leaves
+    /// fewer than two pieces, so that a split always makes progress.
+    refusal: Option<CompactionError>,
+}
+
+/// How a published job moves its source level's cursor.
+#[derive(Debug)]
+enum Cursor {
+    /// Past this key, the source's largest.
+    After(Vec<u8>),
+    /// To this key, a split source's smallest, so that its first piece is
+    /// the level's next source.
+    At(Vec<u8>),
+}
+
+/// A compaction step chosen under the lock: a job to build, or a move,
+/// already done.
+enum Begun<'e> {
+    Job(CompactionJob<'e>),
+    Done(CompactionReport),
 }
 
 impl<'e> CompactionJob<'e> {
@@ -2433,7 +2877,7 @@ impl<'e> CompactionJob<'e> {
             target_block_len: self.engine.target_block_len,
             dictionary: self.engine.dictionary,
         };
-        let output = compact(&views, keep_tombstone, limits, workspace)?;
+        let output = compact_with(&views, keep_tombstone, limits, &self.cuts, workspace)?;
         #[cfg(test)]
         {
             let hook = self.engine.after_build.lock().unwrap().clone();
@@ -2450,6 +2894,8 @@ impl<'e> CompactionJob<'e> {
 impl fmt::Debug for CompactionJob<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompactionJob")
+            .field("kind", &self.kind)
+            .field("level", &self.level)
             .field("inputs", &self.inputs.len())
             .field("input_bytes", &self.input_bytes)
             .field("others", &self.others.len())
@@ -2466,14 +2912,26 @@ struct BuiltCompaction<'e> {
 impl BuiltCompaction<'_> {
     /// Replaces the inputs with the output in one step under the lock.
     ///
-    /// Every input must still be published. Runs published since selection
-    /// are kept. A result over the run limits is accepted if it is no larger
-    /// than what it replaces. On an error the output is dropped and the engine is
-    /// unchanged. The inputs are freed after the lock is released, once no
-    /// reader holds them.
+    /// Every input must still be published where selection found it, and
+    /// the output must fit its level beside the runs there. Runs published
+    /// since selection, all flushes into level 0, are kept. A result over
+    /// the run limits is accepted if it is no larger than what it replaces.
+    /// On an error the output is dropped and the engine is unchanged. The
+    /// inputs are freed after the lock is released, once no reader holds
+    /// them.
     fn publish(self) -> Result<CompactionReport, CompactionError> {
         let Self { job, output } = self;
+        let unchanged =
+            output.runs.len() == 1 && output.stats.records_written == output.stats.records_read;
+        if job.kind == CompactionKind::Split && unchanged {
+            // The source rewritten whole, dropping nothing: no progress. A
+            // split that dropped records (tombstones or older versions) has
+            // fewer to rewrite next time, so it publishes even as one run.
+            return Err(job.refusal.clone().expect("a split carries its job"));
+        }
         let report = CompactionReport {
+            kind: job.kind,
+            level: job.level,
             inputs: job.inputs.len(),
             input_bytes: job.input_bytes,
             input_held_bytes: job.inputs.iter().map(|run| run.run.held_bytes()).sum(),
@@ -2501,19 +2959,33 @@ impl BuiltCompaction<'_> {
         let filters = state.held_bytes - report.input_held_bytes + report.output_held_bytes;
         let (total_bytes, published_bytes) = (stored + filters, state.run_bytes + state.held_bytes);
         // Shrinking is always allowed, so that compaction can make room even
-        // when the limits were lowered below what is published.
+        // when the limits were lowered below what is published. Growth is
+        // what this output adds, measured, not estimated.
         let grows_runs = total_runs > state.max_runs.max(state.runs.len());
         let grows_bytes = total_bytes > state.max_run_bytes.max(published_bytes);
         if grows_runs || grows_bytes {
-            return Err(CompactionError::RunLimit(RunLimitError {
-                runs: total_runs,
-                max_runs: state.max_runs,
-                run_bytes: total_bytes,
-                max_run_bytes: state.max_run_bytes,
-            }));
+            let flushes = state.levels.level0_flushes();
+            return Err(CompactionError::RunLimit(state.run_limit(
+                total_runs,
+                total_bytes,
+                flushes,
+            )));
+        }
+        let outputs: Vec<SharedRun> = published(output.runs).collect();
+        if state
+            .levels
+            .replace(&job.inputs, &outputs, job.dest)
+            .is_err()
+        {
+            return Err(CompactionError::Stale);
+        }
+        match &job.cursor {
+            Some(Cursor::After(key)) => state.levels.advance(job.level, key),
+            Some(Cursor::At(key)) => state.levels.rewind(job.level, key),
+            None => {}
         }
         state.runs.retain(|run| !is_input(run));
-        state.runs.extend(published(output.runs));
+        state.runs.extend(outputs);
         state.order_runs();
         state.run_bytes = stored;
         state.held_bytes = filters;
@@ -2939,7 +3411,7 @@ impl Engine {
             .collect()
     }
 
-    /// What the production selector would compact now.
+    /// What the flat selector that preceded levels would compact now.
     pub(crate) fn selection(
         &self,
         options: CompactionOptions,
@@ -2949,7 +3421,8 @@ impl Engine {
     }
 
     /// Compacts `picks` through the production job: the same tombstone
-    /// rule, limits, build and publication.
+    /// rule, limits, build and publication, with the output placed as
+    /// [`Core::begin_picked`] says.
     pub(crate) fn compact_picked(
         &self,
         options: CompactionOptions,
@@ -2957,10 +3430,15 @@ impl Engine {
         workspace: &mut MergeWorkspace,
     ) -> Result<CompactionReport, CompactionError> {
         self.core
-            .begin_compaction_with(options, |_, _| Ok(Some(picks)))?
-            .expect("picks given")
+            .begin_picked(options, picks)?
             .build(workspace)?
             .publish()
+    }
+
+    /// Changes the level-0 stop, so that tests can drive the flat selector
+    /// with every run in level 0.
+    pub(crate) fn set_level0_stop(&self, stop: usize) {
+        self.core.write_state().level0_stop = stop;
     }
 
     /// Builds the merge of `picks` as [`Engine::compact_picked`] would, and
@@ -2971,10 +3449,7 @@ impl Engine {
         picks: Vec<usize>,
         workspace: &mut MergeWorkspace,
     ) -> Result<DryCompaction, CompactionError> {
-        let job = self
-            .core
-            .begin_compaction_with(options, |_, _| Ok(Some(picks)))?
-            .expect("picks given");
+        let job = self.core.begin_picked(options, picks)?;
         let input_bytes = job.input_bytes;
         let built = job.build(workspace)?;
         let ranges = built
@@ -3123,13 +3598,7 @@ mod tests {
             max_overlap: 3,
             ..options(8, 2)
         };
-        assert_eq!(
-            select(&runs, narrow),
-            Err(CompactionError::InputLimit {
-                input_bytes: 5,
-                max_input_bytes: 2
-            })
-        );
+        assert_eq!(select(&runs, narrow), Err(input_limit(5, narrow)));
     }
 
     #[test]
@@ -3254,10 +3723,9 @@ mod tests {
         assert_eq!(value(&engine, b"a").as_deref(), Some(&b"4"[..]));
     }
 
-    /// Compaction selects the smallest runs, not adjacent ones, so its output
-    /// can span a run it left: here the output holds the oldest and newest
-    /// versions of "k" and the oldest of "j", and the run left between them
-    /// holds the newest of "j".
+    /// A merge that leaves a newer level-0 run out leaves it over the
+    /// output's range: here the output holds "j" and an older "k", and the
+    /// run left out holds the newest "k", and reads decide by sequence.
     #[test]
     fn a_partial_compaction_leaves_interleaved_runs_that_read_correctly() {
         let engine = Engine::new(manual()).unwrap();
@@ -3274,26 +3742,27 @@ mod tests {
         engine.flush().unwrap();
         let before = engine.snapshot().unwrap();
 
-        let report = engine
-            .compact(
-                CompactionOptions {
-                    max_overlap: 2,
-                    max_inputs: 2,
-                    ..CompactionOptions::default()
-                },
-                &mut MergeWorkspace::new(),
-            )
-            .unwrap()
-            .unwrap();
+        let options = CompactionOptions {
+            max_overlap: 2,
+            max_inputs: 2,
+            ..CompactionOptions::default()
+        };
+        let mut workspace = MergeWorkspace::new();
+        // The oldest run moves to level 1; the next merges with it, and the
+        // newest is left in level 0.
+        let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+        assert_eq!(report.kind, CompactionKind::Move);
+        let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+        assert_eq!(report.kind, CompactionKind::Merge);
         assert_eq!((report.inputs, report.outputs), (2, 1));
         assert_eq!(engine.stats().runs, 2);
-        // "k": the output decides alone. "j": the output's version is older
-        // than the run it spans, which is still read.
+        // "k": the newer run decides, before the output's older version.
+        // "j": only the output's range holds it.
         for (value, blocks) in read_counting(&engine, b"k") {
             assert_eq!((value.as_deref(), blocks), (Some(&b"k3"[..]), 1));
         }
         for (value, blocks) in read_counting(&engine, b"j") {
-            assert_eq!((value.as_deref(), blocks), (Some(&b"j2"[..]), 2));
+            assert_eq!((value.as_deref(), blocks), (Some(&b"j2"[..]), 1));
         }
         let mut workspace = EngineWorkspace::new();
         for (key, expected) in [(&b"j"[..], &b"j2"[..]), (b"k", b"k3")] {
@@ -3317,7 +3786,7 @@ mod tests {
         overlapping_runs(&engine);
         let built = engine
             .core
-            .begin_compaction(options(8, usize::MAX))
+            .begin_job(options(8, usize::MAX))
             .unwrap()
             .unwrap()
             .build(&mut MergeWorkspace::new())
@@ -3336,7 +3805,7 @@ mod tests {
         overlapping_runs(&engine);
         let job = engine
             .core
-            .begin_compaction(options(8, usize::MAX))
+            .begin_job(options(8, usize::MAX))
             .unwrap()
             .unwrap();
         let (held, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
@@ -3368,10 +3837,13 @@ mod tests {
         let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
         let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
-        engine
-            .compact(options(8, usize::MAX), &mut MergeWorkspace::new())
+        let mut workspace = MergeWorkspace::new();
+        while engine
+            .compact(options(8, usize::MAX), &mut workspace)
             .unwrap()
-            .unwrap();
+            .is_some()
+        {}
+        assert_eq!(engine.stats().runs, 1);
         assert!(inputs.iter().all(|run| Arc::strong_count(run) == 1));
     }
 
@@ -3379,16 +3851,18 @@ mod tests {
     fn publication_refuses_growth_past_the_run_limits_but_allows_shrinking() {
         let engine = Engine::new(manual()).unwrap();
         overlapping_runs(&engine);
-        let stats = engine.stats();
         engine.set_run_limits(1, 1).unwrap();
         let begin = || {
             engine
                 .core
-                .begin_compaction(options(8, usize::MAX))
+                .begin_job(options(8, usize::MAX))
                 .unwrap()
                 .unwrap()
         };
-        let mut built = begin().build(&mut MergeWorkspace::new()).unwrap();
+        // Beginning may first move a run down, which changes no bytes.
+        let job = begin();
+        let stats = engine.stats();
+        let mut built = job.build(&mut MergeWorkspace::new()).unwrap();
         built.output.output_bytes = stats.run_bytes + stats.held_bytes + 1;
         assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
         assert_eq!(engine.stats(), stats);
@@ -3539,7 +4013,8 @@ mod tests {
         });
         assert_eq!(Arc::strong_count(&core), 1);
         let status = core.background.as_ref().unwrap().status();
-        assert_eq!((status.running, status.compactions), (false, 1));
+        // The oldest run's move, then the merge that was held.
+        assert_eq!((status.running, status.compactions), (false, 2));
         assert_eq!(core.stats().runs, 1);
     }
 
@@ -3567,7 +4042,8 @@ mod tests {
         });
         assert_eq!(Arc::strong_count(&core), 1);
         let status = core.background.as_ref().unwrap().status();
-        assert_eq!((status.running, status.compactions), (false, 1));
+        // The oldest run's move, then the merge that was held.
+        assert_eq!((status.running, status.compactions), (false, 2));
         assert_eq!(core.stats().runs, 1);
         let mut workspace = EngineWorkspace::new();
         let found = snapshot.get(b"a", &mut workspace).unwrap().unwrap();
@@ -3622,8 +4098,10 @@ mod tests {
     #[test]
     fn a_failed_compaction_is_reported_once_per_request_and_recovers() {
         let engine = Engine::new(EngineOptions {
+            target_run_len: 15 << 10,
             background_compaction: Some(CompactionOptions {
                 max_overlap: 1,
+                max_input_bytes: 30 << 10,
                 max_output_bytes: 30 << 10,
                 ..CompactionOptions::default()
             }),
@@ -3632,15 +4110,17 @@ mod tests {
         .unwrap();
         let mut seed = 7u64;
         let mut noise = || {
-            (0..2048)
+            (0..20 << 10)
                 .map(|_| {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     (seed >> 56) as u8
                 })
                 .collect::<Vec<u8>>()
         };
+        // Records longer than the run length: two such runs of one key
+        // exceed the job limits, which no split can help.
         for _ in 0..3 {
-            for key in 0..20u8 {
+            for key in 0..2u8 {
                 engine.put(&[key], &noise()).unwrap();
             }
             engine.flush().unwrap();
@@ -3649,7 +4129,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                BackgroundError::Failed(CompactionError::OutputLimit { .. })
+                BackgroundError::Failed(CompactionError::JobLimit { .. })
             ),
             "{error:?}"
         );
@@ -3660,20 +4140,28 @@ mod tests {
             status.failures <= status.passes && status.passes <= 4,
             "{status:?}"
         );
-        assert_eq!(engine.stats().runs, 3);
+        let runs = engine.stats().runs;
+        assert_eq!(runs, 6);
         for _ in 0..1000 {
             std::thread::yield_now();
         }
         assert_eq!(engine.background_status().unwrap(), status);
 
-        for key in 0..20u8 {
-            engine.delete(&[key]).unwrap();
-        }
+        // Larger limits, given to a manual compaction, resolve it; the next
+        // pass succeeds and clears the failure.
+        let mut workspace = MergeWorkspace::new();
+        let wide = CompactionOptions {
+            max_overlap: 1,
+            ..CompactionOptions::default()
+        };
+        while engine.compact(wide, &mut workspace).unwrap().is_some() {}
+        assert_eq!(engine.stats().runs, 2);
+        engine.put(&[9], b"small").unwrap();
         engine.flush().unwrap();
         engine.wait_for_compaction().unwrap();
         let status = engine.background_status().unwrap();
         assert_eq!(status.last_failure, None);
-        assert_eq!(engine.stats().runs, 0);
+        assert_eq!(engine.stats().level0_flushes, 0);
     }
 
     /// A panic stops the worker for good and is reported; the engine keeps
