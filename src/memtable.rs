@@ -984,6 +984,24 @@ pub(crate) struct FlushCuts {
     pub(crate) max_pieces: usize,
 }
 
+/// Finishes a flush's run: its last block, index and filter. In a test
+/// build the time it takes is added to this thread's `FINISH_NANOS`.
+fn finish(builder: RunBuilder) -> Run<Vec<u8>> {
+    #[cfg(test)]
+    let start = std::time::Instant::now();
+    let run = builder.finish();
+    #[cfg(test)]
+    FINISH_NANOS.with(|nanos| nanos.set(nanos.get() + start.elapsed().as_nanos() as u64));
+    run
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Nanoseconds this thread's flushes spent finishing runs, for the
+    /// engine's flush measurements.
+    pub(crate) static FINISH_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Builds runs from several frozen tables as if they were one, splitting
 /// them as [`FrozenMemtable::flush_with`] does and at `cuts`. `tables` is
 /// ordered oldest first, and where tables share a key the newest update is
@@ -1039,7 +1057,7 @@ pub(crate) fn flush_merged(
             && rest >= cuts.min_piece
             && pieces < cuts.max_pieces
         {
-            runs.extend(builder.take().map(RunBuilder::finish));
+            runs.extend(builder.take().map(finish));
             piece = 0;
             pieces += 1;
         }
@@ -1051,11 +1069,11 @@ pub(crate) fn flush_merged(
         (input, piece, rest) = (input + len, piece + len, rest.saturating_sub(len));
         if input >= target {
             // A full run starts the next target length with its own pieces.
-            runs.extend(builder.take().map(RunBuilder::finish));
+            runs.extend(builder.take().map(finish));
             (input, piece, pieces) = (0, 0, 1);
         }
     }
-    runs.extend(builder.map(RunBuilder::finish));
+    runs.extend(builder.map(finish));
     runs
 }
 
@@ -1140,7 +1158,7 @@ impl Iterator for Flush<'_> {
             };
             record = next;
         }
-        Some(builder.finish())
+        Some(finish(builder))
     }
 }
 

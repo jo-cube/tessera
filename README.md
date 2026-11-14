@@ -458,6 +458,20 @@ it.
   not compaction, dominate the bytes written. Reduced-scale measurements do
   not establish behaviour at hundreds of millions of records.
 - The dataset must fit in memory: there is no disk tiering.
+- Process memory exceeds the run and memtable accounting by the table
+  being flushed, one compaction's unpublished output and allocator
+  overhead: with 64 MiB memtables and 256 MiB jobs, peak resident memory
+  was up to 546 MiB above the accounted bytes in the alpha measurements
+  (1.43 GiB at 881 MiB accounted; `docs/capacity-design.md`, section 18).
+  Leave that margin beside `max_run_bytes`.
+- Reopening under a less dense codec (say Zstandard runs under
+  `Uncompressed`) makes merges of the recovered runs write up to several
+  times what they read. With the default job limits (four runs) no merge
+  failed in the measurements; with limits of two or three runs some
+  merges fail at the output limit a bounded number of times per source,
+  wasting the work they did, and with two uncompressed runs some jobs
+  exceed the limit and are refused as `JobLimit`. Keep
+  `max_output_bytes` at four or more runs when changing codecs.
 - There are no transactions, no reads at an older sequence number than a
   snapshot's, no persisted filters and no parallel log writers.
 

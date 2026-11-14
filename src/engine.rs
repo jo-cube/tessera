@@ -484,6 +484,8 @@ mod wal;
 mod worker;
 
 #[cfg(test)]
+mod alpha_tests;
+#[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]
 mod directory_tests;
@@ -1422,6 +1424,52 @@ struct Core {
     /// Merges that failed at the output limit after reading their inputs.
     #[cfg(test)]
     overflows: std::sync::atomic::AtomicUsize,
+    /// Every flush's phases, while `Some`: for measurements.
+    #[cfg(test)]
+    flush_log: Mutex<Option<Vec<FlushRecord>>>,
+}
+
+/// One flush's phases in nanoseconds, as the thread that ran it saw them:
+/// waiting for level 0, freezing the active table, building the runs
+/// (encoding records and compressing blocks, then finishing the runs'
+/// last blocks, indexes and filters), and publication with taking the
+/// state lock and freeing the flushed tables.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FlushRecord {
+    pub(crate) wait: u64,
+    pub(crate) freeze: u64,
+    pub(crate) encode: u64,
+    pub(crate) finish: u64,
+    pub(crate) publish: u64,
+    /// The part of `publish` spent holding the state lock.
+    pub(crate) locked: u64,
+    pub(crate) runs: usize,
+    pub(crate) bytes: usize,
+    pub(crate) refused: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The phases of the flush this thread is running so far.
+    static FLUSH_PHASES: std::cell::RefCell<FlushRecord> =
+        std::cell::RefCell::new(FlushRecord::default());
+}
+
+#[cfg(test)]
+fn flush_phase(add: impl FnOnce(&mut FlushRecord)) {
+    FLUSH_PHASES.with(|phases| add(&mut phases.borrow_mut()));
+}
+
+/// Reports the nanoseconds since its start when dropped.
+#[cfg(test)]
+struct Timed<F: FnMut(u64)>(std::time::Instant, F);
+
+#[cfg(test)]
+impl<F: FnMut(u64)> Drop for Timed<F> {
+    fn drop(&mut self) {
+        (self.1)(self.0.elapsed().as_nanos() as u64);
+    }
 }
 
 /// One compaction step as [`Core::compact`] saw it, for measurements.
@@ -1446,6 +1494,8 @@ pub(crate) struct StepRecord {
     pub(crate) level0_flushes: usize,
     pub(crate) shape: Vec<(usize, usize)>,
     pub(crate) error: Option<CompactionError>,
+    /// From selection to publication or failure.
+    pub(crate) nanos: u64,
 }
 
 /// A key-value engine. See the [module documentation](self) for its
@@ -1718,6 +1768,8 @@ impl Core {
             step_log: Mutex::new(None),
             #[cfg(test)]
             overflows: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            flush_log: Mutex::new(None),
         }
     }
 
@@ -1842,6 +1894,8 @@ impl Core {
             std::sync::atomic::Ordering::SeqCst,
         );
         #[cfg(test)]
+        flush_phase(|phases| phases.wait += start.elapsed().as_nanos() as u64);
+        #[cfg(test)]
         if waited != Ok(true)
             && let Some(log) = self.step_log.lock().unwrap().as_mut()
         {
@@ -1860,6 +1914,7 @@ impl Core {
                 level0_flushes: self.read_state().levels.level0_flushes(),
                 shape,
                 error: signal.status().last_failure,
+                nanos: 0,
             });
         }
         let mut state = self.write_state();
@@ -1952,6 +2007,10 @@ impl Core {
 
     /// Freezes the active table and replaces it, in constant time.
     fn freeze_active(&self, state: &mut State) {
+        #[cfg(test)]
+        let start = std::time::Instant::now();
+        #[cfg(test)]
+        let _timed = Timed(start, |nanos| flush_phase(|phases| phases.freeze += nanos));
         let frozen = state.frozen_charged() + state.active.memory().charged;
         let successor = Memtable::new(self.active_budget(frozen), Some(state.last_seq));
         let table = std::mem::replace(&mut state.active, successor).freeze();
@@ -2116,7 +2175,9 @@ impl Core {
             level0_flushes,
             shape,
             error: None,
+            nanos: 0,
         };
+        let start = std::time::Instant::now();
         let result = match self.begin_compaction(options) {
             Ok(Some(Begun::Job(job))) => {
                 {
@@ -2160,6 +2221,7 @@ impl Core {
             Ok(None) => return result,
             Err(error) => record.error = Some(error.clone()),
         }
+        record.nanos = start.elapsed().as_nanos() as u64;
         if let Some(log) = self.step_log.lock().unwrap().as_mut() {
             log.push(record);
         }
@@ -2578,6 +2640,10 @@ impl<'e> FlushJob<'e> {
     /// Builds the runs, compressing without the state lock. Several tables
     /// are merged as one, keeping each key's newest update.
     fn build(self) -> BuiltFlush<'e> {
+        #[cfg(test)]
+        let start = std::time::Instant::now();
+        #[cfg(test)]
+        let finished = crate::memtable::FINISH_NANOS.with(std::cell::Cell::take);
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
         let runs = flush_merged(
             &tables,
@@ -2586,6 +2652,15 @@ impl<'e> FlushJob<'e> {
             self.engine.target_block_len,
             &self.cuts,
         );
+        #[cfg(test)]
+        {
+            let finish = crate::memtable::FINISH_NANOS.with(|nanos| nanos.replace(finished));
+            let total = start.elapsed().as_nanos() as u64;
+            flush_phase(|phases| {
+                phases.finish += finish;
+                phases.encode += total.saturating_sub(finish);
+            });
+        }
         BuiltFlush { job: self, runs }
     }
 
@@ -2616,6 +2691,25 @@ impl BuiltFlush<'_> {
     /// On a [`RunLimitError`] the built runs are dropped and the tables stay
     /// frozen and readable.
     fn publish(self) -> Result<FlushReport, RunLimitError> {
+        #[cfg(test)]
+        let (engine, start) = (self.job.engine, std::time::Instant::now());
+        let published = self.publish_untimed();
+        #[cfg(test)]
+        {
+            let mut record = FLUSH_PHASES.with(std::cell::RefCell::take);
+            record.publish = start.elapsed().as_nanos() as u64;
+            match &published {
+                Ok(report) => (record.runs, record.bytes) = (report.runs, report.run_bytes),
+                Err(_) => record.refused = true,
+            }
+            if let Some(log) = engine.flush_log.lock().unwrap().as_mut() {
+                log.push(record);
+            }
+        }
+        published
+    }
+
+    fn publish_untimed(self) -> Result<FlushReport, RunLimitError> {
         let Self { job, runs } = self;
         let report = FlushReport {
             tables: job.tables.len(),
@@ -2626,6 +2720,8 @@ impl BuiltFlush<'_> {
             filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
         let mut state = job.engine.write_state();
+        #[cfg(test)]
+        let locked = std::time::Instant::now();
         let total_runs = state.runs.len() + report.runs;
         let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
         let flushes = state.levels.level0_flushes() + 1;
@@ -2685,6 +2781,8 @@ impl BuiltFlush<'_> {
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
+        #[cfg(test)]
+        flush_phase(|phases| phases.locked = locked.elapsed().as_nanos() as u64);
         job.engine.notify_worker();
         Ok(report)
     }
@@ -2865,8 +2963,10 @@ pub enum CompactionError {
     /// inputs' bytes, so this follows output that outgrew them by more than
     /// the limit's headroom, as a change of codec or dictionary can make it.
     /// Selection then halves what a job from the same source may take, each
-    /// time this happens to it, and splits the source if need be; once no
-    /// job from it fits, the step is refused with this error before
+    /// time this happens to it, but never below the source with the largest
+    /// run below it, and splits the source if need be; once even that job
+    /// has failed, the source's steps are refused with this error, until
+    /// the runs below it change, before
     /// anything is read, naming the output that crossed the limit, and
     /// other levels go on.
     OutputLimit {

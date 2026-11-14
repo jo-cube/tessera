@@ -1276,6 +1276,78 @@ fn output_growth_past_the_headroom_does_not_repeat_a_job() {
     assert_eq!(scan(&engine.snapshot().unwrap()), model);
 }
 
+/// The allowance after a failure at the output limit never falls below
+/// the source with the largest run below it, which is the smallest job
+/// that makes progress on all of the source. Halved below that,
+/// after a few large jobs of a recovered level outgrew jobs of three runs,
+/// it refused every job of the source, including one of two runs that fits,
+/// and compaction never drained (found by the alpha validation after 5AU:
+/// `alpha_tests::alpha_output_growth_after_codec_switch` with a level-0
+/// backlog). Now every source compacts, and compaction drains.
+#[test]
+fn an_outgrown_source_keeps_a_job_that_can_progress() {
+    let dir = std::env::temp_dir().join(format!("tessera-floor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Runs of 32 KiB, where a run's overhead beside its records is small
+    // enough that a job of two uncompressed runs fits jobs of three.
+    const RUN: usize = 32 << 10;
+    let sized = |compression| EngineOptions {
+        memtable_budget: 4 * RUN,
+        target_run_len: RUN,
+        compression,
+        ..options()
+    };
+    let mut model = BTreeMap::new();
+    {
+        let engine = Engine::new(sized(Compression::Zstd)).unwrap();
+        for index in 0..40_000u64 {
+            let key = key(index * 7 % 40_000);
+            engine.put(&key, &value(index)).unwrap();
+            model.insert(key, value(index));
+        }
+        settle(&engine, &mut Steps::default());
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+    }
+    let engine = Engine::recover(&dir, sized(Compression::Uncompressed)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut rng = Rng(9);
+    for write in 0..20_000u64 {
+        let key = key(rng.below(40_000));
+        engine.put(&key, &value(write + 90_000)).unwrap();
+        model.insert(key, value(write + 90_000));
+    }
+    engine.flush().unwrap();
+    let limits = CompactionOptions {
+        max_input_bytes: 3 * RUN,
+        max_output_bytes: 3 * RUN,
+        ..compaction()
+    };
+    let mut workspace = MergeWorkspace::new();
+    let (mut steps, mut last) = (0usize, None);
+    let drained = loop {
+        match engine.compact(limits, &mut workspace) {
+            Ok(Some(_)) => steps += 1,
+            Ok(None) => break true,
+            Err(error) if last.as_ref() == Some(&error) => break false,
+            Err(error) => last = Some(error),
+        }
+        assert!(steps < 100_000);
+    };
+    let overflows = engine.core.overflows.load(Ordering::SeqCst);
+    assert!(overflows > 0, "the output outgrew the headroom");
+    assert!(
+        drained,
+        "{overflows} overflows, {steps} steps, ended on {last:?}"
+    );
+    let runs = engine.stats().runs;
+    assert!(overflows <= 4 * runs, "{overflows} overflows, {runs} runs");
+    level_ids(&engine);
+    assert_eq!(scan(&engine.snapshot().unwrap()), model);
+}
+
 /// A valid configuration in which no level-0 job fits: each flush at the
 /// stop waits for one pass, which is refused, and is then refused naming
 /// the stop; the worker runs one pass per refused flush, not in a loop.

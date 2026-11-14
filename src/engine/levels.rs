@@ -87,8 +87,35 @@ pub(super) struct Refusal {
 /// published.
 struct Outgrown {
     source: Weak<super::Published>,
+    /// Half the input of the smallest job from it that failed.
     max_bytes: usize,
     output_bytes: usize,
+    /// Set once a job no larger than the floor failed: the floor as it was
+    /// then (see [`Levels::floor`]), which stands until the runs below the
+    /// source change.
+    failed_floor: Option<Floor>,
+}
+
+/// The smallest job that makes progress on every part of a source: the
+/// source with the largest run below that it overlaps, by its bytes and
+/// that run (none if it overlaps nothing below).
+#[derive(Clone)]
+struct Floor {
+    bytes: usize,
+    largest: Option<Weak<super::Published>>,
+    overlapped: usize,
+}
+
+impl Floor {
+    fn same(&self, other: &Floor) -> bool {
+        self.bytes == other.bytes
+            && self.overlapped == other.overlapped
+            && match (&self.largest, &other.largest) {
+                (Some(a), Some(b)) => a.ptr_eq(b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 /// The limits a job must fit, from the compaction options.
@@ -215,15 +242,27 @@ impl Levels {
     /// of codec or dictionary can make it). Selection reads the same levels
     /// again, so without this it would choose the same job and fail the
     /// same way every time. From now on a job taking that source may have
-    /// at most half this one's input bytes: it takes fewer runs, splits its
-    /// source, or is refused before reading anything. Each failure halves
-    /// the allowance again, so a source fails at most about
-    /// log2(limit / its size) times before its jobs fit or are refused.
+    /// at most half this one's input bytes, but never less than the floor
+    /// (the source with the largest run below that it overlaps, the
+    /// smallest job that makes progress on every part of it), computed when
+    /// the job is chosen, so a floor grown by changes below still admits
+    /// its job; [`Levels::fit_for`] applies it. A job no larger than the
+    /// floor that fails leaves the source with the halved allowance alone,
+    /// refused before reading anything, until the runs below it change.
+    ///
+    /// Each failure halves the allowance, or is of a job within the floor,
+    /// after which the source fails again only after a change below; so a
+    /// source fails at most about log2(limit / its size) times, plus once
+    /// per change of the runs below it.
     pub(super) fn outgrown(&mut self, inputs: &[SharedRun], output_bytes: usize) {
         let Some(source) = inputs.first() else {
             return;
         };
-        let half = inputs.iter().map(bytes_of).sum::<usize>() / 2;
+        let total = inputs.iter().map(bytes_of).sum::<usize>();
+        let floor = self
+            .find(source)
+            .map(|(level, _)| self.floor(level, source))
+            .filter(|floor| total <= floor.bytes);
         let source = Arc::downgrade(source);
         self.outgrown
             .retain(|outgrown| outgrown.source.strong_count() > 0);
@@ -233,33 +272,61 @@ impl Levels {
             .find(|outgrown| outgrown.source.ptr_eq(&source))
         {
             Some(outgrown) => {
-                outgrown.max_bytes = outgrown.max_bytes.min(half);
+                outgrown.max_bytes = outgrown.max_bytes.min(total / 2);
                 outgrown.output_bytes = output_bytes;
+                if floor.is_some() {
+                    outgrown.failed_floor = floor;
+                }
             }
             None => self.outgrown.push(Outgrown {
                 source,
-                max_bytes: half,
+                max_bytes: total / 2,
                 output_bytes,
+                failed_floor: floor,
             }),
         }
     }
 
-    /// The limits for a job taking `source` as its source: `fit`, or less
-    /// if its jobs have outgrown the output limit, with the output that did.
-    fn fit_for(&self, source: &SharedRun, fit: &Fit) -> (Fit, Option<usize>) {
+    /// The floor of `source`, in `level`, as the runs below it are now.
+    fn floor(&self, level: usize, source: &SharedRun) -> Floor {
+        let overlapped = self.levels.get(level + 1).map_or(&[][..], |below| {
+            &below[overlapping(below, min_of(source), max_of(source))]
+        });
+        let largest = overlapped.iter().max_by_key(|run| bytes_of(run));
+        Floor {
+            bytes: bytes_of(source) + largest.map_or(0, bytes_of),
+            largest: largest.map(Arc::downgrade),
+            overlapped: overlapped.len(),
+        }
+    }
+
+    /// The limits for a job taking `source`, in `level`, as its source:
+    /// `fit`, or less if its jobs have outgrown the output limit, with the
+    /// output that did. Never more than `fit`. With no level (a neighbour
+    /// merge, a job of two runs of one level) only the halved allowance
+    /// applies.
+    fn fit_for(&self, source: &SharedRun, level: Option<usize>, fit: &Fit) -> (Fit, Option<usize>) {
         let found = self
             .outgrown
             .iter()
             .find(|outgrown| std::ptr::eq(outgrown.source.as_ptr(), Arc::as_ptr(source)));
-        match found {
-            Some(outgrown) if outgrown.max_bytes < fit.max_bytes => (
-                Fit {
-                    max_bytes: outgrown.max_bytes,
-                    ..*fit
-                },
-                Some(outgrown.output_bytes),
-            ),
-            _ => (*fit, None),
+        let Some(outgrown) = found else {
+            return (*fit, None);
+        };
+        let floor = level
+            .map(|level| self.floor(level, source))
+            .filter(|floor| {
+                outgrown
+                    .failed_floor
+                    .as_ref()
+                    .is_none_or(|failed| !failed.same(floor))
+            })
+            .map_or(0, |floor| floor.bytes);
+        let max_bytes = outgrown.max_bytes.max(floor);
+        if max_bytes < fit.max_bytes {
+            (Fit { max_bytes, ..*fit }, Some(outgrown.output_bytes))
+        } else {
+            (*fit, None)
         }
     }
 
@@ -513,6 +580,62 @@ impl Levels {
             .clamp(1, target)
     }
 
+    /// Each level's target bytes under `fit`, 0 for level 0 and the last
+    /// level, which have none: for measurements.
+    #[cfg(test)]
+    pub(super) fn targets(&self, fit: &Fit) -> Vec<usize> {
+        let base = BASE_SEGMENTS.saturating_mul(self.segment(fit));
+        let last = self.levels.len() - 1;
+        (0..=last)
+            .map(|level| match level {
+                0 => 0,
+                level if level == last => 0,
+                level => self.target(level, base),
+            })
+            .collect()
+    }
+
+    /// Each live source's allowance and the output that set it, with the
+    /// source's level, bytes, and the bytes of the smallest run below it
+    /// that it overlaps: for measurements.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(super) fn allowances(&self) -> Vec<(usize, usize, Option<usize>, usize, Option<usize>)> {
+        self.outgrown
+            .iter()
+            .filter_map(|outgrown| {
+                let source = outgrown.source.upgrade()?;
+                let level = self.level_of(&source);
+                let smallest = level.and_then(|level| {
+                    let below = self.levels.get(level + 1)?;
+                    below[overlapping(below, min_of(&source), max_of(&source))]
+                        .iter()
+                        .map(bytes_of)
+                        .min()
+                });
+                Some((
+                    outgrown.max_bytes,
+                    outgrown.output_bytes,
+                    level,
+                    bytes_of(&source),
+                    smallest,
+                ))
+            })
+            .collect()
+    }
+
+    /// The sources holding an output allowance, (live, retired but not yet
+    /// pruned): for measurements.
+    #[cfg(test)]
+    pub(super) fn outgrown_entries(&self) -> (usize, usize) {
+        let live = self
+            .outgrown
+            .iter()
+            .filter(|outgrown| outgrown.source.strong_count() > 0)
+            .count();
+        (live, self.outgrown.len() - live)
+    }
+
     fn target(&self, level: usize, base: usize) -> usize {
         let last = self.levels.len() - 1;
         let shrink = RATIO.saturating_pow((last - level) as u32);
@@ -597,7 +720,7 @@ impl Levels {
             if at == here.len() { 0 } else { at }
         };
         let source = &here[at];
-        let (reduced, outgrown) = self.fit_for(source, fit);
+        let (reduced, outgrown) = self.fit_for(source, Some(level), fit);
         let fit = &reduced;
         let below = &self.levels[level + 1];
         let dests = overlapping(below, min_of(source), max_of(source));
@@ -742,7 +865,7 @@ impl Levels {
                     continue;
                 }
                 let runs = [a, b];
-                let (fit, _) = self.fit_for(a, fit);
+                let (fit, _) = self.fit_for(a, None, fit);
                 if !fit.fits(2, bytes_of(a) + bytes_of(b), workspace(&runs)) {
                     continue;
                 }
@@ -802,5 +925,143 @@ impl Levels {
         for pair in self.flushes.windows(2) {
             assert!(pair[0] <= pair[1], "level 0 is in publication order");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::Value;
+    use crate::run::{Codec, RunBuilder};
+
+    /// A run of `count` uncompressed records over keys `0..100` evenly.
+    fn run(count: u64) -> SharedRun {
+        let mut builder = RunBuilder::with_target_block_len(Codec::None, 4096);
+        for at in 0..count {
+            let key = format!("k{:04}", at * 100 / count);
+            builder
+                .add(key.as_bytes(), at + 1, Value::Bytes(&[7; 64]))
+                .unwrap();
+        }
+        super::super::published(vec![builder.finish()])
+            .next()
+            .unwrap()
+    }
+
+    fn with(source: &SharedRun, below: &SharedRun) -> Levels {
+        let mut levels = Levels::new();
+        levels.levels = vec![
+            Vec::new(),
+            vec![Arc::clone(source)],
+            vec![Arc::clone(below)],
+        ];
+        levels.bytes = vec![0, bytes_of(source), bytes_of(below)];
+        levels.cursors = vec![Vec::new(); 3];
+        levels
+    }
+
+    /// A failure within the floor refuses the source while the runs below
+    /// stay as they were, and a change below them, here a larger run in
+    /// their place, admits the new floor's job: the allowance is never left
+    /// below a job that fits by the floor of a failure that is past.
+    #[test]
+    fn a_failed_floor_stands_until_the_runs_below_change() {
+        let (source, small, large) = (run(40), run(20), run(60));
+        let fit = Fit {
+            max_inputs: 32,
+            max_bytes: bytes_of(&source) + bytes_of(&large) + 1,
+            max_workspace_bytes: usize::MAX,
+            trigger: 4,
+            level0_stop: 12,
+            target_run_len: 1 << 20,
+        };
+        let mut levels = with(&source, &small);
+        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
+        // The job of the source and the one run below, its floor, failed.
+        levels.outgrown(
+            &[Arc::clone(&source), Arc::clone(&small)],
+            fit.max_bytes + 1,
+        );
+        assert!(
+            matches!(
+                levels.plan_level(1, &fit),
+                Plan::Refuse(Refusal {
+                    outgrown: Some(_),
+                    ..
+                })
+            ),
+            "the same floor job is not chosen again"
+        );
+        levels.levels[2] = vec![Arc::clone(&large)];
+        levels.bytes[2] = bytes_of(&large);
+        assert!(
+            matches!(levels.plan_level(1, &fit), Plan::Merge { .. }),
+            "a changed floor admits its job"
+        );
+        // That job failing too refuses it until the next change.
+        levels.outgrown(
+            &[Arc::clone(&source), Arc::clone(&large)],
+            fit.max_bytes + 1,
+        );
+        assert!(matches!(levels.plan_level(1, &fit), Plan::Refuse(_)));
+        // Replacing the source retires its allowance: its replacement's
+        // jobs are admitted under the full limits.
+        let replacement = run(40);
+        levels.levels[1] = vec![Arc::clone(&replacement)];
+        drop(source);
+        assert_eq!(levels.outgrown_entries(), (0, 1));
+        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
+        assert_eq!(levels.fit_for(&replacement, Some(1), &fit).1, None);
+    }
+
+    /// A failure larger than the floor halves the allowance but keeps the
+    /// floor's job, which never exceeds the configured limit.
+    #[test]
+    fn a_large_failure_keeps_the_floor_within_the_limit() {
+        let source = run(40);
+        let below: Vec<SharedRun> = (0..4u64)
+            .map(|part| {
+                let mut builder = RunBuilder::with_target_block_len(Codec::None, 4096);
+                for at in 0..30 {
+                    let key = format!("k{:04}.{at:02}", part * 25 + at * 25 / 30);
+                    builder
+                        .add(key.as_bytes(), at + 1, Value::Bytes(&[7; 64]))
+                        .unwrap();
+                }
+                super::super::published(vec![builder.finish()])
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        let all: usize = bytes_of(&source) + below.iter().map(bytes_of).sum::<usize>();
+        let fit = Fit {
+            max_inputs: 32,
+            max_bytes: all,
+            max_workspace_bytes: usize::MAX,
+            trigger: 4,
+            level0_stop: 12,
+            target_run_len: 1 << 20,
+        };
+        let mut levels = Levels::new();
+        levels.levels = vec![Vec::new(), vec![Arc::clone(&source)], below.clone()];
+        levels.bytes = vec![0, bytes_of(&source), below.iter().map(bytes_of).sum()];
+        levels.cursors = vec![Vec::new(); 3];
+        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
+        let inputs: Vec<SharedRun> = std::iter::once(Arc::clone(&source)).chain(below).collect();
+        levels.outgrown(&inputs, all + 1);
+        let (reduced, outgrown) = levels.fit_for(&source, Some(1), &fit);
+        let floor = levels.floor(1, &source).bytes;
+        assert!(outgrown.is_some());
+        assert_eq!(reduced.max_bytes, (all / 2).max(floor));
+        assert!(reduced.max_bytes < fit.max_bytes);
+        // The source is split into pieces that each fit.
+        assert!(
+            matches!(
+                levels.plan_level(1, &fit),
+                Plan::Split { .. } | Plan::Merge { .. }
+            ),
+            "{:?}",
+            levels.plan_level(1, &fit)
+        );
     }
 }

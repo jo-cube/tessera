@@ -823,12 +823,18 @@ measurement below:
   keeps versions of a key together and levels disjoint). After such a
   failure, `Levels::outgrown` records the job's source (by weak
   reference, dropped once the run is retired) with half the job's input
-  bytes as the most a job from it may take. Selection applies it to that
-  source only: fewer joined runs, a split, or, once even the source with
-  one run below exceeds it, a refusal before anything is read, reported
-  as `OutputLimit` with the output that crossed the limit. Each failure
-  halves the allowance, so a source fails at most about log2(limit / its
-  size) times; a refusal at selection lets the other levels proceed in
+  bytes as the most a job from it may take, but never less than its
+  floor: the source with the largest run below that it overlaps, the
+  smallest job that makes progress on every part of it, computed when a
+  job is chosen (so it follows changes below) and never above the
+  configured limit. Selection applies it to that source only: fewer
+  joined runs, a split, or a refusal before anything is read, reported as
+  `OutputLimit` with the output that crossed the limit. A job no larger
+  than the floor that fails leaves the source refused until the runs
+  below it change (another run largest, or a different number
+  overlapped). So a source fails at most about log2(limit / its size)
+  times, plus once per change of the runs below it; a
+  refusal at selection lets the other levels proceed in
   the same pass, where a failed build ends the pass. A single record
   whose output alone exceeds the limit (possible only across a codec
   change, since output keeps one version a key) is refused this way, for
@@ -993,3 +999,201 @@ not show the level-0 priority defect.
   merges fail at the output limit a bounded number of times per source,
   then are refused at selection until the limit is raised.
 - No measurement beyond 200,000 writes at 64 KiB segments.
+
+## 18. Alpha validation (after 5AU)
+
+Measured in the bounded environment: Colima with 4 GiB,
+a container of 3 GiB without swap and 2 CPUs, `/tmp` a 512 MiB tmpfs,
+release test builds (`scripts/validate.sh exec`). Every publication in a
+test build also checks the level invariants, so every run below checked
+them throughout, at a cost a release build of the library does not pay.
+Seeds are fixed; the instruments are `src/engine/alpha_tests.rs` (ignored
+research runs, one selection per process so that peak memory is that
+run's) and test-only phase timers on flushes and compaction steps. The
+largest tested scale is 16 million writes (1.75 GiB logical, 379 MiB of
+runs, text values) and 8 million incompressible writes (844 MiB of runs).
+Nothing here establishes behaviour beyond that.
+
+### Sustained background compaction
+
+The background worker, jobs of four runs as the defaults are, one reader
+thread doing point reads and short scans beside the writer. WA counts
+stored bytes flushed and compacted against stored bytes flushed;
+"operating" is as the writes left it, "drained" after a final flush and a
+pass with nothing due (measured).
+
+| Runs | Writes | Workload | Values | WA operating / drained | Space amp. op. / drained | L0 at stop | Writer waits | Largest put |
+|---|---|---|---|---|---|---|---|---|
+| 8 MiB | 4M | ascending | both | 1.00 / 1.00 (moves only) | 1.00 | 0% | 0 | 12 ms |
+| 8 MiB | 4M | uniform insert | text | 5.21 / 5.60 | 1.06 / 1.06 | 9% | 11, 2.1 s | 371 ms |
+| 8 MiB | 4M | uniform insert | incompressible | 8.21 / 8.46 | 0.99 / 1.00 | 33% | 37, 4.9 s | 598 ms |
+| 8 MiB | 4M | uniform overwrite | text | 3.50 / 3.99 | 1.42 / 1.07 | 10% | 10, 1.0 s | 473 ms |
+| 8 MiB | 4M | uniform overwrite | incompressible | 6.50 / 7.42 | 1.33 / 1.06 | 47% | 52, 4.7 s | 312 ms |
+| 8 MiB | 4M | mixed, 20% deletes | text | 4.01 / 4.17 | 1.22 / 1.19 | 7% | 6, 0.5 s | 171 ms |
+| 8 MiB | 4M | mixed, 20% deletes | incompressible | 9.31 / 9.71 | 1.30 / 1.17 | 27% | 28, 5.4 s | 474 ms |
+| 1 MiB | 4M | hot 2% of 1M keys | text | 1.58 / 1.59 | 1.05 / 1.02 | 3% | 20, 0.09 s | 10 ms |
+| 1 MiB | 4M | hot 2% of 1M keys | incompressible | 1.77 / 1.77 | 1.03 / 1.03 | 0% | 2, 0.01 s | 9 ms |
+| 1 MiB | 4M | uniform insert | text | 8.53 / 8.68 | 1.06 | 17% | 155, 9.1 s | 181 ms |
+| 1 MiB | 4M | uniform insert | incompressible | 14.49 / 14.59 | 1.00 | 52% | 484, 14.6 s | 130 ms |
+| 64 MiB | 16M | uniform insert | text | 4.19 / 4.93 | 1.06 / 1.07 | 5% | 3, 1.6 s | 1.29 s |
+| 64 MiB | 16M | uniform overwrite | text | 3.43 / 3.54 | 1.34 / 1.22 | 0% | 0 | 206 ms |
+| 64 MiB | 16M | mixed, 20% deletes | text | 3.13 / 3.46 | 1.19 / 1.08 | 0% | 0 | 213 ms |
+| 64 MiB | 8M | uniform insert | incompressible | 3.17 / 7.61 | 0.97 / 1.00 | 3% | 1, 0.04 s | 179 ms |
+| 8 MiB | 800k × 1000 B | uniform insert | text | 4.73 / 5.45 | 1.01 | 15% | 15, 4.2 s | 826 ms |
+| 8 MiB | 800k × 1000 B | uniform insert | incompressible | 7.02 / 7.72 | 1.00 | 32% | 28, 1.1 s | 165 ms |
+
+No write, flush or compaction was refused in any run, and every drain
+ended with nothing due. The hot workload at 8 MiB runs fits its 20,000
+hot keys in one memtable and never compacts (WA 1.00); the 1 MiB rows are
+the meaningful ones. WA grows with depth: at 4 million incompressible
+inserts it is 14.6 with 1 MiB runs (four levels), 8.5 with 8 MiB (two)
+and, at 8 million, 7.6 with 64 MiB (one); the 64 MiB rows have one or two
+levels, so they say nothing about deeper trees at that run size. Per
+level, each level's merges add 2–3 to WA (text) and level 0's 5–8
+(incompressible, where level 0 rewrites level 1 more often), consistent
+with section 17.
+
+The single worker is the throughput limit, not a scheduling defect: busy
+76–100% of the time, at 55–66 MiB/s of input on text (Zstandard
+compression) and 250–330 MiB/s incompressible. Writers are paced to it by
+the level-0 stop: where level 0 sat at its stop in a third to a half of
+the samples, the writer waited 5–15 s of a 10–18 s run. At the operating
+endpoint of the 64 MiB incompressible run, level 0 held 36 runs and
+333 MiB, a debt of 325 MiB that took the drain 12.8 s; WA 3.17 operating
+against 7.61 drained is that deferred work.
+
+### Flush phases (measured)
+
+Mean / p99 / max per flush, on the writer that needed room:
+
+| Runs | Wait for level 0 | Freeze | Encode | Finish runs | Publish (state lock held) |
+|---|---|---|---|---|---|
+| 1 MiB | 10–16 ms / 76–112 ms / 180 ms | < 10 µs | 1.0–1.5 ms | 0.1 ms | 0.1 ms |
+| 8 MiB | 4–52 ms / 0.08–0.4 s / 0.6 s | < 10 µs | 8–18 ms / 26 ms | 0.2–0.3 ms / 2 ms | 1.3–1.9 ms / 5 ms |
+| 64 MiB | 0–28 ms / 0.4 s / 1.1 s | < 10 µs | 94–108 ms / 157 ms | 1.2 ms / 3.7 ms | 20–35 ms / 56 ms (47 µs / 54 µs) |
+
+A 64 MiB flush costs the writer about 0.1–0.2 s, mostly encoding and
+compressing; publication holds the state lock for under 0.1 ms, and the
+rest of its 20–35 ms is freeing the flushed table after the lock is
+released. The largest write latencies are flushes that also waited for
+level 0 (up to 1.3 s at 64 MiB). Medians stay at 0.2–0.6 µs and p99.9 at
+1–66 µs: the stall is concentrated in the write that flushes.
+
+### Reads
+
+Point reads cost 12–15 µs on Zstandard text blocks and 1.5–3.4 µs where
+blocks store incompressible values (decode dominates, as `Compression`
+documents). Short prefix scans at the operating endpoint load 2–4 times
+the blocks of the drained endpoint (up to 10.7 blocks, 135 µs, at 64 MiB
+runs with 26 level-0 runs). Under load, the reader's point-read p99 is
+2.8–27 µs; p99.9 is about 2 ms (the histogram's 1.97–2.10 ms bucket) on
+every uniform text run and the hot text run at 1 MiB, and 18–213 µs
+otherwise; the slowest read took 14 ms. With publication holding the lock for under
+0.1 ms, that tail is not lock waiting; three busy threads on two CPUs is
+consistent with it, but it is unattributed.
+
+### Memory (measured)
+
+Peak resident memory against the engine's accounted bytes (runs, filters
+and memtables at the operating endpoint): 1.43 GiB against 881 MiB (64 MiB
+runs, 256 MiB jobs, incompressible), 653 MiB against 461 MiB (64 MiB, text),
+525 MiB against 425 MiB (8 MiB, incompressible), and 2–2.3 times at small
+datasets, where fixed costs dominate. The difference is the table being
+flushed, one job's unpublished output (up to `max_output_bytes`), the
+reader's workspace (0.2–0.75 MiB of decoder contexts), and allocator
+overhead; `tests/compaction_memory.rs` bounds a merge's heap and native
+contexts against its workspace estimate.
+
+How each limit holds:
+
+| Resource | Limit | Kind |
+|---|---|---|
+| Memtables | `memtable_budget`, two budgets in all | hard admission on charged bytes, which estimate allocation |
+| Runs | `max_run_bytes`, `max_runs` | hard on stored and filter bytes at publication; a compaction may pass them only by shrinking |
+| Level 0 | 12 flushes | hard, at publication |
+| Retired runs | `SnapshotLimits::max_retained_bytes` | admission: past it, snapshots and compactions other than moves are refused; one job's inputs can be over it |
+| Compaction input | `max_inputs`, `max_input_bytes` | hard, at selection |
+| Compaction output | `max_output_bytes` | hard, during the merge (fails, publishes nothing) |
+| Compaction workspace | `max_workspace_bytes` | an estimate checked at selection; measured above actual use |
+| Native decoder contexts | inside the workspace estimate | estimated per context, measured |
+| Reader workspaces | none | caller-owned, measured 0.2–0.75 MiB each |
+| Metadata (directory, levels, allowances) | none of its own | proportional to runs, so bounded through `max_runs` |
+| Process memory | none | measured above |
+| Log queue and batches | `max_queue_bytes`, `max_batch_*` | hard |
+
+### Output growth across a codec change, and the allowance floor
+
+`alpha_output_growth_after_codec_switch`: 300,000 records in 256 KiB runs,
+built and checkpointed under one compression, recovered under another,
+then 150,000 overwrites, compacted by the worker or, with
+`ALPHA_GROWTH_SYNC=1`, piled into level 0 first (a 138-flush backlog) and
+then compacted; every case's contents checked against a model.
+
+With jobs of four runs (the defaults' proportion) no merge failed in any
+case: Zstandard to `Uncompressed`, to LZ4, dictionary to plain Zstandard,
+and incompressible values. A run is cut by its input bytes, so
+re-encoding cannot make one larger than its records. Most of the growth
+went through neighbour merges of the small recovered runs (up to 4.5
+times). Level-0 merges grew up to 3.5 times but stayed within the limit.
+
+With jobs of two or three runs, merges over the backlog fail at the
+output limit. Halving alone would take a source's allowance below the
+source with one run below it (measured: 297,204 bytes, against a
+220,205-byte source and 219,799-byte runs below), refusing every job of
+that source, including a two-run job that fits, so that compaction never
+drained. The floor (section 17) prevents that:
+
+| Jobs | Case | Halving only: overflows, WA, drained | With the floor |
+|---|---|---|---|
+| 2 runs | Zstd to uncompressed, backlog | 119, 61.95, no | 42, 15.00, yes |
+| 3 runs | Zstd to uncompressed, backlog | 86, 44.72, no | 32, 10.42, yes |
+| 2 runs | Zstd to LZ4, backlog | 1, 7.58, yes | unchanged |
+| 3 runs | Zstd to uncompressed, worker | 0, 14.61, yes | 2, 14.24, yes |
+
+`an_outgrown_source_keeps_a_job_that_can_progress` fails with halving
+alone (8 overflows, then a standing refusal) and passes with the floor;
+`levels::tests` checks that a failed floor stands only until the runs
+below change, that a replaced source's allowance is dropped, and that
+the floor never exceeds the limit. At most one allowance was held by a
+live source at a time and one by a retired source awaiting pruning.
+Remaining, with jobs of two or three runs: about 100 runs under an eighth
+of the target are left in the last level, pieces too large for neighbour
+merges, whose threshold is the stored size of a full run under the codec
+that built the history; and with two runs and `Uncompressed`, two stored
+runs can exceed the limit by their overhead, refused as `JobLimit` (raise
+the limits).
+
+### Durability and lifecycle
+
+`a_durable_database_survives_its_lifecycle_under_background_leveling`
+runs five opens of one durable database under the worker with flush
+splitting and at least two levels: mixed puts, overwrites and deletes; a
+snapshot held across compactions and checked; durable checkpoints, one
+stopped before its rename by the checkpoint crash point; each open ended
+differently (closed; a failed log sync, whose uncertain write is
+recovered or not, all or nothing, then a closed log; a worker panic with
+writes continuing without it; dropped without closing; closed after a
+checkpoint). Each reopen matched the model and continued the sequence.
+The existing suites cover the rest (WAL torn tails and damage, rotation
+failure, simulated power loss of unsynced data, checkpoint crash points,
+a killed process). None of this is evidence about physical power loss.
+
+### Checkpoint costs (measured, tmpfs)
+
+| Records | Stored | Checkpoint | After 1% overwrites | Recovery |
+|---|---|---|---|---|
+| 250,000 | 6.1 MiB | 0.09 s, 5.8 MiB | 0.09 s, 5.8 MiB | 0.05 s |
+| 1,000,000 | 24.7 MiB | 0.37 s, 23.2 MiB | 0.38 s, 23.2 MiB | 0.19 s |
+| 3,000,000 | 75.3 MiB | 1.16 s, 70.7 MiB | 1.18 s, 70.7 MiB | 0.58 s |
+
+Every checkpoint rewrites all data, about 60 MiB/s of output here with no
+device writes; a 1% change costs the same as the first. Time is linear
+over these three sizes; larger sizes were not measured.
+
+### Not done
+
+- No measurement beyond the scales above, of more than one writer
+  thread, or of sustained reads heavier than one thread.
+- The 2 ms p99.9 read tail under load is unattributed.
+- No asynchronous flushing, incremental checkpoints, scheduler changes
+  or limit expansion.
