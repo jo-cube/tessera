@@ -3882,6 +3882,151 @@ build cache discarded with its container), alternating with runs of the
 change's binary. The passes above instead built the baseline in the shared
 cache before the change and copied its binary aside.
 
+## Indexed run groups: feasibility (5AP)
+
+*Measurement and design; production code is unchanged.* Could the published
+runs be indexed as groups of pairwise disjoint key ranges, binary-searched
+per group, without changing how runs are built, compacted or published?
+Labels: **M** measured, **D** derived from measurements or code, **H**
+hypothesis.
+
+### Method
+
+`src/engine/directory_tests.rs` (ignored research tests). The directory
+partitions the published lookup order by interval partitioning: runs in
+order of smallest key, each into the group whose last run ends earliest if
+that end is strictly below the run's start (ranges are inclusive), else
+into a new group. This uses the fewest groups possible, which equals
+`max_overlap`; the test asserts it. A lookup binary-searches each group for
+the one run that may hold the key and passes those candidates to the
+engine's own `latest_in`, ordered by their own sequence bounds ("grouped")
+or left in group order, by the groups' coarser bounds ("group-order").
+
+Every probe is read through the engine's path (`latest_in` over every run,
+as `Engine::get` reads runs), both directory paths and a counting wrapper,
+and their results must agree; the grouped path must decode exactly the
+engine's blocks. The candidate sets are checked against brute force.
+Timings alternate the three paths twice on one fixture: per-probe p50 and
+p99 (the VM's clock ticks every ~42 ns, so sub-microsecond p50s are coarse)
+and means over whole passes. 2,000 probes a class, release build, bounded
+container, one run.
+
+Fixtures: the 5AO layouts (200,000 keys, exactly N runs, no compaction),
+and three histories under the real selector (default `CompactionOptions`,
+compacted after every flush as the worker would), scaled down to 64 KiB
+memtables and runs and measured as the run count first reaches each mark:
+**ascending** inserts (400,000), **uniform** (300,000 keys in a
+permutation, then 100,000 uniform overwrites and deletes), **hot** (300,000
+ascending, then 100,000 overwrites and deletes within 2% of the keys).
+
+### Topology (M)
+
+| history | runs | max_overlap = groups | isolated runs | largest group | equal-end pairs | groups if equal ends were allowed |
+|---|---|---|---|---|---|---|
+| ascending | 64–2,326 | 1 | all | all | 0–9 | 1 |
+| uniform | 65 / 257 / 1,025 / 1,681 | 4 | 3 / 4 / 29 / 36 | 23 / 83 / 269 / 475 | 0–6 | 4 |
+| hot | 64 / 256 / 1,024 / 1,747 | 1, 1, 1, then 4 | all, then 3 | then 582 | 0–6 | same |
+| disjoint (5AO) | 4–2,048 | 2–3 | 0 | up to 1,706 | 0 | same |
+| overlapping (5AO) | 4–2,048 | = runs | 0 | 1 | 0 | same |
+
+- `max_overlap` counts inclusive ranges, so a run ending at another's
+  first key overlaps it, and it equals the minimum group count. Equal ends
+  were rare in every history and allowing them would have saved no group.
+  They must not be allowed anyway: two runs sharing a key in one group
+  would hide one from the binary search.
+- After each of ~2,900 flushes and its compactions, `max_overlap` was 1 in
+  every ascending one, 4 in 2,905 of 2,922 uniform ones, and at most 4 in
+  hot. Long-lived full-length runs are never rewritten, but under this
+  selector they lie side by side, so they add groups only where they
+  overlap.
+- **The allowance is not an invariant.** Flushes publish regardless of
+  overlap; only compaction lowers it. With a snapshot held and
+  `max_retained_bytes` at 128 KiB, 376 compactions were refused
+  (`Retained`) and overlap reached 380 at 428 runs; it returned to 4 once
+  the snapshot was dropped. Input-limit refusals can hold it high the same
+  way (D).
+
+### Lookups at the largest marks (M), mean ns, engine → grouped
+
+| history | runs | groups | present | overwritten | deleted | missing | range checks a probe, engine → grouped |
+|---|---|---|---|---|---|---|---|
+| ascending | 2,326 | 1 | 17,689 → 11,652 | – | – | 15,930 → 232 | 1,165–2,326 → 1 group |
+| uniform | 1,681 | 4 | 25,627 → 11,949 | 25,666 → 11,898 | 15,075 → 1,000 | 14,967 → 593 | 1,590–1,681 → 4 groups |
+| hot | 1,747 | 4 | 15,589 → 11,606 | 12,182 → 10,989 | 8,244 → 1,700 | 9,908 → 445 | 30–1,747 → 4 groups |
+| disjoint | 2,048 | 3 | 17,876 → 11,864 | 12,451 → 11,131 | 12,589 → 10,979 | 13,051 → 582 | 174–2,048 → 3 groups |
+| overlapping | 2,048 | 2,048 | 131,473 → 158,267 | 28,596 → 49,655 | 29,639 → 50,167 | 207,384 → 239,206 | – |
+
+p99 followed the same pattern: missing keys at 2,326 ascending runs
+25,001 → 542 ns, present keys 25,834 → 15,875 ns (one block decode, about
+11.5 µs here, is the floor). At 4–64 runs the paths are within the spread.
+
+- **Grouped cost tracks groups, not runs, when groups are few (M).**
+  Missing keys cost 0.2–0.6 µs at 1,681–2,326 runs against 15–16 µs, and
+  present keys reach the decode floor. Filter probes are the same in both
+  paths (the engine already probes only runs whose range holds the key);
+  what the directory removes is the walk over every run's sequence bound
+  and range.
+- **When groups are as many as runs, the eager directory is slower (M):**
+  at 2,048 overlapping runs, +20% for present keys and +74% for overwritten
+  ones. It binary-searches every group and sorts ~2,000 candidates before
+  reading, where the engine's walk drops runs on their sequence bound
+  first. A lazy walk over groups in group-bound order that stops once a
+  group's bound is below the version found would avoid that (H), but no
+  directory can help a topology this overlapped: that needs compaction.
+- **Coarse group-order bounds cost a little (M):** the same results with
+  up to 3.7% more block decodes (hot overwritten 1.050 against 1.013 a
+  probe, deleted 0.183 against 0.151), at no measurable mean cost. With at
+  most a handful of candidates, sorting them by their own bounds is cheap
+  and keeps the engine's pruning exactly.
+- **Warm reads (D):** the directory path's only heap use is its candidate
+  buffer, which did not grow after warm-up (asserted); `latest_in` is
+  allocation-free warm (5AO).
+
+### Directory and publication costs (M)
+
+| runs (history) | groups | directory build µs | lookup order rebuild µs | selection µs | directory bytes | build temporary bytes |
+|---|---|---|---|---|---|---|
+| 1,024 (ascending) | 1 | 12 | 3 | 2,542 | 49,280 | 57,440 |
+| 2,326 (ascending) | 1 | 30 | 9 | 17,912 | 111,776 | 130,352 |
+| 1,681 (uniform) | 4 | 99 | 6 | 12,436 | 80,816 | 94,232 |
+| 2,048 (overlapping) | 2,048 | 231 | 8 | 43,587 | 163,840 | 163,840 |
+
+The directory is 48 bytes a run (key-range slices, sequence bound, run
+pointer) against 8 for the lookup order; rebuilt on every publication it
+costs tens of µs at 2,000 runs. The selector, which runs under the read
+lock before every compaction, costs 13–44 ms at that count: it is the
+publication-side cost that scales worst (quadratic).
+
+### Scans (M, prototype)
+
+A test-only concatenating cursor over one group's runs (`Concat`) seeks by
+binary search to the first run whose largest key reaches the target, and
+moves to the next run by handing its single `ReadWorkspace` from one
+`RunCursor` to the next. Against a model over 40 seeds (binary keys, the
+empty key, `0xFF` prefixes, probes at every run's first and last key, mixed
+codecs, several versions a key) it returned every record in order. Over 11
+runs it held one decompression context (95,976 bytes) where a merge of the
+same runs held five (479,880). Under a prefix it continues into the next run
+only if that run's first key has the prefix, which is sufficient because
+the next run starts above every key read so far.
+
+### Capacity (M, at 1/256 scale)
+
+With the default 64-run limit, 256 KiB memtables and runs and compaction
+after every flush, writes were refused after 61.6 run lengths of logical
+input (ascending) and 60.8 (uniform random), with 64 runs at overlap 1 and 4
+respectively. The selector then returned nothing (`Ok(None)`): overlap was
+within the allowance, and full-length runs are never merged. The refusal
+does not clear. At the defaults that is about 64 × 64 MiB = 4 GiB of
+logical input (D), whatever the key order; grouping changes none of it.
+
+### Reproduction
+
+```sh
+scripts/validate.sh exec 3000 env DIRECTORY_SCALE=400 cargo test --locked --release --lib \
+  engine::directory_tests -- --ignored --nocapture --test-threads=1
+```
+
 ## Historical results
 
 Everything below was measured with the former suite, `examples/block_bench.rs`

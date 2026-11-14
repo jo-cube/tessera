@@ -152,6 +152,8 @@ pub use reader::{Run, RunView};
 #[cfg(test)]
 pub use compact::CONTEXT_ALLOWANCE;
 #[cfg(test)]
+pub(crate) use logical::LookupInput;
+#[cfg(test)]
 pub use logical::RunSet;
 #[cfg(test)]
 pub use reader::{KeyRange, ReadWorkspace, RunCursor};

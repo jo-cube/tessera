@@ -550,6 +550,13 @@ struct LoadedBlock<'a> {
 }
 
 impl<'a> RunCursor<'a> {
+    /// Ends the cursor and returns its workspace, for a cursor that moves on
+    /// to another run (research, 5AP).
+    #[cfg(test)]
+    pub(crate) fn into_workspace(self) -> &'a mut ReadWorkspace {
+        self.workspace
+    }
+
     /// Moves before the first record whose user key is at or above `target`,
     /// which is the newest version of that key, and iterates without a bound.
     ///
