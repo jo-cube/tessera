@@ -53,6 +53,11 @@ fn key(index: u64) -> Vec<u8> {
     format!("user/{index:010}").into_bytes()
 }
 
+/// [`value`], for other research modules.
+pub(super) fn value_for(seed: u64) -> Vec<u8> {
+    value(seed)
+}
+
 /// A 100-byte value from a small vocabulary, so that it compresses about
 /// as text does.
 fn value(seed: u64) -> Vec<u8> {

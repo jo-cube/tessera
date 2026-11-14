@@ -391,6 +391,8 @@ mod capacity_tests;
 #[cfg(test)]
 mod directory_tests;
 #[cfg(test)]
+mod leveling_tests;
+#[cfg(test)]
 mod staged_tests;
 
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};

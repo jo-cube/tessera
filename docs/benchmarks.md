@@ -4206,6 +4206,44 @@ search finds under it leaves every other run the same shared run, keeps a
 snapshot's view, and counts the replaced runs as retained until the snapshot
 is dropped.
 
+## Leveled compaction validation (5AS)
+
+Research for sections 4–15 of `docs/capacity-design.md`, in
+`src/engine/leveling_tests.rs`: a discrete model of the leveled policy
+(exact keys, versions, tombstones, snapshots, byte and input limits) whose
+leveled planner is checked against the level invariants after every
+publication and against a reference map for every key at the end, and
+engine tests over small real runs. Model tests are ignored; run with
+`scripts/validate.sh exec 3000 cargo test --locked --release --lib
+engine::leveling_tests -- --ignored --nocapture --test-threads=1` (63 s,
+peak 49 MiB).
+
+Engine measurements:
+
+- Stored plus held bytes per logical byte, 6 MiB per case: text-like values
+  0.224 (Zstd), 0.440 (LZ4), 0.872 (uncompressed); JSON 0.168 / 0.279 /
+  0.913; random 1 KiB values 0.988–0.991; 4-byte keys with no value
+  0.398–0.489. No segment stores more than its logical length.
+- A segment is cut after the record that reaches the target, so a merge
+  with a value of almost two targets wrote a 2.46-target segment, and two
+  such segments in one job exceeded a four-target output limit (4.9 MiB
+  against 4 MiB); the refused job left the engine unchanged.
+- A leveled schedule over recovered runs through the production compaction
+  job (not ignored): recovered runs form one disjoint level; after every job
+  the destination level is disjoint, untouched runs are shared, every run
+  is in exactly one level; a level was inserted; snapshots read what they
+  saw and retained bytes return to 0 when dropped. A job grew published
+  bytes by at most 229 B (76 B per output run).
+
+The discrete model reproduces the measured current policy (WA 2.90 /
+46.28 / 26.63 / 2.88 against 2.91 / 42.65 / 26.66 / 2.88 for ascending,
+uniform insert, uniform overwrite and hot histories). Leveled results at
+400,000 writes (ratio 4, 32 inputs, model): uniform insert WA 11.55,
+uniform overwrite 9.27, ascending 1.00, hot range 2.09, mixed with deletes
+10.43, sustained snapshots 8.94; the current policy 82.22 / 41.16 / 2.92 /
+2.88 / 36.43 / 13.78. With today's 8 inputs a job, leveled WA roughly
+doubles (19.84 for uniform overwrites).
+
 ## Historical results
 
 Everything below was measured with the former suite, `examples/block_bench.rs`
