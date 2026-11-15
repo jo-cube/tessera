@@ -488,7 +488,7 @@ pub struct EngineOptions {
     /// `max_run_bytes` over 64 KiB; scale it with `max_run_bytes`.
     pub max_runs: usize,
     /// The most bytes of published runs, at least 1: their stored bytes, key
-    /// filters together. This is the physical
+    /// filters and segment metadata together. This is the physical
     /// limit on how much the engine holds. Exceeding it refuses flushes as
     /// for `max_runs`; a compaction may exceed it only by publishing less
     /// than it replaces.
@@ -858,7 +858,7 @@ pub struct RunLimitError {
     pub runs: usize,
     /// The run count limit.
     pub max_runs: usize,
-    /// Stored and filter bytes of the runs that would be published.
+    /// Stored, filter and segment metadata bytes of the runs that would be published.
     pub run_bytes: usize,
     /// The limit on those bytes.
     pub max_run_bytes: usize,
@@ -927,8 +927,8 @@ pub struct FlushReport {
     pub runs: usize,
     /// Stored bytes published.
     pub run_bytes: usize,
-    /// Bytes the published runs hold beside their stored bytes: their key
-    /// filters. Segment dictionaries are included in `run_bytes`.
+    /// Key filters and physical segment metadata held beside stored bytes.
+    /// Segment dictionaries are included in `run_bytes`.
     pub held_bytes: usize,
     /// High-water bytes one flush run's filter construction held for key hashes,
     /// freed when that run finished. Aggregated flush reports retain the
@@ -951,7 +951,7 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
-    /// Bytes of key filters held beside `run_bytes`. Segment dictionaries are
+    /// Key filters and physical segment metadata beside `run_bytes`. Dictionaries are
     /// stored inside the runs. [`EngineOptions::max_run_bytes`] limits both.
     pub held_bytes: usize,
     /// The most published runs whose key ranges share one key: the most
@@ -964,14 +964,14 @@ pub struct EngineStats {
     /// or that an [`Engine::get`] in progress is still reading.
     pub retained_sources: usize,
     /// Bytes kept only for snapshots: the charged or stored bytes of those
-    /// sources with any runs' filters, and the history pinned in the engine's
+    /// sources with any runs' filters and segment metadata, and history pinned in the engine's
     /// memtables, which `active` and `frozen` also report as
     /// [`MemoryUsage::pinned`].
     pub retained_bytes: usize,
     /// The part of `retained_bytes` that is runs: stored bytes of runs that
     /// compaction replaced and snapshots still hold.
     pub retained_run_bytes: usize,
-    /// The part of `retained_bytes` that is those runs' filters.
+    /// The part of `retained_bytes` that is runs' filters and segment metadata.
     pub retained_held_bytes: usize,
     /// Flushes whose runs level 0 holds: at most 12, the level-0 stop, with
     /// a background worker.
@@ -1044,7 +1044,7 @@ struct State {
 struct Retired {
     source: Weak<dyn Send + Sync>,
     bytes: usize,
-    /// For a run, its key filter bytes.
+    /// For a run, key filter and physical segment metadata bytes.
     held_bytes: Option<usize>,
 }
 
@@ -2005,7 +2005,7 @@ impl Core {
         Ok(Some(Begun::Job(CompactionJob {
             engine: self,
             _serial: serial,
-            input_bytes: inputs.iter().map(|run| run.run.as_bytes().len()).sum(),
+            input_bytes: inputs.iter().map(|run| run.run.stored_len()).sum(),
             inputs,
             others,
             options,
@@ -2083,7 +2083,7 @@ impl Core {
         Ok(CompactionJob {
             engine: self,
             _serial: serial,
-            input_bytes: inputs.iter().map(|run| run.run.as_bytes().len()).sum(),
+            input_bytes: inputs.iter().map(|run| run.run.stored_len()).sum(),
             inputs,
             others,
             options,
@@ -2302,7 +2302,7 @@ impl BuiltFlush<'_> {
             tables: job.tables.len(),
             records: job.records(),
             runs: runs.len(),
-            run_bytes: runs.iter().map(|run| run.as_bytes().len()).sum(),
+            run_bytes: runs.iter().map(|run| run.stored_len()).sum(),
             held_bytes: runs.iter().map(Run::held_bytes).sum(),
             filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
@@ -2392,10 +2392,10 @@ pub struct CompactionOptions {
     /// The most runs merged at once, at least 2.
     pub max_inputs: usize,
     /// The most bytes of input runs, stored bytes and what they hold beside
-    /// them (key filters), at least twice
+    /// them (key filters and segment metadata), at least twice
     /// [`EngineOptions::target_run_len`].
     pub max_input_bytes: usize,
-    /// The most bytes of output, stored bytes and key filters together,
+    /// The most bytes of output, stored bytes, key filters and segment metadata,
     /// built and held until publication, as for
     /// [`EngineOptions::max_run_bytes`]; at least twice
     /// [`EngineOptions::target_run_len`]. A job's output is estimated by its
@@ -2403,9 +2403,8 @@ pub struct CompactionOptions {
     /// only if its input leaves a thirty-second of this limit free for what
     /// output runs add (footers, filters, blocks packed differently), so
     /// that a job chosen is not refused here and then chosen again. It counts bytes
-    /// written, not allocated: the run being built grows its buffer by
-    /// doubling, so it may hold up to its own size again in unused capacity
-    /// until it is finished.
+    /// written in exact segment allocations; the builder's reusable encoding
+    /// scratch is charged to `max_workspace_bytes`.
     pub max_output_bytes: usize,
     /// The most estimated workspace bytes: one block and a decompression
     /// context per input, plus the builder's segment and block buffers and
@@ -2684,13 +2683,13 @@ pub struct CompactionReport {
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
-    /// What they held beside that: key filters.
+    /// What they held beside that: key filters and physical segment metadata.
     pub input_held_bytes: usize,
     /// Runs published in their place.
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
-    /// What they hold beside that: key filters.
+    /// What they hold beside that: key filters and physical segment metadata.
     pub output_held_bytes: usize,
     /// The most bytes one output's filter construction held for key hashes,
     /// freed when that run was finished.
@@ -2912,7 +2911,7 @@ impl BuiltCompaction<'_> {
         state.held_bytes = filters;
         state.refused = None;
         for input in &job.inputs {
-            let (bytes, filter) = (input.run.as_bytes().len(), input.run.held_bytes());
+            let (bytes, filter) = (input.run.stored_len(), input.run.held_bytes());
             state.retire(
                 Arc::downgrade(input) as Weak<dyn Send + Sync>,
                 bytes,

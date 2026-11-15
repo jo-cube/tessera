@@ -181,6 +181,17 @@ impl BlockBuilder {
         self.record_count = 0;
     }
 
+    /// Release unusually large empty build buffers after an oversized record.
+    pub(crate) fn trim_empty(&mut self, limit: usize) {
+        debug_assert!(self.is_empty());
+        if self.entries.capacity() > limit {
+            self.entries = Vec::new();
+        }
+        if self.restarts.capacity() * U32_LEN > limit {
+            self.restarts = Vec::new();
+        }
+    }
+
     /// Returns the user key of the most recently added record.
     pub(crate) fn last_key(&self) -> &[u8] {
         &self.last_key

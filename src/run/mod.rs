@@ -74,6 +74,7 @@ mod group;
 mod logical;
 mod merge;
 mod reader;
+mod storage;
 
 #[cfg(test)]
 mod tests;

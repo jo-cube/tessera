@@ -7,13 +7,15 @@ use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::dictionary::DICTIONARY_LEN;
 use super::filter::{self as key_filter, KeyFilter, KeyHashes};
 use super::frame::{self, Frame};
+use super::storage::{Region, RunData, Segment, Segmented};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, SEGMENT_ENTRY_LEN,
     TABLE_ENTRY_LEN, read_u32, read_u64,
 };
 
 /// A valid run over any byte storage, such as `Vec<u8>`, `Arc<[u8]>` or
-/// `&[u8]`.
+/// `&[u8]`. Built and recovered runs instead own exact per-segment
+/// allocations plus a small index; the serialized format is the same.
 ///
 /// Holding a `Run` is proof of validity: it comes from
 /// [`RunBuilder::finish`](super::RunBuilder::finish) or from a full check by
@@ -32,7 +34,7 @@ use super::{
 /// [`new`](Self::new) has none and reads as before.
 #[derive(Clone, Debug)]
 pub struct Run<B> {
-    data: B,
+    data: RunData<B>,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
     /// The largest stored sequence number, 0 if there are none. The builder
@@ -55,12 +57,13 @@ struct KeyBounds {
 
 impl KeyBounds {
     /// The bounds of the valid run `data`.
-    fn of(data: &[u8]) -> Option<Self> {
-        let range = RunView::open(data)
+    fn of(data: &RunData<impl AsRef<[u8]>>) -> Option<Self> {
+        let range = data
+            .view()
             .expect(VALIDATED)
             .key_range()
             .expect(VALIDATED)?;
-        let within = |key| subslice(data, key).expect("a run's keys lie in its bytes");
+        let within = |key| subslice(data.key_data(), key).expect("a run's keys lie in its bytes");
         Some(Self {
             min: within(range.min),
             max: within(range.max),
@@ -91,7 +94,8 @@ impl<B: AsRef<[u8]>> Run<B> {
     )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         let max_seq = validate(data.as_ref())?;
-        let bounds = KeyBounds::of(data.as_ref());
+        let data = RunData::Contiguous(data);
+        let bounds = KeyBounds::of(&data);
         Ok(Self {
             data,
             filter: None,
@@ -101,8 +105,8 @@ impl<B: AsRef<[u8]>> Run<B> {
         })
     }
 
-    pub(super) fn from_builder(data: B, filter: Option<KeyFilter>, max_seq: u64) -> Self {
-        let bounds = KeyBounds::of(data.as_ref());
+    pub(super) fn from_builder(data: RunData<B>, filter: Option<KeyFilter>, max_seq: u64) -> Self {
+        let bounds = KeyBounds::of(&data);
         Self {
             data,
             filter: filter.map(Box::new),
@@ -145,8 +149,35 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// read.
     #[cfg(test)]
     pub(crate) fn damaged_at(&self, offset: usize) -> Run<Vec<u8>> {
-        let mut data = self.data.as_ref().to_vec();
-        data[offset] ^= 0xFF;
+        let mut data: RunData<Vec<u8>> = match &self.data {
+            RunData::Contiguous(bytes) => RunData::Contiguous(bytes.as_ref().to_vec()),
+            RunData::Segmented(parts) => RunData::Segmented(parts.clone()),
+        };
+        match &mut data {
+            RunData::Contiguous(bytes) => bytes[offset] ^= 0xFF,
+            RunData::Segmented(parts) => {
+                let mut remaining = offset;
+                let n = parts.segments.len();
+                let mut changed = false;
+                for at in 0..2 * n {
+                    let segment = &mut parts.segments[at % n];
+                    let bytes = if at < n {
+                        &mut segment.bytes[..segment.frames_len]
+                    } else {
+                        &mut segment.bytes[segment.frames_len..]
+                    };
+                    if remaining < bytes.len() {
+                        bytes[remaining] ^= 0xFF;
+                        changed = true;
+                        break;
+                    }
+                    remaining -= bytes.len();
+                }
+                if !changed {
+                    parts.tail[remaining] ^= 0xFF;
+                }
+            }
+        }
         Run {
             data,
             filter: self.filter.clone(),
@@ -156,11 +187,9 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
     }
 
-    /// Returns everything the run holds beside its stored bytes: its key
-    /// filter. What memory limits charge besides
-    /// [`as_bytes`](Self::as_bytes).
+    /// Key filter and physical segment metadata, charged beside stored bytes.
     pub fn held_bytes(&self) -> usize {
-        self.filter_bytes()
+        self.filter_bytes() + self.data.held_bytes()
     }
 
     /// Returns the number of stored records, counting every version.
@@ -191,7 +220,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// only the two keys.
     pub fn key_range(&self) -> Option<KeyRange<'_>> {
         let bounds = self.bounds.as_ref()?;
-        let data = self.data.as_ref();
+        let data = self.data.key_data();
         Some(KeyRange {
             min: &data[bounds.min.clone()],
             max: &data[bounds.max.clone()],
@@ -249,13 +278,29 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn view(&self) -> RunView<'_> {
         RunView {
             seq_override: self.seq_override,
-            ..RunView::open(self.data.as_ref()).expect(VALIDATED)
+            ..self.data.view().expect(VALIDATED)
         }
     }
 
-    /// Returns the run's serialized bytes, without any sequence override.
-    pub fn as_bytes(&self) -> &[u8] {
-        self.data.as_ref()
+    /// Serialized byte count, excluding filters and physical segment metadata.
+    pub fn stored_len(&self) -> usize {
+        self.data.stored_len()
+    }
+
+    /// Regions in checkpoint file order, without materializing a whole run.
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.data.chunks()
+    }
+
+    /// Contiguous serialization only for tests of the on-disk format.
+    #[cfg(test)]
+    pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match &self.data {
+            RunData::Contiguous(bytes) => std::borrow::Cow::Borrowed(bytes.as_ref()),
+            RunData::Segmented(_) => {
+                std::borrow::Cow::Owned(self.chunks().flatten().copied().collect())
+            }
+        }
     }
 }
 
@@ -275,7 +320,67 @@ impl Run<Vec<u8>> {
                 hashes.add(record.key);
             }
         }
-        let run = Self::from_builder(data, hashes.finish(), max_seq);
+        let view = RunView::open(&data)?;
+        let mut segments = Vec::new();
+        let mut start_block = 0;
+        let mut frame_start = 0;
+        let mut dictionary_start = 0;
+        while start_block < view.block_count() {
+            let first = view.frame(start_block)?;
+            let mut end_block = start_block + 1;
+            let mut raw_len = first.decoded_len;
+            while end_block < view.block_count() {
+                let next = view.frame(end_block)?;
+                if next.dictionary_ref != first.dictionary_ref
+                    || (first.codec == Codec::None
+                        && raw_len + next.decoded_len > super::dictionary::SEGMENT_RAW_LEN)
+                {
+                    break;
+                }
+                raw_len += next.decoded_len;
+                end_block += 1;
+            }
+            let frame_end = view
+                .table
+                .get(end_block)
+                .map_or(view.frames.len(), |&e| frame_offset(e));
+            let frames = &data[frame_start..frame_end];
+            let dictionary = if segments.len() < view.segments.len() {
+                view.dictionary((segments.len() + 1) as u32)?
+            } else {
+                &[]
+            };
+            let mut bytes = Vec::with_capacity(frames.len() + dictionary.len());
+            bytes.extend_from_slice(frames);
+            bytes.extend_from_slice(dictionary);
+            segments.push(Segment {
+                frame_start,
+                dictionary_start,
+                frames_len: frames.len(),
+                bytes: bytes.into_boxed_slice(),
+            });
+            frame_start = frame_end;
+            dictionary_start += dictionary.len();
+            start_block = end_block;
+        }
+        while segments.len() < view.segments.len() {
+            let dictionary = view.dictionary((segments.len() + 1) as u32)?;
+            segments.push(Segment {
+                frame_start,
+                dictionary_start,
+                frames_len: 0,
+                bytes: dictionary.into(),
+            });
+            dictionary_start += dictionary.len();
+        }
+        let tail_start = view.frames.len() + view.dictionaries.len();
+        let parts = Segmented {
+            segments: segments.into_boxed_slice(),
+            tail: data[tail_start..].into(),
+            frames_len: view.frames.len(),
+            dictionaries_len: view.dictionaries.len(),
+        };
+        let run = Self::from_builder(RunData::Segmented(parts), hashes.finish(), max_seq);
         Ok((run, max_seq))
     }
 }
@@ -464,8 +569,8 @@ impl LookupWorkspace {
         };
         let value = match version.value {
             Value::Tombstone => Located::Tombstone,
-            Value::Bytes(value) => match subslice(view.frames, value) {
-                Some(range) => Located::Stored(&view.frames[range]),
+            Value::Bytes(value) => match view.frames.stored_subslice(value) {
+                Some(value) => Located::Stored(value),
                 None => {
                     let range = subslice(block, value).expect("a value lies in its block");
                     Located::Decoded(range.start, range.end)
@@ -792,8 +897,8 @@ impl<'a> RunCursor<'a> {
 /// Raw segment dictionaries are borrowed directly from the run on each decode.
 #[derive(Clone, Copy, Debug)]
 pub struct RunView<'a> {
-    frames: &'a [u8],
-    dictionaries: &'a [u8],
+    frames: Region<'a>,
+    dictionaries: Region<'a>,
     segments: &'a [[u8; SEGMENT_ENTRY_LEN]],
     table: &'a [[u8; TABLE_ENTRY_LEN]],
     keys: &'a [u8],
@@ -805,10 +910,18 @@ pub struct RunView<'a> {
 impl<'a> RunView<'a> {
     /// Checks the footer and the index ends without allocating or decoding.
     pub fn open(bytes: &'a [u8]) -> Result<Self, CorruptRun> {
+        Self::open_parts(bytes, None)
+    }
+
+    pub(super) fn open_segmented(data: &'a Segmented) -> Result<Self, CorruptRun> {
+        Self::open_parts(&data.tail, Some(data))
+    }
+
+    fn open_parts(bytes: &'a [u8], physical: Option<&'a Segmented>) -> Result<Self, CorruptRun> {
         let Some((body, footer)) = bytes.split_last_chunk::<FOOTER_LEN>() else {
             return Err(corrupt(0, RunCorruption::Truncated));
         };
-        let offset = body.len();
+        let offset = body.len() + physical.map_or(0, |p| p.frames_len + p.dictionaries_len);
         if read_u32(footer, 44) != MAGIC {
             return Err(corrupt(offset, RunCorruption::InvalidMagic));
         }
@@ -826,11 +939,32 @@ impl<'a> RunView<'a> {
             .checked_mul(SEGMENT_ENTRY_LEN)
             .ok_or(invalid)?;
         let segment_offset = index_offset.checked_sub(segment_len).ok_or(invalid)?;
-        let (before, index) = body.split_at_checked(index_offset).ok_or(invalid)?;
-        let (contents, segments) = before.split_at_checked(segment_offset).ok_or(invalid)?;
-        let (frames, dictionaries) = contents
-            .split_at_checked(dictionary_offset)
-            .ok_or(invalid)?;
+        let (frames, dictionaries, segments, index) = if let Some(data) = physical {
+            if dictionary_offset != data.frames_len
+                || segment_offset != data.frames_len + data.dictionaries_len
+            {
+                return Err(invalid);
+            }
+            let (segments, index) = body.split_at_checked(segment_len).ok_or(invalid)?;
+            (
+                Region::Frames(data),
+                Region::Dictionaries(data),
+                segments,
+                index,
+            )
+        } else {
+            let (before, index) = body.split_at_checked(index_offset).ok_or(invalid)?;
+            let (contents, segments) = before.split_at_checked(segment_offset).ok_or(invalid)?;
+            let (frames, dictionaries) = contents
+                .split_at_checked(dictionary_offset)
+                .ok_or(invalid)?;
+            (
+                Region::Contiguous(frames),
+                Region::Contiguous(dictionaries),
+                segments,
+                index,
+            )
+        };
         let table_len = (read_u32(footer, 16) as usize)
             .checked_mul(TABLE_ENTRY_LEN)
             .ok_or(invalid)?;
@@ -1204,3 +1338,7 @@ fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
     }
     Ok(walk.max_seq)
 }
+
+#[cfg(test)]
+#[path = "tests/storage.rs"]
+mod storage_tests;

@@ -1,6 +1,6 @@
 //! Segment dictionaries, adaptive cuts and checked direct-load decoding.
 use crate::block::Value;
-use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption, RunView};
+use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption};
 
 fn u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
@@ -36,7 +36,7 @@ fn check<B: AsRef<[u8]>>(run: &Run<B>, count: u32, size: usize) {
         assert_eq!(v.seq, u64::from(i) + 1);
         assert_eq!(v.value, Value::Bytes(&vec![(i % 19) as u8; size]));
     }
-    let view = RunView::open(run.as_bytes()).unwrap();
+    let view = run.view();
     let mut c = view.cursor(&mut w);
     let mut n = 0u32;
     while let Some(r) = c.next_record().unwrap() {
@@ -49,16 +49,16 @@ fn check<B: AsRef<[u8]>>(run: &Run<B>, count: u32, size: usize) {
 fn segment_boundaries_dictionaries_and_references_round_trip() {
     let run = build(Codec::Zstd, 1024, 9_000, 1024);
     let bytes = run.as_bytes();
-    let (mut next, table, count) = segments(bytes);
+    let (mut next, table, count) = segments(&bytes);
     assert_eq!(count, 3);
     for i in 0..count {
         let at = table + i * 16;
-        assert_eq!(u64_at(bytes, at), next);
-        let len = u32_at(bytes, at + 8);
+        assert_eq!(u64_at(&bytes, at), next);
+        let len = u32_at(&bytes, at + 8);
         assert_eq!(len, 16 << 10);
         assert_eq!(
             crc32fast::hash(&bytes[next..next + len]) as usize,
-            u32_at(bytes, at + 12)
+            u32_at(&bytes, at + 12)
         );
         next += len;
     }
@@ -72,7 +72,7 @@ fn segment_boundaries_dictionaries_and_references_round_trip() {
         assert_eq!(f.dictionary.len(), 16 << 10);
     }
     assert_eq!(previous, count as u32);
-    assert_eq!(run.held_bytes(), run.filter_bytes());
+    assert!(run.held_bytes() > run.filter_bytes());
     check(&run, 9_000, 1024);
     check(&Run::new(bytes).unwrap(), 9_000, 1024);
 }
@@ -116,7 +116,7 @@ fn an_oversized_record_has_its_own_block() {
 #[test]
 fn corrupt_dictionary_regions_are_rejected_before_decode() {
     let run = build(Codec::Zstd, 1024, 4_200, 1024);
-    let (start, table, count) = segments(run.as_bytes());
+    let (start, table, count) = segments(&run.as_bytes());
     assert_eq!(count, 2);
     for at in [start, table - 1] {
         let mut bytes = run.as_bytes().to_vec();
@@ -160,7 +160,7 @@ fn uncompressed_runs_have_fixed_raw_blocks_and_no_dictionaries() {
     let a = build(Codec::None, 1, 1000, 500);
     let b = build(Codec::None, RAW_BLOCK_CAP, 1000, 500);
     assert_eq!(a.as_bytes(), b.as_bytes());
-    assert_eq!(segments(a.as_bytes()).2, 0);
+    assert_eq!(segments(&a.as_bytes()).2, 0);
     for i in 0..a.block_count() {
         let f = a.view().frame(i).unwrap();
         assert_eq!(f.dictionary_ref, 0);

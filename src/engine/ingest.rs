@@ -93,7 +93,7 @@ impl Core {
                 hook();
             }
         }
-        let bytes: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
+        let bytes: usize = runs.iter().map(|run| run.stored_len()).sum();
         let held: usize = runs.iter().map(Run::held_bytes).sum();
         let logical = batch
             .records()

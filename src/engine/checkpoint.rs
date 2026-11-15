@@ -644,8 +644,8 @@ fn write_runs(
         largest_run_bytes: 0,
     };
     let emit = |run: Run<Vec<u8>>, written: &mut Written| -> Result<(), Failure> {
-        let bytes = run.as_bytes();
-        let total = written.bytes + bytes.len() as u64;
+        let len = run.stored_len();
+        let total = written.bytes + len as u64;
         if total > options.max_bytes {
             return Err(CheckpointError::DiskLimit {
                 bytes: total,
@@ -654,13 +654,19 @@ fn write_runs(
             .into());
         }
         let file = path.join(run_name(written.manifest.runs.len()));
-        write_synced(&file, bytes)?;
+        let mut output = File::create_new(&file).map_err(io_error(&file))?;
+        let mut checksum = crc32fast::Hasher::new();
+        for bytes in run.chunks() {
+            output.write_all(bytes).map_err(io_error(&file))?;
+            checksum.update(bytes);
+        }
+        output.sync_all().map_err(io_error(&file))?;
         written.bytes = total;
-        written.largest_run_bytes = written.largest_run_bytes.max(bytes.len());
+        written.largest_run_bytes = written.largest_run_bytes.max(len);
         written
             .manifest
             .runs
-            .push((bytes.len() as u64, crc(&[bytes])));
+            .push((len as u64, checksum.finalize()));
         crash_point!(Crash::AfterFirstRun, &file);
         Ok(())
     };
@@ -1064,7 +1070,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 },
             ));
         }
-        let run_bytes: usize = runs.iter().map(|run| run.as_bytes().len()).sum();
+        let run_bytes: usize = runs.iter().map(|run| run.stored_len()).sum();
         let held_bytes: usize = runs.iter().map(Run::held_bytes).sum();
         if runs.len() > options.max_runs || run_bytes + held_bytes > options.max_run_bytes {
             return Err(OpenError::RunLimit(RunLimitError {

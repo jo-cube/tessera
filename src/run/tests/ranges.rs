@@ -93,7 +93,7 @@ fn an_empty_run_has_no_range_and_no_stored_key() {
     let run = build(Codec::Zstd, &[], SMALL_BLOCK);
     assert_eq!(run.key_range(), None);
     assert_eq!(run.as_bytes().len(), FOOTER);
-    assert_eq!(layout(run.as_bytes()).min_len, 0);
+    assert_eq!(layout(&run.as_bytes()).min_len, 0);
     assert_eq!(Run::new(run.as_bytes()).unwrap().key_range(), None);
 }
 
@@ -135,7 +135,7 @@ fn the_empty_key_and_binary_keys_are_ordinary_bounds() {
         SMALL_BLOCK,
     );
     assert_eq!(range_of(&run), Some((Vec::new(), vec![0xFF, 0xFF])));
-    assert_eq!(layout(run.as_bytes()).min_len, 0);
+    assert_eq!(layout(&run.as_bytes()).min_len, 0);
     let reloaded = Run::new(run.as_bytes().to_vec()).unwrap();
     assert_eq!(range_of(&reloaded), Some((Vec::new(), vec![0xFF, 0xFF])));
 
@@ -150,7 +150,7 @@ fn the_empty_key_and_binary_keys_are_ordinary_bounds() {
 fn the_minimum_key_is_stored_once_ahead_of_the_block_keys() {
     let run = build(Codec::None, &numbered(0..3), 1);
     let bytes = run.as_bytes();
-    let l = layout(bytes);
+    let l = layout(&bytes);
     assert_eq!(l.min_len, 9);
     assert_eq!(&bytes[l.keys..l.keys + 9], b"key:00000");
     // One minimum key, then one last key per block.

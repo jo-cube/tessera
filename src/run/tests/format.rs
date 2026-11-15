@@ -214,7 +214,7 @@ fn decoded_blocks(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 /// Returns every block's records.
 fn blocks<B: AsRef<[u8]>>(run: &Run<B>) -> Vec<Vec<Owned>> {
-    decoded_blocks(run.as_bytes())
+    decoded_blocks(&run.as_bytes())
         .iter()
         .map(|payload| {
             let block = Block::new(payload.as_slice()).unwrap();
@@ -460,9 +460,10 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
 fn compressed_frames_match_independent_codec_output() {
     let records = sample_records(200);
     let run = build(Codec::Zstd, &records, 512);
-    for (start, end) in frame_ranges(run.as_bytes()) {
-        let frame = &run.as_bytes()[start..end];
-        let dictionary = dictionary_of(run.as_bytes(), frame);
+    let bytes = run.as_bytes();
+    for (start, end) in frame_ranges(&bytes) {
+        let frame = &bytes[start..end];
+        let dictionary = dictionary_of(&bytes, frame);
         let decoded = decode_frame(frame, dictionary);
         let mut expected = Vec::with_capacity(zstd_safe::compress_bound(decoded.len()));
         let mut context = zstd_safe::CCtx::create();
@@ -522,7 +523,7 @@ fn highly_repetitive_data_round_trips_at_extreme_ratios() {
         {
             let (codec, least_ratio) = (Codec::Zstd, 1000);
             let run = build(codec, &records, TARGET_BLOCK_LEN);
-            let stored: usize = frame_ranges(run.as_bytes())
+            let stored: usize = frame_ranges(&run.as_bytes())
                 .iter()
                 .map(|(a, b)| b - a - HEADER)
                 .sum();
@@ -681,7 +682,7 @@ fn blocks_land_near_the_target() {
     let target = 1024;
     for codec in CODECS {
         let run = build(codec, &records, target);
-        let payloads = decoded_blocks(run.as_bytes());
+        let payloads = decoded_blocks(&run.as_bytes());
         let (last, whole) = payloads.split_last().unwrap();
         assert!(whole.len() > 10);
         for payload in whole {
@@ -794,7 +795,7 @@ fn exceptionally_long_chain_spans_bounded_blocks() {
     let target = 1024;
     for codec in CODECS {
         let run = build(codec, &records, target);
-        let payloads = decoded_blocks(run.as_bytes());
+        let payloads = decoded_blocks(&run.as_bytes());
         assert!(payloads.len() > 5, "chain must span blocks");
         for payload in &payloads {
             assert!(payload.len() <= 2 * target + 64, "{} bytes", payload.len());
@@ -990,20 +991,26 @@ fn runs_work_over_shared_and_borrowed_storage() {
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
     let extra =
         size_of::<usize>() + size_of::<u64>() + size_of::<Option<u64>>() + 5 * size_of::<usize>();
-    assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>() + extra);
-    assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>() + extra);
+    assert_eq!(
+        size_of::<Run<Vec<u8>>>(),
+        size_of::<super::super::storage::RunData<Vec<u8>>>() + extra
+    );
+    assert_eq!(
+        size_of::<Run<&[u8]>>(),
+        size_of::<super::super::storage::RunData<&[u8]>>() + extra
+    );
 }
 
 #[test]
 fn uncompressed_reads_borrow_the_run_and_never_use_the_workspace() {
     let run = build(Codec::None, &sample_records(200), 256);
     let mut workspace = ReadWorkspace::new();
-    let range = run.as_bytes().as_ptr_range();
+    let ranges: Vec<_> = run.chunks().map(<[u8]>::as_ptr_range).collect();
     let found = run.get(b"key00150", &mut workspace).unwrap().unwrap();
     let Value::Bytes(value) = found.value else {
         panic!("expected a value");
     };
-    assert!(range.contains(&value.as_ptr()));
+    assert!(ranges.iter().any(|range| range.contains(&value.as_ptr())));
     assert_eq!(workspace.capacity(), 0);
 
     let mut cursor = run.cursor(&mut workspace);
@@ -1019,19 +1026,19 @@ fn uncompressed_reads_borrow_the_run_and_never_use_the_workspace() {
 fn compressed_reads_borrow_the_workspace_at_exactly_the_block_size() {
     for codec in COMPRESSED {
         let run = build(codec, &sample_records(200), 256);
-        let largest = decoded_blocks(run.as_bytes())
+        let largest = decoded_blocks(&run.as_bytes())
             .iter()
             .map(Vec::len)
             .max()
             .unwrap();
         let mut workspace = ReadWorkspace::new();
-        let range = run.as_bytes().as_ptr_range();
+        let ranges: Vec<_> = run.chunks().map(<[u8]>::as_ptr_range).collect();
         {
             let found = run.get(b"key00150", &mut workspace).unwrap().unwrap();
             let Value::Bytes(value) = found.value else {
                 panic!("expected a value");
             };
-            assert!(!range.contains(&value.as_ptr()));
+            assert!(!ranges.iter().any(|range| range.contains(&value.as_ptr())));
         }
         // Touch every block, then the capacity must stop changing.
         for (key, ..) in sample_records(200) {
@@ -1653,7 +1660,7 @@ fn the_default_builder_uses_adaptive_zstandard_blocks() {
     }
     let explicit = explicit.finish();
     assert_eq!(run.as_bytes(), explicit.as_bytes());
-    let blocks = decoded_blocks(run.as_bytes());
+    let blocks = decoded_blocks(&run.as_bytes());
     assert!(
         blocks
             .iter()

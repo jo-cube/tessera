@@ -200,7 +200,11 @@ fn limits_fail_the_merge_with_the_amount_needed() {
             ..UNLIMITED
         };
         let out = merge(&[&older, &newer], |_| true, limits).unwrap();
-        assert_eq!(out.held_bytes > 0, filtered, "{spare}");
+        assert_eq!(
+            out.runs.iter().any(|run| run.filter_bytes() > 0),
+            filtered,
+            "{spare}"
+        );
         assert_eq!(merged(&out), merged(&full));
         let key = b"a".as_slice();
         assert_eq!(

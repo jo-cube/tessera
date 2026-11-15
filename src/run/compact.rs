@@ -69,8 +69,10 @@ pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> us
     // to the raw cap even when all input blocks are small. Oversized records
     // need corresponding buffers as well. Include bounded dictionary scratch.
     total
-        .saturating_add(largest.max(SEGMENT_RAW_LEN).saturating_mul(2))
-        .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(2))
+        // Segment builder (up to 2x growth), raw scratch (2x), encoded
+        // segment scratch (2x), plus reusable raw block and block builder.
+        .saturating_add(largest.max(SEGMENT_RAW_LEN).saturating_mul(6))
+        .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(4))
         .saturating_add(super::dictionary::DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)
 }
 
@@ -120,8 +122,7 @@ pub struct Compacted {
     pub runs: Vec<Run<Vec<u8>>>,
     /// Their total stored length.
     pub output_bytes: usize,
-    /// The total bytes they hold beside that, [`Run::held_bytes`]: key filters
-    /// only.
+    /// Their [`Run::held_bytes`]: key filters and physical segment metadata.
     pub held_bytes: usize,
     /// The workspace estimate checked before decoding.
     pub workspace_bytes: usize,
@@ -416,7 +417,7 @@ impl<'c> Output<'c> {
         let run = builder.finish();
         self.input = 0;
         self.held_bytes += run.held_bytes();
-        self.bytes += run.as_bytes().len() + run.held_bytes();
+        self.bytes += run.stored_len() + run.held_bytes();
         self.check(self.bytes)?;
         self.runs.push(run);
         Ok(())

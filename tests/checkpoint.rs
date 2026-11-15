@@ -486,7 +486,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     assert_eq!(get(&engine, b"user/000003"), Some(profile(3, 1)));
     assert_eq!(get(&engine, b"user/000001"), None);
     let stats = engine.stats();
-    // Only filters are held beside the stored bytes.
+    // Filters and physical segment metadata are held beside stored bytes.
     assert!(stats.held_bytes > reports[0].output_held_bytes / 2);
     assert_eq!(stats.held_bytes, reports[0].output_held_bytes);
     assert!(stats.run_bytes < plain_stats.run_bytes);
@@ -1044,4 +1044,44 @@ fn closing_a_recovered_engine_takes_no_checkpoint() {
     assert!(engine.get(b"kept", &mut workspace).unwrap().is_some());
     assert!(engine.get(b"lost", &mut workspace).unwrap().is_none());
     engine.close().unwrap();
+}
+
+#[test]
+fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
+    for compression in [Compression::Zstd, Compression::Uncompressed] {
+        let options = EngineOptions {
+            compression,
+            ..manual()
+        };
+        let scratch = Scratch::new(&format!("multi-segment-{compression:?}"));
+        let engine = Engine::new(options).unwrap();
+        for i in 0..9_000u32 {
+            engine
+                .put(&i.to_be_bytes(), &vec![(i % 19) as u8; 1024])
+                .unwrap();
+        }
+        let report = engine
+            .checkpoint(&scratch.0, CheckpointOptions::default())
+            .unwrap();
+        assert_eq!((report.runs, report.records), (1, 9_000));
+        assert_eq!(run_versions(&scratch.0), vec![5]);
+        let recovered = Engine::recover(&scratch.0, options).unwrap();
+        assert_eq!(recovered.stats().runs, 1);
+        let mut workspace = EngineWorkspace::new();
+        let guard = recovered.read();
+        let mut scan = guard.scan(&mut workspace);
+        for i in 0..9_000u32 {
+            let record = scan.next_record().unwrap().unwrap();
+            assert_eq!(record.key, i.to_be_bytes());
+            assert_eq!(record.value, vec![(i % 19) as u8; 1024]);
+        }
+        assert!(scan.next_record().unwrap().is_none());
+        drop(scan);
+        for i in [0u32, 4_100, 8_999] {
+            assert_eq!(
+                get(&recovered, &i.to_be_bytes()),
+                Some(vec![(i % 19) as u8; 1024])
+            );
+        }
+    }
 }

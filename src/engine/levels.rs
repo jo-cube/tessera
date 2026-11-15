@@ -180,7 +180,7 @@ pub(super) struct Levels {
 }
 
 fn bytes_of(run: &SharedRun) -> usize {
-    run.run.as_bytes().len() + run.run.held_bytes()
+    run.run.stored_len() + run.run.held_bytes()
 }
 
 fn min_of(run: &SharedRun) -> &[u8] {

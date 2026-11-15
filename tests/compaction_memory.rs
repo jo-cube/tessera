@@ -122,6 +122,8 @@ fn measure(case: &Case) {
     let keys = case.keys;
     let mut workspace = MergeWorkspace::new();
     let options = CompactionOptions {
+        // Include the builder's segment scratch while exercising all 32 inputs.
+        max_workspace_bytes: 96 << 20,
         max_overlap: 1,
         ..CompactionOptions::default()
     };
@@ -190,11 +192,11 @@ fn measure(case: &Case) {
         mib(peak.saturating_sub(output)),
         mib(workspace.context_bytes()),
     );
-    // Within the workspace limit, and the Rust heap beside the output
-    // (whose buffers may double) within the estimate.
+    // Exact output segment allocations leave only builder/reader scratch
+    // beside the output; all of it must fit the workspace estimate.
     assert!(report.workspace_bytes <= options.max_workspace_bytes);
     assert!(
-        peak <= 2 * output + report.workspace_bytes,
+        peak <= output + report.workspace_bytes,
         "{}: peak {peak}, output {output}, estimate {}",
         case.name,
         report.workspace_bytes

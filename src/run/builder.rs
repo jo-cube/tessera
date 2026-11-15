@@ -1,6 +1,7 @@
 use super::codec::{Codec, Compressor};
 use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
+use super::storage::{RunData, Segment, Segmented};
 use super::{
     FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
     TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
@@ -22,7 +23,12 @@ pub struct RunBuilder {
     last_seq: u64,
     pending_key_bytes: usize,
     frames: Vec<u8>,
-    dictionaries: Vec<u8>,
+    stored_segments: Vec<Segment>,
+    frames_len: usize,
+    dictionaries_len: usize,
+    raw: Vec<u8>,
+    uncompressed: Vec<u8>,
+    block: BlockBuilder,
     segments: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
@@ -50,7 +56,12 @@ impl RunBuilder {
             last_seq: 0,
             pending_key_bytes: 0,
             frames: Vec::new(),
-            dictionaries: Vec::new(),
+            stored_segments: Vec::new(),
+            frames_len: 0,
+            dictionaries_len: 0,
+            raw: Vec::new(),
+            uncompressed: Vec::new(),
+            block: BlockBuilder::new(),
             segments: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
@@ -112,8 +123,8 @@ impl RunBuilder {
     }
     /// Stored bytes so far, excluding the buffered raw segment.
     pub fn stored_len(&self) -> usize {
-        self.frames.len()
-            + self.dictionaries.len()
+        self.frames_len
+            + self.dictionaries_len
             + self.segments.len()
             + self.table.len()
             + self.keys.len()
@@ -128,17 +139,16 @@ impl RunBuilder {
     }
     pub fn finish(mut self) -> Run<Vec<u8>> {
         self.cut_segment();
-        let dictionaries_offset = self.frames.len();
-        let index_offset = dictionaries_offset + self.dictionaries.len() + self.segments.len();
+        let dictionaries_offset = self.frames_len;
+        let index_offset = dictionaries_offset + self.dictionaries_len + self.segments.len();
         // Segment offsets were relative to the dictionary region while building.
         for entry in self.segments.as_chunks_mut::<SEGMENT_ENTRY_LEN>().0 {
             let offset = u64::from_le_bytes(entry[..8].try_into().expect("offset"))
                 + dictionaries_offset as u64;
             entry[..8].copy_from_slice(&offset.to_le_bytes());
         }
-        let mut data = self.frames;
-        data.extend_from_slice(&self.dictionaries);
-        data.extend_from_slice(&self.segments);
+        let segment_count = self.segments.len() / SEGMENT_ENTRY_LEN;
+        let mut data = self.segments;
         data.extend_from_slice(&self.table);
         data.extend_from_slice(&self.keys);
         data.extend_from_slice(&(index_offset as u64).to_le_bytes());
@@ -146,12 +156,20 @@ impl RunBuilder {
         data.extend_from_slice(&((self.table.len() / TABLE_ENTRY_LEN) as u32).to_le_bytes());
         data.extend_from_slice(&(self.min_key_len as u32).to_le_bytes());
         data.extend_from_slice(&(dictionaries_offset as u64).to_le_bytes());
-        data.extend_from_slice(&((self.segments.len() / SEGMENT_ENTRY_LEN) as u32).to_le_bytes());
+        data.extend_from_slice(&(segment_count as u32).to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
-        data.shrink_to_fit();
-        Run::from_builder(data, self.key_hashes.finish(), self.max_seq)
+        Run::from_builder(
+            RunData::Segmented(Segmented {
+                segments: self.stored_segments.into_boxed_slice(),
+                tail: data.into_boxed_slice(),
+                frames_len: self.frames_len,
+                dictionaries_len: self.dictionaries_len,
+            }),
+            self.key_hashes.finish(),
+            self.max_seq,
+        )
     }
     fn cut_segment(&mut self) {
         if self.segment.is_empty() {
@@ -159,8 +177,10 @@ impl RunBuilder {
         }
         let count = self.segment.len();
         self.pending_key_bytes = 0;
-        let mut raw = Vec::new();
+        let mut raw = std::mem::take(&mut self.raw);
+        raw.clear();
         self.segment.flush_into(&mut raw);
+        self.segment.trim_empty(2 * SEGMENT_RAW_LEN);
         let codec = self.compressor.codec();
         let dictionary = if codec == Codec::Zstd {
             dictionary::sample(&raw, count)
@@ -174,12 +194,11 @@ impl RunBuilder {
             let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
             assert!(id < 1 << 24, "segment reference fits in 24 bits");
             self.segments
-                .extend_from_slice(&(self.dictionaries.len() as u64).to_le_bytes());
+                .extend_from_slice(&(self.dictionaries_len as u64).to_le_bytes());
             self.segments
                 .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
             self.segments
                 .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
-            self.dictionaries.extend_from_slice(&dictionary);
             id as u32
         } else {
             0
@@ -206,8 +225,8 @@ impl RunBuilder {
         self.compressor.begin_segment(&dictionary, target);
         let view = BlockView::open(&raw).expect("builder's segment");
         let mut cursor = BlockPosition::new();
-        let mut block = BlockBuilder::new();
-        let mut uncompressed = Vec::new();
+        let mut block = std::mem::take(&mut self.block);
+        let mut uncompressed = std::mem::take(&mut self.uncompressed);
         while let Some(record) = cursor.next_record(view).expect("builder's record") {
             let projected = block.encoded_len_after(record.key, record.seq, record.value);
             let cut = if self.raw_target.is_some() {
@@ -237,6 +256,25 @@ impl RunBuilder {
         if !block.is_empty() {
             self.cut_block(&mut block, &mut uncompressed, reference);
         }
+        let frames_len = self.frames.len();
+        self.frames.extend_from_slice(&dictionary);
+        // Copy, rather than shrinking a grown Vec: the output allocation is exact
+        // and the bounded encoding scratch is reused for the next segment.
+        self.stored_segments.push(Segment {
+            frame_start: self.frames_len,
+            dictionary_start: self.dictionaries_len,
+            frames_len,
+            bytes: self.frames.as_slice().into(),
+        });
+        self.frames_len += frames_len;
+        self.dictionaries_len += dictionary.len();
+        retain_scratch(&mut self.frames, 2 * SEGMENT_RAW_LEN);
+        retain_scratch(&mut raw, 2 * SEGMENT_RAW_LEN);
+        retain_scratch(&mut uncompressed, 2 * RAW_BLOCK_CAP);
+        block.trim_empty(2 * RAW_BLOCK_CAP);
+        self.raw = raw;
+        self.uncompressed = uncompressed;
+        self.block = block;
     }
     fn cut_block(&mut self, block: &mut BlockBuilder, raw: &mut Vec<u8>, reference: u32) {
         let offset = self.frames.len();
@@ -252,9 +290,19 @@ impl RunBuilder {
         }
         frame::seal(&mut self.frames[offset..], codec, len, reference);
         self.keys.extend_from_slice(block.last_key());
-        self.table.extend_from_slice(&(offset as u64).to_le_bytes());
+        self.table
+            .extend_from_slice(&((self.frames_len + offset) as u64).to_le_bytes());
         self.table
             .extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
+    }
+}
+
+/// Keep ordinary scratch, but do not retain a singleton oversized record.
+fn retain_scratch(bytes: &mut Vec<u8>, limit: usize) {
+    if bytes.capacity() > limit {
+        *bytes = Vec::new();
+    } else {
+        bytes.clear();
     }
 }
 
