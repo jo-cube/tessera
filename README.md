@@ -17,7 +17,7 @@ bundled Zstandard library.
 - Consistent in-memory snapshots that remain readable after the engine closes.
 - Automatic memtable flushing and background leveled compaction; manual
   maintenance is also available.
-- Adaptive Zstandard level 1 or 3 with raw segment dictionaries and adaptive blocks, or
+- Zstandard level 1 with raw segment dictionaries and adaptive blocks, or
   uncompressed blocks.
 - Explicit full checkpoints and recovery of the latest committed checkpoint,
   including format, checksum and corruption checks.
@@ -114,9 +114,8 @@ choice is `Compression::Uncompressed`. Zstandard buffers up to 4 MiB of raw
 encoded records per segment and stores one sampled raw dictionary of up to
 16 KiB. `target_block_compressed` defaults to 1024 bytes: a 64 KiB sample
 estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
-record gets its own block. Each segment uses level 3 if the same sample is at
-least 5% smaller than at level 1, with dictionaries prepared for the block size;
-otherwise it uses level 1. Block sizing retains its level-3 probe.
+record gets its own block. Segments use level 1; block sizing retains its
+level-3 ratio probe.
 Uncompressed runs use a fixed 16 KiB raw target.
 Compaction builds disjoint key ranges of one selected job in parallel, using up
 to `background_threads` builders (default half the available CPUs, capped at 4,

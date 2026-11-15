@@ -78,7 +78,4 @@ recorded in `environment.txt`; memory charges allocated bytes, not capacity.
 Tessera-only selections (`run.sh --engine tessera`, including streaming) skip
 RAM-disk setup and run entirely in memory. `TESSERA_BENCH_LEVEL_RATIO=10`
 overrides Tessera's level ratio without rebuilding; the selected ratio and
-builder count are logged. Streaming CSVs report segment build counts and the
-fraction choosing level 3 per write phase. These process-wide diagnostics include
-flush and compaction builds, including subsequently retired or refused output;
-each dataset runs in its own process. No compression-level flags are persisted.
+builder count are logged.

@@ -536,7 +536,7 @@ impl Default for EngineOptions {
     /// 64 MiB memtables, 4 GiB of runs (and at most 65,536 of them),
     /// background compaction
     /// with [`CompactionOptions::default`], the default snapshot limits, and
-    /// Adaptive Zstandard level 1 or 3 with segment dictionaries and a 1 KiB compressed target.
+    /// Zstandard level 1 with segment dictionaries and a 1 KiB compressed target.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -713,9 +713,7 @@ impl std::error::Error for ConfigError {}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
-    /// Zstandard with segment dictionaries and adaptive blocks. Each segment
-    /// uses level 3 when its sample is at least 5% smaller than at level 1;
-    /// otherwise it uses level 1. Block sizing always probes at level 3.
+    /// Zstandard level 1, with segment dictionaries and adaptive blocks.
     #[default]
     Zstd,
     /// Fixed 16 KiB raw blocks, read in place.
@@ -4013,11 +4011,3 @@ mod tests {
 
 #[cfg(test)]
 mod subcompaction_tests;
-
-/// Process-wide (segments built, segments choosing level 3) since startup.
-/// Enabled only for build diagnostics; includes unpublished and retired output,
-/// excludes uncompressed segments and recovery, and stores no per-segment flags.
-#[cfg(feature = "compression-stats")]
-pub fn compression_build_counts() -> (u64, u64) {
-    crate::run::compression_build_counts()
-}

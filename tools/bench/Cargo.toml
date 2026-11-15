@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-tessera = { path = "../..", features = ["compression-stats"] }
+tessera = { path = "../.." }
 hdrhistogram = { version = "=7.6.0", default-features = false }
 libc = "0.2"
 # Enables ZDICT_* in the shared static zstd, which RocksDB needs.

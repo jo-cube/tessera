@@ -11,10 +11,6 @@ readme = "README.md"
 # There is no hosted documentation; `cargo doc --open` builds it.
 publish = false
 
-[features]
-# Process-wide build diagnostics for the isolated-process benchmark harness.
-compression-stats = []
-
 [dependencies]
 crc32fast = "1"
 zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "experimental"] }
