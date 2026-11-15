@@ -12,18 +12,32 @@ cargo build --release --locked --quiet --manifest-path "$root/tools/bench/Cargo.
 sha=$(git -C "$root" rev-parse --short HEAD)
 out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
 mkdir -p "$out"
-[ ! -e /Volumes/tessbench ] || { echo "/Volumes/tessbench already exists" >&2; exit 1; }
-disk_gib=4
-if [[ " $* " == *" --mode streaming "* ]]; then disk_gib=8; fi
-disk_gib=${TESSERA_BENCH_DISK_GIB:-$disk_gib}
-[[ "$disk_gib" =~ ^[1-9][0-9]*$ ]] || { echo "invalid RAM-disk GiB: $disk_gib" >&2; exit 1; }
-sectors=$((disk_gib * 2097152))
-dev=$(hdiutil attach -nomount ram://$sectors | awk '{print $1}')
-trap 'hdiutil detach "$dev" >/dev/null || hdiutil detach -force "$dev" >/dev/null' EXIT
-diskutil erasevolume APFS tessbench "$dev" >/dev/null
+# A Tessera-only selection needs no RAM disk or privileged volume setup.
+engine_filter=
+previous=
+for arg in "$@"; do
+  if [[ "$previous" == --engine ]]; then engine_filter=$arg; fi
+  previous=$arg
+done
+disk_gib=0
+if [[ "$engine_filter" == tessera ]]; then
+  export TESSERA_BENCH_NO_DISK=1
+else
+  unset TESSERA_BENCH_NO_DISK
+  [ ! -e /Volumes/tessbench ] || { echo "/Volumes/tessbench already exists" >&2; exit 1; }
+  disk_gib=4
+  if [[ " $* " == *" --mode streaming "* ]]; then disk_gib=8; fi
+  disk_gib=${TESSERA_BENCH_DISK_GIB:-$disk_gib}
+  [[ "$disk_gib" =~ ^[1-9][0-9]*$ ]] || { echo "invalid RAM-disk GiB: $disk_gib" >&2; exit 1; }
+  sectors=$((disk_gib * 2097152))
+  dev=$(hdiutil attach -nomount ram://$sectors | awk '{print $1}')
+  trap 'hdiutil detach "$dev" >/dev/null || hdiutil detach -force "$dev" >/dev/null' EXIT
+  diskutil erasevolume APFS tessbench "$dev" >/dev/null
+fi
 
 {
-  echo "RAM disk: $disk_gib GiB APFS"
+  echo "RAM disk: $disk_gib GiB (0 means none)"
+  echo "Tessera level ratio: ${TESSERA_BENCH_LEVEL_RATIO:-default}"
   echo "date: $(date '+%Y-%m-%d %H:%M:%S %z')"
   echo "sha: $(git -C "$root" rev-parse HEAD) (branch $(git -C "$root" branch --show-current), $(git -C "$root" status --porcelain | wc -l | tr -d ' ') uncommitted paths)"
   echo "machine: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.physicalcpu) cores ($(sysctl -n hw.perflevel0.physicalcpu)P+$(sysctl -n hw.perflevel1.physicalcpu)E), $(( $(sysctl -n hw.memsize) >> 30 )) GiB"

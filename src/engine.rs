@@ -148,13 +148,14 @@
 //! sequence number through the [run directory](self#reading-runs), so a run
 //! returns the same answers whatever its level. Recovery puts a checkpoint's
 //! runs, which are disjoint, in the last level. Each level below 0 is sized
-//! to a quarter of the next, from the last level's size, and empty levels are
+//! using [`EngineOptions::level_ratio`] (4 by default), from the last level's
+//! size, and empty levels are
 //! added under level 0 as the data grows. One step is the first that applies:
 //!
 //! - **A level over its size**, the most over first: the run after the
 //!   level's last job, in key order, merged with the runs of the next level
 //!   it overlaps, found by binary search. Outputs are cut at the run length
-//!   and where they would overlap more than four runs of the level below.
+//!   and where they would overlap more than `level_ratio` runs of the level below.
 //! - **Level 0**, once it holds runs of
 //!   [`CompactionOptions::max_overlap`] flushes and no deeper level is over
 //!   its size: its oldest run, with the other level-0 runs that overlap the
@@ -170,8 +171,14 @@
 //!   that level takes the first piece. Otherwise the step is refused with
 //!   [`CompactionError::JobLimit`], before anything is read.
 //! - Two adjacent runs of one level, both under half a full run, are merged
-//!   into one, if the merged range overlaps at most four full runs' bytes
+//!   into one, if the merged range overlaps at most `level_ratio` full runs' bytes
 //!   in the next level.
+//!
+//! A selected job builds up to [`EngineOptions::background_threads`] disjoint
+//! key ranges in parallel, then publishes all output together. Job selection
+//! and publication remain serialized. Parallel builders divide the segment
+//! buffer allowance and share the configured workspace and output caps; small
+//! jobs, neighbour merges and tight workspace budgets use fewer builders.
 //!
 //! Each step either lowers a level's excess, moves data down, or lowers the
 //! run count, so repeated compaction without new flushes stops. A step reads

@@ -47,6 +47,9 @@ fn footprint() -> u64 {
 }
 
 fn disk_used() -> u64 {
+    if std::env::var_os("TESSERA_BENCH_NO_DISK").is_some() {
+        return 0;
+    }
     let p = std::ffi::CString::new(MOUNT).unwrap();
     let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
     assert_eq!(unsafe { libc::statfs(p.as_ptr(), s.as_mut_ptr()) }, 0, "RAM disk missing");
@@ -260,7 +263,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             thread::sleep(Duration::from_millis(100));
         }
     });
-    let dir = format!("{MOUNT}/{ds}-{engine}");
+    let dir = if engine == "tessera" { format!("{outdir}/{ds}-{engine}") } else { format!("{MOUNT}/{ds}-{engine}") };
     let open = |name: &str| {
         let path = format!("{dir}/{name}");
         fs::create_dir_all(&dir).unwrap();

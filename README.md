@@ -110,11 +110,19 @@ reuse the index, result, value and decode buffers; warm calls allocate nothing
 on the Rust heap. Callbacks run only after a successful read.
 
 `EngineOptions::compression` is `Compression::Zstd` by default; the other
-choice is `Compression::Uncompressed`. Zstandard buffers roughly 4 MiB of raw
+choice is `Compression::Uncompressed`. Zstandard buffers up to 4 MiB of raw
 encoded records per segment and stores one sampled raw dictionary of up to
 16 KiB. `target_block_compressed` defaults to 1024 bytes: a 64 KiB sample
 estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
-record gets its own block. Uncompressed runs use a fixed 16 KiB raw target.
+record gets its own block. Each segment uses level 3 if the same sample is at
+least 5% smaller than at level 1, with dictionaries prepared for the block size;
+otherwise it uses level 1. Block sizing retains its level-3 probe.
+Uncompressed runs use a fixed 16 KiB raw target.
+Compaction builds disjoint key ranges of one selected job in parallel, using up
+to `background_threads` builders (default half the available CPUs, capped at 4,
+at least 1). Segment buffers shrink to share the existing workspace limit;
+small jobs and tight limits use fewer builders. Flush builds remain serial.
+`level_ratio` controls level sizing and overlap bounds and defaults to 4.
 Bottom-level compaction can erase settled sequence numbers to zero when no
 snapshot or overlapping unselected run needs them. Snapshot views keep their
 records and visibility, and checkpoint recovery preserves the write ceiling.

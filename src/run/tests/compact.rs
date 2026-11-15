@@ -443,7 +443,8 @@ fn parallel_inputs() -> Vec<Run<Vec<u8>>> {
 #[test]
 fn subcompactions_match_serial_versions_tombstones_sequences_and_cuts() {
     let runs = parallel_inputs();
-    let views: Vec<_> = runs.iter().map(Run::view).collect();
+    let mut views: Vec<_> = runs.iter().map(Run::view).collect();
+    views.push(runs[0].view());
     let cuts = OutputCuts {
         at: vec![b"k03000".to_vec(), b"k09000".to_vec()],
         overlapped: (0..12)
@@ -473,6 +474,7 @@ fn subcompactions_match_serial_versions_tombstones_sequences_and_cuts() {
             .unwrap();
             assert_eq!(merged(&serial), merged(&parallel));
             assert_eq!(serial.stats, parallel.stats);
+            assert!(parallel.stats.copies_collapsed > 0);
             assert!(parallel.workspace_bytes <= limits.max_workspace_bytes);
             if threads == 4 {
                 assert!(parallel.workspace_bytes > serial.workspace_bytes);

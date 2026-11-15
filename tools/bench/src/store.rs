@@ -93,7 +93,12 @@ impl Batch {
 
 impl Store {
     pub fn tessera() -> Self {
-        Self::T(Engine::new(EngineOptions::default()).unwrap())
+        let mut options = EngineOptions::default();
+        if let Ok(ratio) = std::env::var("TESSERA_BENCH_LEVEL_RATIO") {
+            options.level_ratio = ratio.parse().expect("integer level ratio");
+        }
+        eprintln!("Tessera: level_ratio={}, background_threads={}", options.level_ratio, options.background_threads);
+        Self::T(Engine::new(options).unwrap())
     }
     pub fn rocks(dir: &str, cache: u64) -> Self {
         let c = CString::new(dir).unwrap();

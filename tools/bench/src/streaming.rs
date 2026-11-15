@@ -228,7 +228,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
             thread::sleep(Duration::from_millis(100));
         }
     });
-    let dir = format!("{MOUNT}/{ds}-{engine}");
+    let dir = if engine == "tessera" { format!("{outdir}/{ds}-{engine}") } else { format!("{MOUNT}/{ds}-{engine}") };
     fs::create_dir_all(&dir).unwrap();
     let store = match engine {
         "tessera" => Store::tessera(),
@@ -250,6 +250,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
             break;
         }
         let before = store.counters();
+        let compression_before = tessera::engine::compression_build_counts();
         let mut write = || {
             let span = Span::new();
             let (mut ops, mut bytes) = (0, 0);
@@ -305,6 +306,13 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
             write();
         }
         amplification(&out, phase, before, store.counters());
+        if engine == "tessera" {
+            let after = tessera::engine::compression_build_counts();
+            let (segments, level3) = (after.0 - compression_before.0, after.1 - compression_before.1);
+            out.emit(phase, "segments_built", segments);
+            out.emit(phase, "segments_level3", level3);
+            out.emit(phase, "level3_fraction", format!("{:.6}", level3 as f64 / segments.max(1) as f64));
+        }
         let disk = if engine == "tessera" { 0 } else { disk_used().saturating_sub(base_disk) };
         let ram = rss().saturating_sub(base_rss) + disk;
         let physical = footprint().saturating_sub(base_fp) + disk;

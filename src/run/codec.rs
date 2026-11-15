@@ -86,8 +86,8 @@ impl Compressor {
     /// Compare the same sample using the dictionary parameters of real blocks.
     /// Leave the context configured for the chosen level; no level is persisted.
     pub(super) fn select_level(&mut self, sample: &[u8], dictionary: &[u8], prime: &[u8]) -> i32 {
-        // The first frame prepares the cached dictionary. Give it the real
-        // block length: SrcSizeHint alone loses to a known 64 KiB sample size.
+        // Prepare the cached dictionary with the real block-size hint and
+        // a block-sized frame before comparing the same 64 KiB sample.
         let block_len = prime.len();
         let mut compressed = Vec::new();
         self.begin_segment(dictionary, block_len, 1);
