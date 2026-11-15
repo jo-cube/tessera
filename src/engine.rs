@@ -1,5 +1,5 @@
-//! A RAM-first key-value engine over memtables and runs, RAM-only unless
-//! opened with a checkpoint or a write-ahead log.
+//! A RAM-only key-value engine over memtables and runs, with explicit
+//! checkpoints and recovery.
 //!
 //! An [`Engine`] owns one active memtable, frozen memtables awaiting flush,
 //! the published immutable runs, and the sequence counter:
@@ -30,14 +30,10 @@
 //!
 //! # Consistency
 //!
-//! All state sits behind one reader-writer lock. A RAM-only write holds it
-//! exclusively while taking its sequence number and installing the update. A
-//! durable write reserves its number under the lock, logs and syncs without
-//! it, and installs it under the lock again; batches are installed whole and
-//! in order. In both modes sequence order is visibility order and each
-//! successful write has one position in it, and a write is visible before it
-//! returns. A read holds the lock shared, so reads and writes of a key are
-//! linearizable.
+//! All state sits behind one reader-writer lock. A write holds it exclusively
+//! while taking its sequence number and installing the update. Sequence order
+//! is visibility order, and each successful write is visible before it returns.
+//! A read holds the lock shared, so reads and writes of a key are linearizable.
 //!
 //! There are two ways to make several reads agree:
 //!
@@ -162,10 +158,6 @@
 //! larger than a whole budget ([`WriteError::RecordExceedsBudget`]) and every
 //! other refusal are returned as they are.
 //!
-//! Durable writes do the same in their batch's leader, which freezes for room
-//! while it holds the log and builds the flush after handing leadership on;
-//! see `src/engine/group.rs`.
-//!
 //! # Compaction
 //!
 //! [Background compaction](self#background-compaction) is on by default;
@@ -278,7 +270,7 @@
 //! [`Engine::close`] or drop, which do the same: tell the worker to stop,
 //! wait for the compaction it is running, which is published at its usual
 //! step (within [`CompactionOptions::max_input_bytes`]), start no other, join
-//! the thread and free the engine and any directory lock. Both consume the
+//! the thread and free the engine. Both consume the
 //! engine, so no other call can be in progress or follow; `close` also
 //! returns a worker panic, where a drop discards it. Closing holds no lock
 //! while it waits, so the worker can always finish.
@@ -288,26 +280,17 @@
 //! [`Snapshot`]s own what they read and stay readable after the engine is
 //! gone; a [`ReadGuard`] borrows the engine, so it ends first.
 //!
-//! Closing writes nothing in any mode: no flush, sync, checkpoint or log
-//! truncation. RAM-only data, including an engine recovered from a
-//! checkpoint, is lost unless checkpointed first; a durable engine's
-//! acknowledged writes are already in its log, exactly as after a crash,
-//! though a [`Engine::durable_checkpoint`] before closing shortens the
-//! replay of the next [`Engine::open`].
+//! Closing writes nothing: no flush or checkpoint. Data is lost unless
+//! checkpointed first.
 //!
 //! # Configuration
 //!
-//! [`Engine::new`], [`Engine::create`], [`Engine::open`] and
-//! [`Engine::recover`] check every option before they allocate, start the
-//! worker or touch a file, and refuse one outside its documented range with a
-//! [`ConfigError`] naming it (inside [`OpenError::Config`] for the last
-//! three); [`Engine::compact`] and [`Engine::set_run_limits`] check theirs
-//! the same way. No value is adjusted. Options that pass can still meet
-//! runtime limits, which the operation they stop reports: run limits refuse
-//! flushes ([`UpdateError::FlushRefused`]), log limits refuse writes
-//! ([`UpdateError::LogFull`]), snapshot limits refuse snapshots and
-//! compactions, and compaction limits refuse a merge
-//! ([`CompactionError::JobLimit`] and its neighbours).
+//! [`Engine::new`] and [`Engine::recover`] check every option before they
+//! allocate or start the worker, returning [`OpenError::Config`] on invalid
+//! options. [`Engine::compact`] and [`Engine::set_run_limits`] check theirs
+//! the same way. Run limits refuse flushes ([`UpdateError::FlushRefused`]);
+//! snapshot limits refuse snapshots and compactions; compaction limits
+//! refuse a merge ([`CompactionError::JobLimit`] and its neighbours).
 //!
 //! Compression and block length choose how new runs are built, nothing
 //! else. Every run records its own codec, block lengths and dictionary, so
@@ -433,54 +416,10 @@
 //! older one, before it returns an engine. One engine or process uses a
 //! directory at a time, through an advisory lock on its `LOCK` file, which
 //! the kernel releases if the process dies.
-//!
-//! # Durability
-//!
-//! An engine from [`Engine::create`] or [`Engine::open`] is durable: every
-//! write is appended to a write-ahead log in its directory and synced
-//! (`fdatasync`) before it becomes visible or its sequence number is
-//! returned, with concurrent writers sharing a sync by group commit. Under
-//! the filesystem assumptions below:
-//!
-//! - Every acknowledged write is recovered by [`Engine::open`], from the
-//!   committed checkpoint and the log after it.
-//! - A write that failed with [`UpdateError::LogFailed`], or whose process
-//!   died before it returned, may or may not be recovered: read the key
-//!   back after reopening. It is never applied in part, and never recovered
-//!   without every write before it.
-//! - Any other refused write logged nothing and used no sequence number.
-//! - A failed append or sync closes the log: later writes fail with
-//!   [`UpdateError::LogClosed`] until the database is reopened. Reads,
-//!   flushes, compactions and checkpoints continue.
-//!
-//! The log grows until [`Engine::durable_checkpoint`] commits a checkpoint
-//! into the same directory and removes the log segments it covers. Writes
-//! that would take it past [`DurableOptions::max_log_bytes`] are refused
-//! with [`UpdateError::LogFull`]. On open, an incomplete final append (a
-//! torn tail, never acknowledged) is truncated and reported in
-//! [`OpenReport::torn_tail`]; any other damage refuses the open with
-//! [`OpenError::Log`] or [`OpenError::Corrupt`], and nothing is repaired.
-//! [`Engine::inspect`] reports what open would do, changing nothing.
-//!
-//! **Filesystem assumptions.** The supported environment is a local Linux
-//! filesystem such as ext4 or XFS, where a file sync makes its contents
-//! durable, a directory sync makes its entries durable and `rename` is
-//! atomic. Network filesystems, devices that acknowledge a sync without
-//! persisting, and writers that bypass the lock are unsupported; macOS is
-//! untested. The tests kill processes, fail writes and syncs, interrupt
-//! checkpoints and model lost unsynced data at file level. That a sync
-//! reaches stable media under real power loss, and that an interrupted write
-//! leaves a prefix of its bytes, are assumptions that no test has verified.
-//! After a failed sync, check the device before reopening.
-//!
-//! The on-disk formats and every crash and sync boundary are specified in
-//! the source, in `src/engine/checkpoint.rs` and `src/engine/wal.rs`.
 
 mod checkpoint;
 mod directory;
-mod group;
 mod levels;
-mod wal;
 mod worker;
 
 #[cfg(test)]
@@ -497,9 +436,6 @@ mod leveling_tests;
 mod staged_tests;
 
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};
-pub use wal::{
-    DurableOptions, Inspection, LogDamage, LogPosition, LogStatus, OpenReport, TornTail, Verdict,
-};
 pub use worker::{BackgroundError, BackgroundStatus};
 
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
@@ -597,9 +533,7 @@ pub struct EngineOptions {
     /// than it replaces.
     pub max_run_bytes: usize,
     /// The sequence number a new engine continues after: the first write
-    /// uses the next. [`Engine::new`] and [`Engine::create`] use it;
-    /// [`Engine::open`] ignores it, as the checkpoint and log decide; and
-    /// [`Engine::recover`] continues after the larger of it and the
+    /// uses the next. [`Engine::recover`] continues after the larger of it and the
     /// checkpoint's ceiling.
     pub last_seq: u64,
     /// Starts a background worker that compacts with these options whenever
@@ -993,22 +927,10 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-/// Why a write was refused. It was not applied and used no sequence number,
-/// and reads see no change, though after [`Self::LogFailed`] the record may
-/// survive in the log. A flush the write started may have frozen the active
-/// table.
-///
-/// The variants fall into three kinds:
-///
-/// - **Permanent for this write**: [`Self::Rejected`]. Retrying the same
-///   write cannot succeed.
-/// - **Backpressure**, which clears once the engine is maintained:
-///   [`Self::FlushRefused`] (compact, or raise the run limits),
-///   [`Self::LogFull`] (take a [durable checkpoint](Engine::durable_checkpoint)).
-///   Nothing was applied, and the write can be retried.
-/// - **Terminal for this engine**: [`Self::LogFailed`] and [`Self::LogClosed`]
-///   (reopen the database) and [`Self::SequencesExhausted`]. Reads keep
-///   working.
+/// Why a write was refused. It was not applied, used no sequence number,
+/// and changed no reads. A flush it started may have frozen the active table.
+/// A rejected write cannot succeed unchanged; a refused flush can be retried
+/// after maintenance; exhausted sequence numbers prevent further writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateError {
     /// The write can never be applied: its key or value is too long, or its
@@ -1022,23 +944,6 @@ pub enum UpdateError {
     /// Every sequence number has been used, which only an engine started
     /// near `u64::MAX` ([`EngineOptions::last_seq`]) can reach.
     SequencesExhausted,
-    /// Logging this write failed (its append or sync, or the thread logging
-    /// its batch panicked: [`std::io::ErrorKind::Other`]), so it was not
-    /// applied, but its record may survive and be recovered: its outcome is
-    /// uncertain until the database is reopened. The log is now closed. See
-    /// [Durability](self#durability).
-    LogFailed(std::io::ErrorKind),
-    /// An earlier log failure closed the log: nothing was logged. Reopen the
-    /// database to write again.
-    LogClosed,
-    /// The log would exceed [`DurableOptions::max_log_bytes`]: nothing was
-    /// logged. [`Engine::durable_checkpoint`] frees segments.
-    LogFull {
-        /// Bytes the log would reach.
-        bytes: u64,
-        /// The limit.
-        max_bytes: u64,
-    },
 }
 
 impl fmt::Display for UpdateError {
@@ -1050,19 +955,6 @@ impl fmt::Display for UpdateError {
                 "the memtables are full and {error}; compaction can make room"
             ),
             Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
-            Self::LogFailed(kind) => write!(
-                f,
-                "logging the write failed ({kind}), so its outcome is uncertain; \
-                 the log is closed until the database is reopened"
-            ),
-            Self::LogClosed => {
-                f.write_str("the log closed after an earlier failure; reopen the database to write")
-            }
-            Self::LogFull { bytes, max_bytes } => write!(
-                f,
-                "the log would reach {bytes} bytes, over the limit of {max_bytes}; \
-                 a durable checkpoint frees space"
-            ),
         }
     }
 }
@@ -1385,9 +1277,6 @@ struct Core {
     compacting: Mutex<()>,
     /// Held by a checkpoint, so that checkpoints run one at a time.
     checkpointing: Mutex<()>,
-    /// The log and directory lock of a durable engine, set once it is open.
-    /// Unset, writes touch no file.
-    durable: std::sync::OnceLock<wal::Durable>,
     memtable_budget: usize,
     target_run_len: usize,
     /// The codec of the runs this engine builds.
@@ -1530,7 +1419,7 @@ impl Engine {
 
     /// Shuts the engine down: stops the background worker after the
     /// compaction it is running, if any, which is published as usual, joins
-    /// its thread and releases the engine's memory and any directory lock.
+    /// its thread and releases the engine's memory.
     /// No new compaction starts once this begins.
     ///
     /// It consumes the engine, so no read, write, [`ReadGuard`] or other
@@ -1538,9 +1427,8 @@ impl Engine {
     /// is closed once it is the last reference ([`Arc::into_inner`]).
     /// [`Snapshot`]s are unaffected and stay readable.
     ///
-    /// Closing writes nothing: no flush, sync, checkpoint or truncation. A
-    /// RAM-only engine's data goes with it; a durable engine's acknowledged
-    /// writes are already in its log, as they would be after a crash.
+    /// Closing writes nothing: no flush or checkpoint. The engine's data
+    /// goes with it unless checkpointed first.
     /// Dropping the engine does the same and discards the result.
     ///
     /// Fails only with [`BackgroundError::Panicked`] if the worker had
@@ -1745,7 +1633,6 @@ impl Core {
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             checkpointing: Mutex::new(()),
-            durable: std::sync::OnceLock::new(),
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
@@ -1782,9 +1669,6 @@ impl Core {
     }
 
     fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
-        if let Some(durable) = self.durable.get() {
-            return self.update_durable(durable, key, value);
-        }
         // Bound first, so the state lock is released before making room.
         let written = self.write(&mut self.write_state(), key, value);
         match written {
@@ -1825,16 +1709,6 @@ impl Core {
                 written => return written.map_err(Refusal::into_error),
             };
         }
-    }
-
-    /// Freezes the active table for durable writes the memtables refused,
-    /// returning the flush of every frozen table, which its batch's leader
-    /// publishes after committing the batch. See
-    /// [Automatic flushing](self#automatic-flushing).
-    fn freeze_for_room(&self) -> Result<Option<FlushJob<'_>>, RunLimitError> {
-        let serial = self.serialize_flush();
-        let mut state = self.wait_for_level0(self.write_state());
-        self.begin_making_room(serial, &mut state)
     }
 
     /// The level-0 backpressure, before a flush is built: while level 0 is
@@ -3974,6 +3848,45 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic while holding the state lock poisons it. Closing takes no
+    /// state lock, so it still stops the worker, reports the worker's own
+    /// panic if the poison reached it, and releases the core.
+    #[test]
+    fn closing_with_a_poisoned_state_lock_still_releases_the_core() {
+        for worker in [false, true] {
+            let options = if worker {
+                EngineOptions::default()
+            } else {
+                manual()
+            };
+            let engine = Engine::new(options).unwrap();
+            engine.put(b"k", b"v").unwrap();
+            std::thread::scope(|scope| {
+                let poisoned = scope.spawn(|| {
+                    let _state = engine.core.write_state();
+                    panic!("poison the state lock");
+                });
+                assert!(poisoned.join().is_err());
+            });
+            assert!(engine.core.state.is_poisoned());
+            let core = Arc::clone(&engine.core);
+            if worker {
+                // The worker's next compaction meets the poisoned lock and
+                // panics; that panic is what closing reports.
+                let error = engine.wait_for_compaction().unwrap_err();
+                let crate::engine::BackgroundError::Panicked(message) = &error else {
+                    panic!("{error:?}");
+                };
+                assert!(message.starts_with(crate::engine::LOCK), "{message}");
+                assert_eq!(engine.close(), Err(error));
+            } else {
+                assert_eq!(engine.close(), Ok(()));
+            }
+            assert_eq!(Arc::strong_count(&core), 1);
+            drop(core);
+        }
+    }
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.

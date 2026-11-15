@@ -434,29 +434,8 @@ impl Table {
         }
     }
 
-    /// Whether [`Self::write`] would accept the update now with `reserved`
-    /// more bytes of the budget already promised to other updates.
-    fn check(
-        &mut self,
-        key: &[u8],
-        seq: u64,
-        value: Value<'_>,
-        reserved: usize,
-    ) -> Result<(), TableError> {
-        self.admit(key, seq, value, Some(reserved)).map(|_| ())
-    }
-
     fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), TableError> {
-        let admitted = self.admit(key, seq, value, Some(0))?;
-        self.insert(key, seq, admitted);
-        Ok(())
-    }
-
-    /// Writes an update [`Self::check`] once admitted, though the budget may
-    /// have shrunk or snapshots pinned more since; the other checks still
-    /// apply.
-    fn write_admitted(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), TableError> {
-        let admitted = self.admit(key, seq, value, None)?;
+        let admitted = self.admit(key, seq, value)?;
         self.insert(key, seq, admitted);
         Ok(())
     }
@@ -491,15 +470,13 @@ impl Table {
         self.last_seq = Some(seq);
     }
 
-    /// Every check of [`Self::write`], the budget's only if `budget` gives
-    /// the bytes already reserved beside this update, changing nothing but
-    /// forgetting dead snapshots.
+    /// Every check of [`Self::write`], changing nothing but forgetting dead
+    /// snapshots.
     fn admit<'v>(
         &mut self,
         key: &[u8],
         seq: u64,
         value: Value<'v>,
-        budget: Option<usize>,
     ) -> Result<Admitted<'v>, TableError> {
         let bytes = match value {
             Value::Bytes(bytes) => Some(bytes),
@@ -517,7 +494,7 @@ impl Table {
         }
         // Both lengths are within the limits above, so this cannot overflow.
         let charge = key.len() + value_len + ENTRY_OVERHEAD;
-        if budget.is_some() && charge > self.budget {
+        if charge > self.budget {
             return Err(TableError::RecordExceedsBudget {
                 charge,
                 budget: self.budget,
@@ -533,18 +510,11 @@ impl Table {
             None => (charge, 0),
         };
         let needed = grows + detach;
-        // Equal to the budget's headroom plus what the update releases, but
-        // a table over its budget (by an update a durable engine logged, see
-        // `write_admitted`) must release the excess first, so every update
-        // checked leaves the table within its budget and the excess never
-        // accumulates.
         let available = self
             .budget
             .saturating_add(released)
             .saturating_sub(self.live + self.pinned());
-        if let Some(reserved) = budget
-            && needed.saturating_add(reserved) > available
-        {
+        if needed > available {
             return Err(TableError::BudgetExceeded { needed, available });
         }
         Ok(Admitted {
@@ -747,33 +717,6 @@ impl Memtable {
     /// rules as [`put`](Self::put).
     pub fn delete(&mut self, key: &[u8], seq: u64) -> Result<(), TableError> {
         self.0.write(key, seq, Value::Tombstone)
-    }
-
-    /// Whether [`put`](Self::put) or [`delete`](Self::delete) would accept
-    /// this update now, changing nothing, with `reserved` bytes of the budget
-    /// already promised to updates admitted but not yet written.
-    pub(crate) fn check(
-        &mut self,
-        key: &[u8],
-        seq: u64,
-        value: Value<'_>,
-        reserved: usize,
-    ) -> Result<(), TableError> {
-        self.0.check(key, seq, value, reserved)
-    }
-
-    /// Writes an update that [`check`](Self::check) admitted, on this table
-    /// or the one it was frozen from, even if the budget no longer admits
-    /// it: a durable engine has already logged it. The table may then exceed
-    /// its budget by the updates of one logged batch. Lengths and sequence
-    /// order are still checked.
-    pub(crate) fn write_admitted(
-        &mut self,
-        key: &[u8],
-        seq: u64,
-        value: Value<'_>,
-    ) -> Result<(), TableError> {
-        self.0.write_admitted(key, seq, value)
     }
 
     /// Returns the latest update of `key`, which may be a tombstone, or `None`

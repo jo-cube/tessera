@@ -9,9 +9,8 @@
 //! snapshot's sequence number, its **ceiling**: every key live then, with the
 //! value and sequence number of its newest version. A key deleted by then is
 //! absent, which is its deletion state, since nothing lies beneath a full
-//! checkpoint. Writes after the ceiling are not in it; nothing makes them
-//! durable until a write-ahead log exists, which would replay records with
-//! sequence numbers above the ceiling.
+//! checkpoint. Writes after the ceiling are not in it and are lost unless
+//! included in a later checkpoint.
 //!
 //! A checkpoint is **committed** once the file `CURRENT` durably names its
 //! generation. Recovery reads exactly that checkpoint and nothing else: there
@@ -135,8 +134,7 @@ use crate::run::{
 
 use super::levels::{LEVEL0_STOP, Levels};
 use super::{
-    Core, Engine, EngineOptions, EngineWorkspace, RunLimitError, SnapshotError, WriteError,
-    published,
+    Core, Engine, EngineOptions, EngineWorkspace, RunLimitError, SnapshotError, published,
 };
 
 pub(super) const LOCK: &str = "LOCK";
@@ -197,9 +195,6 @@ pub struct CheckpointReport {
     /// Older checkpoint directories that could not be removed; the next
     /// checkpoint tries again.
     pub unreclaimed: usize,
-    /// Write-ahead log segments removed because the checkpoint covers them.
-    /// Always 0 but for [`Engine::durable_checkpoint`].
-    pub pruned_segments: usize,
 }
 
 /// Why a checkpoint was not committed, or (for [`Self::Io`] after the commit
@@ -211,14 +206,8 @@ pub enum CheckpointError {
     Snapshot(SnapshotError),
     /// Reading the snapshot failed.
     Read(ReadError),
-    /// Another process, or a durable engine, holds the directory's `LOCK`.
+    /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
-    /// The directory holds a write-ahead log, so it belongs to a durable
-    /// database, which only its own engine checkpoints.
-    HasLog(PathBuf),
-    /// [`Engine::durable_checkpoint`] was called on a RAM-only engine, which
-    /// has no directory of its own: give [`Engine::checkpoint`] one instead.
-    NotDurable,
     /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
     DiskLimit {
         /// Bytes the checkpoint would have reached.
@@ -249,10 +238,6 @@ impl fmt::Display for CheckpointError {
                 "{} is locked by another engine or process",
                 path.display()
             ),
-            Self::HasLog(path) => {
-                write!(f, "{} holds a write-ahead log", path.display())
-            }
-            Self::NotDurable => f.write_str("the engine has no write-ahead log"),
             Self::DiskLimit { bytes, max_bytes } => write!(
                 f,
                 "checkpoint reached {bytes} bytes, over the limit of {max_bytes}"
@@ -327,36 +312,17 @@ pub enum Damage {
     },
 }
 
-/// Why [`Engine::new`], [`Engine::create`], [`Engine::open`] or
-/// [`Engine::recover`] returned no engine. Nothing is exposed, no worker is
-/// left running and any directory lock taken is released. Opening and
-/// recovering change nothing on disk before they succeed, and never
-/// substitute an empty database or an older checkpoint; `create` may leave
-/// an uncommitted directory, as it documents. [`Engine::new`] fails only
-/// with [`Self::Config`] or [`Self::Worker`].
+/// Why [`Engine::new`] or [`Engine::recover`] returned no engine. Nothing is
+/// exposed, no worker is left running and any directory lock is released.
+/// Recovery changes nothing on disk and never substitutes an empty database
+/// or an older checkpoint. [`Engine::new`] fails only with [`Self::Config`]
+/// or [`Self::Worker`].
 #[derive(Debug)]
 pub enum OpenError {
     /// The directory or its `CURRENT` file does not exist.
     NoCheckpoint(PathBuf),
-    /// Another process, or a durable engine, holds the directory's `LOCK`.
+    /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
-    /// [`Engine::recover`] found a write-ahead log, whose records a recovery
-    /// of the checkpoint alone would drop. Open it with [`Engine::open`].
-    HasLog(PathBuf),
-    /// [`Engine::create`] found files in the directory.
-    NotEmpty(PathBuf),
-    /// A write-ahead log segment failed its checks.
-    Log {
-        /// The segment, or the directory for a missing one.
-        path: PathBuf,
-        /// Offset of the damaged record or header in the segment.
-        offset: u64,
-        /// How.
-        damage: super::LogDamage,
-    },
-    /// A logged record was refused on replay, which happens only if the
-    /// memtable budget is smaller than when the record was written.
-    Replay(WriteError),
     /// A file could not be read.
     Io {
         /// The file.
@@ -373,12 +339,11 @@ pub enum OpenError {
     },
     /// The checkpoint holds more runs or bytes than the options allow.
     RunLimit(RunLimitError),
-    /// The engine or log options were refused before anything was started or
+    /// The engine options were refused before anything was started or
     /// the directory touched.
     Config(super::ConfigError),
     /// The operating system could not create the background compaction
-    /// worker's thread. Nothing on disk was changed by `open` or `recover`,
-    /// and `create` had not yet touched the directory.
+    /// worker's thread. Recovery changed nothing on disk.
     Worker(io::Error),
 }
 
@@ -391,22 +356,6 @@ impl fmt::Display for OpenError {
                 "{} is locked by another engine or process",
                 path.display()
             ),
-            Self::HasLog(path) => write!(
-                f,
-                "{} holds a write-ahead log; open it as a durable database",
-                path.display()
-            ),
-            Self::NotEmpty(path) => write!(f, "{} is not empty", path.display()),
-            Self::Log {
-                path,
-                offset,
-                damage,
-            } => write!(
-                f,
-                "log segment {} is damaged at offset {offset}: {damage:?}",
-                path.display()
-            ),
-            Self::Replay(error) => write!(f, "a logged record was refused on replay: {error}"),
             Self::Io { path, error } => write!(f, "cannot read {}: {error}", path.display()),
             Self::Corrupt { path, damage } => {
                 write!(
@@ -569,8 +518,6 @@ pub(super) enum Crash {
     BeforeRename,
     AfterRename,
     BeforeReclaim,
-    /// After a durable checkpoint commits, before it prunes the log.
-    BeforePrune,
 }
 
 #[cfg(test)]
@@ -816,11 +763,6 @@ impl Engine {
             Ok(file) => file,
             Err(()) => return Err(CheckpointError::Locked(dir.to_owned())),
         };
-        // A checkpoint beside another engine's log would pair a foreign state
-        // with its records.
-        if super::wal::has_log(dir).map_err(io_error(dir))? {
-            return Err(CheckpointError::HasLog(dir.to_owned()));
-        }
         self.publish(dir, options)
     }
 
@@ -925,7 +867,6 @@ impl Engine {
             dictionary,
             reclaimed,
             unreclaimed,
-            pruned_segments: 0,
         })
     }
 
@@ -942,12 +883,6 @@ impl Engine {
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
         options.validate().map_err(OpenError::Config)?;
         let _lock = lock_existing(dir)?;
-        if super::wal::has_log(dir).map_err(|error| OpenError::Io {
-            path: dir.to_owned(),
-            error,
-        })? {
-            return Err(OpenError::HasLog(dir.to_owned()));
-        }
         let loaded = load(dir, &options)?;
         let options = EngineOptions {
             last_seq: options.last_seq.max(loaded.ceiling),
@@ -994,7 +929,6 @@ pub(super) fn lock_existing(dir: &Path) -> Result<File, OpenError> {
 
 /// A committed checkpoint, read and checked in full.
 pub(super) struct Loaded {
-    pub(super) generation: u64,
     pub(super) ceiling: u64,
     runs: Vec<Run<Vec<u8>>>,
     run_bytes: usize,
@@ -1090,65 +1024,10 @@ fn committed_manifest(
     Ok((path, manifest_path, manifest))
 }
 
-/// The generation and ceiling `CURRENT` and its manifest name, without
-/// reading the runs, or `None` if there is no `CURRENT`.
-pub(super) fn committed(
-    dir: &Path,
-    options: &EngineOptions,
-) -> Result<Option<(u64, u64)>, OpenError> {
-    if !dir.join(CURRENT).try_exists().map_err(read_error(dir))? {
-        return Ok(None);
-    }
-    let (_, _, manifest) = committed_manifest(dir, options.max_runs)?;
-    Ok(Some((manifest.generation, manifest.last_seq)))
-}
-
-/// Whether the checkpoint directories in `dir` are at most what an
-/// interrupted [`Engine::create`] leaves: generation 1, with no manifest yet
-/// or one of no runs.
-pub(super) fn at_most_an_empty_first_checkpoint(dir: &Path) -> io::Result<bool> {
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
-            continue;
-        };
-        if rest != format!("{:020}", 1) {
-            return Ok(false);
-        }
-        match fs::read(checkpoint_dir(dir, 1).join(MANIFEST)) {
-            Ok(bytes) => {
-                if !Manifest::decode(&bytes).is_ok_and(|manifest| manifest.runs.is_empty()) {
-                    return Ok(false);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(true)
-}
-
-/// A shared lock on `dir`'s `LOCK` for a read-only inspection, without
-/// creating it: `None` if there is no `LOCK`, which no live engine lacks.
-pub(super) fn lock_shared(dir: &Path) -> Result<Option<File>, OpenError> {
-    let path = dir.join(LOCK);
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(OpenError::Io { path, error }),
-    };
-    match file.try_lock_shared() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Err(OpenError::Locked(dir.to_owned())),
-        Err(TryLockError::Error(error)) => Err(OpenError::Io { path, error }),
-    }
-}
-
 /// Reads and checks the checkpoint `dir`'s `CURRENT` names, under its lock.
 pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenError> {
     {
         let (path, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
-        let generation = manifest.generation;
 
         // The manifest's lengths bound what reading the runs allocates; refuse
         // before reading any. Filters are added to the bytes once rebuilt.
@@ -1230,7 +1109,6 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
         }
 
         Ok(Loaded {
-            generation,
             ceiling: manifest.last_seq,
             runs,
             run_bytes,
@@ -1250,6 +1128,51 @@ mod tests {
             background_compaction: None,
             ..EngineOptions::default()
         }
+    }
+
+    /// Every file under `dir` with its length and contents, to show that a
+    /// failed open changed nothing.
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_owned()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_worker_that_cannot_start_leaves_the_directory_as_it_was() {
+        let fail_next = || crate::engine::worker::tests::FAIL_SPAWN.with(|f| f.set(true));
+        let options = EngineOptions::default();
+        let checkpoint = scratch("spawn-failure-checkpoint");
+        let engine = Engine::new(options).unwrap();
+        engine.put(b"k", b"checkpointed").unwrap();
+        engine
+            .checkpoint(&checkpoint, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let before = files(&checkpoint);
+        fail_next();
+        let refused = Engine::recover(&checkpoint, options).map(drop);
+        assert!(matches!(refused, Err(OpenError::Worker(_))), "{refused:?}");
+        assert_eq!(files(&checkpoint), before);
+        let engine = Engine::recover(&checkpoint, options).unwrap();
+        let mut workspace = EngineWorkspace::new();
+        assert_eq!(
+            engine.get(b"k", &mut workspace).unwrap().unwrap().value,
+            b"checkpointed"
+        );
+        engine.close().unwrap();
+        fs::remove_dir_all(&checkpoint).unwrap();
     }
 
     #[test]

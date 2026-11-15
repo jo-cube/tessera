@@ -27,3 +27,5 @@ rustc-ice-*.txt
 .codex/
 .claude/
 .codegraph/
+
+/.work/
