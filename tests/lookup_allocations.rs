@@ -7,22 +7,15 @@
 //! loading raw-content dictionaries allocates nothing in Zstandard 1.5.
 //!
 //! The counting allocator sees every thread, so this binary holds one test,
-//! and the engine runs no worker.
+//! with compaction settled before measuring.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tessera::engine::{
-    CompactionOptions, Compression, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
-};
+use tessera::engine::{Compression, Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
 
-/// The defaults without the background worker: these tests flush and
-/// compact by hand and count what each step leaves.
-fn manual() -> EngineOptions {
-    EngineOptions {
-        background_compaction: None,
-        ..EngineOptions::default()
-    }
+fn options() -> EngineOptions {
+    EngineOptions::default()
 }
 
 struct Counting;
@@ -91,9 +84,8 @@ fn consolidated(compression: Compression) -> Engine {
     let engine = Engine::new(EngineOptions {
         target_block_compressed: 4 << 10,
         compression,
-        max_runs: usize::MAX,
-        max_run_bytes: usize::MAX,
-        ..manual()
+
+        ..options()
     })
     .unwrap();
     // A fixed permutation, flushed in four parts whose key ranges overlap.
@@ -104,15 +96,9 @@ fn consolidated(compression: Compression) -> Engine {
             engine.flush().unwrap();
         }
     }
-    let options = CompactionOptions {
-        max_overlap: 1,
-        max_inputs: usize::MAX,
-        max_input_bytes: usize::MAX,
-        max_output_bytes: usize::MAX,
-        ..CompactionOptions::default()
-    };
     let mut workspace = MergeWorkspace::new();
-    while engine.compact(options, &mut workspace).unwrap().is_some() {}
+    while engine.compact(&mut workspace).unwrap().is_some() {}
+    engine.wait_for_compaction().unwrap();
     engine
 }
 
@@ -139,6 +125,7 @@ fn warm_lookups_allocate_nothing_and_decode_one_block() {
         for j in 4_000..8_000_u32 {
             let index = j.wrapping_mul(104_729) % RECORDS;
             let (expected, key) = (value(index).len(), key(index));
+            engine.wait_for_compaction().unwrap();
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let found = engine.get(&key, &mut workspace).unwrap();
             allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
@@ -158,6 +145,7 @@ fn warm_lookups_allocate_nothing_and_decode_one_block() {
                 })
                 .unwrap();
         }
+        engine.wait_for_compaction().unwrap();
         let before = ALLOCATIONS.load(Ordering::Relaxed);
         engine
             .multi_get(&keys, &mut workspace, |_, value| {

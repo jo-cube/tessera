@@ -1,8 +1,8 @@
 //! In-memory publication sequences must survive every read and rewrite path.
 use crate::block::Value;
 use crate::run::{
-    Codec, CompactError, CompactLimits, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadError,
-    ReadWorkspace, Run, RunBuilder, RunSet, RunView, compact, latest_in,
+    Codec, CompactLimits, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadError, ReadWorkspace,
+    Run, RunBuilder, RunSet, RunView, compact, latest_in,
 };
 
 fn build(codec: Codec, records: &[(&[u8], u64, Value<'_>)]) -> Run<Vec<u8>> {
@@ -16,7 +16,6 @@ fn build(codec: Codec, records: &[(&[u8], u64, Value<'_>)]) -> Run<Vec<u8>> {
 fn limits(zero_seq: bool) -> CompactLimits {
     CompactLimits {
         target_run_len: usize::MAX,
-        max_output_bytes: usize::MAX,
         max_workspace_bytes: usize::MAX,
         codec: Codec::Zstd,
         target_block_compressed: 1024,
@@ -158,7 +157,7 @@ fn effective_sequences_detect_conflicting_copies_and_collapse_identical_ones() {
         matches!(scan.next_record(), Err(ReadError::ConflictingCopies(error)) if error.seq == 17)
     );
     assert!(
-        matches!(compact(&views, |_| true, limits(false), &mut MergeWorkspace::new()), Err(CompactError::Read(ReadError::ConflictingCopies(error))) if error.seq == 17)
+        matches!(compact(&views, |_| true, limits(false), &mut MergeWorkspace::new()), Err(ReadError::ConflictingCopies(error)) if error.seq == 17)
     );
     let copy = build(Codec::None, &[(b"key", 17, Value::Bytes(b"one"))]);
     let output = compact(

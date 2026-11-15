@@ -23,6 +23,9 @@ impl Signal {
     pub(super) fn lock(&self) -> MutexGuard<'_, Progress> {
         self.progress.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    pub(super) fn failed(&self, progress: &Progress) -> bool {
+        progress.failure.is_some()
+    }
     pub(super) fn wait<'a>(&self, guard: MutexGuard<'a, Progress>) -> MutexGuard<'a, Progress> {
         self.changed
             .wait(guard)
@@ -75,8 +78,8 @@ fn run(core: &Core) {
             progress.requested = false;
         }
         let serial = core.serialize_flush();
-        let state = core.wait_for_level0(core.write_state());
-        if state.refused.is_some() || state.frozen.is_empty() {
+        let state = core.write_state();
+        if state.frozen.is_empty() {
             continue;
         }
         let job = FlushJob {
@@ -90,7 +93,7 @@ fn run(core: &Core) {
         if let Some(hook) = core.before_flush_build.lock().unwrap().take() {
             hook();
         }
-        let _ = job.build().publish();
+        job.build().publish();
         core.flush_signal.changed();
     }
 }
@@ -164,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_background_build_stays_readable_and_reaches_a_blocked_writer() {
+    fn a_failed_background_build_is_readable_and_writers_flush_synchronously() {
         let engine = Engine::new(EngineOptions {
             memtable_budget: ENTRY_OVERHEAD + 2,
             max_frozen_memtables: 1,
@@ -176,14 +179,8 @@ mod tests {
             Some(Arc::new(|| panic!("injected flush failure")));
         engine.put(b"a", b"v").unwrap();
         engine.put(b"b", b"v").unwrap();
-        let error = engine.put(b"c", b"v").unwrap_err();
-        let UpdateError::FlushRefused(error) = error else {
-            panic!("{error:?}");
-        };
-        assert!(
-            matches!(error.background.as_deref(), Some(BackgroundError::Panicked(message)) if message == "injected flush failure")
-        );
-        assert!(engine.flush().is_err());
+        engine.put(b"c", b"v").unwrap();
+        assert!(matches!(engine.flush(), Err(BackgroundError::Panicked(_))));
         let mut workspace = EngineWorkspace::new();
         assert_eq!(
             engine.get(b"a", &mut workspace).unwrap().unwrap().value,

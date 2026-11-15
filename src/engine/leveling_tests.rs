@@ -33,7 +33,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
     let options = EngineOptions {
         memtable_budget: 16 << 10,
         target_run_len: 4 << 10,
-        max_runs: 1 << 16,
+
         background_compaction: None,
         ..EngineOptions::default()
     };
@@ -53,10 +53,10 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         let count = engine.stats().runs;
         engine
             .compact_picked(
-                CompactionOptions {
+                CompactionPolicy {
                     max_inputs: count.max(2),
                     max_workspace_bytes: 256 << 20,
-                    ..CompactionOptions::default()
+                    ..CompactionPolicy::default()
                 },
                 (0..count).collect(),
                 &mut MergeWorkspace::new(),
@@ -133,7 +133,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         let before = engine.core.read_state().runs.clone();
         let report = engine
             .compact_picked(
-                CompactionOptions::default(),
+                CompactionPolicy::default(),
                 picks.clone(),
                 &mut MergeWorkspace::new(),
             )
@@ -208,7 +208,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         flushed.sort_by_key(|run| range(run).0);
         levels[0].extend(flushed);
         if round == 3 {
-            snapshot = Some((engine.snapshot().unwrap(), model.clone()));
+            snapshot = Some((engine.snapshot(), model.clone()));
         }
         // Level 0 drains oldest first; level i keeps at most 4·4^(i−1) runs
         // by pushing runs down; a level is inserted under level 0 when the

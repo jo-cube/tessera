@@ -506,6 +506,10 @@ pub(crate) struct RecordWalk {
     pub(crate) record_count: usize,
     /// The largest sequence number walked so far.
     pub(crate) max_seq: u64,
+    /// Tombstones or older versions that a complete merge could discard.
+    pub(crate) reclaimable: bool,
+    /// Logical output estimate for a run rebuilt with different block cuts.
+    pub(crate) build_estimate: usize,
 }
 
 impl RecordWalk {
@@ -547,8 +551,19 @@ impl RecordWalk {
                 }
             }
 
+            self.reclaimable |= record.value == Value::Tombstone
+                || (self.record_count > 0 && self.key[record.shared..] == *record.suffix);
             self.key.truncate(record.shared);
             self.key.extend_from_slice(record.suffix);
+            let value_bytes = match record.value {
+                Value::Bytes(bytes) => bytes.len(),
+                Value::Tombstone => 0,
+            };
+            self.build_estimate = self.build_estimate.saturating_add(
+                (self.key.len() + value_bytes)
+                    .saturating_mul(4)
+                    .saturating_add(256),
+            );
             self.seq = record.seq;
             self.max_seq = self.max_seq.max(record.seq);
             self.record_count += 1;

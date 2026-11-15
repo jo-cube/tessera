@@ -1,3 +1,4 @@
+#![cfg(test)]
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, UpdateError, WriteBatch};
 
 #[test]
@@ -10,7 +11,7 @@ fn batches_are_ordered_atomic_and_reusable() {
     batch.put(b"a", b"last");
     assert_eq!(batch.len(), 4);
     assert_eq!(engine.write(&batch), Ok(4));
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     batch.clear();
     assert!(batch.is_empty());
     assert_eq!(engine.write(&batch), Ok(4));
@@ -73,7 +74,7 @@ fn readers_and_snapshots_see_whole_batches() {
                 })
                 .unwrap();
             assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
-            let snapshot = engine.snapshot().unwrap();
+            let snapshot = engine.snapshot();
             let a = snapshot
                 .get(b"a", &mut ws)
                 .unwrap()
@@ -102,7 +103,7 @@ fn ingestion_drains_overlapping_tables_and_keeps_snapshots() {
     let engine = Engine::new(EngineOptions::default()).unwrap();
     engine.put(b"a", b"old").unwrap();
     engine.put(b"c", b"old").unwrap();
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"ingested");
     batch.delete(b"c");
@@ -204,7 +205,7 @@ fn multi_get_preserves_order_duplicates_misses_and_deletes_in_every_view() {
     engine.flush().unwrap();
     engine.delete(b"b").unwrap();
     engine.put(b"c", b"new").unwrap();
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     engine.put(b"a", b"later").unwrap();
     let keys: &[&[u8]] = &[b"c", b"missing", b"a", b"b", b"c", b"", b"a"];
     let mut ws = EngineWorkspace::new();
@@ -271,7 +272,7 @@ fn multi_get_preserves_order_duplicates_misses_and_deletes_in_every_view() {
 #[test]
 fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
     use std::collections::BTreeMap;
-    use tessera::engine::{CompactionOptions, Compression, MergeWorkspace};
+    use tessera::engine::{CompactionPolicy, Compression, MergeWorkspace};
     for seed in 1..=12u64 {
         let mut rng = seed;
         let mut next = |bound: u64| {
@@ -349,14 +350,15 @@ fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
                     if snapshots.len() == 4 {
                         snapshots.remove(0);
                     }
-                    snapshots.push((engine.snapshot().unwrap(), model.clone()));
+                    snapshots.push((engine.snapshot(), model.clone()));
                 }
                 6 => {
                     engine.flush().unwrap();
                 }
                 7 => {
                     engine
-                        .compact(CompactionOptions::default(), &mut merge)
+                        .core
+                        .compact(CompactionPolicy::default(), &mut merge)
                         .unwrap();
                 }
                 _ => {}
@@ -399,7 +401,7 @@ fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
                 assert_eq!(actual, expected);
             }
             if round % 25 == 0 {
-                let snapshot = engine.snapshot().unwrap();
+                let snapshot = engine.snapshot();
                 let mut scan = snapshot.scan(&mut ws);
                 let mut actual = BTreeMap::new();
                 while let Some(record) = scan.next_record().unwrap() {
@@ -414,10 +416,10 @@ fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
 }
 
 #[test]
-fn rejected_batches_and_refused_ingestion_leave_no_partial_data_or_sequences() {
+fn rejected_batches_and_memory_limited_ingestion_leave_no_partial_data_or_sequences() {
     use tessera::engine::MAX_KEY_LEN;
     let engine = Engine::new(EngineOptions {
-        max_run_bytes: 1,
+        memory_limit: Some(0),
         background_compaction: None,
         ..EngineOptions::default()
     })
@@ -427,7 +429,7 @@ fn rejected_batches_and_refused_ingestion_leave_no_partial_data_or_sequences() {
     batch.put(b"b", b"value");
     assert!(matches!(
         engine.ingest_sorted(&batch),
-        Err(UpdateError::FlushRefused(_))
+        Err(UpdateError::MemoryLimit { .. })
     ));
     assert_eq!(engine.stats().last_seq, 0);
     let mut ws = EngineWorkspace::new();
@@ -439,7 +441,7 @@ fn rejected_batches_and_refused_ingestion_leave_no_partial_data_or_sequences() {
     ));
     assert_eq!(engine.stats().last_seq, 0);
     assert!(engine.get(b"a", &mut ws).unwrap().is_none());
-    engine.set_run_limits(100, usize::MAX).unwrap();
+    let engine = Engine::new(EngineOptions::default()).unwrap();
     batch.clear();
     batch.put(b"a", b"value");
     batch.put(b"b", b"value");

@@ -1,4 +1,5 @@
-//! Compaction in the engine: which runs it selects, the limits that stop it,
+#![cfg(test)]
+//! Compaction in the engine: which runs it selects,
 //! and how it replaces runs while reads, writes and flushes continue.
 //!
 //! The merge itself is tested beside it in `src/run`, and compactions staged
@@ -12,8 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CompactionKind, CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
-    UpdateError,
+    CompactionKind, CompactionPolicy, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -26,11 +26,11 @@ fn manual() -> EngineOptions {
 }
 
 /// Merges any overlap, up to `max_inputs` runs at a time.
-fn options(max_inputs: usize) -> CompactionOptions {
-    CompactionOptions {
+fn options(max_inputs: usize) -> CompactionPolicy {
+    CompactionPolicy {
         max_inputs,
         max_overlap: 1,
-        ..CompactionOptions::default()
+        ..CompactionPolicy::default()
     }
 }
 
@@ -57,13 +57,18 @@ type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn compact_fully(engine: &Engine) {
     let mut workspace = MergeWorkspace::new();
-    let options = CompactionOptions {
+    let options = CompactionPolicy {
         max_inputs: usize::MAX,
         max_input_bytes: usize::MAX,
         max_workspace_bytes: usize::MAX,
         ..options(0)
     };
-    while engine.compact(options, &mut workspace).unwrap().is_some() {}
+    while engine
+        .core
+        .compact(options, &mut workspace)
+        .unwrap()
+        .is_some()
+    {}
 }
 
 /// The resurrection hazard: a tombstone merged without a run that could
@@ -87,12 +92,20 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     // job, the tombstone's run merges with it, and the newest run, which
     // also covers k100, is left out.
     let mut workspace = MergeWorkspace::new();
-    let report = engine.compact(options(2), &mut workspace).unwrap().unwrap();
+    let report = engine
+        .core
+        .compact(options(2), &mut workspace)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (report.kind, report.output_bytes),
         (CompactionKind::Move, 0)
     );
-    let report = engine.compact(options(2), &mut workspace).unwrap().unwrap();
+    let report = engine
+        .core
+        .compact(options(2), &mut workspace)
+        .unwrap()
+        .unwrap();
     assert_eq!(report.kind, CompactionKind::Merge);
     assert_eq!((report.inputs, report.outputs), (2, 1));
     assert!(!report.complete);
@@ -100,7 +113,11 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert_eq!(get(&engine, b"k100"), None);
     assert_eq!(engine.stats().runs, 2);
 
-    let report = engine.compact(options(8), &mut workspace).unwrap().unwrap();
+    let report = engine
+        .core
+        .compact(options(8), &mut workspace)
+        .unwrap()
+        .unwrap();
     assert!(report.complete);
     assert_eq!(report.stats.tombstones_dropped, 1);
     assert_eq!(get(&engine, b"k100"), None);
@@ -110,6 +127,7 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert_eq!(engine.stats().runs, 1);
     assert!(
         engine
+            .core
             .compact(options(8), &mut workspace)
             .unwrap()
             .is_none()
@@ -127,9 +145,15 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
     }
     engine.flush().unwrap();
     let mut workspace = MergeWorkspace::new();
-    let options = CompactionOptions::default();
+    let options = CompactionPolicy::default();
     // Alone in level 0, below the trigger: nothing is due.
-    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
+    assert!(
+        engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .is_none()
+    );
     let base = engine.stats().run_bytes;
     for round in 0..3 {
         engine.put(b"k0000", format!("{round}").as_bytes()).unwrap();
@@ -137,18 +161,38 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
         engine.flush().unwrap();
     }
     assert_eq!(engine.stats().max_overlap, 4);
-    let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+    let report = engine
+        .core
+        .compact(options, &mut workspace)
+        .unwrap()
+        .unwrap();
     // The oldest, the large run, moves to the empty level 1.
     assert_eq!(report.kind, CompactionKind::Move);
-    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
+    assert!(
+        engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .is_none()
+    );
     engine.put(b"k0000", b"3").unwrap();
     engine.put(b"k1999", b"3").unwrap();
     engine.flush().unwrap();
-    let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+    let report = engine
+        .core
+        .compact(options, &mut workspace)
+        .unwrap()
+        .unwrap();
     assert_eq!((report.kind, report.inputs), (CompactionKind::Merge, 5));
     assert!(report.input_bytes > base);
     assert!(report.complete);
-    assert!(engine.compact(options, &mut workspace).unwrap().is_none());
+    assert!(
+        engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .is_none()
+    );
     let stats = engine.stats();
     assert_eq!(
         (stats.runs, stats.max_overlap, stats.level0_flushes),
@@ -167,8 +211,7 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
 fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     let engine = Engine::new(EngineOptions {
         target_run_len: 4_096,
-        max_runs: usize::MAX,
-        max_run_bytes: usize::MAX,
+
         ..manual()
     })
     .unwrap();
@@ -194,16 +237,16 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     let stats = engine.stats();
     assert_eq!(stats.held_bytes, flushed.held_bytes + second.held_bytes);
 
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let mut workspace = MergeWorkspace::new();
     let mut inputs = (0, 0usize);
-    let options = CompactionOptions {
+    let options = CompactionPolicy {
         max_inputs: usize::MAX,
         max_input_bytes: usize::MAX,
         max_workspace_bytes: usize::MAX,
         ..options(0)
     };
-    while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
+    while let Some(report) = engine.core.compact(options, &mut workspace).unwrap() {
         assert!(report.outputs == 0 || report.output_held_bytes > 0);
         inputs.0 += report.input_bytes;
         inputs.1 += report.input_held_bytes;
@@ -236,76 +279,12 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     );
 }
 
-/// Limits below what a job of two runs needs are refused before anything
-/// changes, and compaction proceeds within valid ones, even over lowered run
-/// limits as long as it shrinks what is published.
-#[test]
-fn a_compaction_over_any_limit_changes_nothing() {
-    let engine = Engine::new(EngineOptions {
-        target_run_len: 64,
-        ..manual()
-    })
-    .unwrap();
-    for round in 0..4 {
-        for i in 0..20 {
-            engine
-                .put(
-                    format!("k{i:02}").as_bytes(),
-                    format!("v{round}").as_bytes(),
-                )
-                .unwrap();
-        }
-        engine.flush().unwrap();
-    }
-    let stats = engine.stats();
-    let contents = everything(&engine);
-    let mut workspace = MergeWorkspace::new();
-    let refusals = [
-        CompactionOptions {
-            max_input_bytes: 1,
-            ..options(8)
-        },
-        CompactionOptions {
-            max_output_bytes: 1,
-            ..options(8)
-        },
-        CompactionOptions {
-            max_workspace_bytes: 1,
-            ..options(8)
-        },
-    ];
-    for refusal in refusals {
-        assert!(engine.compact(refusal, &mut workspace).is_err());
-        assert_eq!(engine.stats(), stats);
-        assert_eq!(everything(&engine), contents);
-    }
-    // Over lowered run limits, a compaction that shrinks storage is still
-    // allowed, so that it can make room for flushes.
-    engine.set_run_limits(1, stats.run_bytes / 2).unwrap();
-    let wide = CompactionOptions {
-        max_inputs: 64,
-        ..options(8)
-    };
-    while engine.compact(wide, &mut workspace).unwrap().is_some() {}
-    assert!(engine.stats().run_bytes < stats.run_bytes);
-    assert_eq!(everything(&engine), contents);
-}
-
 /// Writers, a flusher, a manual compactor and the background worker run
 /// beside a reader. Each key's value only moves forward, a deleted key never
 /// returns, and the final state is exactly what was written.
 /// Flushes, waiting for the worker whenever level 0 is at its stop.
 fn flush_waiting(engine: &Engine) {
-    for _ in 0..1_000 {
-        match engine.flush() {
-            Ok(_) => return,
-            Err(refused) if refused.level0_flushes > refused.max_level0_flushes => {
-                engine.wait_for_compaction().unwrap();
-            }
-            Err(refused) => panic!("{refused}"),
-        }
-    }
-    panic!("level 0 never drained");
+    engine.flush().unwrap();
 }
 
 #[test]
@@ -316,11 +295,10 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
 
     let engine = Engine::new(EngineOptions {
         target_run_len: 4 << 10,
-        max_runs: usize::MAX,
-        max_run_bytes: usize::MAX,
-        background_compaction: Some(CompactionOptions {
+
+        background_compaction: Some(CompactionPolicy {
             max_overlap: 2,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         }),
         ..manual()
     })
@@ -338,29 +316,10 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
                     barrier.wait();
                     for round in 1..=ROUNDS {
                         for i in 0..KEYS {
-                            // Level 0 at its stop refuses the update's flush
-                            // and changes nothing: the worker catches up and
-                            // the update is retried.
-                            for attempt in 0.. {
-                                assert!(attempt < 1_000, "level 0 never drained");
-                                let result = if round == ROUNDS && i % 2 == 1 {
-                                    engine.delete(&key(writer, i))
-                                } else {
-                                    engine.put(&key(writer, i), &round.to_be_bytes())
-                                };
-                                match result {
-                                    Err(UpdateError::FlushRefused(_)) => {
-                                        engine.wait_for_compaction().unwrap();
-                                    }
-                                    result => {
-                                        assert!(!matches!(
-                                            result,
-                                            Err(UpdateError::SequencesExhausted)
-                                        ));
-                                        result.unwrap();
-                                        break;
-                                    }
-                                }
+                            if round == ROUNDS && i % 2 == 1 {
+                                engine.delete(&key(writer, i)).unwrap();
+                            } else {
+                                engine.put(&key(writer, i), &round.to_be_bytes()).unwrap();
                             }
                         }
                         // Overlapping runs accumulate while writing goes on.
@@ -382,6 +341,7 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
             let mut workspace = MergeWorkspace::new();
             while writing.load(Ordering::Acquire) {
                 if engine
+                    .core
                     .compact(options(3), &mut workspace)
                     .unwrap()
                     .is_some()

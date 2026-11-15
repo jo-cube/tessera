@@ -21,7 +21,7 @@
 //! assert!(engine.get(b"user/1", &mut workspace)?.is_none());
 //!
 //! // A snapshot holds no lock; writes, flushes and compactions continue.
-//! let snapshot = engine.snapshot()?;
+//! let snapshot = engine.snapshot();
 //! let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
 //! assert_eq!(scan.next_record()?.unwrap().value, b"grace");
 //! assert_eq!(scan.next_record()?, None);
@@ -55,6 +55,9 @@
 
 mod block;
 mod chunk;
+#[cfg(test)]
+extern crate self as tessera;
+
 pub mod engine;
 mod memtable;
 mod run;

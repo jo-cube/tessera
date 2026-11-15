@@ -40,7 +40,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             engine.put(&at.to_be_bytes(), &[1; 128]).unwrap();
         }
         engine.flush().unwrap();
-        let early = (snapshot_at == 1).then(|| engine.snapshot().unwrap());
+        let early = (snapshot_at == 1).then(|| engine.snapshot());
         for at in 0..6000u64 {
             if at % 5 == 0 {
                 engine.delete(&at.to_be_bytes()).unwrap();
@@ -49,13 +49,13 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             }
         }
         engine.flush().unwrap();
-        let options = CompactionOptions {
+        let options = CompactionPolicy {
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         };
         let job = engine.core.begin_job(options).unwrap().unwrap();
         assert_eq!(job.zero_seq, target_run_len == 4 << 20 && snapshot_at != 1);
-        let late = (snapshot_at == 2).then(|| engine.snapshot().unwrap());
+        let late = (snapshot_at == 2).then(|| engine.snapshot());
         let views: Vec<_> = job.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = job
             .others
@@ -67,7 +67,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             |key| ranges.iter().any(|r| r.min <= key && key <= r.max),
             CompactLimits {
                 target_run_len: engine.core.target_run_len,
-                max_output_bytes: options.max_output_bytes,
+
                 max_workspace_bytes: options.max_workspace_bytes,
                 codec: engine.core.codec,
                 target_block_compressed: engine.core.target_block_compressed,

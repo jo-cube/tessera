@@ -8,10 +8,10 @@
 //! built from the run set alone and orders by sequence number, so a level
 //! tag can only change what compaction does next, never what a read returns.
 //! Checkpoints preserve level membership and level-0 flush tags. Scheduling
-//! cursors, size estimates and remembered refusals restart on recovery.
+//! cursors and size estimates restart on recovery.
 
 use std::ops::Range;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use crate::memtable::FlushCuts;
 use crate::run::workspace_estimate;
@@ -20,10 +20,6 @@ use super::{NOT_EMPTY, SharedRun};
 
 /// Level 1's least target, in segments.
 const BASE_SEGMENTS: usize = 4;
-
-/// Flushes level 0 may hold. A flush that would add one more is refused
-/// until compaction drains level 0.
-pub(super) const LEVEL0_STOP: usize = 12;
 
 /// A flush is split at level 1's boundaries into pieces of at least this
 /// fraction of a run length of input...
@@ -49,83 +45,22 @@ pub(super) enum Plan {
         /// job's range, at which outputs are cut to bound their next job.
         below: Vec<Vec<u8>>,
     },
-    /// Rewrite `source` alone, in its level, cut at `cuts`, because its job
-    /// does not fit and each piece's does.
-    Split {
-        level: usize,
-        source: SharedRun,
-        cuts: Vec<Vec<u8>>,
-        /// The whole job, reported if the split leaves one piece.
-        refused: Refusal,
-    },
     /// Merge two adjacent small runs of `level` into one.
     Neighbours { level: usize, runs: [SharedRun; 2] },
-    /// A level needs compacting, but not even its smallest job fits.
-    Refuse(Refusal),
+    /// Rewrite an isolated run to discard its tombstones or old versions.
+    Clean { level: usize, run: SharedRun },
 }
 
-/// The smallest job a level needed, which the limits refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Refusal {
-    pub(super) level: usize,
-    pub(super) inputs: usize,
-    pub(super) bytes: usize,
-    pub(super) workspace_bytes: usize,
-    /// Set when the job was refused under a source's allowance after its
-    /// output outgrew the limit: the output bytes that crossed it.
-    pub(super) outgrown: Option<usize>,
-}
-
-/// A run whose job failed at the output limit, and the most input bytes a
-/// job taking it as its source may have since. Kept while the run is
-/// published.
-struct Outgrown {
-    source: Weak<super::Published>,
-    /// Half the input of the smallest job from it that failed.
-    max_bytes: usize,
-    output_bytes: usize,
-    /// Set once a job no larger than the floor failed: the floor as it was
-    /// then (see [`Levels::floor`]), which stands until the runs below the
-    /// source change.
-    failed_floor: Option<Floor>,
-}
-
-/// The smallest job that makes progress on every part of a source: the
-/// source with the largest run below that it overlaps, by its bytes and
-/// that run (none if it overlaps nothing below).
-#[derive(Clone)]
-struct Floor {
-    bytes: usize,
-    largest: Option<Weak<super::Published>>,
-    overlapped: usize,
-}
-
-impl Floor {
-    fn same(&self, other: &Floor) -> bool {
-        self.bytes == other.bytes
-            && self.overlapped == other.overlapped
-            && match (&self.largest, &other.largest) {
-                (Some(a), Some(b)) => a.ptr_eq(b),
-                (None, None) => true,
-                _ => false,
-            }
-    }
-}
-
-/// The limits a job must fit, from the compaction options.
+/// Scheduling bounds on optional fan-in, from the internal policy.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Fit {
     pub(super) max_inputs: usize,
-    /// The lesser of the input limit and the output limit less a
-    /// [`OUTPUT_HEADROOM`](super::OUTPUT_HEADROOM)th: a merge's output is
-    /// estimated by its input, and can exceed it by run overhead (up to
-    /// about a kilobyte a job measured), so a job admitted at the output
-    /// limit itself would fail there, and be chosen again, every time.
+    /// Soft bytes of optional inputs.
     pub(super) max_bytes: usize,
     pub(super) max_workspace_bytes: usize,
     /// Level 0 is compacted once it holds runs of this many flushes.
     pub(super) trigger: usize,
-    /// The flushes level 0 may hold before flushes wait or are refused.
+    /// The flushes level 0 may hold before writers wait.
     pub(super) level0_stop: usize,
     /// The engine's run length, which bounds a segment.
     pub(super) target_run_len: usize,
@@ -144,8 +79,6 @@ impl Fit {
 pub(super) enum Dest {
     /// Into this level, at least 1, in key order beside its other runs.
     Level(usize),
-    /// Into level 0 in place of the one input there, as part of its flush.
-    InPlace,
     /// Into `level` if they fit there, or else into level 0 as a new flush:
     /// for the tests' arbitrary merges.
     #[cfg(test)]
@@ -173,8 +106,6 @@ pub(super) struct Levels {
     /// a full run.
     flushed_logical: u64,
     flushed_stored: u64,
-    /// Sources whose jobs outgrew the output limit; see [`Levels::outgrown`].
-    outgrown: Vec<Outgrown>,
 }
 
 fn bytes_of(run: &SharedRun) -> usize {
@@ -220,7 +151,6 @@ impl Levels {
             cursors: vec![Vec::new(), Vec::new()],
             flushed_logical: 0,
             flushed_stored: 0,
-            outgrown: Vec::new(),
         }
     }
 
@@ -263,101 +193,6 @@ impl Levels {
         levels
     }
 
-    /// Notes that the job of `inputs`, `inputs[0]` its source, failed when
-    /// its output reached `output_bytes`, over the output limit. Its input
-    /// was admitted within the limit, so its output outgrew it (as a change
-    /// of codec or dictionary can make it). Selection reads the same levels
-    /// again, so without this it would choose the same job and fail the
-    /// same way every time. From now on a job taking that source may have
-    /// at most half this one's input bytes, but never less than the floor
-    /// (the source with the largest run below that it overlaps, the
-    /// smallest job that makes progress on every part of it), computed when
-    /// the job is chosen, so a floor grown by changes below still admits
-    /// its job; [`Levels::fit_for`] applies it. A job no larger than the
-    /// floor that fails leaves the source with the halved allowance alone,
-    /// refused before reading anything, until the runs below it change.
-    ///
-    /// Each failure halves the allowance, or is of a job within the floor,
-    /// after which the source fails again only after a change below; so a
-    /// source fails at most about log2(limit / its size) times, plus once
-    /// per change of the runs below it.
-    pub(super) fn outgrown(&mut self, inputs: &[SharedRun], output_bytes: usize) {
-        let Some(source) = inputs.first() else {
-            return;
-        };
-        let total = inputs.iter().map(bytes_of).sum::<usize>();
-        let floor = self
-            .find(source)
-            .map(|(level, _)| self.floor(level, source))
-            .filter(|floor| total <= floor.bytes);
-        let source = Arc::downgrade(source);
-        self.outgrown
-            .retain(|outgrown| outgrown.source.strong_count() > 0);
-        match self
-            .outgrown
-            .iter_mut()
-            .find(|outgrown| outgrown.source.ptr_eq(&source))
-        {
-            Some(outgrown) => {
-                outgrown.max_bytes = outgrown.max_bytes.min(total / 2);
-                outgrown.output_bytes = output_bytes;
-                if floor.is_some() {
-                    outgrown.failed_floor = floor;
-                }
-            }
-            None => self.outgrown.push(Outgrown {
-                source,
-                max_bytes: total / 2,
-                output_bytes,
-                failed_floor: floor,
-            }),
-        }
-    }
-
-    /// The floor of `source`, in `level`, as the runs below it are now.
-    fn floor(&self, level: usize, source: &SharedRun) -> Floor {
-        let overlapped = self.levels.get(level + 1).map_or(&[][..], |below| {
-            &below[overlapping(below, min_of(source), max_of(source))]
-        });
-        let largest = overlapped.iter().max_by_key(|run| bytes_of(run));
-        Floor {
-            bytes: bytes_of(source) + largest.map_or(0, bytes_of),
-            largest: largest.map(Arc::downgrade),
-            overlapped: overlapped.len(),
-        }
-    }
-
-    /// The limits for a job taking `source`, in `level`, as its source:
-    /// `fit`, or less if its jobs have outgrown the output limit, with the
-    /// output that did. Never more than `fit`. With no level (a neighbour
-    /// merge, a job of two runs of one level) only the halved allowance
-    /// applies.
-    fn fit_for(&self, source: &SharedRun, level: Option<usize>, fit: &Fit) -> (Fit, Option<usize>) {
-        let found = self
-            .outgrown
-            .iter()
-            .find(|outgrown| std::ptr::eq(outgrown.source.as_ptr(), Arc::as_ptr(source)));
-        let Some(outgrown) = found else {
-            return (*fit, None);
-        };
-        let floor = level
-            .map(|level| self.floor(level, source))
-            .filter(|floor| {
-                outgrown
-                    .failed_floor
-                    .as_ref()
-                    .is_none_or(|failed| !failed.same(floor))
-            })
-            .map_or(0, |floor| floor.bytes);
-        let max_bytes = outgrown.max_bytes.max(floor);
-        if max_bytes < fit.max_bytes {
-            (Fit { max_bytes, ..*fit }, Some(outgrown.output_bytes))
-        } else {
-            (*fit, None)
-        }
-    }
-
-    /// Levels below 0, including empty ones.
     pub(super) fn depth(&self) -> usize {
         self.levels.len() - 1
     }
@@ -487,13 +322,6 @@ impl Levels {
             }
             Dest::Level(level) if level >= 1 && fits_level(level) => dest,
             Dest::Level(_) => return Err(Stale),
-            Dest::InPlace => {
-                let mut level0 = found.iter().filter(|(level, _)| *level == 0);
-                if found.len() != 1 || level0.next().is_none() {
-                    return Err(Stale);
-                }
-                dest
-            }
         };
         match dest {
             Dest::Level(level) => {
@@ -505,14 +333,6 @@ impl Levels {
                 };
                 runs.splice(at..at, outputs.iter().cloned());
                 self.bytes[level] += outputs.iter().map(bytes_of).sum::<usize>();
-            }
-            Dest::InPlace => {
-                let at = found[0].1;
-                let flush = self.flushes[at];
-                self.bytes[0] -= bytes_of(&self.levels[0][at]);
-                self.levels[0].splice(at..=at, outputs.iter().cloned());
-                self.flushes.splice(at..=at, outputs.iter().map(|_| flush));
-                self.bytes[0] += outputs.iter().map(bytes_of).sum::<usize>();
             }
             #[cfg(test)]
             Dest::Anywhere(_) => unreachable!("resolved above"),
@@ -560,13 +380,6 @@ impl Levels {
         }
     }
 
-    /// Starts the next job of `level` at `key`.
-    pub(super) fn rewind(&mut self, level: usize, key: &[u8]) {
-        if level > 0 {
-            self.cursors[level] = key.to_vec();
-        }
-    }
-
     /// The published runs outside `inputs` whose ranges share a key with
     /// `lo..=hi`: every level 0 run by scan, every deeper level by search.
     pub(super) fn others(&self, inputs: &[SharedRun], lo: &[u8], hi: &[u8]) -> Vec<SharedRun> {
@@ -606,18 +419,6 @@ impl Levels {
             .clamp(1, target)
     }
 
-    /// The sources holding an output allowance, (live, retired but not yet
-    /// pruned): for measurements.
-    #[cfg(test)]
-    pub(super) fn outgrown_entries(&self) -> (usize, usize) {
-        let live = self
-            .outgrown
-            .iter()
-            .filter(|outgrown| outgrown.source.strong_count() > 0)
-            .count();
-        (live, self.outgrown.len() - live)
-    }
-
     fn target(&self, level: usize, base: usize) -> usize {
         let last = self.levels.len() - 1;
         let shrink = self.ratio.saturating_pow((last - level) as u32);
@@ -643,9 +444,7 @@ impl Levels {
         }
     }
 
-    /// The next step: the level with the highest score above 1 that has a
-    /// job that fits, then any small neighbours, then the refusal of the
-    /// highest-scoring level, or idle.
+    /// The next step: the highest-scoring level, then small neighbours, or idle.
     pub(super) fn plan(&self, fit: &Fit) -> Plan {
         let segment = self.segment(fit);
         let base = BASE_SEGMENTS.saturating_mul(segment);
@@ -653,7 +452,7 @@ impl Levels {
         // Scores as fractions: (numerator, denominator), compared exactly.
         let mut due: Vec<(usize, usize, usize)> = Vec::new();
         // At most the stop, so that level 0 is due whenever flushes wait
-        // or are refused for it: a pass of the worker never ends idle with
+        // for it: a pass of the worker never ends idle with
         // level 0 at its stop.
         let trigger = fit.trigger.min(fit.level0_stop).max(1);
         let flushes = self.level0_flushes();
@@ -677,19 +476,48 @@ impl Levels {
             let right = b.1 as u128 * a.2 as u128;
             right.cmp(&left).then(a.0.cmp(&b.0))
         });
-        let mut refused = None;
-        for &(level, _, _) in &due {
-            match self.plan_level(level, fit) {
-                Plan::Refuse(refusal) => {
-                    refused.get_or_insert(refusal);
-                }
-                plan => return plan,
-            }
+        if let Some(&(level, _, _)) = due.first() {
+            return self.plan_level(level, fit);
         }
-        if let Some(plan) = self.plan_neighbours(fit, segment) {
+        self.plan_neighbours(fit, segment).unwrap_or(Plan::Idle)
+    }
+
+    /// Pressure may reclaim versions below ordinary level targets. Every job
+    /// still follows the same source, overlap and output-cut policy.
+    pub(super) fn plan_reclaim(&self, fit: &Fit) -> Plan {
+        let eager = Fit { trigger: 1, ..*fit };
+        let plan = self.plan(&eager);
+        if !matches!(plan, Plan::Idle) {
             return plan;
         }
-        refused.map_or(Plan::Idle, Plan::Refuse)
+        let last = self.levels.len() - 1;
+        for level in 1..last {
+            for run in &self.levels[level] {
+                if self.levels[level + 1..]
+                    .iter()
+                    .any(|below| !overlapping(below, min_of(run), max_of(run)).is_empty())
+                {
+                    // Use the existing cursor choice; moving other sources out
+                    // of its way also makes finite progress towards this run.
+                    return self.plan_level(level, &eager);
+                }
+            }
+        }
+        for level in 1..=last {
+            for run in &self.levels[level] {
+                if run.run.reclaimable()
+                    && self
+                        .others(std::slice::from_ref(run), min_of(run), max_of(run))
+                        .is_empty()
+                {
+                    return Plan::Clean {
+                        level,
+                        run: Arc::clone(run),
+                    };
+                }
+            }
+        }
+        Plan::Idle
     }
 
     fn plan_level(&self, level: usize, fit: &Fit) -> Plan {
@@ -701,8 +529,6 @@ impl Levels {
             if at == here.len() { 0 } else { at }
         };
         let source = &here[at];
-        let (reduced, outgrown) = self.fit_for(source, Some(level), fit);
-        let fit = &reduced;
         let below = &self.levels[level + 1];
         let dests = overlapping(below, min_of(source), max_of(source));
         if dests.is_empty() {
@@ -721,10 +547,6 @@ impl Levels {
             let bytes: usize = runs.iter().map(|run| bytes_of(run)).sum();
             (runs.len(), bytes, workspace(&runs))
         };
-        let (inputs, bytes, needed) = size(&sources, &dests);
-        if !fit.fits(inputs, bytes, needed) {
-            return self.plan_split(level, source, dests, fit, outgrown);
-        }
         let (mut lo, mut hi) = (min_of(source), max_of(source));
         let mut dests = dests;
         if level == 0 {
@@ -770,72 +592,9 @@ impl Levels {
         }
     }
 
-    /// Cuts `source` at the boundaries of the runs below it so that each
-    /// piece's job fits now, estimating each piece by the whole source.
-    /// Taken only if that leaves at least two pieces; otherwise refused.
-    fn plan_split(
-        &self,
-        level: usize,
-        source: &SharedRun,
-        dests: Range<usize>,
-        fit: &Fit,
-        outgrown: Option<usize>,
-    ) -> Plan {
-        let below = &self.levels[level + 1][dests];
-        let all: Vec<&SharedRun> = std::iter::once(source).chain(below).collect();
-        let refused = Refusal {
-            level,
-            inputs: all.len(),
-            bytes: all.iter().map(|run| bytes_of(run)).sum(),
-            workspace_bytes: workspace(&all),
-            outgrown,
-        };
-        let mut cuts = Vec::new();
-        let mut start = 0;
-        while start < below.len() {
-            let mut end = start;
-            while end < below.len() {
-                let runs: Vec<&SharedRun> =
-                    std::iter::once(source).chain(&below[start..=end]).collect();
-                let bytes = runs.iter().map(|run| bytes_of(run)).sum();
-                if !fit.fits(runs.len(), bytes, workspace(&runs)) {
-                    break;
-                }
-                end += 1;
-            }
-            if end == start {
-                // The source with one run below does not fit.
-                let runs = [source, &below[start]];
-                return Plan::Refuse(Refusal {
-                    level,
-                    inputs: 2,
-                    bytes: runs.iter().map(|run| bytes_of(run)).sum(),
-                    workspace_bytes: workspace(&runs),
-                    outgrown,
-                });
-            }
-            if end < below.len() {
-                cuts.push(min_of(&below[end]).to_vec());
-            }
-            start = end;
-        }
-        // Only cuts with the source's records on both sides make pieces.
-        let (lo, hi) = (min_of(source), max_of(source));
-        cuts.retain(|cut| lo < cut.as_slice() && cut.as_slice() <= hi);
-        if cuts.is_empty() {
-            return Plan::Refuse(refused);
-        }
-        Plan::Split {
-            level,
-            source: Arc::clone(source),
-            cuts,
-            refused,
-        }
-    }
-
     /// Two adjacent runs of a level below 0, both under half a segment,
     /// whose merged range overlaps at most `ratio` segments' bytes below.
-    fn plan_neighbours(&self, fit: &Fit, segment: usize) -> Option<Plan> {
+    fn plan_neighbours(&self, _fit: &Fit, segment: usize) -> Option<Plan> {
         let small = segment / 2;
         let last = self.levels.len() - 1;
         for level in 1..=last {
@@ -843,11 +602,6 @@ impl Levels {
             for pair in here.windows(2) {
                 let (a, b) = (&pair[0], &pair[1]);
                 if bytes_of(a) >= small || bytes_of(b) >= small {
-                    continue;
-                }
-                let runs = [a, b];
-                let (fit, _) = self.fit_for(a, None, fit);
-                if !fit.fits(2, bytes_of(a) + bytes_of(b), workspace(&runs)) {
                     continue;
                 }
                 let bounded = level == last || {
@@ -905,172 +659,6 @@ impl Levels {
         }
         for pair in self.flushes.windows(2) {
             assert!(pair[0] <= pair[1], "level 0 is in publication order");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::Value;
-    use crate::run::{Codec, RunBuilder};
-
-    /// A run of `count` uncompressed records over keys `0..100` evenly.
-    fn run(count: u64) -> SharedRun {
-        let mut builder = RunBuilder::with_raw_block_target(Codec::None, 4096);
-        for at in 0..count {
-            let key = format!("k{:04}", at * 100 / count);
-            builder
-                .add(key.as_bytes(), at + 1, Value::Bytes(&[7; 64]))
-                .unwrap();
-        }
-        super::super::published(vec![builder.finish()])
-            .next()
-            .unwrap()
-    }
-
-    fn with(source: &SharedRun, below: &SharedRun) -> Levels {
-        let mut levels = Levels::new(4);
-        levels.levels = vec![
-            Vec::new(),
-            vec![Arc::clone(source)],
-            vec![Arc::clone(below)],
-        ];
-        levels.bytes = vec![0, bytes_of(source), bytes_of(below)];
-        levels.cursors = vec![Vec::new(); 3];
-        levels
-    }
-
-    /// A failure within the floor refuses the source while the runs below
-    /// stay as they were, and a change below them, here a larger run in
-    /// their place, admits the new floor's job: the allowance is never left
-    /// below a job that fits by the floor of a failure that is past.
-    #[test]
-    fn a_failed_floor_stands_until_the_runs_below_change() {
-        let (source, small, large) = (run(40), run(20), run(60));
-        let fit = Fit {
-            max_inputs: 32,
-            max_bytes: bytes_of(&source) + bytes_of(&large) + 1,
-            max_workspace_bytes: usize::MAX,
-            trigger: 4,
-            level0_stop: 12,
-            target_run_len: 1 << 20,
-        };
-        let mut levels = with(&source, &small);
-        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
-        // The job of the source and the one run below, its floor, failed.
-        levels.outgrown(
-            &[Arc::clone(&source), Arc::clone(&small)],
-            fit.max_bytes + 1,
-        );
-        assert!(
-            matches!(
-                levels.plan_level(1, &fit),
-                Plan::Refuse(Refusal {
-                    outgrown: Some(_),
-                    ..
-                })
-            ),
-            "the same floor job is not chosen again"
-        );
-        levels.levels[2] = vec![Arc::clone(&large)];
-        levels.bytes[2] = bytes_of(&large);
-        assert!(
-            matches!(levels.plan_level(1, &fit), Plan::Merge { .. }),
-            "a changed floor admits its job"
-        );
-        // That job failing too refuses it until the next change.
-        levels.outgrown(
-            &[Arc::clone(&source), Arc::clone(&large)],
-            fit.max_bytes + 1,
-        );
-        assert!(matches!(levels.plan_level(1, &fit), Plan::Refuse(_)));
-        // Replacing the source retires its allowance: its replacement's
-        // jobs are admitted under the full limits.
-        let replacement = run(40);
-        levels.levels[1] = vec![Arc::clone(&replacement)];
-        drop(source);
-        assert_eq!(levels.outgrown_entries(), (0, 1));
-        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
-        assert_eq!(levels.fit_for(&replacement, Some(1), &fit).1, None);
-    }
-
-    /// A failure larger than the floor halves the allowance but keeps the
-    /// floor's job, which never exceeds the configured limit.
-    #[test]
-    fn a_large_failure_keeps_the_floor_within_the_limit() {
-        let source = run(40);
-        let below: Vec<SharedRun> = (0..4u64)
-            .map(|part| {
-                let mut builder = RunBuilder::with_raw_block_target(Codec::None, 4096);
-                for at in 0..30 {
-                    let key = format!("k{:04}.{at:02}", part * 25 + at * 25 / 30);
-                    builder
-                        .add(key.as_bytes(), at + 1, Value::Bytes(&[7; 64]))
-                        .unwrap();
-                }
-                super::super::published(vec![builder.finish()])
-                    .next()
-                    .unwrap()
-            })
-            .collect();
-        let all: usize = bytes_of(&source) + below.iter().map(bytes_of).sum::<usize>();
-        let fit = Fit {
-            max_inputs: 32,
-            max_bytes: all,
-            max_workspace_bytes: usize::MAX,
-            trigger: 4,
-            level0_stop: 12,
-            target_run_len: 1 << 20,
-        };
-        let mut levels = Levels::new(4);
-        levels.levels = vec![Vec::new(), vec![Arc::clone(&source)], below.clone()];
-        levels.bytes = vec![0, bytes_of(&source), below.iter().map(bytes_of).sum()];
-        levels.cursors = vec![Vec::new(); 3];
-        assert!(matches!(levels.plan_level(1, &fit), Plan::Merge { .. }));
-        let inputs: Vec<SharedRun> = std::iter::once(Arc::clone(&source)).chain(below).collect();
-        levels.outgrown(&inputs, all + 1);
-        let (reduced, outgrown) = levels.fit_for(&source, Some(1), &fit);
-        let floor = levels.floor(1, &source).bytes;
-        assert!(outgrown.is_some());
-        assert_eq!(reduced.max_bytes, (all / 2).max(floor));
-        assert!(reduced.max_bytes < fit.max_bytes);
-        // The source is split into pieces that each fit.
-        assert!(
-            matches!(
-                levels.plan_level(1, &fit),
-                Plan::Split { .. } | Plan::Merge { .. }
-            ),
-            "{:?}",
-            levels.plan_level(1, &fit)
-        );
-    }
-}
-
-#[cfg(test)]
-mod ratio_tests {
-    use super::*;
-
-    #[test]
-    fn non_default_ratios_control_dynamic_depth_and_targets() {
-        for ratio in [2usize, 10] {
-            let fit = Fit {
-                max_inputs: 32,
-                max_bytes: usize::MAX,
-                max_workspace_bytes: usize::MAX,
-                trigger: 4,
-                level0_stop: 12,
-                target_run_len: 1 << 20,
-            };
-            let base = BASE_SEGMENTS * fit.target_run_len;
-            let mut levels = Levels::new(ratio);
-            levels.bytes[1] = base * ratio * ratio;
-            assert_eq!(levels.insert_levels(&fit), 1);
-            assert_eq!(levels.depth(), 2);
-            assert_eq!(levels.target(1, base), base * ratio);
-            assert_eq!(levels.insert_levels(&fit), 0);
-            let recovered = Levels::recovered(&[], 1, ratio);
-            assert_eq!(recovered.ratio, ratio);
         }
     }
 }

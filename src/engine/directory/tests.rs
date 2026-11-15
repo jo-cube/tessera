@@ -9,8 +9,8 @@ use std::thread;
 use super::*;
 use crate::block::Value;
 use crate::engine::{
-    CheckpointOptions, CompactionError, CompactionOptions, Engine, EngineOptions, EngineWorkspace,
-    MergeWorkspace, Published, deepest_overlap,
+    CheckpointOptions, CompactionPolicy, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
+    Published, deepest_overlap,
 };
 use crate::run::{
     Codec, ConflictingCopies, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunBuilder,
@@ -558,8 +558,7 @@ fn small() -> EngineOptions {
     EngineOptions {
         memtable_budget: 16 << 10,
         target_run_len: 16 << 10,
-        max_runs: 1 << 12,
-        max_run_bytes: usize::MAX / 4,
+
         background_compaction: None,
         ..EngineOptions::default()
     }
@@ -591,7 +590,7 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
         engine.flush().unwrap();
         assert_published(&engine);
     }
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let pinned = Arc::clone(&snapshot.runs);
     assert!(Arc::ptr_eq(&pinned, &engine.core.read_state().directory));
     let mut workspace = EngineWorkspace::new();
@@ -604,9 +603,9 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
         keys
     };
     loop {
-        match engine.compact(CompactionOptions::default(), &mut merge) {
+        match engine.core.compact(CompactionPolicy::default(), &mut merge) {
             Ok(Some(_)) => assert_published(&engine),
-            Ok(None) | Err(CompactionError::Retained { .. }) => break,
+            Ok(None) => break,
             Err(error) => panic!("{error:?}"),
         }
     }
@@ -698,7 +697,7 @@ fn readers_see_whole_directories_while_runs_are_published() {
         }
         engine.flush().unwrap();
         if round % 4 == 0 {
-            while let Ok(Some(_)) = engine.compact(CompactionOptions::default(), &mut merge) {}
+            while let Ok(Some(_)) = engine.core.compact(CompactionPolicy::default(), &mut merge) {}
         }
     }
     for reader in readers {

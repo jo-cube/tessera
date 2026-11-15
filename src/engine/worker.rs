@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::run::MergeWorkspace;
 
-use super::{CompactionError, CompactionOptions, Core};
+use super::{CompactionError, CompactionPolicy, Core};
 
 /// What the background worker has done since the engine was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,8 +33,8 @@ pub struct BackgroundStatus {
     pub output_bytes: u64,
     /// Passes that ended on a failure.
     pub failures: u64,
-    /// The failure that ended the most recent pass, if it failed. Such a
-    /// refusal is not terminal: the next request starts another pass.
+    /// The failure that ended the most recent pass, if it failed. A
+    /// read failure is not terminal: the next request starts another pass.
     pub last_failure: Option<CompactionError>,
     /// The message of the panic that stopped the worker, if it panicked. A
     /// stopped worker is not restarted; the engine works on without it.
@@ -44,20 +44,16 @@ pub struct BackgroundStatus {
 /// Why waiting for background compaction did not end in success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackgroundError {
-    /// The engine has no background worker.
-    Disabled,
     /// The worker panicked and has stopped for good, with this message.
     Panicked(String),
     /// The pass waited for ended on this failure. Nothing is retried until
-    /// the next flush, write waiting at the level-0 stop, refusal at a run
-    /// limit, limit change or wait.
+    /// the next publication or explicit wait.
     Failed(CompactionError),
 }
 
 impl fmt::Display for BackgroundError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Disabled => f.write_str("the engine has no background compaction"),
             Self::Panicked(message) => {
                 write!(f, "the background worker panicked: {message}")
             }
@@ -111,17 +107,6 @@ impl Signal {
 
     pub(super) fn status(&self) -> BackgroundStatus {
         self.lock().status.clone()
-    }
-
-    /// Waits for all already-requested passes without requesting another one.
-    #[cfg(test)]
-    pub(super) fn wait_until_idle(&self) {
-        let mut progress = self.lock();
-        while progress.status.running
-            && (progress.status.busy || progress.finished < progress.requested)
-        {
-            progress = self.wait_on(progress);
-        }
     }
 
     #[cfg(test)]
@@ -216,30 +201,30 @@ impl Signal {
 /// Starts the worker. Its thread holds the core, not the engine, so closing
 /// or dropping the engine can stop and join it. Fails, leaving the worker
 /// marked as not running, if the operating system cannot create the thread.
-pub(super) fn start(core: Arc<Core>, options: CompactionOptions) -> io::Result<JoinHandle<()>> {
+pub(super) fn start(core: Arc<Core>) -> io::Result<JoinHandle<()>> {
     signal(&core).lock().status.running = true;
     let thread = Arc::clone(&core);
     #[cfg(test)]
     let spawned = if tests::FAIL_SPAWN.with(|fail| fail.replace(false)) {
         Err(io::Error::other("injected spawn failure"))
     } else {
-        spawn(thread, options)
+        spawn(thread)
     };
     #[cfg(not(test))]
-    let spawned = spawn(thread, options);
+    let spawned = spawn(thread);
     if spawned.is_err() {
         signal(&core).lock().status.running = false;
     }
     spawned
 }
 
-fn spawn(core: Arc<Core>, options: CompactionOptions) -> io::Result<JoinHandle<()>> {
+fn spawn(core: Arc<Core>) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("tessera-compaction".into())
         .spawn(move || {
             // A panic is caught here, after unwinding released every lock
             // it held, so that its message is kept for `wait` and `close`.
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&core, options)));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&core)));
             let signal = signal(&core);
             let mut progress = signal.lock();
             progress.status.running = false;
@@ -267,9 +252,8 @@ fn signal(core: &Core) -> &Signal {
         .expect("an engine with a worker has its signal")
 }
 
-fn run(core: &Core, options: CompactionOptions) {
+fn run(core: &Core) {
     let signal = signal(core);
-    let mut workspace = MergeWorkspace::new();
     loop {
         let generation = {
             let mut progress = signal.lock();
@@ -283,7 +267,7 @@ fn run(core: &Core, options: CompactionOptions) {
             progress.status.busy = true;
             progress.started
         };
-        let failure = pass(core, signal, options, &mut workspace).err();
+        let failure = pass(core, signal).err();
         let mut progress = signal.lock();
         progress.finished = generation;
         progress.status.busy = false;
@@ -291,6 +275,8 @@ fn run(core: &Core, options: CompactionOptions) {
         progress.status.failures += u64::from(failure.is_some());
         progress.status.last_failure = failure;
         signal.changed.notify_all();
+        drop(progress);
+        core.resources.changed();
     }
 }
 
@@ -298,18 +284,24 @@ fn run(core: &Core, options: CompactionOptions) {
 /// told to stop. Each step lowers a level's excess, moves data down or lowers
 /// the run count, which only new flushes undo, so without them the pass
 /// ends; with them it ends once flushes stop, which the level-0 stop forces
-/// if compaction falls behind. A refused step ends the pass, so a refusal
-/// is not retried in a loop: the next flush or request tries again.
-fn pass(
-    core: &Core,
-    signal: &Signal,
-    options: CompactionOptions,
-    workspace: &mut MergeWorkspace,
-) -> Result<(), CompactionError> {
+/// if compaction falls behind. A read failure ends the pass and is retried
+/// only after another publication or request.
+fn pass(core: &Core, signal: &Signal) -> Result<(), CompactionError> {
     #[cfg(test)]
     tests::fault_point(core);
+    let reclaim = core
+        .reclaim
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    let options = CompactionPolicy {
+        reclaim,
+        ..core.policy
+    };
     while !signal.lock().stop {
-        let Some(report) = core.compact(options, workspace)? else {
+        // Keep no uncharged decode buffers or native contexts while idle.
+        let mut workspace = MergeWorkspace::new();
+        let result = core.compact(options, &mut workspace);
+        drop(workspace);
+        let Some(report) = result? else {
             break;
         };
         let mut progress = signal.lock();
@@ -318,6 +310,8 @@ fn pass(
         progress.status.output_bytes += report.output_bytes as u64;
         // A writer waiting for level 0 checks again after every step.
         signal.changed.notify_all();
+        drop(progress);
+        core.resources.changed();
     }
     Ok(())
 }

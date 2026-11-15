@@ -51,10 +51,8 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::levels::{LEVEL0_STOP, Levels};
-use super::{
-    Core, Engine, EngineOptions, FlushJob, Published, RunLimitError, SharedRun, SnapshotError,
-};
+use super::levels::Levels;
+use super::{Core, Engine, EngineOptions, FlushJob, Published, SharedRun};
 
 pub(super) const LOCK: &str = "LOCK";
 const CURRENT: &str = "CURRENT";
@@ -138,10 +136,6 @@ pub struct CheckpointReport {
 /// committed generation is retained.
 #[derive(Debug)]
 pub enum CheckpointError {
-    /// The snapshot the checkpoint needs was refused.
-    Snapshot(SnapshotError),
-    /// The normal flush path refused publication.
-    Flush(RunLimitError),
     /// Application metadata exceeds the 16 MiB format bound.
     MetadataLimit,
     /// Another operation or process holds the directory's `LOCK`.
@@ -169,8 +163,6 @@ pub enum CheckpointError {
 impl fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Snapshot(error) => write!(f, "checkpoint snapshot refused: {error}"),
-            Self::Flush(error) => write!(f, "checkpoint flush refused: {error}"),
             Self::MetadataLimit => f.write_str("checkpoint metadata exceeds 16 MiB"),
             Self::Locked(path) => write!(
                 f,
@@ -278,8 +270,6 @@ pub enum OpenError {
         /// How.
         damage: Damage,
     },
-    /// The checkpoint holds more runs or bytes than the options allow.
-    RunLimit(RunLimitError),
     /// The engine options were refused before anything was started or
     /// the directory touched.
     Config(super::ConfigError),
@@ -305,7 +295,6 @@ impl fmt::Display for OpenError {
                     path.display()
                 )
             }
-            Self::RunLimit(error) => write!(f, "recovered runs exceed the limits: {error}"),
             Self::Config(error) => error.fmt(f),
             Self::Worker(error) => {
                 write!(f, "cannot start the background compaction worker: {error}")
@@ -694,9 +683,9 @@ impl Core {
     fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
         loop {
             let serial = self.serialize_flush();
-            let mut state = self.wait_for_level0(self.write_state());
+            let mut state = self.write_state();
             // Respect the ordinary frozen-table bound before rotating active.
-            // This can occur after an abandoned or refused background flush.
+            // This can occur while the background flush is building.
             if !state.active.is_empty() && state.frozen.len() >= self.max_frozen_memtables {
                 let job = FlushJob {
                     engine: self,
@@ -705,22 +694,8 @@ impl Core {
                     cuts: state.flush_cuts(self.target_run_len),
                 };
                 drop(state);
-                job.build().publish().map_err(CheckpointError::Flush)?;
+                job.build().publish();
                 continue;
-            }
-            let live = Arc::strong_count(&self.snapshots) - 1;
-            if live >= self.snapshot_limits.max_live {
-                return Err(CheckpointError::Snapshot(SnapshotError::Readers {
-                    live,
-                    max: self.snapshot_limits.max_live,
-                }));
-            }
-            let bytes = state.retained().bytes;
-            if bytes > self.snapshot_limits.max_retained_bytes {
-                return Err(CheckpointError::Snapshot(SnapshotError::Retained {
-                    bytes,
-                    max: self.snapshot_limits.max_retained_bytes,
-                }));
             }
             let mut image = Image {
                 runs: state.levels.checkpoint_runs(),
@@ -748,7 +723,7 @@ impl Core {
                     hook();
                 }
             });
-            let (_, runs) = job.build().publish_kept().map_err(CheckpointError::Flush)?;
+            let (_, runs) = job.build().publish_kept();
             image
                 .runs
                 .extend(runs.into_iter().map(|run| (0, flush, run)));
@@ -950,8 +925,7 @@ impl Engine {
         if metadata.len() > MAX_METADATA_BYTES {
             return Err(CheckpointError::MetadataLimit);
         }
-        let max_runs = self.core.read_state().max_runs;
-        let previous = match committed_manifest(dir, max_runs) {
+        let previous = match committed_manifest(dir) {
             Ok((_, _, manifest)) => Some(manifest),
             Err(OpenError::Corrupt {
                 path,
@@ -1051,7 +1025,7 @@ impl Engine {
     }
 
     /// Recovers CURRENT without changing disk. Sequences continue after the
-    /// larger of the checkpoint ceiling and options.last_seq. No fallback.
+    /// checkpoint ceiling. No fallback.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
         Self::recover_with_metadata(dir, options).map(|(engine, _)| engine)
     }
@@ -1063,12 +1037,8 @@ impl Engine {
     ) -> Result<(Engine, Vec<u8>), OpenError> {
         options.validate().map_err(OpenError::Config)?;
         let _lock = lock_existing(dir)?;
-        let mut loaded = load(dir, &options)?;
+        let mut loaded = load(dir)?;
         let metadata = std::mem::take(&mut loaded.metadata);
-        let options = EngineOptions {
-            last_seq: options.last_seq.max(loaded.ceiling),
-            ..options
-        };
         let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options)?;
         Ok((engine, metadata))
     }
@@ -1133,6 +1103,12 @@ impl Loaded {
         let core = Core::with_pool(options, self.pool);
         {
             let mut state = core.write_state();
+            state.last_seq = self.ceiling;
+            state.active = crate::memtable::Memtable::in_pool(
+                options.memtable_budget,
+                Some(self.ceiling),
+                &core.chunks,
+            );
             state.runs = self
                 .runs
                 .iter()
@@ -1181,25 +1157,49 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, OpenError> {
     Ok(bytes)
 }
 
-/// CURRENT's generation and checked manifest. Bounds the allocation to a
-/// list of max(max_runs, 2^20) entries plus the metadata format allowance.
-fn committed_manifest(
-    dir: &Path,
-    max_runs: usize,
-) -> Result<(PathBuf, PathBuf, Manifest), OpenError> {
+/// CURRENT's generation and checked manifest, bounded before allocation.
+fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manifest), OpenError> {
     let current = dir.join(CURRENT);
     let bytes = read_bounded(&current, CURRENT_LEN as u64)?;
     let generation = decode_current(&bytes).map_err(|damage| corrupt(&current, damage))?;
     let path = checkpoint_dir(dir, generation);
     let manifest_path = path.join(MANIFEST);
-    // Generous beside the run limit, which is checked once it is decoded and
-    // reported as such; capped by the format's u32 count.
-    let most = max_runs
-        .max(1 << 20)
-        .min(u32::MAX as usize)
-        .saturating_mul(MANIFEST_ENTRY_LEN)
-        .saturating_add(MANIFEST_HEADER_LEN + MAX_METADATA_BYTES + 4);
-    let bytes = read_bounded(&manifest_path, most as u64)?;
+    let mut file = File::open(&manifest_path).map_err(read_error(&manifest_path))?;
+    let found = file.metadata().map_err(read_error(&manifest_path))?.len();
+    let mut header = [0u8; MANIFEST_HEADER_LEN];
+    if found < (MANIFEST_HEADER_LEN + 4) as u64 {
+        return Err(corrupt(
+            &manifest_path,
+            Damage::Length {
+                expected: (MANIFEST_HEADER_LEN + 4) as u64,
+                found,
+            },
+        ));
+    }
+    file.read_exact(&mut header)
+        .map_err(read_error(&manifest_path))?;
+    let count = u32::from_le_bytes(header[68..72].try_into().unwrap()) as u64;
+    let metadata = u64::from_le_bytes(header[60..68].try_into().unwrap());
+    let expected = MANIFEST_HEADER_LEN as u64
+        + count * MANIFEST_ENTRY_LEN as u64
+        + metadata.min(MAX_METADATA_BYTES as u64)
+        + 4;
+    if found != expected || metadata > MAX_METADATA_BYTES as u64 {
+        return Err(corrupt(&manifest_path, Damage::Length { expected, found }));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(expected).map_err(|_| {
+        corrupt(
+            &manifest_path,
+            Damage::Length {
+                expected: usize::MAX as u64,
+                found,
+            },
+        )
+    })?);
+    bytes.extend_from_slice(&header);
+    file.take(expected - MANIFEST_HEADER_LEN as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error(&manifest_path))?;
     let manifest = Manifest::decode(&bytes).map_err(|damage| corrupt(&manifest_path, damage))?;
     if manifest.generation != generation {
         return Err(corrupt(
@@ -1214,27 +1214,8 @@ fn committed_manifest(
 }
 
 /// Reads and checks exactly CURRENT's generation under LOCK.
-pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenError> {
-    let (_, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
-    let listed = manifest
-        .runs
-        .iter()
-        .try_fold(0u64, |total, run| total.checked_add(run.len))
-        .unwrap_or(u64::MAX);
-    let limit = |runs, bytes| {
-        OpenError::RunLimit(RunLimitError {
-            runs,
-            max_runs: options.max_runs,
-            run_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
-            max_run_bytes: options.max_run_bytes,
-            level0_flushes: 0,
-            max_level0_flushes: LEVEL0_STOP,
-            background: None,
-        })
-    };
-    if manifest.runs.len() > options.max_runs || listed > options.max_run_bytes as u64 {
-        return Err(limit(manifest.runs.len(), listed));
-    }
+pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
+    let (_, manifest_path, manifest) = committed_manifest(dir)?;
     let pool = ChunkPool::new(RESERVE_BYTES);
     let mut runs: Vec<(usize, u64, SharedRun)> = Vec::with_capacity(manifest.runs.len());
     let mut records = 0u64;
@@ -1319,12 +1300,6 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
     }
     let run_bytes: usize = runs.iter().map(|(_, _, r)| r.run.stored_len()).sum();
     let held_bytes: usize = runs.iter().map(|(_, _, r)| r.run.held_bytes()).sum();
-    if run_bytes.saturating_add(held_bytes) > options.max_run_bytes {
-        return Err(limit(
-            runs.len(),
-            run_bytes.saturating_add(held_bytes) as u64,
-        ));
-    }
     Ok(Loaded {
         ceiling: manifest.last_seq,
         metadata: manifest.metadata,
@@ -1622,16 +1597,21 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
     fn manifest(dir: &Path) -> Manifest {
-        committed_manifest(dir, usize::MAX).unwrap().2
+        committed_manifest(dir).unwrap().2
     }
 
     fn compact_all(engine: &Engine) {
-        let options = super::super::CompactionOptions {
+        let options = super::super::CompactionPolicy {
             max_overlap: 1,
-            ..super::super::CompactionOptions::default()
+            ..super::super::CompactionPolicy::default()
         };
         let mut workspace = super::super::MergeWorkspace::new();
-        while engine.compact(options, &mut workspace).unwrap().is_some() {}
+        while engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .is_some()
+        {}
     }
 
     #[test]
@@ -1825,7 +1805,7 @@ mod tests {
         for i in 0..10u32 {
             engine.delete(&i.to_be_bytes()).unwrap();
         }
-        let pin = engine.snapshot().unwrap();
+        let pin = engine.snapshot();
         let expected = state(&engine);
         let ceiling = engine.stats().last_seq;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();

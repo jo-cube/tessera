@@ -57,6 +57,7 @@ impl Packing {
             };
             let range = used..used + bytes.len();
             self.allocations[at].bytes_mut()[range.clone()].copy_from_slice(bytes);
+            self.allocations[at].set_used(range.end);
             self.active = Some((at, range.end));
             (at, range)
         };

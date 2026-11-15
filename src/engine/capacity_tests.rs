@@ -8,19 +8,18 @@ fn engine_options() -> EngineOptions {
     EngineOptions {
         memtable_budget: RUN_LEN,
         target_run_len: RUN_LEN,
-        max_runs: 1 << 20,
-        max_run_bytes: usize::MAX / 4,
+
         background_compaction: None,
         ..EngineOptions::default()
     }
 }
 
 /// The defaults with their byte limits scaled as the runs are.
-pub(super) fn compaction_options() -> CompactionOptions {
-    CompactionOptions {
+pub(super) fn compaction_options() -> CompactionPolicy {
+    CompactionPolicy {
         max_input_bytes: 4 * RUN_LEN,
-        max_output_bytes: 4 * RUN_LEN,
-        ..CompactionOptions::default()
+
+        ..CompactionPolicy::default()
     }
 }
 
@@ -85,7 +84,7 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
     engine.flush().unwrap();
     let disjoint = engine.core.read_state().runs.len();
     assert!(disjoint >= 5, "{disjoint} runs");
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     for index in 1_500..1_520 {
         engine.put(&key(index), b"updated").unwrap();
     }

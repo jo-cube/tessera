@@ -91,6 +91,7 @@ impl Arena {
             page.chunk.bytes_mut()[offset..offset + key.len()].copy_from_slice(key);
             page.chunk.bytes_mut()[offset + key.len()..offset + len].copy_from_slice(value);
             page.used += len;
+            page.chunk.set_used(page.used);
             (at, offset, copied)
         };
         self.used += len;

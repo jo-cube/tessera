@@ -4,23 +4,15 @@
 //! generations and released out of order, flushes and compactions.
 //!
 //! The counting allocator sees every thread, so this binary holds one test,
-//! and the engine runs no worker.
+//! with compaction settled before measuring.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tessera::engine::{
-    CompactionOptions, Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot,
-    SnapshotLimits,
-};
+use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot};
 
-/// The defaults without the background worker: these tests flush and
-/// compact by hand and count what each step leaves.
-fn manual() -> EngineOptions {
-    EngineOptions {
-        background_compaction: None,
-        ..EngineOptions::default()
-    }
+fn options() -> EngineOptions {
+    EngineOptions::default()
 }
 
 struct Counting;
@@ -98,11 +90,8 @@ const OWN: usize = 1 << 10;
 fn memtable_only() -> Engine {
     Engine::new(EngineOptions {
         memtable_budget: 64 << 20,
-        snapshots: SnapshotLimits {
-            max_live: 64,
-            max_retained_bytes: usize::MAX,
-        },
-        ..manual()
+
+        ..options()
     })
     .unwrap()
 }
@@ -121,7 +110,7 @@ fn memtable_checkpoints(seed: u64) -> usize {
             engine.put(&key, &value(&mut rng)).unwrap();
         }
         if rng.chance(2) && held.len() < 60 {
-            held.push(engine.snapshot().unwrap());
+            held.push(engine.snapshot());
         }
         if rng.chance(1) {
             drop_one(&mut rng, &mut held);
@@ -156,7 +145,7 @@ fn whole_table_replaced() {
         engine.put(key, b"12345678").unwrap();
     }
     let arena_used = engine.stats().active.arena_bytes;
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     for key in &keys {
         engine.put(key, b"abcdefgh").unwrap();
     }
@@ -182,24 +171,14 @@ fn whole_table_replaced() {
 fn engine_options() -> EngineOptions {
     EngineOptions {
         memtable_budget: 96 << 10,
-        target_run_len: 32 << 10,
-        max_runs: 1 << 12,
-        max_run_bytes: usize::MAX,
-        snapshots: SnapshotLimits {
-            max_live: 64,
-            max_retained_bytes: usize::MAX,
-        },
-        ..manual()
+
+        ..options()
     }
 }
 
 fn compact_some(engine: &Engine, rng: &mut Rng, workspace: &mut MergeWorkspace) {
-    let options = CompactionOptions {
-        max_overlap: 1 + rng.below(3) as usize,
-        ..CompactionOptions::default()
-    };
     for _ in 0..rng.below(4) {
-        if engine.compact(options, workspace).unwrap().is_none() {
+        if engine.compact(workspace).unwrap().is_none() {
             break;
         }
     }
@@ -227,7 +206,7 @@ fn engine_checkpoints(seed: u64) -> usize {
             compact_some(&engine, &mut rng, &mut merge);
         }
         if rng.chance(3) && held.len() < 48 {
-            held.push(engine.snapshot().unwrap());
+            held.push(engine.snapshot());
         }
         if rng.chance(2) {
             drop_one(&mut rng, &mut held);

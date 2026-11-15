@@ -1,8 +1,5 @@
 //! Merging runs into fewer runs that hold only what can still be read.
 
-use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::block::{Record, Value};
 use crate::chunk::ChunkPool;
 
@@ -16,22 +13,15 @@ use super::{
 
 const BUILDABLE: &str = "merged records are ordered, within the limits, and fit in one run";
 
-/// Bounds on what one compaction may produce.
+/// Internal run sizing and workspace policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactLimits {
     /// Input per output run, as for a flush, reduced to
     /// [`MAX_TARGET_RUN_LEN`] if larger.
     pub target_run_len: usize,
-    /// The most bytes of output, stored bytes and key filters together. It is
-    /// checked after every record against the finished runs and the stored
-    /// bytes of the run being built, and again as each run is finished with
-    /// its filter.
-    pub max_output_bytes: usize,
-    /// The most bytes the merge and builder may need beside the output. The
-    /// estimate from [`workspace_bytes`] is checked before anything is
-    /// decoded; what it leaves is the most the open builder may hold for key
-    /// hashes, and an output run whose distinct keys need more is built
-    /// without a filter.
+    /// Workspace allowance, raised to the minimum serial estimate. Parallel
+    /// builders and filter hashes share its remaining room. A filter needing
+    /// more scratch is omitted; the merge still succeeds.
     pub max_workspace_bytes: usize,
     /// How the output runs store their blocks.
     pub codec: Codec,
@@ -139,62 +129,6 @@ pub struct Compacted {
     pub stats: CompactStats,
 }
 
-/// Why a compaction produced nothing. The engine reports it as the
-/// matching [`CompactionError`](crate::engine::CompactionError) variant.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CompactError {
-    /// An input is damaged, or two inputs hold different records under one
-    /// internal key, at any version.
-    Read(ReadError),
-    /// The output would exceed its byte limit, in the engine
-    /// [`CompactionOptions::max_output_bytes`](crate::engine::CompactionOptions::max_output_bytes).
-    OutputLimit {
-        /// Bytes of output, stored and filters, when the limit was crossed.
-        output_bytes: usize,
-        /// The limit.
-        max_output_bytes: usize,
-    },
-    /// The workspace estimate exceeds its limit, in the engine
-    /// [`CompactionOptions::max_workspace_bytes`](crate::engine::CompactionOptions::max_workspace_bytes).
-    /// Nothing was decoded.
-    WorkspaceLimit {
-        /// The estimate.
-        workspace_bytes: usize,
-        /// The limit.
-        max_workspace_bytes: usize,
-    },
-}
-
-impl From<CorruptRun> for CompactError {
-    fn from(error: CorruptRun) -> Self {
-        Self::Read(ReadError::Corrupt(error))
-    }
-}
-
-impl fmt::Display for CompactError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read(error) => error.fmt(f),
-            Self::OutputLimit {
-                output_bytes,
-                max_output_bytes,
-            } => write!(
-                f,
-                "compaction output reached {output_bytes} bytes, over the limit of {max_output_bytes}"
-            ),
-            Self::WorkspaceLimit {
-                workspace_bytes,
-                max_workspace_bytes,
-            } => write!(
-                f,
-                "compaction needs {workspace_bytes} workspace bytes, over the limit of {max_workspace_bytes}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CompactError {}
-
 /// Merges `inputs` into new runs with the limits' codec and block length, keeping
 /// only the newest version of each user key.
 ///
@@ -211,9 +145,9 @@ impl std::error::Error for CompactError {}
 /// Beside the output, the merge holds one decoded block and decompression
 /// context per input in `workspace`, and one run builder is open; see
 /// [`workspace_bytes`]. The builder's key hashes are held within what the
-/// estimate leaves of the workspace limit. Both limits are checked as
-/// described on [`CompactLimits`], and on any error the partial output is
-/// dropped.
+/// estimate leaves of the workspace allowance. Inputs always fit the minimum
+/// serial workspace; tighter allowances reduce concurrency and filter scratch.
+/// On a read error partial output is dropped.
 ///
 /// Output runs end before a record that would
 /// take them past the target length, unless they hold no record yet.
@@ -223,7 +157,7 @@ pub fn compact<'a>(
     keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
     workspace: &'a mut MergeWorkspace,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     compact_with(
         inputs,
         keep_tombstone,
@@ -241,7 +175,7 @@ pub(crate) fn compact_with<'a>(
     limits: CompactLimits,
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     compact_with_in(
         inputs,
         keep_tombstone,
@@ -259,7 +193,7 @@ fn compact_with_in<'a>(
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
     pool: &ChunkPool,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     compact_range(
         inputs,
         &mut keep_tombstone,
@@ -272,12 +206,11 @@ fn compact_with_in<'a>(
             end: None,
             segment_len: SEGMENT_RAW_LEN,
             needed: workspace_bytes(inputs)?,
-            total: None,
         },
     )
 }
 
-/// Builds disjoint key ranges of one selected job, under the same total limits.
+/// Builds disjoint key ranges of one selected job with a shared workspace allowance.
 /// Single-output neighbour merges and small jobs retain the serial path.
 #[cfg(test)]
 pub fn compact_parallel<'a>(
@@ -288,7 +221,7 @@ pub fn compact_parallel<'a>(
     threads: usize,
     estimated_run_bytes: usize,
     workspace: &'a mut MergeWorkspace,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     compact_parallel_in(
         inputs,
         keep_tombstone,
@@ -308,15 +241,13 @@ pub(crate) fn compact_parallel_in<'a>(
     threads: usize,
     estimated_run_bytes: usize,
     build: (&'a mut MergeWorkspace, &ChunkPool),
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     let (workspace, pool) = build;
     let needed = workspace_bytes(inputs)?;
-    if needed > limits.max_workspace_bytes {
-        return Err(CompactError::WorkspaceLimit {
-            workspace_bytes: needed,
-            max_workspace_bytes: limits.max_workspace_bytes,
-        });
-    }
+    let limits = CompactLimits {
+        max_workspace_bytes: limits.max_workspace_bytes.max(needed),
+        ..limits
+    };
     let stored: usize = inputs.iter().map(|input| input.frame_bytes()).sum();
     // Use the planner's flush-derived stored/logical ratio: a builder must
     // have at least one full target-length run to build. Ignore the final tail.
@@ -364,14 +295,12 @@ pub(crate) fn compact_parallel_in<'a>(
         return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
     let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
-    let total = AtomicUsize::new(0);
     let parts = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..=starts.len())
             .map(|at| {
                 let start = at.checked_sub(1).map(|i| starts[i]);
                 let end = starts.get(at).copied();
                 let keep = &keep_tombstone;
-                let total = &total;
                 scope.spawn(move || {
                     compact_range(
                         inputs,
@@ -388,7 +317,6 @@ pub(crate) fn compact_parallel_in<'a>(
                             end,
                             segment_len,
                             needed: builder_workspace,
-                            total: Some(total),
                         },
                     )
                 })
@@ -459,7 +387,6 @@ struct BuildRange<'a> {
     end: Option<&'a [u8]>,
     segment_len: usize,
     needed: usize,
-    total: Option<&'a AtomicUsize>,
 }
 
 fn compact_range<'a>(
@@ -469,14 +396,12 @@ fn compact_range<'a>(
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
     range: BuildRange<'_>,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     let needed = range.needed;
-    if needed > limits.max_workspace_bytes {
-        return Err(CompactError::WorkspaceLimit {
-            workspace_bytes: needed,
-            max_workspace_bytes: limits.max_workspace_bytes,
-        });
-    }
+    let limits = CompactLimits {
+        max_workspace_bytes: limits.max_workspace_bytes.max(needed),
+        ..limits
+    };
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
     if let Some(start) = range.start {
         merge.seek(start)?;
@@ -484,7 +409,6 @@ fn compact_range<'a>(
     let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
     output.pool = range.pool.clone();
     output.segment_len = range.segment_len;
-    output.total = range.total;
     let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
@@ -515,10 +439,10 @@ fn compact_range<'a>(
         output.add(Record {
             seq: if limits.zero_seq { 0 } else { record.seq },
             ..record
-        })?;
+        });
         stats.records_written += 1;
     }
-    output.finish_run()?;
+    output.finish_run();
     Ok(Compacted {
         runs: output.runs,
         output_bytes: output.bytes - output.held_bytes,
@@ -529,17 +453,12 @@ fn compact_range<'a>(
 }
 
 /// Removes identical copies of the current record and rejects any that differ.
-fn collapse_copies(
-    merge: &mut MergeCursor<'_>,
-    stats: &mut CompactStats,
-) -> Result<(), CompactError> {
+fn collapse_copies(merge: &mut MergeCursor<'_>, stats: &mut CompactStats) -> Result<(), ReadError> {
     while let Some(at) = merge.next_copy() {
         if let Some([(first, record), (other, copy)]) = merge.copies(at)
             && record.value != copy.value
         {
-            return Err(CompactError::Read(conflict(
-                record.key, record.seq, first, other,
-            )));
+            return Err(conflict(record.key, record.seq, first, other));
         }
         merge.drop_copy(at)?;
         stats.records_read += 1;
@@ -551,8 +470,6 @@ fn collapse_copies(
 struct Output<'c> {
     pool: ChunkPool,
     segment_len: usize,
-    total: Option<&'c AtomicUsize>,
-    charged: usize,
     limits: CompactLimits,
     cuts: &'c OutputCuts,
     /// The next of `cuts.at` not yet passed.
@@ -586,8 +503,6 @@ impl<'c> Output<'c> {
             },
             cuts,
             segment_len: SEGMENT_RAW_LEN,
-            total: None,
-            charged: 0,
             next_cut: 0,
             next_overlapped: 0,
             overlapped: 0,
@@ -605,7 +520,7 @@ impl<'c> Output<'c> {
     /// below. A run with no record yet takes any record, however long, so
     /// that a record longer than the target is a run of its own and every
     /// run has a record.
-    fn add(&mut self, record: Record<'_>) -> Result<(), CompactError> {
+    fn add(&mut self, record: Record<'_>) {
         let value_len = match record.value {
             Value::Bytes(bytes) => bytes.len(),
             Value::Tombstone => 0,
@@ -628,7 +543,7 @@ impl<'c> Output<'c> {
             && ((!self.cuts.overlapped.is_empty() && self.overlapped > self.cuts.max_overlapped)
                 || self.input + len > self.limits.target_run_len);
         if self.builder.is_some() && !self.cuts.single && (cut || over) {
-            self.finish_run()?;
+            self.finish_run();
         }
         if self.builder.is_none() {
             // The run starts here: only the runs below it from this key on
@@ -648,48 +563,20 @@ impl<'c> Output<'c> {
         builder
             .add(record.key, record.seq, record.value)
             .expect(BUILDABLE);
-        let stored = builder.stored_len();
         self.input += len;
-        self.check(self.bytes + stored)?;
         if self.input >= self.limits.target_run_len {
-            self.finish_run()?;
+            self.finish_run();
         }
-        Ok(())
     }
 
-    fn check(&mut self, output_bytes: usize) -> Result<(), CompactError> {
-        let output_bytes = if let Some(total) = self.total {
-            let delta = output_bytes.saturating_sub(self.charged);
-            self.charged = self.charged.max(output_bytes);
-            if delta == 0 {
-                total.load(Ordering::Relaxed)
-            } else {
-                total
-                    .fetch_add(delta, Ordering::Relaxed)
-                    .saturating_add(delta)
-            }
-        } else {
-            output_bytes
-        };
-        if output_bytes > self.limits.max_output_bytes {
-            return Err(CompactError::OutputLimit {
-                output_bytes,
-                max_output_bytes: self.limits.max_output_bytes,
-            });
-        }
-        Ok(())
-    }
-
-    fn finish_run(&mut self) -> Result<(), CompactError> {
+    fn finish_run(&mut self) {
         let Some(builder) = self.builder.take() else {
-            return Ok(());
+            return;
         };
         let run = builder.finish();
         self.input = 0;
         self.held_bytes += run.held_bytes();
         self.bytes += run.stored_len() + run.held_bytes();
-        self.check(self.bytes)?;
         self.runs.push(run);
-        Ok(())
     }
 }

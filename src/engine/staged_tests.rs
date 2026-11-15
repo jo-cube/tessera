@@ -88,7 +88,7 @@ mod flush {
         assert_eq!(scanned(&engine, b""), expected);
         assert_eq!(engine.stats().runs, 1, "built runs are not visible yet");
 
-        built.publish().unwrap();
+        built.publish();
         assert_eq!(scanned(&engine, b""), expected);
         assert_eq!(value_of(&engine, b"b"), Some((b, b"2".to_vec())));
         let stats = engine.stats();
@@ -111,7 +111,7 @@ mod flush {
 
         let built = job.build();
         assert_eq!(scanned(&engine, b""), expected);
-        built.publish().unwrap();
+        built.publish();
         assert_eq!(scanned(&engine, b""), expected);
         assert_eq!(value_of(&engine, b"b"), None);
         assert_eq!(engine.stats().active.payload, 1 + 6 + 1 + 1 + 6);
@@ -126,7 +126,7 @@ mod flush {
         assert_eq!(job.tables.iter().map(|table| table.len()).sum::<usize>(), 1);
         let built = job.build();
         assert_eq!(built.runs[0].len(), 1);
-        built.publish().unwrap();
+        built.publish();
         assert_eq!(value_of(&engine, b"a").unwrap().1, b"during");
     }
 
@@ -142,13 +142,7 @@ mod flush {
         assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
         assert_eq!(engine.stats().runs, 0);
 
-        engine
-            .core
-            .begin_flush()
-            .unwrap()
-            .build()
-            .publish()
-            .unwrap();
+        engine.core.begin_flush().unwrap().build().publish();
         assert_eq!(value_of(&engine, b"a"), Some((seq, b"v".to_vec())));
         assert!(no_frozen(engine.stats()));
         assert_eq!(engine.stats().runs, 1);
@@ -195,7 +189,7 @@ mod flush {
         let stats = engine.stats();
         assert_eq!(stats.frozen.unwrap().payload, 6);
         assert_eq!(stats.active.payload, 3);
-        job.build().publish().unwrap();
+        job.build().publish();
         let stats = engine.stats();
         assert_eq!(stats.active.payload, 3);
         assert!(stats.run_bytes > 0);
@@ -260,7 +254,7 @@ mod flush {
                 .join()
                 .unwrap();
         });
-        built.publish().unwrap();
+        built.publish();
         assert_eq!(scanned(&engine, b"").len(), 2);
     }
 }
@@ -295,10 +289,10 @@ mod snapshot {
         found.map(|found| found.value.to_vec())
     }
 
-    fn merge_all() -> CompactionOptions {
-        CompactionOptions {
+    fn merge_all() -> CompactionPolicy {
+        CompactionPolicy {
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         }
     }
 
@@ -310,7 +304,7 @@ mod snapshot {
         let mut expected: Pairs = Vec::new();
         let mut held: Vec<(Snapshot, Pairs)> = Vec::new();
         let mut take = |engine: &Engine, expected: &Pairs| {
-            let snapshot = engine.snapshot().unwrap();
+            let snapshot = engine.snapshot();
             assert_eq!(&scanned(&snapshot, b""), expected);
             held.push((snapshot, expected.clone()));
         };
@@ -325,7 +319,7 @@ mod snapshot {
             take(&engine, &expected);
             let built = job.build();
             take(&engine, &expected);
-            built.publish().unwrap();
+            built.publish();
             take(&engine, &expected);
         }
         let job = engine.core.begin_job(merge_all()).unwrap().unwrap();
@@ -348,11 +342,11 @@ mod compaction {
     use super::*;
 
     /// Merges any overlap, up to `max_inputs` runs at a time.
-    fn options(max_inputs: usize) -> CompactionOptions {
-        CompactionOptions {
+    fn options(max_inputs: usize) -> CompactionPolicy {
+        CompactionPolicy {
             max_inputs,
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         }
     }
 
@@ -403,13 +397,18 @@ mod compaction {
 
     fn compact_fully(engine: &Engine) {
         let mut workspace = MergeWorkspace::new();
-        let options = CompactionOptions {
+        let options = CompactionPolicy {
             max_inputs: usize::MAX,
             max_input_bytes: usize::MAX,
             max_workspace_bytes: usize::MAX,
             ..options(0)
         };
-        while engine.compact(options, &mut workspace).unwrap().is_some() {}
+        while engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .is_some()
+        {}
     }
 
     /// Runs flushed between selection and publication, and the memtables, are
@@ -494,11 +493,10 @@ mod compaction {
             let mut rng = Rng(seed);
             let engine = Engine::new(EngineOptions {
                 target_run_len: [64, 1_024, 1 << 20][rng.below(3)],
-                max_runs: usize::MAX,
-                max_run_bytes: usize::MAX,
-                background_compaction: background.then(|| CompactionOptions {
+
+                background_compaction: background.then(|| CompactionPolicy {
                     max_overlap: 1 + seed as usize % 3,
-                    ..CompactionOptions::default()
+                    ..CompactionPolicy::default()
                 }),
                 // Odd seeds use small memtables, which the history pinned by
                 // snapshots fills, so writes flush them.
@@ -516,14 +514,12 @@ mod compaction {
                     55..=59 if held.len() >= 6 || (!held.is_empty() && rng.below(3) == 0) => {
                         held.swap_remove(rng.below(held.len()));
                     }
-                    55..=59 => match engine.snapshot() {
-                        Ok(snapshot) => {
-                            assert_eq!(snapshot.last_seq(), engine.stats().last_seq);
-                            held.push((snapshot, model.clone()));
-                            snapshots += 1;
-                        }
-                        Err(error) => panic!("seed {seed}: {error}"),
-                    },
+                    55..=59 => {
+                        let snapshot = engine.snapshot();
+                        assert_eq!(snapshot.last_seq(), engine.stats().last_seq);
+                        held.push((snapshot, model.clone()));
+                        snapshots += 1;
+                    }
                     0..=54 => {
                         let key = pool[rng.below(pool.len())].clone();
                         let value = (rng.below(4) != 0).then(|| {
@@ -549,10 +545,10 @@ mod compaction {
                         engine.flush().unwrap();
                     }
                     _ => {
-                        let options = CompactionOptions {
+                        let options = CompactionPolicy {
                             max_inputs: 2 + rng.below(4),
                             max_overlap: 1 + rng.below(3),
-                            ..CompactionOptions::default()
+                            ..CompactionPolicy::default()
                         };
                         stage = match stage {
                             Stage::Idle => match engine.core.begin_compaction(options).unwrap() {
@@ -634,7 +630,7 @@ mod compaction {
             compact_fully(&engine);
             // Fully compacted: nothing overlaps and no two tails are adjacent.
             let done = options(usize::MAX);
-            assert!(engine.compact(done, &mut workspace).unwrap().is_none());
+            assert!(engine.core.compact(done, &mut workspace).unwrap().is_none());
             let expected: Vec<_> = model.into_iter().collect();
             assert_eq!(
                 everything(&engine),

@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Snapshots: views that hold no lock, what they keep alive, and the limits on
 //! taking them.
 //!
@@ -8,11 +9,9 @@
 
 use std::sync::Barrier;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use tessera::engine::{
-    BackgroundError, CompactionError, CompactionKind, CompactionOptions, Engine, EngineOptions,
-    EngineWorkspace, MergeWorkspace, Snapshot, SnapshotError, SnapshotLimits,
+    CompactionPolicy, Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -52,10 +51,10 @@ fn value(snapshot: &Snapshot, key: &[u8]) -> Option<Vec<u8>> {
     found.map(|found| found.value.to_vec())
 }
 
-fn merge_all() -> CompactionOptions {
-    CompactionOptions {
+fn merge_all() -> CompactionPolicy {
+    CompactionPolicy {
         max_overlap: 1,
-        ..CompactionOptions::default()
+        ..CompactionPolicy::default()
     }
 }
 
@@ -65,6 +64,7 @@ fn compact_all(engine: &Engine) -> usize {
     let mut workspace = MergeWorkspace::new();
     let mut done = 0;
     while engine
+        .core
         .compact(merge_all(), &mut workspace)
         .unwrap()
         .is_some()
@@ -84,7 +84,7 @@ fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
     engine.put(b"a", b"2").unwrap();
     // A tombstone in a table over a value in a run.
     engine.delete(b"b").unwrap();
-    let first = engine.snapshot().unwrap();
+    let first = engine.snapshot();
     // Nothing was frozen, flushed or copied.
     let stats = engine.stats();
     assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
@@ -95,7 +95,7 @@ fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
     engine.put(b"b", b"2").unwrap();
     engine.delete(b"c").unwrap();
     engine.put(b"ab", b"1").unwrap();
-    let second = engine.snapshot().unwrap();
+    let second = engine.snapshot();
     let later = pairs(&[
         (b"a", b"3"),
         (b"ab", b"1"),
@@ -127,7 +127,7 @@ fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
     );
     assert_eq!(scanned(&second, b"\xff"), pairs(&[(b"\xff\x00", b"1")]));
 
-    let now = engine.snapshot().unwrap();
+    let now = engine.snapshot();
     assert_eq!(
         scanned(&now, b""),
         pairs(&[
@@ -152,7 +152,7 @@ fn a_long_scan_lets_writes_flushes_and_compactions_publish() {
     }
     engine.put(&key(0), b"2").unwrap();
 
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let mut workspace = EngineWorkspace::new();
     let mut scan = snapshot.scan(&mut workspace);
     assert_eq!(scan.next_record().unwrap().unwrap().value, b"2");
@@ -190,9 +190,9 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     engine.put(b"a", b"1").unwrap();
     engine.flush().unwrap();
     engine.put(b"a", b"2").unwrap();
-    let first = engine.snapshot().unwrap();
+    let first = engine.snapshot();
     // Nothing written since: the second shares the first's view.
-    let second = engine.snapshot().unwrap();
+    let second = engine.snapshot();
     let stats = engine.stats();
     assert_eq!((stats.snapshots, stats.frozen_tables), (2, 0));
     assert_eq!((stats.retained_sources, stats.retained_bytes), (0, 0));
@@ -238,7 +238,7 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     })
     .unwrap();
     engine.put(b"seen", b"1").unwrap();
-    let small = engine.snapshot().unwrap();
+    let small = engine.snapshot();
     let seen = engine.stats().active.charged;
     // Nearly full: a write that found no room would flush.
     let mut key = 0u32;
@@ -255,91 +255,18 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     assert_eq!(retained, seen + pinned);
     assert!(retained * 20 < full, "{retained} of {full}");
 
-    // A snapshot holding the frozen table itself keeps all of it. A refused
-    // flush leaves the table frozen.
+    // Holding a frozen table retains all of it through publication.
     engine.put(b"seen", b"2").unwrap();
-    engine.set_run_limits(1, 1).unwrap();
-    engine.flush().unwrap_err();
-    let whole = engine.snapshot().unwrap();
+    let job = engine.core.begin_flush().unwrap();
+    let whole = engine.snapshot();
     let frozen = engine.stats().frozen.unwrap().charged;
-    engine.set_run_limits(usize::MAX, usize::MAX).unwrap();
-    engine.flush().unwrap();
+    job.build().publish();
     assert_eq!(engine.stats().retained_bytes, retained + frozen);
 
     assert_eq!(value(&small, b"seen").unwrap(), b"1");
     assert_eq!(value(&whole, b"seen").unwrap(), b"2");
     drop((small, whole));
     assert_eq!(engine.stats().retained_bytes, 0);
-}
-
-#[test]
-fn each_limit_refuses_with_its_own_error_and_changes_nothing() {
-    let engine = Engine::new(EngineOptions {
-        snapshots: SnapshotLimits {
-            max_live: 2,
-            max_retained_bytes: 0,
-        },
-        ..manual()
-    })
-    .unwrap();
-    for (key, value) in [(b"a", b"1"), (b"z", b"1"), (b"a", b"2"), (b"z", b"2")] {
-        engine.put(key, value).unwrap();
-        engine.flush().unwrap();
-    }
-    engine.put(b"m", b"1").unwrap();
-    let first = engine.snapshot().unwrap();
-    let second = engine.snapshot().unwrap();
-
-    let before = engine.stats();
-    let refused = engine.snapshot().unwrap_err();
-    assert_eq!(refused, SnapshotError::Readers { live: 2, max: 2 });
-    assert_eq!(engine.stats(), before);
-    drop(second);
-
-    // The write pins the snapshot's leaf, which is over the limit of zero.
-    engine.put(b"m", b"2").unwrap();
-    let before = engine.stats();
-    let retained = before.retained_bytes;
-    assert!(retained > 0);
-    let refused = engine.snapshot().unwrap_err();
-    assert_eq!(
-        refused,
-        SnapshotError::Retained {
-            bytes: retained,
-            max: 0
-        }
-    );
-    assert!(refused.to_string().contains("retain"));
-    // Compaction waits too, since snapshots could hold its inputs; only
-    // moves, which retire nothing, go on.
-    let refused = loop {
-        match engine.compact(merge_all(), &mut MergeWorkspace::new()) {
-            Ok(Some(report)) => assert_eq!(report.kind, CompactionKind::Move),
-            other => break other.unwrap_err(),
-        }
-    };
-    assert_eq!(
-        refused,
-        CompactionError::Retained {
-            bytes: retained,
-            max: 0
-        }
-    );
-    let after = engine.stats();
-    let published = |stats: &tessera::engine::EngineStats| {
-        let runs = (stats.runs, stats.run_bytes, stats.held_bytes);
-        (runs, stats.retained_bytes, stats.last_seq)
-    };
-    assert_eq!(published(&after), published(&before));
-
-    drop(first);
-    assert_eq!(engine.stats().retained_bytes, 0);
-    assert!(compact_all(&engine) > 0);
-    let now = engine.snapshot().unwrap();
-    assert_eq!(
-        scanned(&now, b""),
-        pairs(&[(b"a", b"2"), (b"m", b"2"), (b"z", b"2")])
-    );
 }
 
 /// Snapshots after every write cost no generation: nothing is frozen or
@@ -352,7 +279,7 @@ fn frequent_snapshots_freeze_and_flush_nothing() {
         engine.put(&key(i), b"0").unwrap();
     }
     for i in 0..2_000 {
-        let snapshot = engine.snapshot().unwrap();
+        let snapshot = engine.snapshot();
         engine.put(&key(i * 7 % 2_000), b"1").unwrap();
         assert!(engine.stats().active.pinned > 0);
         assert_eq!(value(&snapshot, &key(i * 7 % 2_000)).unwrap(), b"0");
@@ -380,7 +307,7 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
         engine.put(&key(i), &[0; 100]).unwrap();
     }
     let live = engine.stats().active.charged;
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let (mut written, mut full) = (0, engine.stats());
     loop {
         engine.put(&key(written % 200), &[1; 100]).unwrap();
@@ -435,7 +362,7 @@ fn concurrent_snapshots_see_a_prefix_of_the_writes() {
         start.wait();
         let mut seen = 0;
         while seen < WRITES {
-            let snapshot = engine.snapshot().unwrap();
+            let snapshot = engine.snapshot();
             let records = scanned(&snapshot, b"");
             let len = records.len();
             assert_eq!(len as u64, snapshot.last_seq());
@@ -459,9 +386,9 @@ fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
     let key = |i: usize| format!("k{i:03}").into_bytes();
     let engine = Engine::new(EngineOptions {
         target_run_len: 1 << 10,
-        background_compaction: Some(CompactionOptions {
+        background_compaction: Some(CompactionPolicy {
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         }),
         ..manual()
     })
@@ -472,7 +399,7 @@ fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
         }
         engine.flush().unwrap();
     }
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     shareable(&snapshot);
     let expected: Pairs = (0..100).map(|i| (key(i), vec![2])).collect();
 
@@ -497,55 +424,6 @@ fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
     drop(engine);
     let reader = thread::spawn(move || scanned(&snapshot, b""));
     assert_eq!(reader.join().unwrap(), expected);
-}
-
-/// A compaction refused while snapshots retain too much is retried when a
-/// flush is next refused for want of it, so a writer that only flushes
-/// recovers once the snapshot is dropped.
-#[test]
-fn a_flush_refused_after_retention_blocked_compaction_recovers_on_its_own() {
-    let engine = Engine::new(EngineOptions {
-        max_runs: 2,
-        background_compaction: Some(merge_all()),
-        snapshots: SnapshotLimits {
-            max_live: 1,
-            max_retained_bytes: 0,
-        },
-        ..manual()
-    })
-    .unwrap();
-    engine.put(b"a", b"1").unwrap();
-    let snapshot = engine.snapshot().unwrap();
-    // Pins the snapshot's leaf, over the limit of zero.
-    engine.put(b"a", b"2").unwrap();
-    engine.flush().unwrap();
-    engine.put(b"a", b"3").unwrap();
-    engine.flush().unwrap();
-    assert!(matches!(
-        engine.wait_for_compaction(),
-        Err(BackgroundError::Failed(CompactionError::Retained { .. }))
-    ));
-    engine.put(b"a", b"4").unwrap();
-    assert!(engine.flush().is_err());
-    drop(snapshot);
-
-    // Only flushes from here: the refused one asks the worker for a pass.
-    let status = engine.background_status().unwrap();
-    assert!(engine.flush().is_err());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let now = engine.background_status().unwrap();
-        if now.passes > status.passes && !now.busy {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the worker was never asked");
-        thread::yield_now();
-    }
-    engine.flush().unwrap();
-    assert_eq!(
-        value(&engine.snapshot().unwrap(), b"a"),
-        Some(b"4".to_vec())
-    );
 }
 
 /// A point read takes the runs it reads without the lock, and lets go of

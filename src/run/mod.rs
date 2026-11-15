@@ -87,9 +87,9 @@ pub use builder::RunBuilder;
 pub use codec::Codec;
 #[cfg(test)]
 pub(crate) use compact::compact_parallel;
+pub(crate) use compact::compact_parallel_in;
 #[cfg(test)]
 pub(crate) use compact::compact_with;
-pub(crate) use compact::{CompactError, compact_parallel_in};
 pub use compact::{CompactLimits, CompactStats, Compacted, OutputCuts, workspace_estimate};
 pub(crate) use group::RunList;
 #[cfg(test)]

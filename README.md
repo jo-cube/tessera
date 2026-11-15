@@ -21,8 +21,8 @@ bundled Zstandard library.
   uncompressed blocks.
 - Explicit incremental checkpoints and recovery of the latest committed checkpoint,
   including format, checksum and corruption checks.
-- Configurable admission limits for memtables, runs, snapshots and compaction.
-  These account for estimated bytes; they do not cap process resident memory.
+- One optional memory budget for writer admission, with component accounting.
+  Reads, snapshots and maintenance continue under pressure.
 
 There is no write-ahead log, per-write durability, automatic checkpointing,
 transactions beyond atomic batches, replication or disk tier.
@@ -58,7 +58,7 @@ engine.multi_get(&[b"user/2", b"user/1"], &mut workspace, |index, value| {
 })?;
 
 // Snapshots hold no lock while readers scan them.
-let snapshot = engine.snapshot()?;
+let snapshot = engine.snapshot();
 let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
 assert_eq!(scan.next_record()?.unwrap().value, b"grace");
 assert_eq!(scan.next_record()?.unwrap().value, b"katherine");
@@ -83,14 +83,12 @@ batches built directly into runs take one publication sequence. In either case
 all operations become visible together. An empty batch returns the current ceiling.
 `put` and `delete` share the memtable update path. A dedicated flush thread
 builds runs while reads and writes continue; writers wait when the frozen-table
-limit or level-0 stop is reached. `max_frozen_memtables` defaults to 2, in
-addition to one active table, each with `memtable_budget` charged bytes.
-`flush()` waits until all earlier writes are in runs. Refused or failed builds
-leave frozen tables readable and surface through the existing flush errors.
+bound of two tables or the level-0 stop is reached. Each table has
+`memtable_budget` charged bytes. `flush()` always publishes and waits until all
+earlier writes are in runs; a worker panic leaves its tables readable.
 
 Strictly key-sorted, unique batches use the direct run path when their charged
-input reaches `bulk_ingest_min: Option<usize>` (`None` means half the memtable
-budget). `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
+input reaches half the memtable budget. `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
 duplicate keys. Tables sharing an actual batch key are flushed before atomic
 publication into level 0; range overlap alone causes no wait. Builds release the
 state lock, so concurrent writes proceed. Each ingestion builds once with stored
@@ -124,12 +122,13 @@ A finished run copies its partial final chunk into an exact allocation.
 Retired chunks return to a shared pool, whose free reserve is capped at the
 fixed 32 MiB, independent of job size.
 `EngineStats` reports free reserve, its cap and checked-out chunk capacity,
-including padding and snapshots. Stored run limits exclude chunk padding;
-index, footer and filter buffers remain exact allocations.
+including padding and snapshots. Index, footer and filter buffers remain exact
+allocations. `used` counts charged memtables, runs and held metadata, retired
+sources, reserve and unused checked-out capacity, plus in-flight build estimates.
 Compaction builds disjoint key ranges of one selected job in parallel, using up
 to `background_threads` builders (default half the available CPUs, capped at 4,
-at least 1). Segment buffers shrink to share the existing workspace limit;
-small jobs and tight limits use fewer builders. Flush builds remain serial.
+at least 1). Segment buffers share an internal workspace allowance;
+small jobs and tight memory budgets use fewer builders. Flush builds remain serial.
 Bottom-level compaction can erase settled sequence numbers to zero when no
 snapshot or overlapping unselected run needs them. Snapshot views keep their
 records and visibility, and checkpoint recovery preserves the write ceiling.
@@ -143,6 +142,23 @@ preserve levels, sequence overrides and the ceiling. Reports count written/reuse
 bytes and runs, and deleted run files; GC retains the latest two generations.
 `checkpoint_with_metadata(dir, options, blob)` and `recover_with_metadata` round-trip
 opaque application data (up to 16 MiB) with the same commit.
+
+## Options and errors
+
+`EngineOptions` contains `memory_limit` (default `None`, unlimited),
+`memtable_budget`, `level_ratio`, `background_threads`, `compression` and
+`target_block_compressed`. Background compaction is always enabled; run sizing,
+flush backlog and compaction scheduling use internal defaults.
+
+At 90% of the memory budget a writer waits briefly for publication. At 100% it
+waits while maintenance can reclaim memory, then returns
+`UpdateError::MemoryLimit { used, limit }` if live data or held snapshots prevent
+progress. The other write errors are `Rejected(WriteError)` for invalid input
+and `SequencesExhausted`. `snapshot()` is infallible. Flushes and compactions
+have no size or retention refusal; maintenance still reports corruption and
+worker panics. `EngineStats` exposes `used` and its accounting components.
+The budget covers engine estimates, with transient maintenance headroom;
+caller workspaces and allocator overhead are outside it.
 
 ## Tuning
 

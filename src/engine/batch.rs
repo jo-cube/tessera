@@ -117,7 +117,10 @@ impl Core {
             let (key, value) = batch.records().next().unwrap();
             return self.update(key, value);
         }
-        let mut state = self.write_state();
+        if batch.is_empty() {
+            return Ok(self.read_state().last_seq);
+        }
+        let mut state = self.admit(self.write_state())?;
         loop {
             let end = state
                 .last_seq
@@ -137,7 +140,7 @@ impl Core {
                 }
                 return Ok(end);
             }
-            state = self.make_room(state)?;
+            state = self.admit(self.make_room(state))?;
         }
     }
 }

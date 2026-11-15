@@ -10,6 +10,7 @@ pub(crate) const RESERVE_BYTES: usize = 32 << 20;
 struct State {
     free: Vec<Box<[u8]>>,
     in_use: usize,
+    used: usize,
     limit: usize,
 }
 
@@ -36,24 +37,41 @@ impl ChunkPool {
         .unwrap_or_else(|| vec![0; CHUNK_BYTES].into_boxed_slice());
         Chunk {
             bytes,
+            used: 0,
             pool: Arc::downgrade(&self.0),
         }
     }
 
     /// (free reserve bytes, checked-out bytes, reserve cap bytes).
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
+        let (reserve, in_use, cap, _) = self.accounting();
+        (reserve, in_use, cap)
+    }
+    /// A coherent snapshot, including capacity beyond logically charged bytes.
+    pub(crate) fn accounting(&self) -> (usize, usize, usize, usize) {
         let state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
         (
             state.free.len() * CHUNK_BYTES,
             state.in_use * CHUNK_BYTES,
             state.limit * CHUNK_BYTES,
+            (state.in_use * CHUNK_BYTES).saturating_sub(state.used),
         )
+    }
+    pub(crate) fn trim(&self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .free
+            .clear();
     }
 }
 
 pub(crate) struct Chunk {
     bytes: Box<[u8]>,
     pool: Weak<Pool>,
+    used: usize,
 }
 
 impl Chunk {
@@ -61,6 +79,7 @@ impl Chunk {
         Self {
             bytes: bytes.into(),
             pool: Weak::new(),
+            used: 0,
         }
     }
 
@@ -71,7 +90,16 @@ impl Chunk {
         Self {
             bytes,
             pool: Weak::new(),
+            used: 0,
         }
+    }
+
+    pub(crate) fn set_used(&mut self, used: usize) {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut state = pool.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.used = state.used - self.used + used;
+        }
+        self.used = used;
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -87,6 +115,7 @@ impl Clone for Chunk {
         if let Some(pool) = self.pool.upgrade() {
             let mut copy = ChunkPool(pool).take();
             copy.bytes.copy_from_slice(&self.bytes);
+            copy.set_used(self.used);
             copy
         } else {
             Self::exact(&self.bytes)
@@ -99,6 +128,7 @@ impl Drop for Chunk {
         if let Some(pool) = self.pool.upgrade() {
             let mut state = pool.0.lock().unwrap_or_else(|error| error.into_inner());
             state.in_use -= 1;
+            state.used -= self.used;
             if state.free.len() < state.limit {
                 state.free.push(std::mem::take(&mut self.bytes));
             }

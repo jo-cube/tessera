@@ -1,4 +1,6 @@
 [package]
+# Engine suites are included as unit modules so scheduling hooks stay private.
+autotests = false
 name = "tessera"
 version = "0.1.0-alpha.1"
 edition = "2024"
@@ -21,3 +23,14 @@ zstd-safe = { version = "8", default-features = false, features = ["std", "vendo
 # writes again, 30–65% larger (the unit-test binary 33 MiB against 20 MiB).
 [profile.dev]
 debug = "line-tables-only"
+[[test]]
+name = "process"
+path = "tests/process.rs"
+
+[[test]]
+name = "lookup_allocations"
+path = "tests/lookup_allocations.rs"
+
+[[test]]
+name = "retention"
+path = "tests/retention.rs"

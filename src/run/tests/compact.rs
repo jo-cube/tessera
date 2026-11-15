@@ -3,9 +3,9 @@
 
 use crate::block::Value;
 use crate::run::{
-    CONTEXT_ALLOWANCE, Codec, CompactError, CompactLimits, Compacted, ConflictingCopies,
-    MergeWorkspace, OutputCuts, RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, ReadError, ReadWorkspace,
-    Run, RunBuilder, TARGET_BLOCK_LEN, compact, compact_with,
+    CONTEXT_ALLOWANCE, Codec, CompactLimits, Compacted, ConflictingCopies, MergeWorkspace,
+    OutputCuts, RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, ReadError, ReadWorkspace, Run, RunBuilder,
+    TARGET_BLOCK_LEN, compact, compact_with,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -39,7 +39,6 @@ fn physical(key: &str, seq: u64, value: Option<&str>) -> Physical {
 
 const UNLIMITED: CompactLimits = CompactLimits {
     target_run_len: usize::MAX,
-    max_output_bytes: usize::MAX,
     max_workspace_bytes: usize::MAX,
     codec: Codec::Zstd,
     target_block_compressed: crate::run::TARGET_BLOCK_LEN,
@@ -50,7 +49,7 @@ fn merge(
     inputs: &[&Run<Vec<u8>>],
     keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
-) -> Result<Compacted, CompactError> {
+) -> Result<Compacted, ReadError> {
     let views: Vec<_> = inputs.iter().map(|run| run.view()).collect();
     compact(&views, keep_tombstone, limits, &mut MergeWorkspace::new())
 }
@@ -98,11 +97,11 @@ fn differing_copies_fail_the_merge_even_when_obsolete() {
     let error = merge(&[&left, &right], |_| true, UNLIMITED).unwrap_err();
     assert_eq!(
         error,
-        CompactError::Read(ReadError::ConflictingCopies(ConflictingCopies {
+        ReadError::ConflictingCopies(ConflictingCopies {
             key: b"k".to_vec(),
             seq: 4,
             inputs: (0, 1),
-        }))
+        })
     );
 }
 
@@ -143,54 +142,24 @@ fn output_is_split_into_ascending_disjoint_runs() {
     assert_eq!(merged(&out).len(), 400);
 }
 
-/// Each limit fails with a precise error and nothing is returned. The
-/// workspace limit fails before any block is decoded.
+/// Workspace allowances reduce filter construction without refusing a merge.
 #[test]
-fn limits_fail_the_merge_with_the_amount_needed() {
+fn workspace_allowance_controls_filters_without_refusing_the_merge() {
     let older = run(&[("a", 1, Some("one")), ("b", 2, Some("two"))]);
     let newer = run(&[("a", 3, Some("three"))]);
     let full = merge(&[&older, &newer], |_| true, UNLIMITED).unwrap();
 
-    // Output counts the stored bytes and the filters together.
-    let output = full.output_bytes + full.held_bytes;
-    assert!(full.held_bytes > 0);
-    let error = merge(
+    // A tight allowance still admits the serial job rather than refusing it.
+    let tight = merge(
         &[&older, &newer],
         |_| true,
         CompactLimits {
-            max_output_bytes: output - 1,
+            max_workspace_bytes: 0,
             ..UNLIMITED
         },
     )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        CompactError::OutputLimit {
-            output_bytes: output,
-            max_output_bytes: output - 1
-        }
-    );
-    let at_limit = CompactLimits {
-        max_output_bytes: output,
-        ..UNLIMITED
-    };
-    merge(&[&older, &newer], |_| true, at_limit).unwrap();
-
-    let views = [older.view(), newer.view()];
-    let mut workspace = MergeWorkspace::new();
-    let limits = CompactLimits {
-        max_workspace_bytes: full.workspace_bytes - 1,
-        ..UNLIMITED
-    };
-    let error = compact(&views, |_| true, limits, &mut workspace).unwrap_err();
-    assert_eq!(
-        error,
-        CompactError::WorkspaceLimit {
-            workspace_bytes: full.workspace_bytes,
-            max_workspace_bytes: full.workspace_bytes - 1,
-        }
-    );
-    assert_eq!(workspace.blocks_loaded(), 0);
+    .unwrap();
+    assert_eq!(merged(&tight), merged(&full));
 
     // What the estimate leaves of the workspace limit holds the key hashes:
     // none left means output without a filter, which reads the same.
@@ -523,24 +492,6 @@ fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
     )
     .unwrap();
     assert_eq!(out.workspace_bytes, needed);
-    let limits = CompactLimits {
-        max_output_bytes: 1 << 20,
-        max_workspace_bytes: 64 << 20,
-        codec: Codec::None,
-        ..UNLIMITED
-    };
-    assert!(matches!(
-        super::super::compact_parallel(
-            &views,
-            |_| true,
-            limits,
-            &OutputCuts::default(),
-            4,
-            limits.target_run_len,
-            &mut MergeWorkspace::new()
-        ),
-        Err(CompactError::OutputLimit { .. })
-    ));
     let single = OutputCuts {
         single: true,
         ..OutputCuts::default()

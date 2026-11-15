@@ -18,13 +18,8 @@ use tessera::engine::{
     CheckpointError, CheckpointOptions, Engine, EngineOptions, EngineWorkspace, OpenError,
 };
 
-/// The defaults without the background worker: these tests flush and
-/// compact by hand and count what each step leaves.
-fn manual() -> EngineOptions {
-    EngineOptions {
-        background_compaction: None,
-        ..EngineOptions::default()
-    }
+fn options() -> EngineOptions {
+    EngineOptions::default()
 }
 
 /// Held by each parent test, so that one test never forks while the other
@@ -69,11 +64,7 @@ fn contents(engine: &Engine) -> Model {
 
 /// A RAM-only engine with flushed runs, deletes and a memtable.
 fn varied_engine() -> (Engine, Model) {
-    let engine = Engine::new(EngineOptions {
-        target_run_len: 4096,
-        ..manual()
-    })
-    .unwrap();
+    let engine = Engine::new(EngineOptions { ..options() }).unwrap();
     let mut model = Model::new();
     for i in 0..2_000u32 {
         let (key, value) = (i.to_be_bytes().to_vec(), format!("v{i}").into_bytes());
@@ -135,7 +126,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
         Err(CheckpointError::Locked(_))
     ));
     assert!(matches!(
-        Engine::recover(&scratch.0, manual()),
+        Engine::recover(&scratch.0, options()),
         Err(OpenError::Locked(_))
     ));
 
@@ -147,7 +138,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
     assert_eq!(report.generation, 2);
-    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
+    let recovered = Engine::recover(&scratch.0, options()).unwrap();
     assert_eq!(contents(&recovered), model);
 }
 
@@ -163,7 +154,7 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
     }
     let _serial = one_at_a_time();
     let scratch = Scratch::new("exec");
-    let engine = Engine::new(manual()).unwrap();
+    let engine = Engine::new(options()).unwrap();
     engine.put(b"k", b"v").unwrap();
     engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
@@ -184,7 +175,7 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
         .spawn()
         .unwrap();
     drop(lock);
-    let reopened = Engine::recover(&scratch.0, manual());
+    let reopened = Engine::recover(&scratch.0, options());
     child.kill().unwrap();
     child.wait().unwrap();
     let engine = reopened.unwrap();

@@ -50,6 +50,8 @@ pub struct Run<B> {
     /// an empty run, found once so that a lookup can rule the run out
     /// without opening it.
     bounds: Option<KeyBounds>,
+    reclaimable: bool,
+    build_estimate: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +98,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         expect(dead_code, reason = "tested component API the engine does not use")
     )]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        let max_seq = validate(data.as_ref())?;
+        let (max_seq, reclaimable, build_estimate) = validate(data.as_ref())?;
         let data = RunData::Contiguous(data);
         let bounds = KeyBounds::of(&data);
         Ok(Self {
@@ -105,10 +107,18 @@ impl<B: AsRef<[u8]>> Run<B> {
             max_seq,
             seq_override: None,
             bounds,
+            reclaimable,
+            build_estimate,
         })
     }
 
-    pub(super) fn from_builder(data: RunData<B>, filter: Option<KeyFilter>, max_seq: u64) -> Self {
+    pub(super) fn from_builder(
+        data: RunData<B>,
+        filter: Option<KeyFilter>,
+        max_seq: u64,
+        reclaimable: bool,
+        build_estimate: usize,
+    ) -> Self {
         let bounds = KeyBounds::of(&data);
         Self {
             data,
@@ -116,7 +126,17 @@ impl<B: AsRef<[u8]>> Run<B> {
             max_seq,
             seq_override: None,
             bounds,
+            reclaimable,
+            build_estimate,
         }
+    }
+
+    pub(crate) fn build_estimate(&self) -> usize {
+        self.build_estimate
+    }
+
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.reclaimable
     }
 
     /// Returns the largest sequence number of any record in the run, or 0
@@ -182,6 +202,8 @@ impl<B: AsRef<[u8]>> Run<B> {
             max_seq: self.max_seq,
             seq_override: self.seq_override,
             bounds: self.bounds.clone(),
+            reclaimable: self.reclaimable,
+            build_estimate: self.build_estimate,
         }
     }
 
@@ -322,7 +344,7 @@ impl Run<Vec<u8>> {
 
     #[cfg(test)]
     pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
-        let max_seq = validate(&data)?;
+        let (max_seq, reclaimable, build_estimate) = validate(&data)?;
         let mut hashes = KeyHashes::new();
         {
             let mut workspace = ReadWorkspace::new();
@@ -332,7 +354,14 @@ impl Run<Vec<u8>> {
                 hashes.add(record.key);
             }
         }
-        Self::pack_recovered(data, pool, hashes.finish(), max_seq)
+        Self::pack_recovered(
+            data,
+            pool,
+            hashes.finish(),
+            max_seq,
+            reclaimable,
+            build_estimate,
+        )
     }
 
     pub(crate) fn recover_checkpoint_in(
@@ -340,7 +369,7 @@ impl Run<Vec<u8>> {
         filter: &[u8],
         pool: &ChunkPool,
     ) -> Result<(Self, u64), CorruptRun> {
-        let max_seq = validate(&data)?;
+        let (max_seq, reclaimable, build_estimate) = validate(&data)?;
         let filter = if filter.is_empty() {
             None
         } else {
@@ -349,7 +378,7 @@ impl Run<Vec<u8>> {
                     .ok_or(corrupt(data.len(), RunCorruption::InvalidFilter))?,
             )
         };
-        Self::pack_recovered(data, pool, filter, max_seq)
+        Self::pack_recovered(data, pool, filter, max_seq, reclaimable, build_estimate)
     }
 
     fn pack_recovered(
@@ -357,6 +386,8 @@ impl Run<Vec<u8>> {
         pool: &ChunkPool,
         filter: Option<KeyFilter>,
         max_seq: u64,
+        reclaimable: bool,
+        build_estimate: usize,
     ) -> Result<(Self, u64), CorruptRun> {
         let view = RunView::open(&data)?;
         let mut packing = Packing::new(pool);
@@ -373,7 +404,13 @@ impl Run<Vec<u8>> {
         }
         let tail_start = view.frames.len() + view.dictionaries.len();
         let parts = packing.finish(data[tail_start..].into());
-        let run = Self::from_builder(RunData::Segmented(parts), filter, max_seq);
+        let run = Self::from_builder(
+            RunData::Segmented(parts),
+            filter,
+            max_seq,
+            reclaimable,
+            build_estimate,
+        );
         Ok((run, max_seq))
     }
 }
@@ -1295,7 +1332,7 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// index checks.
 ///
 /// Checks all raw dictionaries before decoding any frame. No prepared state.
-fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
+fn validate(bytes: &[u8]) -> Result<(u64, bool, usize), CorruptRun> {
     let view = RunView::open(bytes)?;
     let mut next = view.frames.len();
     for (i, entry) in view.segments.iter().enumerate() {
@@ -1343,7 +1380,7 @@ fn validate(bytes: &[u8]) -> Result<u64, CorruptRun> {
             RunCorruption::RecordCountMismatch,
         ));
     }
-    Ok(walk.max_seq)
+    Ok((walk.max_seq, walk.reclaimable, walk.build_estimate))
 }
 
 #[cfg(test)]

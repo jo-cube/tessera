@@ -63,6 +63,13 @@ impl Core {
         ceiling
             .checked_add(1)
             .ok_or(UpdateError::SequencesExhausted)?;
+        let state = self.admit(self.write_state())?;
+        let input = batch.validate(self.memtable_budget)?;
+        let mut charge = self.resources.build(
+            input.saturating_mul(3),
+            crate::run::workspace_estimate([]).saturating_add(if sorted { 0 } else { input }),
+        );
+        drop(state);
         let mut keys: Vec<_> = batch.records().map(|(key, _)| key).collect();
         let runs = if sorted {
             self.build_ingestion(batch.records())
@@ -103,6 +110,7 @@ impl Core {
                     + RECORD_INPUT_OVERHEAD
             })
             .sum();
+        charge.finished(bytes + held);
         let mut runs: Vec<_> = published(runs).collect();
         let (lo, hi) = (keys[0], keys[keys.len() - 1]);
         let mut state = self.write_state();
@@ -146,9 +154,6 @@ impl Core {
                         .first()
                         .is_some_and(|table| table.last_seq().is_some_and(|seq| seq <= target))
                 }) {
-                    if let Some(error) = self.flush_error(&state) {
-                        return Err(UpdateError::FlushRefused(error));
-                    }
                     self.flush_signal.request();
                     state = self.wait_for_flush(state);
                 }
@@ -156,7 +161,7 @@ impl Core {
                 continue;
             }
             if overlaps(state.active.iter_from(lo), &keys) {
-                state = self.make_room(state)?;
+                state = self.make_room(state);
                 continue;
             }
             break;
@@ -165,19 +170,6 @@ impl Core {
             .last_seq
             .checked_add(1)
             .ok_or(UpdateError::SequencesExhausted)?;
-        let total_runs = state.runs.len() + runs.len();
-        let total_bytes = state.run_bytes + state.held_bytes + bytes + held;
-        let flushes = state.levels.level0_flushes() + 1;
-        if total_runs > state.max_runs
-            || total_bytes > state.max_run_bytes
-            || flushes > state.level0_stop
-        {
-            return Err(UpdateError::FlushRefused(state.run_limit(
-                total_runs,
-                total_bytes,
-                flushes,
-            )));
-        }
         for run in &mut runs {
             Arc::get_mut(run)
                 .expect("unpublished run is private")
@@ -190,7 +182,9 @@ impl Core {
         state.held_bytes += held;
         state.order_runs();
         state.last_seq = seq;
+        drop(charge);
         drop(state);
+        self.resources.changed();
         self.notify_worker();
         Ok(seq)
     }
@@ -202,12 +196,12 @@ mod tests {
     use std::sync::Barrier;
 
     fn settle(engine: &Engine) {
-        let options = CompactionOptions {
+        let options = CompactionPolicy {
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         };
         let mut merge = MergeWorkspace::new();
-        while engine.compact(options, &mut merge).unwrap().is_some() {}
+        while engine.core.compact(options, &mut merge).unwrap().is_some() {}
     }
 
     fn check_snapshot(snapshot: &Snapshot, expected: [Option<&[u8]>; 3]) {
@@ -276,7 +270,7 @@ mod tests {
                             .is_none()
                     );
                 }
-                let snapshot = engine.snapshot().unwrap();
+                let snapshot = engine.snapshot();
                 check_snapshot(&snapshot, [Some(b"new"), None, None]);
                 resume.wait();
                 ingest.join().unwrap();
@@ -293,11 +287,11 @@ mod tests {
                     assert_eq!(value, Some(&b"ingest"[..]));
                 })
                 .unwrap();
-            check_snapshot(&engine.snapshot().unwrap(), [Some(b"ingest"); 3]);
+            check_snapshot(&engine.snapshot(), [Some(b"ingest"); 3]);
             check_snapshot(&snapshot, [Some(b"new"), None, None]);
             drop(snapshot);
             settle(&engine);
-            check_snapshot(&engine.snapshot().unwrap(), [Some(b"ingest"); 3]);
+            check_snapshot(&engine.snapshot(), [Some(b"ingest"); 3]);
             assert_eq!(engine.stats().last_seq, 5);
         }
     }
@@ -327,15 +321,9 @@ mod tests {
         assert_eq!(engine.ingest_sorted(&batch), Ok(2));
         let recovered = Engine::recover(&dir, EngineOptions::default()).unwrap();
         assert_eq!(recovered.stats().last_seq, 1);
-        check_snapshot(
-            &recovered.snapshot().unwrap(),
-            [Some(b"before"), None, None],
-        );
+        check_snapshot(&recovered.snapshot(), [Some(b"before"), None, None]);
         assert_eq!(recovered.put(b"c", b"after recovery"), Ok(2));
-        check_snapshot(
-            &engine.snapshot().unwrap(),
-            [Some(b"ingest"), Some(b"ingest"), None],
-        );
+        check_snapshot(&engine.snapshot(), [Some(b"ingest"), Some(b"ingest"), None]);
         recovered.close().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -356,12 +344,9 @@ mod tests {
             .is_err()
         );
         assert_eq!(engine.stats().last_seq, 1);
-        check_snapshot(&engine.snapshot().unwrap(), [Some(b"before"), None, None]);
+        check_snapshot(&engine.snapshot(), [Some(b"before"), None, None]);
         assert_eq!(engine.ingest_sorted(&batch), Ok(2));
-        check_snapshot(
-            &engine.snapshot().unwrap(),
-            [Some(b"ingest"), Some(b"ingest"), None],
-        );
+        check_snapshot(&engine.snapshot(), [Some(b"ingest"), Some(b"ingest"), None]);
     }
 
     fn check_engine(engine: &Engine, expected: [Option<&[u8]>; 3]) {
@@ -390,7 +375,7 @@ mod tests {
             }
             assert!(scan.next_record().unwrap().is_none());
         }
-        check_snapshot(&engine.snapshot().unwrap(), expected);
+        check_snapshot(&engine.snapshot(), expected);
     }
 
     #[test]
@@ -485,7 +470,7 @@ mod tests {
             for key in [b"a", b"b", b"c"] {
                 assert_eq!(engine.get(key, &mut ws).unwrap().unwrap().seq, seq);
             }
-            let at_publication = engine.snapshot().unwrap();
+            let at_publication = engine.snapshot();
             assert_eq!(engine.put(b"a", b"after"), Ok(seq + 1));
             assert_eq!(engine.delete(b"b"), Ok(seq + 2));
             check_engine(&engine, [Some(b"after"), None, Some(b"ingest")]);
@@ -527,7 +512,7 @@ mod tests {
                         .count(),
                     3
                 );
-                let pin = pinned.then(|| engine.snapshot().unwrap());
+                let pin = pinned.then(|| engine.snapshot());
                 // Export overrides before a compaction has materialized them,
                 // then repeat after either preserving sequences or zeroing them.
                 let dir = std::env::temp_dir().join(format!(

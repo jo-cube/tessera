@@ -1,198 +1,88 @@
-//! A RAM-only key-value engine over memtables and runs, with explicit
-//! checkpoints and recovery.
-//!
-//! An [`Engine`] owns one active memtable, frozen memtables awaiting flush,
-//! the published immutable runs, and the sequence counter:
+//! A RAM-first key-value engine with explicit checkpoints and recovery.
 //!
 //! ```
 //! use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
-//!
 //! let engine = Engine::new(EngineOptions::default())?;
-//! let mut workspace = EngineWorkspace::new();
 //! engine.put(b"apple", b"red")?;
-//! engine.flush()?;
-//! engine.put(b"apricot", b"orange")?;
-//!
-//! assert_eq!(engine.get(b"apple", &mut workspace)?.unwrap().value, b"red");
-//!
-//! // A snapshot holds no lock, so scanning it delays no writer.
-//! let snapshot = engine.snapshot()?;
-//! let mut scan = snapshot.scan_prefix(b"ap", &mut workspace);
-//! assert_eq!(scan.next_record()?.unwrap().key, b"apple");
-//! assert_eq!(scan.next_record()?.unwrap().key, b"apricot");
-//! assert_eq!(scan.next_record()?, None);
-//! drop(scan);
-//!
-//! // Stops the background worker; a RAM-only engine's data goes with it.
+//! let snapshot = engine.snapshot();
+//! engine.put(b"apple", b"green")?;
+//! let mut workspace = EngineWorkspace::new();
+//! assert_eq!(snapshot.get(b"apple", &mut workspace)?.unwrap().value, b"red");
 //! engine.close()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # Consistency
 //!
-//! All state sits behind one reader-writer lock. A write holds it exclusively
-//! while taking its sequence number and installing the update. Sequence order
-//! is visibility order, and each successful write is visible before it returns.
-//! A read holds the lock shared, so reads and writes of a key are linearizable.
-//!
-//! There are two ways to make several reads agree:
-//!
-//! - A [`ReadGuard`] holds the lock for as long as it lives, so everything
-//!   read through it sees one state. **Writers and publication wait while a
-//!   guard is held**, so use one only for a few reads. A waiting writer holds
-//!   back new readers, so readers cannot starve it, and each write waits for
-//!   at most the guards already held.
-//! - A [`Snapshot`] holds no lock. See [Snapshots](self#snapshots).
-//!
-//! [`Engine::get`] holds the lock only to search the memtables and take
-//! shared references to the published runs, which it then reads without the
-//! lock, so decoding a block delays no writer. It sees every write that
-//! returned before it began. A snapshot's reads see the state when it
-//! was taken, which grows older as writes continue.
-//!
-//! Do not call a method of the [`Engine`] on a thread that holds a guard: a
-//! write would deadlock, and so can a read once a writer is waiting. Use the
-//! guard's own reads instead.
-//!
-//! Writer priority rests on one rule: a writer holds an internal gate while it
-//! waits for the lock, and every reader takes that gate before the lock. Tests
-//! check that a waiting writer holds the gate. They cannot check how the
-//! operating system wakes the threads that queue behind it.
-//!
-//! # Panics
-//!
-//! A panic while the state lock is held for writing poisons it, and every later
-//! operation then panics too. No write section is expected to panic short of a
-//! bug, and the engine does not try to recover from one. A panic anywhere else,
-//! including in a caller holding a [`ReadGuard`] or while a flush or
-//! compaction builds without the lock, leaves the engine usable, and so does
-//! a panic in the background worker, which stops it and is kept for
-//! [`Engine::wait_for_compaction`] and [`Engine::close`]. No constructor
-//! panics: a worker thread that cannot be created is [`OpenError::Worker`].
+//! Writes and publication use one exclusive state lock; sequence order is
+//! visibility order. A read takes immutable run references under the shared
+//! lock and decodes after releasing it. A [`ReadGuard`] holds the shared lock
+//! for several consistent reads. Drop it before calling an engine method:
+//! writers and publication must acquire that lock. Writers have priority over
+//! new readers. Caller-owned read workspaces are outside engine accounting.
 //!
 //! # Snapshots
 //!
-//! [`Engine::snapshot`] takes, under the exclusive lock, a snapshot of the
-//! active memtable, a shared reference to each frozen table, and one shared
-//! reference to the list of published runs, so its cost does not grow with
-//! the number of runs. The memtable is a
-//! copy-on-write tree, so its snapshot shares every node, and later writes
-//! copy only the nodes they change that a snapshot still shares. Nothing is
-//! frozen or flushed for a snapshot. Taking one copies the memtable arena
-//! chunk handles; its first later append may copy a shared partial chunk.
-//!
-//! Every source a snapshot holds is immutable, so it reads without the lock,
-//! in the same newest-first order as the engine, and sees exactly the writes
-//! up to its [`last_seq`](Snapshot::last_seq), tombstones included, while
-//! writes, flushes and compactions continue. The acquisition point is the
-//! moment it holds the lock, between two writes.
-//!
-//! A snapshot keeps the sources it saw rather than asking the engine for
-//! versions later, so flushes and compactions keep only the latest version of
-//! each key: no reader of an older state ever reads their output. A flush or
-//! compaction that removes a source from the engine leaves it to the
-//! snapshots holding it, and it is freed with the last of them. A snapshot
-//! taken with nothing written since the previous one shares that one's view.
-//!
-//! [`SnapshotLimits`] bound the live snapshots and the bytes kept only for
-//! them; see [Memory](self#memory). A refused snapshot changes nothing.
+//! [`Engine::snapshot`] is infallible and holds no lock after acquisition.
+//! It shares the copy-on-write memtable and immutable run directory. Later
+//! writes copy only shared nodes and partial arena chunks. Snapshots retain
+//! their sources through flushes, compactions, and engine closure; maintenance
+//! keeps only the newest version because older readers own their own sources.
 //!
 //! # Flushing
 //!
-//! A dedicated thread builds and publishes flushes. Writers only freeze the
-//! active table and replace it under the lock, then signal that thread. Runs
-//! are built without the state lock and replace their frozen tables atomically.
-//! [`Engine::flush`] freezes everything written before the call and waits for
-//! its tables to appear in runs. Flushes run one at a time.
-//!
-//! A flush's runs end at the run length and also at the smallest keys of
-//! level 1's runs, taken in stage 1, so that each later level-0 job meets
-//! fewer of them: a run ends there only if it holds an eighth of a run
-//! length of input and the rest of the flush does too, and one run length
-//! is cut into at most eight runs. Level 0 may hold any overlap, so cuts
-//! that compaction has made stale by stage 3 cost nothing but fit; they
-//! change how records are grouped, never which are written.
-//!
-//! Frozen tables stay readable throughout, and no reader sees their runs
-//! until they replace them. Flushes run one at a time. A flush refused by the
-//! run limits, or interrupted by a panic while building, leaves its tables
-//! frozen, and the next flush merges them with the active table into one set
-//! of runs.
-//!
-//! # Automatic flushing
-//!
-//! A writer rotates a full active table without building runs. It waits on a
-//! condition variable when [`EngineOptions::max_frozen_memtables`] (default 2)
-//! is reached, or waits for compaction at the level-0 stop. Readers and writes
-//! that fit keep going during a flush build. A refused flush keeps its tables
-//! readable; the next writer needing room and [`Engine::flush`] report the
-//! existing [`UpdateError::FlushRefused`] / [`RunLimitError`]. Raising run limits
-//! or successful compaction enables a retry. A worker panic is carried in the
-//! refusal's [`RunLimitError::background`] and reported by [`Engine::close`].
+//! Writers rotate full memtables and a dedicated worker builds runs outside
+//! the state lock. At most two frozen tables await flush. [`Engine::flush`]
+//! waits for everything written before the call. Flushes always publish;
+//! readers see either the tables or their replacement runs atomically.
+//! Outputs end at the target run length and selected level-1 boundaries.
 //!
 //! # Compaction
 //!
-//! [Background compaction](self#background-compaction) is on by default;
-//! with [`EngineOptions::background_compaction`] set to `None`, compaction is
-//! explicit. [`Engine::compact`] takes one step in three stages, like a
-//! flush: inputs are selected under the lock, merged without any lock, and
-//! replaced by the output in one step under the exclusive lock. Readers see
-//! either all of the inputs or all of the output. Compactions run one at a
-//! time; flushes, reads and writes continue beside them.
+//! Background compaction is always enabled. Level 0 holds overlapping flushes;
+//! deeper levels have disjoint key ranges. Dynamic level targets use
+//! [`EngineOptions::level_ratio`]. Selection takes the most overfull level,
+//! then level 0 at four flushes, then small neighbours. Outputs are cut at the
+//! target run length and the overlap bound. Nonoverlapping runs move without
+//! rewriting. Optional level-0 inputs fit an internal transient allowance;
+//! the first source and its overlaps always proceed. Independent output ranges
+//! build in parallel and publish together. No snapshot or size limit refuses
+//! a compaction. Only the latest version survives; tombstones survive while
+//! an unselected run could hold an older value.
 //!
-//! Compaction is leveled. Every published run belongs to one level. Level 0
-//! holds the runs of recent flushes in publication order, and they may
-//! overlap; each deeper level is sorted by key and its runs are strictly
-//! disjoint. Levels are compaction's bookkeeping only: they are kept in
-//! memory and recorded in checkpoints, and never consulted by reads, which go by
-//! sequence number through the [run directory](self#reading-runs), so a run
-//! returns the same answers whatever its level. Recovery restores the levels
-//! and level-0 flush groups recorded by the checkpoint. Each level below 0 is sized
-//! using [`EngineOptions::level_ratio`] (10 by default), from the last level's
-//! size, and empty levels are
-//! added under level 0 as the data grows. One step is the first that applies:
+//! # Memory
 //!
-//! - **A level over its size**, the most over first: the run after the
-//!   level's last job, in key order, merged with the runs of the next level
-//!   it overlaps, found by binary search. Outputs are cut at the run length
-//!   and where they would overlap more than `level_ratio` runs of the level below.
-//! - **Level 0**, once it holds runs of
-//!   [`CompactionOptions::max_overlap`] flushes and no deeper level is over
-//!   its size: its oldest run, with the other level-0 runs that overlap the
-//!   job while it fits, merged with the level-1 runs they overlap. However
-//!   many flushes level 0 holds, a deeper level over its size goes first:
-//!   level 0 waiting lets each of its jobs take more flushes at once, while
-//!   a level 1 left over its size makes every one of them rewrite more.
-//! - A run that overlaps nothing in the next level **moves** there: nothing
-//!   is read or written.
-//! - A job that does not fit the [`CompactionOptions`] limits **splits** its
-//!   first run, rewriting it alone at the boundaries of the runs below it, if
-//!   that leaves at least two pieces whose own jobs fit; the next job from
-//!   that level takes the first piece. Otherwise the step is refused with
-//!   [`CompactionError::JobLimit`], before anything is read.
-//! - Two adjacent runs of one level, both under half a full run, are merged
-//!   into one, if the merged range overlaps at most `level_ratio` full runs' bytes
-//!   in the next level.
+//! [`EngineOptions::memory_limit`] defaults to unlimited. [`EngineStats::used`]
+//! sums charged memtables, stored runs and their held metadata, pool reserve
+//! and unused checked-out capacity, retired sources, and estimates of build
+//! output and workspace. Pinned history is charged once in memtables, then in
+//! retired sources after publication. Shared sources are counted once.
+//! Estimates and allocator overhead mean this is an admission budget, not an
+//! operating-system RSS cap. An admitted record or maintenance build can
+//! temporarily cross it; flushes and compactions must still finish.
 //!
-//! A selected job builds up to [`EngineOptions::background_threads`] disjoint
-//! key ranges in parallel, then publishes all output together. Job selection
-//! and publication remain serialized. Parallel builders divide the segment
-//! buffer allowance and share the configured workspace and output caps; small
-//! jobs, neighbour merges and tight workspace budgets use fewer builders.
+//! Below 90% writers proceed. Above that they wait briefly on publication;
+//! at 100% they flush and request reclamation while it can make progress.
+//! Reclamation drains overlapping versions and isolated tombstones even when
+//! ordinary level targets are satisfied. Live data and held snapshots that
+//! cannot shrink cause [`UpdateError::MemoryLimit`] without waiting for their
+//! owners. Writers also wait at the internal level-0 stop (12 flushes).
+//! Reads, snapshots, checkpoints and maintenance never wait on the budget.
 //!
-//! Each step either lowers a level's excess, moves data down, or lowers the
-//! run count, so repeated compaction without new flushes stops. A step reads
-//! level sizes and key ranges only, never the runs' contents, and no step
-//! compares every pair of runs.
+//! # Background compaction
 //!
-//! Only the newest version of each key is kept, which is correct because no
-//! reader can ask for an older one. A tombstone is dropped only if no run
-//! outside the inputs, in any level, overlaps its key and so could hold an
-//! older value under it. Runs published after selection come from flushes
-//! and are newer than every input, and the memtables are newer still, so
-//! neither can be harmed by the replacement. Publication checks that every
-//! input is still published where selection found it and that the output
-//! fits its level, and a compaction that fails at any stage changes nothing.
+//! Publication wakes the compaction worker. [`Engine::wait_for_compaction`]
+//! requests a complete pass; [`Engine::background_status`] reports progress,
+//! read failures and a worker panic. A failed pass sleeps until requested
+//! again. Closing joins both workers and reports a panic; it writes nothing.
+//! Snapshots remain usable after closure.
+//!
+//! # Panics
+//!
+//! A panic under the exclusive state lock poisons the engine. Build panics
+//! leave published sources readable. A stopped flush worker is replaced by
+//! synchronous flushing when needed; a stopped compaction worker can likewise
+//! be serviced synchronously. Corrupt runs are reported by reads and maintenance.
 //!
 //! # Reading runs
 //!
@@ -217,170 +107,6 @@
 //! through one decoded block and one decompression context, after a binary
 //! search for where to start. The memory a scan holds therefore grows with
 //! the overlap, not with the number of runs.
-//!
-//! # Background compaction
-//!
-//! With [`EngineOptions::background_compaction`] set, the engine owns one
-//! worker thread. Each flush publication and each change to the run limits
-//! asks it for a pass; requests made while it is busy are counted as one, so
-//! nothing queues. A pass runs [`Engine::compact`] with those options until
-//! nothing is eligible, so the selection, limits and publication checks are
-//! the synchronous ones, and it competes with manual compactions only for
-//! the same one-at-a-time slot. The worker sleeps on a condition variable
-//! between passes.
-//!
-//! A failed compaction ends its pass. It is recorded in
-//! [`Engine::background_status`] and not retried until the next request, so
-//! a lasting failure is reported once per flush, never in a loop. A flush
-//! refused by the run limits also requests a pass, so a writer that retries
-//! flushes recovers once compaction can run again, for example after the
-//! snapshots that blocked it are dropped.
-//! [`Engine::wait_for_compaction`] requests a pass, waits for it and returns
-//! its failure. A compaction refused this way is not terminal: the next
-//! request tries again. A panic in the worker stops it for good and is
-//! reported as [`BackgroundError::Panicked`] with its message; the engine
-//! stays usable without it.
-//!
-//! # Lifecycle
-//!
-//! An engine is open from the moment a constructor returns it until
-//! [`Engine::close`] or drop, which do the same: tell the worker to stop,
-//! wait for the compaction it is running, which is published at its usual
-//! step (within [`CompactionOptions::max_input_bytes`]), start no other, join
-//! the thread and free the engine. Both consume the
-//! engine, so no other call can be in progress or follow; `close` also
-//! returns a worker panic, where a drop discards it. Closing holds no lock
-//! while it waits, so the worker can always finish.
-//!
-//! The worker thread holds the engine's shared core, not the engine, so
-//! nothing keeps the engine alive, and nothing else holds the core.
-//! [`Snapshot`]s own what they read and stay readable after the engine is
-//! gone; a [`ReadGuard`] borrows the engine, so it ends first.
-//!
-//! Closing writes nothing: no flush or checkpoint. Data is lost unless
-//! checkpointed first.
-//!
-//! # Configuration
-//!
-//! [`Engine::new`] and [`Engine::recover`] check every option before they
-//! allocate or start the worker, returning [`OpenError::Config`] on invalid
-//! options. [`Engine::compact`] and [`Engine::set_run_limits`] check theirs
-//! the same way. Run limits refuse flushes ([`UpdateError::FlushRefused`]);
-//! snapshot limits refuse snapshots and compactions; compaction limits
-//! refuse a merge ([`CompactionError::JobLimit`] and its neighbours).
-//!
-//! Compression and block length choose how new runs are built, nothing
-//! else. Every run records its own codec, block lengths and dictionary, so
-//! runs and checkpoints written under other settings are read and recovered
-//! as they are, and are rebuilt with the current settings only when a
-//! compaction rewrites their records. Checkpoints preserve existing bytes.
-//!
-//! # Memory
-//!
-//! Each memtable has [`EngineOptions::memtable_budget`] charged bytes, including
-//! all appended arena bytes, overwritten garbage, node overhead and
-//! snapshot-pinned copies. The active table and up to
-//! [`EngineOptions::max_frozen_memtables`] frozen tables may coexist. An atomic
-//! batch exceeding one budget uses the ingestion path (unsorted input is
-//! staged in a private table sized for that batch).
-//! Long-lived snapshots make rotations come sooner.
-//!
-//! Published runs are limited by a byte total, [`EngineOptions::max_run_bytes`],
-//! their stored data plus filters and chunk metadata, and by a count,
-//! [`EngineOptions::max_runs`], a safety valve on their metadata. With a
-//! background worker, a flush is also refused while level 0 holds runs of
-//! 12 flushes (the level-0 stop), so that lookups stay bounded when the
-//! worker falls behind; without one, the application compacts when it
-//! chooses and only the run limits bound level 0. Once a flush
-//! would pass any of these it is rejected, and writes needing room fail with
-//! [`UpdateError::FlushRefused`]. Compaction lifts the level-0 stop by
-//! itself, and the byte limit when the runs hold overwritten or deleted
-//! versions it can drop; a database of live data at the byte limit needs
-//! [`Engine::set_run_limits`] (deletes are writes, and are refused too).
-//!
-//! A compaction adds, until it publishes, its output and workspace, each
-//! limited by [`CompactionOptions`]. Only one compaction builds at a time,
-//! whether in the background or not. Its inputs stay published until it
-//! publishes, and are freed as it releases the lock: a reader holding the lock
-//! delays publication rather than keeping old runs. An [`Engine::get`] in
-//! progress keeps the runs it is reading until it returns, a few blocks'
-//! decoding, and until then they count as retained. Run bytes can therefore
-//! briefly be the published total plus one output, beside two memtable
-//! budgets and one workspace. A compaction is refused only if it would leave
-//! more runs or bytes than both the limits and what is published now: its
-//! growth is measured on its built output, so a compaction that shrinks
-//! what is published, the one that reclaims space, is never blocked by the
-//! limit that refuses a flush.
-//!
-//! When flushes outpace compaction, level 0 reaches its stop. A flush, or a
-//! write needing room, then waits for the background worker before building
-//! anything: it asks for a pass and sleeps, holding no lock that reads,
-//! fitting writes or compaction need, until a step the worker publishes
-//! leaves level 0 room, the pass ends, or the worker stops. It waits for
-//! that one pass at most. A pass ends only when nothing is due or a step is
-//! refused, and level 0 at its stop is always due, so a pass that leaves no
-//! room was refused, and waiting longer would not help:
-//!
-//! - **A backlog**: the worker drains level 0 and the flush goes on. This
-//!   is the only case that waits, and it is the common one.
-//! - **Snapshots retaining too much**: merges are refused
-//!   ([`CompactionError::Retained`]) while moves go on. The flush is refused
-//!   with [`UpdateError::FlushRefused`] at the stop; once the snapshots are
-//!   dropped, the next write needing room waits for a pass that succeeds.
-//! - **A job over the [`CompactionOptions`] limits**
-//!   ([`CompactionError::JobLimit`], or [`CompactionError::OutputLimit`]
-//!   when an output outgrows its estimate, as a change of codec can make
-//!   it): refused the same way, and again on every retry until the limits
-//!   are raised. Each refused write asks for one pass, never more.
-//! - **The byte or run limit** ([`EngineOptions::max_run_bytes`],
-//!   [`EngineOptions::max_runs`]): refused at once, without waiting, and the
-//!   worker is asked for a pass in case compaction can reclaim space.
-//! - **A stopped worker** (it panicked): nothing waits; flushes at the stop
-//!   are refused until [`Engine::compact`] drains level 0.
-//!
-//! A refusal at the stop carries why the pass it waited for made no room,
-//! in [`RunLimitError::background`]: the pass's failure, which says whether
-//! anything but a change of snapshots or limits will lift it, or the
-//! worker's panic. [`Engine::background_status`] reports the latest pass,
-//! which may be a later one. Without a worker there is no stop and nothing
-//! waits. Flushes themselves still run
-//! on the writer that needs room, so a write that fills the memtable stalls
-//! for the flush, and for level 0 as above.
-//!
-//! Snapshots keep memory in two ways, both reported as
-//! [`EngineStats::retained_bytes`]: the history pinned in the engine's
-//! memtables, within their budgets, and the memtables and runs the engine
-//! has released but snapshots still hold. A released memtable is charged in
-//! full while a snapshot holds it; one that only snapshots of the earlier,
-//! still writable table share is charged the newest such snapshot's charge
-//! plus the history pinned since the oldest, fixed when it is released and
-//! dropped once none lives. Each live snapshot holds at most the
-//! state it saw, so the total depends on what is flushed and compacted while
-//! it lives. While it exceeds [`SnapshotLimits::max_retained_bytes`], new
-//! snapshots are refused and so are compactions, whose output would be held
-//! beside inputs that snapshots keep (a move, which retires nothing, still
-//! goes on). That is the backpressure: runs then accumulate in level 0
-//! until its stop refuses flushes and so writes, until snapshots are
-//! dropped. Each reader's [`EngineWorkspace`] adds two decoded blocks for
-//! point lookups and, for scans, one per group of key-disjoint runs it has
-//! read (see [Reading runs](self#reading-runs)).
-//!
-//! The run directory and the levels are not charged against any limit. The
-//! directory holds a pointer per run and a few words per group, the levels a
-//! pointer per run and a key per level, and a snapshot or a lookup in
-//! progress keeps the directory it read, with the runs in it, until it is
-//! dropped. [`EngineOptions::max_runs`] bounds both.
-//!
-//! These limits use the memtable's estimated charges, stored run lengths and
-//! an estimate of workspace. They are not a limit on process memory.
-//!
-//! Runs pack whole frames and dictionaries into engine-owned 1 MiB chunks.
-//! Consecutive segments of a run share chunks; a larger frame has an exact
-//! allocation. Chunk padding is at most one frame/dictionary per filled chunk
-//! plus the final chunk per run. Pool capacity and its bounded free reserve
-//! are reported separately in [`EngineStats`]; stored byte limits exclude
-//! padding. The free reserve is capped at max(64 MiB, the largest compaction
-//! output allowance used so far), and is allocated only as chunks are returned.
 //!
 //! # Checkpoints
 //!
@@ -415,6 +141,7 @@ mod flusher;
 mod ingest;
 mod levels;
 mod multi;
+mod resources;
 mod worker;
 
 #[cfg(test)]
@@ -432,7 +159,6 @@ pub use worker::{BackgroundError, BackgroundStatus};
 
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
-use crate::run::CompactError;
 pub use crate::run::{
     CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue, MergeWorkspace, ReadError,
     RunCorruption,
@@ -445,17 +171,14 @@ use std::sync::{
 
 use crate::block::{Record, Value, Version};
 use crate::chunk::{ChunkPool, RESERVE_BYTES};
-use crate::memtable::{
-    FlushCuts, FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
-};
+use crate::memtable::{FlushCuts, FrozenMemtable, Memtable, Records, TableError, flush_merged};
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_TARGET_RUN_LEN, OutputCuts,
-    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED,
-    compact_parallel_in, latest_from,
+    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP,
+    RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
 };
 
 use directory::RunDirectory;
-use levels::{Dest, Fit, LEVEL0_STOP, Levels, Plan};
+use levels::{Dest, Fit, Levels, Plan};
 
 type SharedRun = Arc<Published>;
 
@@ -485,108 +208,68 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
     })
 }
 
-/// The configuration of an [`Engine`], fixed when it starts except for the
-/// run limits, which [`Engine::set_run_limits`] replaces.
-///
-/// Every limit is an admission check on accounted bytes or counts: none
-/// reserves memory or disk up front, and none bounds the process's resident
-/// memory, which also holds snapshots, workspaces and allocator overhead. See
-/// [Memory](self#memory).
+/// Engine configuration, fixed at construction. See [Memory](self#memory).
 #[derive(Clone, Copy, Debug)]
 pub struct EngineOptions {
-    /// Charged bytes each memtable may hold, from [`ENTRY_OVERHEAD`] (the
-    /// charge of an empty record) to half of `usize::MAX`. The active table
-    /// and each frozen table have this budget. A record charged more
-    /// is refused with [`WriteError::RecordExceedsBudget`].
+    /// Writer admission budget; `None` (the default) is unlimited.
+    pub memory_limit: Option<usize>,
+    /// Charged bytes per memtable, at least [`ENTRY_OVERHEAD`].
     pub memtable_budget: usize,
-    /// Maximum frozen tables awaiting background flush, at least one (default 2).
-    pub max_frozen_memtables: usize,
-    /// Minimum charged input bytes for automatic sorted ingestion. `None`
-    /// selects half the memtable budget; `Some(0)` ingests any sorted batch.
-    pub bulk_ingest_min: Option<usize>,
-    /// Bytes of memtable records per run a flush writes, so that a large
-    /// flush writes several runs with disjoint key ranges: from 1 to 1 GiB.
-    /// A run holds at least one record.
-    pub target_run_len: usize,
-    /// The most runs that may be published, at least 1: a safety valve on
-    /// the metadata runs need (a few hundred bytes each, not charged
-    /// against `max_run_bytes`), not a capacity limit. Leveled compaction
-    /// keeps runs at about the target length, so the run count grows with
-    /// the data and `max_run_bytes` decides how much fits. A flush that
-    /// would exceed it is refused, and the writes waiting for it with
-    /// [`UpdateError::FlushRefused`], until compaction merges small runs or
-    /// the limit is raised. The default, 65,536, is the default
-    /// `max_run_bytes` over 64 KiB; scale it with `max_run_bytes`.
-    pub max_runs: usize,
-    /// The most bytes of published runs, at least 1: their stored bytes, key
-    /// filters and chunk metadata together. Chunk padding and the free pool
-    /// reserve are separate, reported in [`EngineStats::pool_in_use_bytes`]
-    /// and [`EngineStats::pool_reserve_bytes`]. Exceeding it refuses flushes as
-    /// for `max_runs`; a compaction may exceed it only by publishing less
-    /// than it replaces.
-    pub max_run_bytes: usize,
-    /// The sequence number a new engine continues after: the first write
-    /// uses the next. [`Engine::recover`] continues after the larger of it and the
-    /// checkpoint's ceiling.
-    pub last_seq: u64,
-    /// Starts a background worker that compacts with these options whenever
-    /// a flush publishes runs; on by default with
-    /// [`CompactionOptions::default`]. `None` runs no worker, and then the
-    /// application must call [`Engine::compact`], or runs accumulate until
-    /// flushes, and the writes that need them, are refused. See
-    /// [Background compaction](self#background-compaction).
-    pub background_compaction: Option<CompactionOptions>,
-    /// Maximum parallel builders within one compaction job, at least 1.
-    /// Defaults to half the available CPUs, capped at 4 and at least 1.
-    /// Small jobs and tight workspace budgets use fewer builders.
-    pub background_threads: usize,
     /// Size multiplier between adjacent levels, at least 2 (default 10).
-    /// Dynamic level targets and the bounds on overlap use this ratio.
     pub level_ratio: usize,
-    /// Limits on [`Engine::snapshot`]. Zero is valid for both and refuses
-    /// every snapshot (`max_live`) or every snapshot and compaction while a
-    /// snapshot retains anything (`max_retained_bytes`).
-    pub snapshots: SnapshotLimits,
-    /// How the runs this engine builds store their blocks. See
-    /// [`Compression`].
+    /// Parallel builders per compaction, at least 1 (default half the CPUs, capped at 4).
+    pub background_threads: usize,
+    /// Compression used for new runs.
     pub compression: Compression,
-    /// Estimated compressed bytes per Zstandard block, 1024 by default, from
-    /// 1 to 256 KiB. Each segment estimates its ratio from a 64 KiB sample.
-    /// Blocks end at record boundaries, with a 256 KiB raw cap; a larger
-    /// record has its own block. Uncompressed runs use a fixed 16 KiB target.
+    /// Estimated compressed block bytes, from 1 to 256 KiB (default 1024).
     pub target_block_compressed: usize,
+    // Deterministic scheduling and small run fixtures, absent from the public build.
+    #[cfg(test)]
+    pub(crate) target_run_len: usize,
+    #[cfg(test)]
+    pub(crate) last_seq: u64,
+    #[cfg(test)]
+    pub(crate) max_frozen_memtables: usize,
+    #[cfg(test)]
+    pub(crate) bulk_ingest_min: Option<usize>,
+    #[cfg(test)]
+    pub(crate) background_compaction: Option<CompactionPolicy>,
 }
 
+// Internal scheduling defaults. None is an admission/refusal limit.
+const TARGET_RUN_LEN: usize = crate::memtable::TARGET_RUN_LEN; // 64 MiB logical input per run.
+const LEVEL0_STOP: usize = 12; // Bound read amplification while writers wait.
+const BULK_INGEST_DIVISOR: usize = 2; // Sorted ingestion at half a memtable.
+const MAX_FROZEN_MEMTABLES: usize = 2; // Bound the flush backlog.
+const MAX_COMPACTION_INPUTS: usize = 32; // Optional level-0 fan-in.
+const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 input.
+const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowance.
+const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
+const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
+
 impl Default for EngineOptions {
-    /// 64 MiB memtables, 4 GiB of runs (and at most 65,536 of them),
-    /// background compaction
-    /// with [`CompactionOptions::default`], the default snapshot limits, and
-    /// Zstandard level 1 with segment dictionaries and a 1 KiB compressed target.
     fn default() -> Self {
         Self {
+            memory_limit: None,
             memtable_budget: 64 << 20,
-            max_frozen_memtables: 2,
-            bulk_ingest_min: None,
-            target_run_len: TARGET_RUN_LEN,
-            max_runs: DEFAULT_MAX_RUNS,
-            max_run_bytes: DEFAULT_MAX_RUN_BYTES,
-            last_seq: 0,
-            background_compaction: Some(CompactionOptions::default()),
             level_ratio: 10,
             background_threads: std::thread::available_parallelism()
                 .map_or(1, |cpus| (cpus.get() / 2).clamp(1, 4)),
-            snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
             target_block_compressed: TARGET_BLOCK_COMPRESSED,
+            #[cfg(test)]
+            target_run_len: TARGET_RUN_LEN,
+            #[cfg(test)]
+            last_seq: 0,
+            #[cfg(test)]
+            max_frozen_memtables: MAX_FROZEN_MEMTABLES,
+            #[cfg(test)]
+            bulk_ingest_min: None,
+            #[cfg(test)]
+            background_compaction: Some(CompactionPolicy::default()),
         }
     }
 }
-
-/// The default [`EngineOptions::max_run_bytes`].
-const DEFAULT_MAX_RUN_BYTES: usize = 4 << 30;
-/// The default [`EngineOptions::max_runs`]: one run per 64 KiB of the
-/// default `max_run_bytes`.
-const DEFAULT_MAX_RUNS: usize = DEFAULT_MAX_RUN_BYTES / (64 << 10);
 
 impl EngineOptions {
     /// The one check of these options, made before an engine starts a
@@ -598,20 +281,6 @@ impl EngineOptions {
             ENTRY_OVERHEAD as u64,
             (usize::MAX / 2) as u64,
             "it must admit the smallest record, and twice it must not overflow",
-        )?;
-        ConfigError::check(
-            "EngineOptions::target_run_len",
-            self.target_run_len as u64,
-            1,
-            MAX_TARGET_RUN_LEN as u64,
-            "runs are at most 1 GiB",
-        )?;
-        ConfigError::check(
-            "EngineOptions::max_frozen_memtables",
-            self.max_frozen_memtables as u64,
-            1,
-            usize::MAX as u64,
-            "at least one frozen table must be allowed",
         )?;
         ConfigError::check(
             "EngineOptions::background_threads",
@@ -627,7 +296,6 @@ impl EngineOptions {
             usize::MAX as u64,
             "level sizes must grow by at least two",
         )?;
-        ConfigError::check_run_limits(self.max_runs, self.max_run_bytes)?;
         ConfigError::check(
             "EngineOptions::target_block_compressed",
             self.target_block_compressed as u64,
@@ -635,21 +303,11 @@ impl EngineOptions {
             RAW_BLOCK_CAP as u64,
             "compressed targets are from 1 byte to the 256 KiB raw cap",
         )?;
-        if let Some(compaction) = &self.background_compaction {
-            compaction.validate(self.target_run_len, self.target_block_compressed)?;
-        }
         Ok(())
     }
 }
 
-/// Why options were refused: a setting outside the range the engine
-/// supports, or one that contradicts another. Nothing was started,
-/// allocated or written.
-///
-/// Every setting is checked, and none is adjusted: a value is accepted as
-/// given or refused here. Settings that are valid can still meet runtime
-/// limits, which are reported by the operation they stop, such as
-/// [`UpdateError::FlushRefused`] or [`CompactionError::JobLimit`].
+/// An option lies outside its supported range. Nothing was started or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConfigError {
@@ -685,25 +343,6 @@ impl ConfigError {
             max,
             reason,
         })
-    }
-
-    /// [`EngineOptions::max_runs`] and [`EngineOptions::max_run_bytes`], as
-    /// given or as [`Engine::set_run_limits`] replaces them.
-    fn check_run_limits(max_runs: usize, max_run_bytes: usize) -> Result<(), Self> {
-        Self::check(
-            "EngineOptions::max_runs",
-            max_runs as u64,
-            1,
-            usize::MAX as u64,
-            "with no runs allowed, no flush could publish",
-        )?;
-        Self::check(
-            "EngineOptions::max_run_bytes",
-            max_run_bytes as u64,
-            1,
-            usize::MAX as u64,
-            "with no run bytes allowed, no flush could publish",
-        )
     }
 }
 
@@ -752,64 +391,6 @@ impl Compression {
         }
     }
 }
-
-/// Admission limits for [`Engine::snapshot`]. A snapshot that would exceed
-/// one is refused with a [`SnapshotError`]; none is ever weakened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotLimits {
-    /// The most snapshots alive at once, including any that outlived the
-    /// engine.
-    pub max_live: usize,
-    /// No snapshot is taken, and no compaction, while snapshots keep more
-    /// than this many bytes: memtable history they pin, and memtables and
-    /// runs the engine has released. See [Memory](self#memory).
-    pub max_retained_bytes: usize,
-}
-
-impl Default for SnapshotLimits {
-    /// 16 live snapshots and 1 GiB retained.
-    fn default() -> Self {
-        Self {
-            max_live: 16,
-            max_retained_bytes: 1 << 30,
-        }
-    }
-}
-
-/// Why [`Engine::snapshot`] refused. Nothing was changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotError {
-    /// [`SnapshotLimits::max_live`] snapshots are alive. Drop one.
-    Readers {
-        /// Snapshots alive.
-        live: usize,
-        /// The limit.
-        max: usize,
-    },
-    /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`].
-    /// Dropping old snapshots frees it.
-    Retained {
-        /// Bytes retained.
-        bytes: usize,
-        /// The limit.
-        max: usize,
-    },
-}
-
-impl fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Readers { live, max } => {
-                write!(f, "{live} snapshots are alive, the limit is {max}")
-            }
-            Self::Retained { bytes, max } => {
-                write!(f, "snapshots retain {bytes} bytes, over the limit of {max}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
 
 /// Why a write can never be applied with the engine's current options. A
 /// write that only needs room flushes instead; see
@@ -862,22 +443,20 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-/// Why a write was refused. It was not applied, used no sequence number,
-/// and changed no reads. A flush it started may have frozen the active table.
-/// A rejected write cannot succeed unchanged; a refused flush can be retried
-/// after maintenance; exhausted sequence numbers prevent further writes.
+/// A write used no sequence number and changed no reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateError {
     /// The write can never be applied: its key or value is too long, or its
     /// record exceeds a whole memtable budget.
     Rejected(WriteError),
-    /// The memtables are full and the flush that would make room is refused
-    /// by the run limits, now or since they or the runs last changed.
-    /// Compaction or [`Engine::set_run_limits`] can make room, after which
-    /// the write can be retried.
-    FlushRefused(RunLimitError),
-    /// Every sequence number has been used, which only an engine started
-    /// near `u64::MAX` ([`EngineOptions::last_seq`]) can reach.
+    /// No further memory can currently be reclaimed. The write used no sequence.
+    MemoryLimit {
+        /// Accounted memory at admission.
+        used: usize,
+        /// Configured budget.
+        limit: usize,
+    },
+    /// Every sequence number has been used.
     SequencesExhausted,
 }
 
@@ -885,92 +464,15 @@ impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(error) => error.fmt(f),
-            Self::FlushRefused(error) => write!(
-                f,
-                "the memtables are full and {error}; compaction can make room"
-            ),
+            Self::MemoryLimit { used, limit } => {
+                write!(f, "memory use {used} bytes reached the limit of {limit}")
+            }
             Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
         }
     }
 }
 
 impl std::error::Error for UpdateError {}
-
-/// Publishing would exceed the run limits ([`EngineOptions::max_runs`] and
-/// [`EngineOptions::max_run_bytes`]), or a flush would leave level 0 with
-/// more flushes than the background worker lets it hold (the level-0 stop,
-/// 12; unlimited without a worker). A
-/// refused flush keeps its frozen table readable, and a later flush retries
-/// it; a refused compaction publishes nothing.
-///
-/// Compaction lifts a refusal at the level-0 stop by itself, and one at
-/// `max_run_bytes` when it can reclaim overwritten or deleted versions; a
-/// database of live data at `max_run_bytes` needs
-/// [`Engine::set_run_limits`]. `max_runs` is a safety valve on run metadata,
-/// not a capacity limit: see [`EngineOptions::max_runs`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunLimitError {
-    /// Runs that would be published.
-    pub runs: usize,
-    /// The run count limit.
-    pub max_runs: usize,
-    /// Stored, filter and segment metadata bytes of the runs that would be published.
-    pub run_bytes: usize,
-    /// The limit on those bytes.
-    pub max_run_bytes: usize,
-    /// Flushes level 0 would hold.
-    pub level0_flushes: usize,
-    /// The level-0 stop: 12 with a background worker, `usize::MAX`
-    /// without.
-    pub max_level0_flushes: usize,
-    /// At the level-0 stop, why the worker could not make room while the
-    /// flush waited for it: the failure that ended the pass it waited for
-    /// ([`BackgroundError::Failed`]), which retrying meets again until what
-    /// it names changes (snapshots dropped, limits raised), or the worker's
-    /// panic ([`BackgroundError::Panicked`]), after which only
-    /// [`Engine::compact`] makes room. Also carries a flush-worker panic;
-    /// its frozen tables remain readable, and that worker is not restarted.
-    pub background: Option<Box<BackgroundError>>,
-}
-
-impl RunLimitError {
-    /// Whether only the level-0 stop refused, which the worker lifts by
-    /// itself unless its compactions are refused.
-    fn level0_only(&self) -> bool {
-        self.level0_flushes > self.max_level0_flushes
-            && self.runs <= self.max_runs
-            && self.run_bytes <= self.max_run_bytes
-    }
-}
-
-impl fmt::Display for RunLimitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.level0_flushes > self.max_level0_flushes {
-            write!(
-                f,
-                "publishing would leave {} flushes in level 0, over the stop of {}",
-                self.level0_flushes, self.max_level0_flushes
-            )?;
-            return match &self.background {
-                Some(error) => write!(f, ", and {error}"),
-                None => f.write_str("; compaction drains it"),
-            };
-        }
-        if self.runs <= self.max_runs
-            && self.run_bytes <= self.max_run_bytes
-            && let Some(error) = &self.background
-        {
-            return write!(f, "background flush failed: {error}");
-        }
-        write!(
-            f,
-            "publishing would leave {} runs of {} bytes, over the limits of {} runs and {} bytes",
-            self.runs, self.run_bytes, self.max_runs, self.max_run_bytes
-        )
-    }
-}
-
-impl std::error::Error for RunLimitError {}
 
 /// What a flush published.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -997,6 +499,20 @@ pub struct FlushReport {
 pub struct EngineStats {
     /// The last sequence number used.
     pub last_seq: u64,
+    /// Total memory charged to writer admission (sum of the components below).
+    pub used: usize,
+    /// Configured writer admission budget, or unlimited.
+    pub memory_limit: Option<usize>,
+    /// Charged active and frozen memtables, including their pinned history.
+    pub memtable_bytes: usize,
+    /// Retired sources held by snapshots/readers, excluding history already in memtables.
+    pub snapshot_bytes: usize,
+    /// Checked-out chunk capacity not already counted in sources or output estimates.
+    pub pool_unaccounted_bytes: usize,
+    /// Estimated in-flight output; exact bytes after a build finishes.
+    pub build_output_bytes: usize,
+    /// Estimated in-flight build workspace, including private ingestion staging.
+    pub build_workspace_bytes: usize,
     /// The active memtable's accounting.
     pub active: MemoryUsage,
     /// The frozen memtables' accounting, summed, if any await flush.
@@ -1008,7 +524,7 @@ pub struct EngineStats {
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
     /// Key filters and physical segment metadata beside `run_bytes`. Dictionaries are
-    /// stored inside the runs. [`EngineOptions::max_run_bytes`] limits both.
+    /// stored inside the runs.
     pub held_bytes: usize,
     /// Unused 1 MiB chunks available for reuse by this engine.
     pub pool_reserve_bytes: usize,
@@ -1056,9 +572,8 @@ struct State {
     last_seq: u64,
     active: Memtable,
     /// Oldest first. Each table's sequence numbers are above the runs' and
-    /// those of the tables before it, and below `active`'s. Only flushes
-    /// freeze tables, so there is more than one only after a flush was
-    /// refused or panicked.
+    /// those of the tables before it, and below `active`'s. Writers rotate
+    /// tables while the flush worker builds.
     frozen: Vec<Arc<FrozenMemtable>>,
     /// Shared so that a compaction can read its inputs without the lock while
     /// flushes publish beside them.
@@ -1075,15 +590,12 @@ struct State {
     /// The same runs as compaction sees them, in levels. Changed in the same
     /// write section as `runs`, and never read by lookups or scans.
     levels: Levels,
-    /// Level 0 flushes beyond which a flush is refused: [`LEVEL0_STOP`]
-    /// with a background worker, otherwise unlimited; tests may change it.
+    /// Level-0 writer stop; deterministic tests may change it.
     level0_stop: usize,
     /// Whether flushes are split at level 1's boundaries; tests turn it off
     /// to compare.
     #[cfg(test)]
     split_flushes: bool,
-    max_runs: usize,
-    max_run_bytes: usize,
     /// Sources removed from the state, kept track of until no snapshot holds
     /// them. Pruned whenever a source is added.
     retired: Vec<Retired>,
@@ -1091,13 +603,6 @@ struct State {
     /// taken at. Every write raises `last_seq`, so while it is unchanged the
     /// snapshot still equals the active table and can be shared.
     last_view: Option<(u64, Weak<FrozenMemtable>)>,
-    /// The last flush's refusal, until a flush or compaction publishes or
-    /// the run limits change: the same flush would be refused again, so a
-    /// write needing room does not build it.
-    refused: Option<RunLimitError>,
-    /// Why the last wait at the level-0 stop ended without room, until
-    /// level 0 has room: the cause a refusal at the stop reports.
-    blocked: Option<BackgroundError>,
     /// Flushes published, and their stored bytes.
     flushes: u64,
     flushed_bytes: u64,
@@ -1139,22 +644,6 @@ impl State {
             return FlushCuts::default();
         }
         self.levels.flush_cuts(target_run_len)
-    }
-
-    /// The refusal of anything that would leave `runs` runs of `bytes`
-    /// bytes and `flushes` level-0 flushes.
-    fn run_limit(&self, runs: usize, bytes: usize, flushes: usize) -> RunLimitError {
-        RunLimitError {
-            runs,
-            max_runs: self.max_runs,
-            run_bytes: bytes,
-            max_run_bytes: self.max_run_bytes,
-            level0_flushes: flushes,
-            max_level0_flushes: self.level0_stop,
-            background: (flushes > self.level0_stop)
-                .then(|| self.blocked.clone().map(Box::new))
-                .flatten(),
-        }
     }
 
     /// `held_bytes` is `Some` for a run.
@@ -1233,10 +722,13 @@ struct Core {
     codec: Codec,
     /// The estimated compressed block target of the runs this engine builds.
     target_block_compressed: usize,
-    snapshot_limits: SnapshotLimits,
     /// Cloned by every snapshot, so that its count is the live snapshots.
     snapshots: Arc<()>,
-    /// Present when a background worker compacts this engine.
+    memory_limit: Option<usize>,
+    policy: CompactionPolicy,
+    resources: resources::Progress,
+    reclaim: std::sync::atomic::AtomicBool,
+    /// Test fixtures can suspend the compaction worker.
     background: Option<worker::Signal>,
     /// Makes the worker panic at the start of its next pass.
     #[cfg(test)]
@@ -1256,9 +748,6 @@ struct Core {
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Merges that failed at the output limit after reading their inputs.
-    #[cfg(test)]
-    overflows: std::sync::atomic::AtomicUsize,
 }
 
 /// A key-value engine. See the [module documentation](self) for its
@@ -1271,11 +760,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Creates an empty RAM-only engine, starting a background compaction
-    /// worker if [`EngineOptions::background_compaction`] is set (the
-    /// default). Fails with [`OpenError::Config`] if any option is outside
-    /// its range, before anything is allocated or started, or with
-    /// [`OpenError::Worker`] if the worker's thread cannot be created.
+    /// Creates an empty engine and starts flush and compaction workers.
+    /// Invalid options return [`OpenError::Config`]; thread creation failures
+    /// return [`OpenError::Worker`].
     pub fn new(options: EngineOptions) -> Result<Self, OpenError> {
         options.validate().map_err(OpenError::Config)?;
         Self::start(Arc::new(Core::new(&options)), &options)
@@ -1284,9 +771,15 @@ impl Engine {
     /// Wraps `core`, starting its worker if `options` ask for one. On failure
     /// the core is dropped with nothing running.
     fn start(core: Arc<Core>, options: &EngineOptions) -> Result<Self, OpenError> {
-        let worker = options
-            .background_compaction
-            .map(|compaction| worker::start(Arc::clone(&core), compaction))
+        #[cfg(test)]
+        let enabled = options.background_compaction.is_some();
+        #[cfg(not(test))]
+        let enabled = {
+            let _ = options;
+            true
+        };
+        let worker = enabled
+            .then(|| worker::start(Arc::clone(&core)))
             .transpose()
             .map_err(OpenError::Worker)?;
         let mut engine = Self {
@@ -1315,9 +808,7 @@ impl Engine {
     ///
     /// Fails only with [`BackgroundError::Panicked`] if the worker had
     /// stopped by panicking, at any time; the engine is shut down all the
-    /// same. A compaction that the worker found refused is not a failure
-    /// here: it is reported by [`Engine::background_status`] while the
-    /// engine is open.
+    /// same. A compaction read failure is reported by [`Engine::background_status`].
     ///
     /// Nothing can use the engine after it is closed, or close it while a
     /// [`ReadGuard`] is held:
@@ -1416,72 +907,32 @@ impl Engine {
         self.core.read()
     }
 
-    /// Returns a view of the current state that holds no lock.
-    ///
-    /// Takes the exclusive lock to snapshot the active memtable, in constant
-    /// time, to copy one pointer per frozen table, and to share the run list
-    /// with one reference count; see
-    /// [Snapshots](self#snapshots). Snapshots taken with nothing written
-    /// between them share the same view of the active table.
-    ///
-    /// Refused, changing nothing, when a [`SnapshotLimits`] would be exceeded.
-    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+    /// Takes a consistent copy-on-write view without retaining a lock.
+    /// Snapshots keep their own immutable sources through maintenance and closure.
+    pub fn snapshot(&self) -> Snapshot {
         self.core.snapshot()
     }
 
-    /// Waits for the flush thread to put everything written before this call
-    /// into runs, including any tables left by a refused flush
-    /// and published in place of them. Waits for any flush in progress. An
-    /// engine with nothing in memory does nothing.
-    ///
-    /// Writes never need this to make room. Refused with a [`RunLimitError`],
-    /// leaving the tables frozen and readable, if publishing would exceed
-    /// the run limits.
-    pub fn flush(&self) -> Result<FlushReport, RunLimitError> {
+    /// Waits for everything written before this call to appear in runs.
+    /// Publication is unconditional. A stopped flush worker reports its panic;
+    /// its tables stay readable and writers can flush them synchronously.
+    pub fn flush(&self) -> Result<FlushReport, BackgroundError> {
         self.core.flush()
     }
 
-    /// Takes one compaction step, building in `workspace`, or returns `None`
-    /// if nothing is due. Waits for any compaction in progress, including
-    /// the background worker's.
-    ///
-    /// The step is the first of those described under
-    /// [Compaction](self#compaction) that applies: a merge of level 0 into
-    /// level 1, a merge from the level most over its size into the next, a
-    /// move, a split, or a merge of two small neighbours. A move or a level
-    /// insertion changes only levels, which reads never consult, and returns
-    /// a [`CompactionKind::Move`] report with nothing read or written.
-    ///
-    /// Each step lowers a level's excess, moves data down or lowers the run
-    /// count, so compacting repeatedly with the same options and no new
-    /// flushes stops. Afterwards a lookup visits at most one run per level
-    /// and one per level-0 flush ([`EngineStats::max_overlap`]).
-    ///
-    /// The merge runs without the state lock: reads, writes and flushes
-    /// proceed beside it, and its output is published in one step. Inputs a
-    /// snapshot holds stay allocated until it is dropped.
-    ///
-    /// Refused with [`CompactionError::JobLimit`] if a level needs a job
-    /// that no split brings within the limits, which only larger limits
-    /// resolve; with [`CompactionError::Retained`] while snapshots retain
-    /// too much, which dropping them resolves (a move still goes on).
+    /// Takes one eager compaction step, for deterministic maintenance tests.
+    #[doc(hidden)]
     pub fn compact(
         &self,
-        options: CompactionOptions,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        self.core.compact(options, workspace)
-    }
-
-    /// Replaces the limits on published runs, as for
-    /// [`EngineOptions::max_runs`] and [`EngineOptions::max_run_bytes`].
-    /// Values below what is published now are accepted: flushes are then
-    /// refused until compaction makes room. Refused, changing nothing, if
-    /// either is 0.
-    pub fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) -> Result<(), ConfigError> {
-        ConfigError::check_run_limits(max_runs, max_run_bytes)?;
-        self.core.set_run_limits(max_runs, max_run_bytes);
-        Ok(())
+        self.core.compact(
+            CompactionPolicy {
+                max_overlap: 1,
+                ..self.core.policy
+            },
+            workspace,
+        )
     }
 
     /// Returns a summary of the current state.
@@ -1489,19 +940,12 @@ impl Engine {
         self.core.stats()
     }
 
-    /// Asks the background worker to compact everything now eligible and
-    /// waits until a pass that started after this call has finished.
-    ///
-    /// Use it to drain pending compaction, or after a flush rejected at the
-    /// run limits: on success the flush can be retried, and a failure says
-    /// compaction cannot make room. The wait lasts one pass, which ends once
-    /// nothing is eligible; flushes during it can extend it, until the run
-    /// limits stop them. Do not call it while holding a [`ReadGuard`] or a
-    /// compaction job, which the worker would wait for.
+    /// Requests a complete compaction pass and waits for it, or reports a
+    /// read failure or worker panic. Do not hold a [`ReadGuard`] while waiting.
     pub fn wait_for_compaction(&self) -> Result<(), BackgroundError> {
         match &self.core.background {
             Some(signal) => signal.wait(),
-            None => Err(BackgroundError::Disabled),
+            None => Ok(()),
         }
     }
 
@@ -1518,11 +962,31 @@ impl Core {
     }
 
     fn with_pool(options: &EngineOptions, chunks: ChunkPool) -> Self {
-        let active = Memtable::in_pool(options.memtable_budget, Some(options.last_seq), &chunks);
+        #[cfg(test)]
+        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
+            options.last_seq,
+            options.target_run_len,
+            options.max_frozen_memtables,
+            options
+                .bulk_ingest_min
+                .unwrap_or(options.memtable_budget / BULK_INGEST_DIVISOR),
+            options.background_compaction.unwrap_or_default(),
+            options.background_compaction.map(|_| worker::Signal::new()),
+        );
+        #[cfg(not(test))]
+        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
+            0,
+            TARGET_RUN_LEN,
+            MAX_FROZEN_MEMTABLES,
+            options.memtable_budget / BULK_INGEST_DIVISOR,
+            CompactionPolicy::for_memory(options.memory_limit),
+            Some(worker::Signal::new()),
+        );
+        let active = Memtable::in_pool(options.memtable_budget, Some(last_seq), &chunks);
         Self {
             chunks,
             state: RwLock::new(State {
-                last_seq: options.last_seq,
+                last_seq,
                 active,
                 frozen: Vec::new(),
                 runs: Vec::new(),
@@ -1530,22 +994,15 @@ impl Core {
                 run_bytes: 0,
                 held_bytes: 0,
                 levels: Levels::new(options.level_ratio),
-                // The stop is the worker's backpressure. Without one, the
-                // application compacts when it chooses, and only the run
-                // limits bound level 0.
-                level0_stop: if options.background_compaction.is_some() {
+                level0_stop: if background.is_some() {
                     LEVEL0_STOP
                 } else {
                     usize::MAX
                 },
                 #[cfg(test)]
                 split_flushes: true,
-                max_runs: options.max_runs,
-                max_run_bytes: options.max_run_bytes,
                 retired: Vec::new(),
                 last_view: None,
-                refused: None,
-                blocked: None,
                 flushes: 0,
                 flushed_bytes: 0,
                 flush_totals: FlushReport::default(),
@@ -1557,17 +1014,18 @@ impl Core {
             level_ratio: options.level_ratio,
             checkpointing: Mutex::new(()),
             memtable_budget: options.memtable_budget,
-            max_frozen_memtables: options.max_frozen_memtables,
+            max_frozen_memtables,
             flush_signal: flusher::Signal::new(),
-            bulk_ingest_min: options
-                .bulk_ingest_min
-                .unwrap_or(options.memtable_budget / 2),
-            target_run_len: options.target_run_len,
+            bulk_ingest_min,
+            target_run_len,
             codec: options.compression.codec(),
             target_block_compressed: options.target_block_compressed,
-            snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
-            background: options.background_compaction.map(|_| worker::Signal::new()),
+            background,
+            memory_limit: options.memory_limit,
+            policy: CompactionPolicy::for_memory(options.memory_limit).with_test_policy(policy),
+            resources: resources::Progress::default(),
+            reclaim: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             panic_worker: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1580,8 +1038,6 @@ impl Core {
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
-            #[cfg(test)]
-            overflows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1594,10 +1050,11 @@ impl Core {
     }
 
     fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
-        let mut state = self.write_state();
+        self.validate_record(key, value)?;
+        let mut state = self.admit(self.write_state())?;
         loop {
             match self.write(&mut state, key, value) {
-                Err(Refusal::Full) => state = self.make_room(state)?,
+                Err(Refusal::Full) => state = self.admit(self.make_room(state))?,
                 written => return written.map_err(Refusal::into_error),
             }
         }
@@ -1607,108 +1064,72 @@ impl Core {
     fn make_room<'s>(
         &'s self,
         mut state: RwLockWriteGuard<'s, State>,
-    ) -> Result<RwLockWriteGuard<'s, State>, UpdateError> {
+    ) -> RwLockWriteGuard<'s, State> {
         state = self.wait_for_level0(state);
-        if state.levels.level0_flushes() >= state.level0_stop {
-            return Err(UpdateError::FlushRefused(state.run_limit(
-                state.runs.len(),
-                state.run_bytes + state.held_bytes,
-                state.levels.level0_flushes() + 1,
-            )));
-        }
         while state.frozen.len() >= self.max_frozen_memtables {
-            if let Some(error) = self.flush_error(&state) {
-                return Err(UpdateError::FlushRefused(error));
-            }
             state = self.wait_for_flush(state);
         }
         if !state.active.is_empty() {
             self.freeze_active(&mut state);
         }
         self.flush_signal.request();
-        Ok(state)
-    }
-
-    fn flush_error(&self, state: &State) -> Option<RunLimitError> {
-        if let Some(error) = self.flush_signal.failure() {
-            let mut refusal = state.run_limit(
-                state.runs.len(),
-                state.run_bytes + state.held_bytes,
-                state.levels.level0_flushes(),
-            );
-            refusal.background = Some(Box::new(error));
-            Some(refusal)
-        } else {
-            state.refused.clone()
-        }
+        state
     }
 
     fn wait_for_flush<'s>(
         &'s self,
         state: RwLockWriteGuard<'s, State>,
     ) -> RwLockWriteGuard<'s, State> {
+        let progress = self.flush_signal.lock();
+        if self.flush_signal.failed(&progress) {
+            drop(progress);
+            drop(state);
+            let serial = self.serialize_flush();
+            let state = self.write_state();
+            let job = FlushJob {
+                engine: self,
+                _serial: serial,
+                tables: state.frozen.clone(),
+                cuts: state.flush_cuts(self.target_run_len),
+            };
+            drop(state);
+            if !job.tables.is_empty() {
+                job.build().publish();
+            }
+            return self.write_state();
+        }
         // Acquire the notification mutex before releasing state: completion
         // cannot slip between checking the predicate and entering the condvar.
-        let progress = self.flush_signal.lock();
         drop(state);
         drop(self.flush_signal.wait(progress));
         self.write_state()
     }
 
-    /// The level-0 backpressure, before a flush is built: while level 0 is
-    /// at its stop and a running worker can drain it, waits for the worker
-    /// without the state lock until
-    /// a step it publishes leaves room or a pass begun after this call ends.
-    /// One pass is all it waits for: a pass ends only once nothing is due or
-    /// a step is refused, and level 0 at its stop is always due, so a pass
-    /// that leaves no room ended on a refusal (snapshots retaining too much,
-    /// a job over the limits) that waiting longer would not lift. That
-    /// failure, or the worker's panic, is kept in `State::blocked` for the
-    /// refusal at publication to carry. Callers recheck their predicates
-    /// after this wait because ingestion can publish concurrently.
-    ///
-    /// A refusal at the level-0 stop is forgotten once level 0 has room
-    /// again, so the next write needing room tries a flush; any other
-    /// standing refusal is returned at once by the caller, without waiting.
+    /// Wait for compaction publication without holding the state lock.
     fn wait_for_level0<'s>(
         &'s self,
-        state: RwLockWriteGuard<'s, State>,
+        mut state: RwLockWriteGuard<'s, State>,
     ) -> RwLockWriteGuard<'s, State> {
-        let full = |state: &State| state.levels.level0_flushes() >= state.level0_stop;
-        let lift = |mut state: RwLockWriteGuard<'s, State>| {
-            if !full(&state) {
-                state.blocked = None;
-                if state
-                    .refused
-                    .as_ref()
-                    .is_some_and(RunLimitError::level0_only)
-                {
-                    state.refused = None;
-                }
+        while state.levels.level0_flushes() >= state.level0_stop {
+            drop(state);
+            #[cfg(test)]
+            self.level0_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let signal = self.background.as_ref().expect(WORKER);
+            if signal
+                .wait_for(|| {
+                    let state = self.read_state();
+                    state.levels.level0_flushes() < state.level0_stop
+                })
+                .is_err()
+            {
+                // A worker panic does not prevent synchronous maintenance.
+                self.compact(self.policy, &mut MergeWorkspace::new())
+                    .expect("compaction cannot read its inputs while writers wait at level 0");
             }
-            state
-        };
-        let Some(signal) = &self.background else {
-            return lift(state);
-        };
-        if !full(&state)
-            || state
-                .refused
-                .as_ref()
-                .is_some_and(|refused| !refused.level0_only())
-        {
-            return lift(state);
+            state = self.write_state();
         }
-        drop(state);
-        #[cfg(test)]
-        self.level0_waits
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let waited = signal.wait_for(|| !full(&self.read_state()));
-        let mut state = self.write_state();
-        if full(&state) {
-            state.blocked = waited.err();
-        }
-        lift(state)
+        state
     }
 
     /// Waits for any flush in progress and holds off others until the guard
@@ -1802,25 +1223,8 @@ impl Core {
         ReadGuard(self.read_state())
     }
 
-    fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
-        let limits = self.snapshot_limits;
+    fn snapshot(&self) -> Snapshot {
         let mut state = self.write_state();
-        // Clones are made only under the exclusive lock, so this count is
-        // exact; drops can only lower it.
-        let live = Arc::strong_count(&self.snapshots) - 1;
-        if live >= limits.max_live {
-            return Err(SnapshotError::Readers {
-                live,
-                max: limits.max_live,
-            });
-        }
-        let bytes = state.retained().bytes;
-        if bytes > limits.max_retained_bytes {
-            return Err(SnapshotError::Retained {
-                bytes,
-                max: limits.max_retained_bytes,
-            });
-        }
         let mut tables =
             Vec::with_capacity(state.frozen.len() + usize::from(!state.active.is_empty()));
         if !state.active.is_empty() {
@@ -1837,21 +1241,21 @@ impl Core {
             tables.push(view);
         }
         tables.extend(state.frozen.iter().rev().cloned());
-        Ok(Snapshot {
+        Snapshot {
             tables,
             runs: Arc::clone(&state.directory),
             last_seq: state.last_seq,
             _live: Arc::clone(&self.snapshots),
-        })
+        }
     }
 
-    fn flush(&self) -> Result<FlushReport, RunLimitError> {
+    fn flush(&self) -> Result<FlushReport, BackgroundError> {
         let mut state = self.write_state();
         let before = state.flush_totals;
+        if let Some(error) = self.flush_signal.failure() {
+            return Err(error);
+        }
         while !state.active.is_empty() && state.frozen.len() >= self.max_frozen_memtables {
-            if let Some(error) = self.flush_error(&state) {
-                return Err(error);
-            }
             self.flush_signal.request();
             state = self.wait_for_flush(state);
         }
@@ -1866,10 +1270,10 @@ impl Core {
                 .first()
                 .is_some_and(|table| table.last_seq().is_some_and(|seq| seq <= target))
         }) {
-            if let Some(error) = self.flush_error(&state) {
+            state = self.wait_for_flush(state);
+            if let Some(error) = self.flush_signal.failure() {
                 return Err(error);
             }
-            state = self.wait_for_flush(state);
         }
         Ok(state.flush_totals.since(before))
     }
@@ -1899,12 +1303,9 @@ impl Core {
 
     fn compact(
         &self,
-        options: CompactionOptions,
+        options: CompactionPolicy,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        options
-            .validate(self.target_run_len, self.target_block_compressed)
-            .map_err(CompactionError::Config)?;
         match self.begin_compaction(options)? {
             Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
@@ -1918,7 +1319,7 @@ impl Core {
     /// level sizes, key ranges by binary search and the runs of level 0.
     fn begin_compaction(
         &self,
-        options: CompactionOptions,
+        options: CompactionPolicy,
     ) -> Result<Option<Begun<'_>>, CompactionError> {
         // As for flushing, this mutex guards no data.
         let serial = self
@@ -1933,51 +1334,18 @@ impl Core {
             panic!("injected compaction failure");
         }
         let mut state = self.write_state();
-        let bytes = state.retained().bytes;
-        let max = self.snapshot_limits.max_retained_bytes;
         let fit = options.fit(self.target_run_len, state.level0_stop);
         state.levels.insert_levels(&fit);
-        let plan = state.levels.plan(&fit);
-        // Snapshots retaining too much refuse every step that would retire
-        // runs they hold. A move retires nothing, so it goes on, and can
-        // drain level 0 while the snapshots last.
-        if bytes > max && !matches!(plan, Plan::Idle | Plan::Move { .. }) {
-            return Err(CompactionError::Retained { bytes, max });
-        }
-        let refusal = |refusal: levels::Refusal| match refusal.outgrown {
-            // Refused under a source's allowance: what stops it is the
-            // output limit, which an earlier job from it reached.
-            Some(output_bytes) => CompactionError::OutputLimit {
-                output_bytes,
-                max_output_bytes: options.max_output_bytes,
-            },
-            None => CompactionError::JobLimit {
-                level: refusal.level,
-                inputs: refusal.inputs,
-                input_bytes: refusal.bytes,
-                workspace_bytes: refusal.workspace_bytes,
-                max_inputs: options.max_inputs,
-                max_input_bytes: options.max_input_bytes,
-                max_output_bytes: options.max_output_bytes,
-                max_workspace_bytes: options.max_workspace_bytes,
-            },
+        let plan = if options.reclaim {
+            state.levels.plan_reclaim(&fit)
+        } else {
+            state.levels.plan(&fit)
         };
-        let (kind, level, inputs, dest, cuts, cursor, split) = match plan {
+        let (kind, level, inputs, dest, cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
-            Plan::Refuse(refused) => return Err(refusal(refused)),
             Plan::Move { level, run } => {
                 if state.levels.move_down(level, &run).is_err() {
                     return Err(CompactionError::Stale);
-                }
-                // A move from level 0 can lift the level-0 stop, so a flush
-                // refused only for it may succeed now. It changes no run
-                // count or byte, so any other refusal stands.
-                if state
-                    .refused
-                    .as_ref()
-                    .is_some_and(RunLimitError::level0_only)
-                {
-                    state.refused = None;
                 }
                 if cfg!(any(test, debug_assertions)) {
                     state.levels.check(&state.runs);
@@ -2022,36 +1390,16 @@ impl Core {
                     dest,
                     cuts,
                     Some(cursor),
-                    None,
                 )
             }
-            Plan::Split {
+            Plan::Clean { level, run } => (
+                CompactionKind::Merge,
                 level,
-                source,
-                cuts,
-                refused,
-            } => {
-                let cursor = Cursor::At(source.run.key_range().expect(NOT_EMPTY).min.to_vec());
-                let dest = if level == 0 {
-                    Dest::InPlace
-                } else {
-                    Dest::Level(level)
-                };
-                let cuts = OutputCuts {
-                    at: cuts,
-                    ..OutputCuts::default()
-                };
-                let split = Some(refusal(refused));
-                (
-                    CompactionKind::Split,
-                    level,
-                    vec![source],
-                    dest,
-                    cuts,
-                    Some(cursor),
-                    split,
-                )
-            }
+                vec![run],
+                Dest::Level(level),
+                OutputCuts::default(),
+                None,
+            ),
             Plan::Neighbours { level, runs } => {
                 let cuts = OutputCuts {
                     single: true,
@@ -2064,7 +1412,6 @@ impl Core {
                     inputs,
                     Dest::Level(level),
                     cuts,
-                    None,
                     None,
                 )
             }
@@ -2090,7 +1437,6 @@ impl Core {
             zero_seq,
             cuts,
             cursor,
-            refusal: split,
             estimated_run_bytes,
         })))
     }
@@ -2100,7 +1446,7 @@ impl Core {
     #[cfg(test)]
     fn begin_job(
         &self,
-        options: CompactionOptions,
+        options: CompactionPolicy,
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         loop {
             match self.begin_compaction(options)? {
@@ -2132,7 +1478,7 @@ impl Core {
     #[cfg(test)]
     fn begin_picked(
         &self,
-        options: CompactionOptions,
+        options: CompactionPolicy,
         picks: Vec<usize>,
     ) -> Result<CompactionJob<'_>, CompactionError> {
         let serial = self
@@ -2140,11 +1486,6 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let state = self.write_state();
-        let bytes = state.retained().bytes;
-        let max = self.snapshot_limits.max_retained_bytes;
-        if bytes > max {
-            return Err(CompactionError::Retained { bytes, max });
-        }
         let inputs: Vec<SharedRun> = picks
             .iter()
             .map(|&index| Arc::clone(&state.runs[index]))
@@ -2171,18 +1512,8 @@ impl Core {
             zero_seq: false,
             cuts: OutputCuts::default(),
             cursor: None,
-            refusal: None,
             estimated_run_bytes,
         })
-    }
-
-    fn set_run_limits(&self, max_runs: usize, max_run_bytes: usize) {
-        let mut state = self.write_state();
-        state.max_runs = max_runs;
-        state.max_run_bytes = max_run_bytes;
-        state.refused = None;
-        drop(state);
-        self.notify_worker();
     }
 
     /// Asks the worker, if any, to look for eligible compactions.
@@ -2196,11 +1527,19 @@ impl Core {
     fn stats(&self) -> EngineStats {
         let state = self.read_state();
         let retained = state.retained();
-        let (pool_reserve_bytes, pool_in_use_bytes, pool_reserve_limit) = self.chunks.stats();
+        let usage = self.usage(&state);
+
         EngineStats {
-            pool_reserve_bytes,
-            pool_in_use_bytes,
-            pool_reserve_limit,
+            used: usage.used,
+            memory_limit: self.memory_limit,
+            memtable_bytes: usage.memtables,
+            snapshot_bytes: usage.snapshots,
+            pool_unaccounted_bytes: usage.pool_unaccounted,
+            build_output_bytes: usage.build_output,
+            build_workspace_bytes: usage.build_workspace,
+            pool_reserve_bytes: usage.pool_reserve,
+            pool_in_use_bytes: usage.pool_in_use,
+            pool_reserve_limit: usage.pool_cap,
             last_seq: state.last_seq,
             active: state.active.memory(),
             frozen: state
@@ -2343,6 +1682,14 @@ impl<'e> FlushJob<'e> {
     /// Builds the runs, compressing without the state lock. Several tables
     /// are merged as one, keeping each key's newest update.
     fn build(self) -> BuiltFlush<'e> {
+        let estimate = self.tables.iter().fold(0usize, |sum, table| {
+            sum.saturating_add(table.memory().payload.saturating_mul(4))
+                .saturating_add(table.len().saturating_mul(256))
+        });
+        let mut charge = self
+            .engine
+            .resources
+            .build(estimate, crate::run::workspace_estimate([]));
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
         let runs = flush_merged(
             &tables,
@@ -2352,7 +1699,16 @@ impl<'e> FlushJob<'e> {
             &self.cuts,
             &self.engine.chunks,
         );
-        BuiltFlush { job: self, runs }
+        charge.finished(
+            runs.iter()
+                .map(|run| run.stored_len() + run.held_bytes())
+                .sum(),
+        );
+        BuiltFlush {
+            job: self,
+            runs,
+            charge,
+        }
     }
 
     /// The records in the tables, counting a key once per table.
@@ -2372,6 +1728,7 @@ impl fmt::Debug for FlushJob<'_> {
 
 /// A flush with its runs built but not visible to anyone.
 struct BuiltFlush<'e> {
+    charge: resources::BuildCharge<'e>,
     job: FlushJob<'e>,
     runs: Vec<Run<Vec<u8>>>,
 }
@@ -2379,15 +1736,13 @@ struct BuiltFlush<'e> {
 impl BuiltFlush<'_> {
     /// Publishes the runs and removes the frozen tables in one step.
     ///
-    /// On a [`RunLimitError`] the built runs are dropped and the tables stay
-    /// frozen and readable.
-    fn publish(self) -> Result<FlushReport, RunLimitError> {
-        self.publish_kept().map(|(report, _)| report)
+    fn publish(self) -> FlushReport {
+        self.publish_kept().0
     }
 
     /// The checkpoint keeps the exact outputs even if compaction replaces them.
-    fn publish_kept(self) -> Result<(FlushReport, Vec<SharedRun>), RunLimitError> {
-        let Self { job, runs } = self;
+    fn publish_kept(self) -> (FlushReport, Vec<SharedRun>) {
+        let Self { job, runs, charge } = self;
         let report = FlushReport {
             tables: job.tables.len(),
             records: job.records(),
@@ -2397,26 +1752,6 @@ impl BuiltFlush<'_> {
             filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
         let mut state = job.engine.write_state();
-        let total_runs = state.runs.len() + report.runs;
-        let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
-        let flushes = state.levels.level0_flushes() + 1;
-        if total_runs > state.max_runs
-            || total_bytes > state.max_run_bytes
-            || flushes > state.level0_stop
-        {
-            let error = state.run_limit(total_runs, total_bytes, flushes);
-            state.refused = Some(error.clone());
-            drop(state);
-            // Compaction is what makes room. A pass that failed earlier, say
-            // while snapshots retained too much, is otherwise not retried.
-            // At the level-0 stop alone, this flush has just waited for a
-            // whole pass and nothing has flushed since, so another would
-            // only repeat the refused job.
-            if !error.level0_only() {
-                job.engine.notify_worker();
-            }
-            return Err(error);
-        }
         let flushed = job.tables.len();
         assert!(
             state.frozen[..flushed]
@@ -2436,7 +1771,6 @@ impl BuiltFlush<'_> {
         state.order_runs();
         state.run_bytes += report.run_bytes;
         state.held_bytes += report.held_bytes;
-        state.refused = None;
         state.flushes += 1;
         state.flushed_bytes += report.run_bytes as u64;
         state.flush_totals.add(report);
@@ -2452,12 +1786,14 @@ impl BuiltFlush<'_> {
             };
             state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
         }
+        drop(charge);
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
         job.engine.notify_worker();
         job.engine.flush_signal.changed();
-        Ok((report, runs))
+        job.engine.resources.changed();
+        (report, runs)
     }
 }
 
@@ -2469,126 +1805,53 @@ impl fmt::Debug for BuiltFlush<'_> {
     }
 }
 
-/// Bounds and policy for one compaction. See [`Engine::compact`].
-///
-/// Each limit is checked against a job before anything is read: a job that
-/// would exceed one is not formed. Every option is checked on its own, as
-/// below, and the byte and workspace limits also against the engine's
-/// [`EngineOptions::target_run_len`] and
-/// [`EngineOptions::target_block_compressed`], so that a job of two full runs
-/// always fits (a [`ConfigError`] otherwise).
+/// Soft bounds on optional fan-in and parallel workspace, never refusals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompactionOptions {
-    /// The most runs merged at once, at least 2.
-    pub max_inputs: usize,
-    /// The most bytes of input runs, stored bytes and what they hold beside
-    /// them (key filters and segment metadata), at least twice
-    /// [`EngineOptions::target_run_len`].
-    pub max_input_bytes: usize,
-    /// The most bytes of output, stored bytes, key filters and segment metadata,
-    /// built and held until publication, as for
-    /// [`EngineOptions::max_run_bytes`]; at least twice
-    /// [`EngineOptions::target_run_len`]. A job's output is estimated by its
-    /// input before it starts, and checked as it is written; a job is formed
-    /// only if its input leaves a thirty-second of this limit free for what
-    /// output runs add (footers, filters, blocks packed differently), so
-    /// that a job chosen is not refused here and then chosen again. It counts bytes
-    /// stored in chunks, excluding their padding; the builder's reusable encoding
-    /// scratch is charged to `max_workspace_bytes`.
-    pub max_output_bytes: usize,
-    /// The most estimated workspace bytes: one block and a decompression
-    /// context per input, plus the builder's segment and block buffers and
-    /// compression context. Parallel builders share this cap: segment buffers
-    /// shrink with their count, and high fan-in jobs use fewer builders.
-    /// A job exceeding this is refused before decoding.
-    /// Remaining room bounds key hashes; an output needing more hashes gets
-    /// no filter. At least the estimate for two 256 KiB input blocks.
-    pub max_workspace_bytes: usize,
-    /// Level 0 is compacted once it holds runs of this many flushes, at
-    /// least 1, which compacts every flush (level 0 is compacted at 12
-    /// whatever this is). After compaction a point read of a key absent
-    /// from the memtables visits at most one run per flush left in level 0,
-    /// fewer than this, and one per level below it.
-    ///
-    /// Before leveled compaction this bounded every key's overlap; level
-    /// 0's flushes are what remains of that overlap, and the default is the
-    /// same.
-    pub max_overlap: usize,
+pub(crate) struct CompactionPolicy {
+    max_inputs: usize,
+    max_input_bytes: usize,
+    max_workspace_bytes: usize,
+    max_overlap: usize,
+    reclaim: bool,
 }
-
-impl Default for CompactionOptions {
-    /// 32 inputs, 256 MiB in and out, 64 MiB of workspace, and level 0
-    /// compacted at 4 flushes.
+impl Default for CompactionPolicy {
     fn default() -> Self {
-        Self {
-            max_inputs: 32,
-            max_input_bytes: 256 << 20,
-            max_output_bytes: 256 << 20,
-            max_workspace_bytes: 64 << 20,
-            max_overlap: 4,
-        }
+        Self::for_memory(None)
     }
 }
-
-/// The share of [`CompactionOptions::max_output_bytes`] that selection keeps
-/// free, as one part in this many, for what a merge's output adds to its
-/// inputs' bytes: run footers, filters and blocks packed differently.
-/// Measured growth is at most about a kilobyte for jobs of tens to
-/// hundreds of kilobytes; a change of codec or dictionary can add more, and
-/// then the merge fails at the output limit as before.
-const OUTPUT_HEADROOM: usize = 32;
-
-impl CompactionOptions {
-    /// The one check of these options, made when an engine is built with
-    /// them for its worker and by every [`Engine::compact`], against the
-    /// engine's run and block lengths.
-    fn validate(
-        &self,
-        target_run_len: usize,
-        _target_block_compressed: usize,
-    ) -> Result<(), ConfigError> {
-        ConfigError::check(
-            "CompactionOptions::max_inputs",
-            self.max_inputs as u64,
-            2,
-            usize::MAX as u64,
-            "a merge takes at least two runs",
-        )?;
-        let two_runs = target_run_len.saturating_mul(2);
-        for (setting, value) in [
-            ("CompactionOptions::max_input_bytes", self.max_input_bytes),
-            ("CompactionOptions::max_output_bytes", self.max_output_bytes),
-        ] {
-            ConfigError::check(
-                setting,
-                value as u64,
-                two_runs as u64,
-                usize::MAX as u64,
-                "a job of two full runs must fit, twice EngineOptions::target_run_len",
-            )?;
+impl CompactionPolicy {
+    fn for_memory(limit: Option<usize>) -> Self {
+        Self {
+            max_inputs: MAX_COMPACTION_INPUTS,
+            max_input_bytes: limit.map_or(COMPACTION_INPUT_BYTES, |n| {
+                (n / 8).clamp(1, COMPACTION_INPUT_BYTES)
+            }),
+            max_workspace_bytes: limit.map_or(COMPACTION_WORKSPACE_BYTES, |n| {
+                (n / 8).clamp(1, COMPACTION_WORKSPACE_BYTES)
+            }),
+            max_overlap: COMPACTION_TRIGGER,
+            reclaim: false,
         }
-        ConfigError::check(
-            "CompactionOptions::max_workspace_bytes",
-            self.max_workspace_bytes as u64,
-            crate::run::workspace_estimate([RAW_BLOCK_CAP; 2]) as u64,
-            usize::MAX as u64,
-            "a merge of two runs of EngineOptions::target_block_compressed blocks must fit",
-        )?;
-        ConfigError::check(
-            "CompactionOptions::max_overlap",
-            self.max_overlap as u64,
-            1,
-            usize::MAX as u64,
-            "level 0 holds at least one flush",
-        )
     }
-
+    fn with_test_policy(self, policy: Self) -> Self {
+        #[cfg(test)]
+        {
+            Self {
+                max_input_bytes: self.max_input_bytes.min(policy.max_input_bytes),
+                max_workspace_bytes: self.max_workspace_bytes.min(policy.max_workspace_bytes),
+                ..policy
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = policy;
+            self
+        }
+    }
     fn fit(&self, target_run_len: usize, level0_stop: usize) -> Fit {
         Fit {
             max_inputs: self.max_inputs,
-            max_bytes: self
-                .max_input_bytes
-                .min(self.max_output_bytes - self.max_output_bytes / OUTPUT_HEADROOM),
+            max_bytes: self.max_input_bytes,
             max_workspace_bytes: self.max_workspace_bytes,
             trigger: self.max_overlap,
             level0_stop,
@@ -2600,146 +1863,27 @@ impl CompactionOptions {
 /// Why a compaction changed nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionError {
-    /// A level needs compacting, but the smallest job that would make
-    /// progress there exceeds a limit: its inputs, their bytes (as input,
-    /// and as the estimate of its output), or its workspace estimate.
-    /// Nothing was read. Every job of two full runs fits the limits
-    /// [`CompactionOptions`] accepts, so this follows runs longer than
-    /// [`EngineOptions::target_run_len`] (a single record longer than it,
-    /// or runs built under a larger setting) or blocks longer than
-    /// [`EngineOptions::target_block_compressed`]; raising the limit named lets it
-    /// proceed, and retrying unchanged meets it again.
-    JobLimit {
-        /// The level whose job it is.
-        level: usize,
-        /// Runs the job would merge.
-        inputs: usize,
-        /// Their stored and held bytes.
-        input_bytes: usize,
-        /// The job's workspace estimate.
-        workspace_bytes: usize,
-        /// [`CompactionOptions::max_inputs`].
-        max_inputs: usize,
-        /// [`CompactionOptions::max_input_bytes`].
-        max_input_bytes: usize,
-        /// [`CompactionOptions::max_output_bytes`].
-        max_output_bytes: usize,
-        /// [`CompactionOptions::max_workspace_bytes`].
-        max_workspace_bytes: usize,
-    },
-    /// The output would exceed [`CompactionOptions::max_output_bytes`],
-    /// the limit on all of one job's output runs together. Nothing was
-    /// published; a larger limit lets it proceed. A job is admitted by its
-    /// inputs' bytes, so this follows output that outgrew them by more than
-    /// the limit's headroom, as a change of codec or dictionary can make it.
-    /// Selection then halves what a job from the same source may take, each
-    /// time this happens to it, but never below the source with the largest
-    /// run below it, and splits the source if need be; once even that job
-    /// has failed, the source's steps are refused with this error, until
-    /// the runs below it change, before
-    /// anything is read, naming the output that crossed the limit, and
-    /// other levels go on.
-    OutputLimit {
-        /// Bytes of output, stored and filters, when the limit was crossed.
-        output_bytes: usize,
-        /// The limit.
-        max_output_bytes: usize,
-    },
-    /// The merge's workspace estimate exceeds
-    /// [`CompactionOptions::max_workspace_bytes`]. Nothing was decoded.
-    WorkspaceLimit {
-        /// The estimate.
-        workspace_bytes: usize,
-        /// The limit.
-        max_workspace_bytes: usize,
-    },
     /// An input run is damaged, or two runs disagree about one update. The
     /// runs are unchanged; this is corruption, not a limit, and retrying
     /// meets it again.
     Read(ReadError),
-    /// Publishing would leave more runs or run bytes than both the engine's
-    /// limit and what is published now.
-    RunLimit(RunLimitError),
-    /// Snapshots retain more than [`SnapshotLimits::max_retained_bytes`], so
-    /// the output could only add to it. Dropping snapshots lifts this. Moves,
-    /// which write and retire nothing, are not refused.
-    Retained {
-        /// Bytes retained.
-        bytes: usize,
-        /// The limit.
-        max: usize,
-    },
     /// The runs the job chose were no longer where it found them when it
     /// was to publish. Nothing was published; compactions are serialized,
     /// so this is a defect, reported rather than published.
     Stale,
-    /// The options were refused before anything was selected.
-    Config(ConfigError),
 }
 
-impl From<CompactError> for CompactionError {
-    fn from(error: CompactError) -> Self {
-        match error {
-            CompactError::Read(error) => Self::Read(error),
-            CompactError::OutputLimit {
-                output_bytes,
-                max_output_bytes,
-            } => Self::OutputLimit {
-                output_bytes,
-                max_output_bytes,
-            },
-            CompactError::WorkspaceLimit {
-                workspace_bytes,
-                max_workspace_bytes,
-            } => Self::WorkspaceLimit {
-                workspace_bytes,
-                max_workspace_bytes,
-            },
-        }
+impl From<ReadError> for CompactionError {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
     }
 }
 
 impl fmt::Display for CompactionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::JobLimit {
-                level,
-                inputs,
-                input_bytes,
-                workspace_bytes,
-                max_inputs,
-                max_input_bytes,
-                max_output_bytes,
-                max_workspace_bytes,
-            } => write!(
-                f,
-                "level {level} needs a compaction of {inputs} runs, {input_bytes} bytes and \
-                 {workspace_bytes} workspace bytes, over the limits of {max_inputs} runs, \
-                 {max_input_bytes} bytes in, {max_output_bytes} bytes out and \
-                 {max_workspace_bytes} workspace bytes; raise them to proceed"
-            ),
-            Self::OutputLimit {
-                output_bytes,
-                max_output_bytes,
-            } => write!(
-                f,
-                "compaction output reached {output_bytes} bytes, over the limit of {max_output_bytes}"
-            ),
-            Self::WorkspaceLimit {
-                workspace_bytes,
-                max_workspace_bytes,
-            } => write!(
-                f,
-                "compaction needs {workspace_bytes} workspace bytes, over the limit of {max_workspace_bytes}"
-            ),
             Self::Read(error) => error.fmt(f),
-            Self::RunLimit(error) => error.fmt(f),
-            Self::Retained { bytes, max } => write!(
-                f,
-                "snapshots retain {bytes} bytes, over the limit of {max}; compaction waits"
-            ),
             Self::Stale => f.write_str("compaction found its runs moved and published nothing"),
-            Self::Config(error) => error.fmt(f),
         }
     }
 }
@@ -2756,9 +1900,6 @@ pub enum CompactionKind {
     /// A run relabelled to the next level, which it overlaps nowhere:
     /// nothing was read or written.
     Move,
-    /// A run rewritten alone, in its level, in pieces whose own merges fit
-    /// the limits where its whole merge did not.
-    Split,
     /// Two adjacent small runs of one level merged into one.
     Neighbours,
 }
@@ -2809,7 +1950,7 @@ struct CompactionJob<'e> {
     /// Unselected runs whose key ranges overlap the inputs' span. They may
     /// hold older versions that the inputs' tombstones hide.
     others: Vec<SharedRun>,
-    options: CompactionOptions,
+    options: CompactionPolicy,
     kind: CompactionKind,
     level: usize,
     /// Where the output goes.
@@ -2819,9 +1960,6 @@ struct CompactionJob<'e> {
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.
     cursor: Option<Cursor>,
-    /// For a split, the job it stands in for: refused if the split leaves
-    /// fewer than two pieces, so that a split always makes progress.
-    refusal: Option<CompactionError>,
     /// Stored size of a full target-length run, using the planner estimate.
     estimated_run_bytes: usize,
 }
@@ -2831,9 +1969,6 @@ struct CompactionJob<'e> {
 enum Cursor {
     /// Past this key, the source's largest.
     After(Vec<u8>),
-    /// To this key, a split source's smallest, so that its first piece is
-    /// the level's next source.
-    At(Vec<u8>),
 }
 
 /// A compaction step chosen under the lock: a job to build, or a move,
@@ -2861,6 +1996,16 @@ impl<'e> CompactionJob<'e> {
     /// published later come from flushes and hold only newer updates. On an
     /// error nothing is built and the engine is unchanged.
     fn build(self, workspace: &mut MergeWorkspace) -> Result<BuiltCompaction<'e>, CompactionError> {
+        let estimate = self.inputs.iter().fold(0usize, |sum, run| {
+            sum.saturating_add(run.run.build_estimate())
+        });
+        let workspace_bytes = self
+            .options
+            .max_workspace_bytes
+            .max(crate::run::workspace_estimate(
+                self.inputs.iter().map(|run| run.largest_block),
+            ));
+        let mut charge = self.engine.resources.build(estimate, workspace_bytes);
         let views: Vec<RunView<'_>> = self.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = self
             .others
@@ -2874,13 +2019,14 @@ impl<'e> CompactionJob<'e> {
         };
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
-            max_output_bytes: self.options.max_output_bytes,
-            max_workspace_bytes: self.options.max_workspace_bytes,
+            max_workspace_bytes: self.options.max_workspace_bytes.max(
+                crate::run::workspace_estimate(self.inputs.iter().map(|run| run.largest_block)),
+            ),
             codec: self.engine.codec,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
         };
-        let output = match compact_parallel_in(
+        let output = compact_parallel_in(
             &views,
             keep_tombstone,
             limits,
@@ -2888,21 +2034,7 @@ impl<'e> CompactionJob<'e> {
             self.engine.background_threads,
             self.estimated_run_bytes,
             (workspace, &self.engine.chunks),
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                if let CompactError::OutputLimit { output_bytes, .. } = error {
-                    // So that selection does not choose this job again.
-                    #[cfg(test)]
-                    self.engine
-                        .overflows
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut state = self.engine.write_state();
-                    state.levels.outgrown(&self.inputs, output_bytes);
-                }
-                return Err(error.into());
-            }
-        };
+        )?;
         #[cfg(test)]
         {
             let hook = self.engine.after_build.lock().unwrap().clone();
@@ -2912,7 +2044,12 @@ impl<'e> CompactionJob<'e> {
         }
         drop(ranges);
         drop(views);
-        Ok(BuiltCompaction { job: self, output })
+        charge.finished(output.output_bytes + output.held_bytes);
+        Ok(BuiltCompaction {
+            job: self,
+            output,
+            charge,
+        })
     }
 }
 
@@ -2930,6 +2067,7 @@ impl fmt::Debug for CompactionJob<'_> {
 
 /// A compaction with its output built but not visible to anyone.
 struct BuiltCompaction<'e> {
+    charge: resources::BuildCharge<'e>,
     job: CompactionJob<'e>,
     output: crate::run::Compacted,
 }
@@ -2939,21 +2077,17 @@ impl BuiltCompaction<'_> {
     ///
     /// Every input must still be published where selection found it, and
     /// the output must fit its level beside the runs there. Runs published
-    /// since selection, all flushes into level 0, are kept. A result over
+    /// since selection, all flushes into level 0, are kept.
     /// the run limits is accepted if it is no larger than what it replaces.
     /// On an error the output is dropped and the engine is unchanged. The
     /// inputs are freed after the lock is released, once no reader holds
     /// them.
     fn publish(self) -> Result<CompactionReport, CompactionError> {
-        let Self { job, output } = self;
-        let unchanged =
-            output.runs.len() == 1 && output.stats.records_written == output.stats.records_read;
-        if job.kind == CompactionKind::Split && unchanged {
-            // The source rewritten whole, dropping nothing: no progress. A
-            // split that dropped records (tombstones or older versions) has
-            // fewer to rewrite next time, so it publishes even as one run.
-            return Err(job.refusal.clone().expect("a split carries its job"));
-        }
+        let Self {
+            job,
+            output,
+            charge,
+        } = self;
         let report = CompactionReport {
             kind: job.kind,
             level: job.level,
@@ -2979,23 +2113,8 @@ impl BuiltCompaction<'_> {
             drop(state);
             unreachable!("compactions are serialized, so only this one removes runs");
         }
-        let total_runs = state.runs.len() - report.inputs + report.outputs;
         let stored = state.run_bytes - report.input_bytes + report.output_bytes;
         let filters = state.held_bytes - report.input_held_bytes + report.output_held_bytes;
-        let (total_bytes, published_bytes) = (stored + filters, state.run_bytes + state.held_bytes);
-        // Shrinking is always allowed, so that compaction can make room even
-        // when the limits were lowered below what is published. Growth is
-        // what this output adds, measured, not estimated.
-        let grows_runs = total_runs > state.max_runs.max(state.runs.len());
-        let grows_bytes = total_bytes > state.max_run_bytes.max(published_bytes);
-        if grows_runs || grows_bytes {
-            let flushes = state.levels.level0_flushes();
-            return Err(CompactionError::RunLimit(state.run_limit(
-                total_runs,
-                total_bytes,
-                flushes,
-            )));
-        }
         let outputs: Vec<SharedRun> = published(output.runs).collect();
         if state
             .levels
@@ -3006,7 +2125,6 @@ impl BuiltCompaction<'_> {
         }
         match &job.cursor {
             Some(Cursor::After(key)) => state.levels.advance(job.level, key),
-            Some(Cursor::At(key)) => state.levels.rewind(job.level, key),
             None => {}
         }
         state.runs.retain(|run| !is_input(run));
@@ -3014,7 +2132,6 @@ impl BuiltCompaction<'_> {
         state.order_runs();
         state.run_bytes = stored;
         state.held_bytes = filters;
-        state.refused = None;
         for input in &job.inputs {
             let (bytes, filter) = (input.run.stored_len(), input.run.held_bytes());
             state.retire(
@@ -3023,7 +2140,9 @@ impl BuiltCompaction<'_> {
                 Some(filter),
             );
         }
+        drop(charge);
         drop(state);
+        job.engine.resources.changed();
         job.engine.flush_signal.request();
         drop(job);
         Ok(report)
@@ -3166,15 +2285,13 @@ impl fmt::Debug for ReadGuard<'_> {
 /// new one to see later writes. While it lives it keeps whatever the engine
 /// releases from its view, and the memtable history later writes copy away
 /// from it, reported in [`EngineStats::retained_bytes`], so drop it once read.
-/// Nothing bounds how long it lives, but while it retains too much, new
-/// snapshots and compactions are refused; see [Memory](self#memory).
+/// Retained bytes count towards writer admission; see [Memory](self#memory).
 ///
-/// It does not implement `Clone`, so that each one counts against
-/// [`SnapshotLimits::max_live`]. Share one by reference or in an `Arc`:
+/// Share one by reference or in an `Arc`:
 ///
 /// ```compile_fail,E0599
 /// # let engine = tessera::engine::Engine::new(Default::default()).unwrap();
-/// let snapshot = engine.snapshot().unwrap();
+/// let snapshot = engine.snapshot();
 /// let second = snapshot.clone();
 /// ```
 pub struct Snapshot {
@@ -3371,11 +2488,11 @@ impl fmt::Debug for Scan<'_> {
 #[cfg(test)]
 impl Engine {
     /// Compacts `picks` through the production job: the same tombstone
-    /// rule, limits, build and publication, with the output placed as
+    /// rule, build and publication, with the output placed as
     /// [`Core::begin_picked`] says.
     pub(crate) fn compact_picked(
         &self,
-        options: CompactionOptions,
+        options: CompactionPolicy,
         picks: Vec<usize>,
         workspace: &mut MergeWorkspace,
     ) -> Result<CompactionReport, CompactionError> {
@@ -3491,7 +2608,7 @@ mod tests {
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         assert_eq!(Arc::strong_count(&held), 3);
-        job.build().publish().unwrap();
+        job.build().publish();
         assert_eq!(Arc::strong_count(&held), 1);
     }
 
@@ -3505,27 +2622,12 @@ mod tests {
         assert_eq!(Arc::strong_count(&held), 2);
     }
 
-    #[test]
-    fn a_rejected_publication_keeps_the_frozen_table_in_the_engine() {
-        let engine = Engine::new(EngineOptions {
-            max_run_bytes: 1,
-            ..manual()
-        })
-        .unwrap();
-        engine.put(b"k", b"v").unwrap();
-        let job = engine.core.begin_flush().unwrap();
-        let held = frozen_handle(&engine);
-        job.build().publish().unwrap_err();
-        assert_eq!(Arc::strong_count(&held), 2);
-        assert!(Arc::ptr_eq(&held, &frozen_handle(&engine)));
-    }
-
-    fn options(max_inputs: usize, max_input_bytes: usize) -> CompactionOptions {
-        CompactionOptions {
+    fn options(max_inputs: usize, max_input_bytes: usize) -> CompactionPolicy {
+        CompactionPolicy {
             max_inputs,
             max_input_bytes,
             max_overlap: 1,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         }
     }
 
@@ -3576,7 +2678,7 @@ mod tests {
             }
         }
         // A snapshot keeps the runs it saw, and still reads one block.
-        let snapshot = engine.snapshot().unwrap();
+        let snapshot = engine.snapshot();
         engine.put(b"a", b"4").unwrap();
         engine.flush().unwrap();
         let mut workspace = EngineWorkspace::new();
@@ -3607,19 +2709,27 @@ mod tests {
         engine.flush().unwrap();
         engine.put(b"k", b"k3").unwrap();
         engine.flush().unwrap();
-        let before = engine.snapshot().unwrap();
+        let before = engine.snapshot();
 
-        let options = CompactionOptions {
+        let options = CompactionPolicy {
             max_overlap: 2,
             max_inputs: 2,
-            ..CompactionOptions::default()
+            ..CompactionPolicy::default()
         };
         let mut workspace = MergeWorkspace::new();
         // The oldest run moves to level 1; the next merges with it, and the
         // newest is left in level 0.
-        let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+        let report = engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .unwrap();
         assert_eq!(report.kind, CompactionKind::Move);
-        let report = engine.compact(options, &mut workspace).unwrap().unwrap();
+        let report = engine
+            .core
+            .compact(options, &mut workspace)
+            .unwrap()
+            .unwrap();
         assert_eq!(report.kind, CompactionKind::Merge);
         assert_eq!((report.inputs, report.outputs), (2, 1));
         assert_eq!(engine.stats().runs, 2);
@@ -3706,41 +2816,13 @@ mod tests {
         let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
         let mut workspace = MergeWorkspace::new();
         while engine
+            .core
             .compact(options(8, usize::MAX), &mut workspace)
             .unwrap()
             .is_some()
         {}
         assert_eq!(engine.stats().runs, 1);
         assert!(inputs.iter().all(|run| Arc::strong_count(run) == 1));
-    }
-
-    #[test]
-    fn publication_refuses_growth_past_the_run_limits_but_allows_shrinking() {
-        let engine = Engine::new(manual()).unwrap();
-        overlapping_runs(&engine);
-        engine.set_run_limits(1, 1).unwrap();
-        let begin = || {
-            engine
-                .core
-                .begin_job(options(8, usize::MAX))
-                .unwrap()
-                .unwrap()
-        };
-        // Beginning may first move a run down, which changes no bytes.
-        let job = begin();
-        let stats = engine.stats();
-        let mut built = job.build(&mut MergeWorkspace::new()).unwrap();
-        built.output.output_bytes = stats.run_bytes + stats.held_bytes + 1;
-        assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
-        assert_eq!(engine.stats(), stats);
-
-        let report = begin()
-            .build(&mut MergeWorkspace::new())
-            .unwrap()
-            .publish()
-            .unwrap();
-        assert!(report.output_bytes < stats.run_bytes);
-        assert_eq!(engine.stats().runs, 1);
     }
 
     // Background compaction.
@@ -3750,9 +2832,9 @@ mod tests {
 
     fn background(max_overlap: usize) -> EngineOptions {
         EngineOptions {
-            background_compaction: Some(CompactionOptions {
+            background_compaction: Some(CompactionPolicy {
                 max_overlap,
-                ..CompactionOptions::default()
+                ..CompactionPolicy::default()
             }),
             ..manual()
         }
@@ -3894,7 +2976,7 @@ mod tests {
         let (built, release) = pause_after_build(&engine);
         let slot = engine.core.compacting.lock().unwrap();
         overlapping_runs(&engine);
-        let snapshot = engine.snapshot().unwrap();
+        let snapshot = engine.snapshot();
         drop(slot);
         built.wait();
         let core = Arc::clone(&engine.core);
@@ -3960,77 +3042,6 @@ mod tests {
         assert_eq!(engine.close(), Ok(()));
     }
 
-    /// A lasting failure ends the pass and waits for the next request: it is
-    /// reported, counted once per request, and cleared by a later success.
-    #[test]
-    fn a_failed_compaction_is_reported_once_per_request_and_recovers() {
-        let engine = Engine::new(EngineOptions {
-            target_run_len: 15 << 10,
-            background_compaction: Some(CompactionOptions {
-                max_overlap: 1,
-                max_input_bytes: 30 << 10,
-                max_output_bytes: 30 << 10,
-                ..CompactionOptions::default()
-            }),
-            ..manual()
-        })
-        .unwrap();
-        let mut seed = 7u64;
-        let mut noise = || {
-            (0..20 << 10)
-                .map(|_| {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    (seed >> 56) as u8
-                })
-                .collect::<Vec<u8>>()
-        };
-        // Records longer than the run length: two such runs of one key
-        // exceed the job limits, which no split can help.
-        for _ in 0..3 {
-            for key in 0..2u8 {
-                engine.put(&[key], &noise()).unwrap();
-            }
-            engine.flush().unwrap();
-        }
-        let error = engine.wait_for_compaction().unwrap_err();
-        assert!(
-            matches!(
-                error,
-                BackgroundError::Failed(CompactionError::JobLimit { .. })
-            ),
-            "{error:?}"
-        );
-        let status = engine.background_status().unwrap();
-        // Three flushes and one wait made four requests.
-        assert!(status.failures >= 1, "{status:?}");
-        assert!(
-            status.failures <= status.passes && status.passes <= 4,
-            "{status:?}"
-        );
-        let runs = engine.stats().runs;
-        assert_eq!(runs, 6);
-        for _ in 0..1000 {
-            std::thread::yield_now();
-        }
-        assert_eq!(engine.background_status().unwrap(), status);
-
-        // Larger limits, given to a manual compaction, resolve it; the next
-        // pass succeeds and clears the failure.
-        let mut workspace = MergeWorkspace::new();
-        let wide = CompactionOptions {
-            max_overlap: 1,
-            ..CompactionOptions::default()
-        };
-        while engine.compact(wide, &mut workspace).unwrap().is_some() {}
-        assert_eq!(engine.stats().runs, 2);
-        engine.put(&[9], b"small").unwrap();
-        engine.flush().unwrap();
-        engine.wait_for_compaction().unwrap();
-        let status = engine.background_status().unwrap();
-        assert_eq!(status.last_failure, None);
-        assert_eq!(engine.stats().level0_flushes, 0);
-    }
-
     /// A panic stops the worker for good and is reported; the engine keeps
     /// working without it and is still dropped cleanly.
     #[test]
@@ -4053,6 +3064,7 @@ mod tests {
             Err(BackgroundError::Panicked("injected worker failure".into()))
         );
         engine
+            .core
             .compact(options(8, usize::MAX), &mut MergeWorkspace::new())
             .unwrap()
             .unwrap();
@@ -4061,14 +3073,23 @@ mod tests {
         drop(engine);
         assert_eq!(Arc::strong_count(&core), 1);
     }
-
-    #[test]
-    fn an_engine_without_a_worker_says_so() {
-        let engine = Engine::new(manual()).unwrap();
-        assert_eq!(engine.background_status(), None);
-        assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Disabled));
-    }
 }
 
 #[cfg(test)]
 mod subcompaction_tests;
+
+#[cfg(test)]
+#[path = "../tests/batch.rs"]
+mod api_batch_tests;
+#[cfg(test)]
+#[path = "../tests/checkpoint.rs"]
+mod api_checkpoint_tests;
+#[cfg(test)]
+#[path = "../tests/compaction.rs"]
+mod api_compaction_tests;
+#[cfg(test)]
+#[path = "../tests/engine.rs"]
+mod api_engine_tests;
+#[cfg(test)]
+#[path = "../tests/snapshot.rs"]
+mod api_snapshot_tests;

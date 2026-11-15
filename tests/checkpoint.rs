@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Checkpoints and recovery through the public API: what a checkpoint holds,
 //! what recovery accepts and rejects, and what a failed checkpoint leaves.
 //! Interrupted publication is tested beside the code, where crashes can be
@@ -11,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tessera::engine::{
-    CheckpointError, CheckpointOptions, CompactionError, CompactionOptions, Compression, Damage,
-    Engine, EngineOptions, EngineWorkspace, MergeWorkspace, OpenError, Snapshot, SnapshotLimits,
+    CheckpointError, CheckpointOptions, CompactionPolicy, Compression, Damage, Engine,
+    EngineOptions, EngineWorkspace, MergeWorkspace, OpenError,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -72,15 +73,20 @@ fn checkpoint_dirs(dir: &Path) -> Vec<String> {
 }
 
 fn compact_all(engine: &Engine) {
-    let options = CompactionOptions {
+    let options = CompactionPolicy {
         max_overlap: 1,
-        ..CompactionOptions::default()
+        ..CompactionPolicy::default()
     };
     let mut workspace = MergeWorkspace::new();
-    while engine.compact(options, &mut workspace).unwrap().is_some() {}
+    while engine
+        .core
+        .compact(options, &mut workspace)
+        .unwrap()
+        .is_some()
+    {}
 }
 
-/// State in runs, in a frozen table left by a refused flush, and in the
+/// State in runs and the active memtable, including deletes in the
 /// active table, with binary and empty keys, a large value, and deletes that
 /// hide older values in runs.
 fn varied_engine() -> (Engine, Model) {
@@ -163,17 +169,6 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
     assert_eq!(stats.last_seq, report.last_seq);
     assert!(stats.held_bytes > 0, "filters are restored");
     assert_eq!(recovered.put(b"next", b"1").unwrap(), report.last_seq + 1);
-
-    // A larger configured sequence number wins; a smaller one never does.
-    let ahead = Engine::recover(
-        &scratch.0,
-        EngineOptions {
-            last_seq: report.last_seq + 100,
-            ..manual()
-        },
-    )
-    .unwrap();
-    assert_eq!(ahead.put(b"k", b"v").unwrap(), report.last_seq + 101);
 
     // The recovered engine flushes, compacts and checkpoints like any other.
     recovered.delete(&4u32.to_be_bytes()).unwrap();
@@ -261,7 +256,7 @@ fn checkpoints_recover_under_any_compression() {
                 assert_eq!(found.as_ref(), expected, "{written:?} as {read:?}");
                 assert_eq!(workspace.blocks_loaded(), 1, "key {key}");
             }
-            let snapshot = recovered.snapshot().unwrap();
+            let snapshot = recovered.snapshot();
             // Compaction writes the merged runs with the configured codec;
             // the snapshot keeps reading the runs it replaced.
             compact_all(&recovered);
@@ -357,7 +352,7 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
 
             // Compaction rewrites the merged runs in the configured length;
             // a snapshot keeps reading the runs it replaced.
-            let snapshot = recovered.snapshot().unwrap();
+            let snapshot = recovered.snapshot();
             compact_all(&recovered);
             assert_eq!(recovered.stats().max_overlap, 1);
             assert_eq!(contents(&recovered, b""), newer, "{written} as {read}");
@@ -427,13 +422,13 @@ fn profile(index: u32, version: u32) -> Vec<u8> {
 /// Compacts until one run covers each key, returning the report of every
 /// job that rewrote runs (moves rewrite nothing and are left out).
 fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
-    let options = CompactionOptions {
+    let options = CompactionPolicy {
         max_overlap: 1,
-        ..CompactionOptions::default()
+        ..CompactionPolicy::default()
     };
     let mut workspace = MergeWorkspace::new();
     let mut reports = Vec::new();
-    while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
+    while let Some(report) = engine.core.compact(options, &mut workspace).unwrap() {
         if report.kind != tessera::engine::CompactionKind::Move {
             reports.push(report);
         }
@@ -471,8 +466,7 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 /// structured values and reads equal the model; a checkpoint writes them
 /// (version 5) and they recover under every compression setting, beside
 /// newer plain runs; a snapshot keeps reading dictionary runs that a later
-/// compaction replaced; and a compaction refused by its job limits
-/// publishes nothing.
+/// compaction replaced.
 #[test]
 fn dictionary_runs_recover_mix_and_are_rewritten() {
     let with = |compression| EngineOptions {
@@ -513,10 +507,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     assert_eq!(stats.held_bytes, reports[0].output_held_bytes);
     assert!(stats.run_bytes < plain_stats.run_bytes);
 
-    // A refused compaction publishes nothing and keeps every read. A record
-    // eight blocks long gets a block of its own, so the job over its flush
-    // needs more workspace than the smallest limit allowed, which admits
-    // two raw-cap input blocks.
+    // Oversized records remain readable and can be compacted.
     for i in (0..14_000).step_by(5) {
         put(&engine, &mut model, i, 2);
     }
@@ -524,37 +515,11 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     engine.put(b"user/large", &large).unwrap();
     model.insert(b"user/large".to_vec(), large);
     engine.flush().unwrap();
-    let before = engine.stats();
-    let narrowest = CompactionOptions {
-        max_overlap: 1,
-        max_workspace_bytes: 0,
-        ..CompactionOptions::default()
-    };
-    let Err(CompactionError::Config(config)) =
-        engine.compact(narrowest, &mut MergeWorkspace::new())
-    else {
-        panic!("a workspace limit of 0 is refused");
-    };
-    let refused = CompactionOptions {
-        max_workspace_bytes: config.min as usize,
-        ..narrowest
-    };
-    let error = engine
-        .compact(refused, &mut MergeWorkspace::new())
-        .unwrap_err();
-    assert!(
-        matches!(error, CompactionError::JobLimit { inputs: 2, .. }),
-        "{error:?}"
-    );
-    let after = engine.stats();
-    assert_eq!(
-        (after.runs, after.run_bytes),
-        (before.runs, before.run_bytes)
-    );
+    compact_reports(&engine);
     assert_eq!(contents(&engine, b""), model);
 
     // A snapshot holds the dictionary runs a compaction replaces.
-    let snapshot = engine.snapshot().unwrap();
+    let snapshot = engine.snapshot();
     let held = model.clone();
     for i in (0..14_000).step_by(7) {
         put(&engine, &mut model, i, 3);
@@ -644,99 +609,6 @@ fn segment_dictionaries_round_trip_sensor_records() {
     assert_eq!(get(&engine, &7u32.to_be_bytes()), Some(reading(7, 1)));
 }
 
-/// After a switch to a less compact codec, a compaction that would grow the
-/// runs past `max_run_bytes` is refused and leaves the runs, their contents
-/// and a snapshot's view as they were; lifting the limit lets it through.
-#[test]
-fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
-    let scratch = Scratch::new("codec-switch-limit");
-    let with = |compression| EngineOptions {
-        target_run_len: 128 << 10,
-        compression,
-        ..manual()
-    };
-    let engine = Engine::new(with(Compression::Zstd)).unwrap();
-    let mut model = Model::new();
-    for i in 0..3_000u32 {
-        let (key, value) = (
-            i.to_be_bytes().to_vec(),
-            format!("value {} of {i} {}", i % 10, "x".repeat(1024)),
-        );
-        engine.put(&key, value.as_bytes()).unwrap();
-        model.insert(key, value.into_bytes());
-    }
-    engine.flush().unwrap();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-
-    // Recovered Zstandard runs under a newer uncompressed run of overwrites.
-    let recovered = Engine::recover(&scratch.0, with(Compression::Uncompressed)).unwrap();
-    for i in (0..3_000u32).step_by(5) {
-        let (key, value) = (
-            i.to_be_bytes().to_vec(),
-            format!("newer {i} {}", "x".repeat(1024)),
-        );
-        recovered.put(&key, value.as_bytes()).unwrap();
-        model.insert(key, value.into_bytes());
-    }
-    recovered.flush().unwrap();
-    let snapshot = recovered.snapshot().unwrap();
-    let before = recovered.stats();
-    assert!(before.max_overlap > 1, "{before:?}");
-    recovered
-        .set_run_limits(usize::MAX, before.run_bytes + before.held_bytes)
-        .unwrap();
-    let options = CompactionOptions {
-        max_overlap: 1,
-        ..CompactionOptions::default()
-    };
-    let (refused, before_refusal) = loop {
-        let before_step = recovered.stats();
-        let result = recovered.compact(options, &mut MergeWorkspace::new());
-        if matches!(&result, Ok(Some(_))) {
-            continue;
-        }
-        break (result, before_step);
-    };
-    assert!(
-        matches!(refused, Err(CompactionError::RunLimit(_))),
-        "{refused:?}"
-    );
-    let after = recovered.stats();
-    assert_eq!(
-        (
-            after.run_bytes,
-            after.held_bytes,
-            after.runs,
-            after.last_seq
-        ),
-        (
-            before_refusal.run_bytes,
-            before_refusal.held_bytes,
-            before_refusal.runs,
-            before_refusal.last_seq
-        )
-    );
-    assert_eq!(contents(&recovered, b""), model);
-    let snapshot_contents = |snapshot: &Snapshot| {
-        let mut workspace = EngineWorkspace::new();
-        let mut scan = snapshot.scan_prefix(b"", &mut workspace);
-        let mut seen = Model::new();
-        while let Some(record) = scan.next_record().unwrap() {
-            seen.insert(record.key.to_vec(), record.value.to_vec());
-        }
-        seen
-    };
-    assert_eq!(snapshot_contents(&snapshot), model);
-
-    recovered.set_run_limits(usize::MAX, usize::MAX).unwrap();
-    compact_all(&recovered);
-    assert!(recovered.stats().run_bytes > before.run_bytes);
-    assert_eq!(contents(&recovered, b""), model);
-    assert_eq!(snapshot_contents(&snapshot), model);
-}
-
 #[test]
 fn an_empty_engine_checkpoints_and_recovers_empty_but_nothing_is_not_a_checkpoint() {
     let scratch = Scratch::new("empty");
@@ -763,15 +635,9 @@ fn an_empty_engine_checkpoints_and_recovers_empty_but_nothing_is_not_a_checkpoin
     assert_eq!(recovered.put(b"a", b"1").unwrap(), 42);
 }
 
-/// Flushes, waiting for the worker whenever the run limit refuses.
+/// Publishes all pending memtables.
 fn flush(engine: &Engine) {
-    for _ in 0..1_000 {
-        if engine.flush().is_ok() {
-            return;
-        }
-        engine.wait_for_compaction().unwrap();
-    }
-    panic!("compaction never made room");
+    engine.flush().unwrap();
 }
 
 /// Writes, flushes and compactions continue during the checkpoint, which
@@ -782,7 +648,7 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
     let engine = Engine::new(EngineOptions {
         memtable_budget: 256 << 10,
         target_run_len: 64 << 10,
-        background_compaction: Some(CompactionOptions::default()),
+        background_compaction: Some(CompactionPolicy::default()),
         ..manual()
     })
     .unwrap();
@@ -958,24 +824,6 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
     assert_eq!(contents(&recovered, b""), model);
     assert_eq!(recovered.stats().last_seq, first.last_seq);
 
-    // Without a snapshot to take, nothing is written.
-    let limited = Engine::new(EngineOptions {
-        snapshots: SnapshotLimits {
-            max_live: 0,
-            ..SnapshotLimits::default()
-        },
-        ..manual()
-    })
-    .unwrap();
-    assert!(matches!(
-        limited.checkpoint(&scratch.0, CheckpointOptions::default()),
-        Err(CheckpointError::Snapshot(_))
-    ));
-    assert_eq!(
-        checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000001", "runs"]
-    );
-
     // The next checkpoint takes a new generation and succeeds.
     let next = engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
@@ -985,32 +833,6 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
         get(&Engine::recover(&scratch.0, manual()).unwrap(), b"later"),
         Some(b"x".to_vec())
     );
-}
-
-#[test]
-fn recovery_refuses_more_runs_than_the_options_allow() {
-    let scratch = Scratch::new("limits");
-    let (engine, _) = varied_engine();
-    let report = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-    let error = Engine::recover(
-        &scratch.0,
-        EngineOptions {
-            max_runs: report.runs - 1,
-            ..manual()
-        },
-    );
-    assert!(matches!(error, Err(OpenError::RunLimit(_))));
-    // Refused from the manifest's lengths, before reading a run.
-    let error = Engine::recover(
-        &scratch.0,
-        EngineOptions {
-            max_run_bytes: report.largest_run_bytes,
-            ..manual()
-        },
-    );
-    assert!(matches!(error, Err(OpenError::RunLimit(_))));
 }
 
 /// A file longer than its manifest entry or format allows is refused before

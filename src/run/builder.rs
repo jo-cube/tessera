@@ -3,7 +3,7 @@ use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
 use super::storage::{Packing, RunData};
 use super::{
-    FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
+    FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
     TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
 };
 use crate::block::{
@@ -34,6 +34,8 @@ pub struct RunBuilder {
     keys: Vec<u8>,
     min_key_len: usize,
     record_count: usize,
+    reclaimable: bool,
+    build_estimate: usize,
     max_seq: u64,
     key_hashes: KeyHashes,
 }
@@ -66,6 +68,8 @@ impl RunBuilder {
             keys: Vec::new(),
             min_key_len: 0,
             record_count: 0,
+            reclaimable: false,
+            build_estimate: 0,
             max_seq: 0,
             key_hashes: KeyHashes::new(),
         }
@@ -108,6 +112,17 @@ impl RunBuilder {
             self.keys.extend_from_slice(key);
             self.min_key_len = key.len();
         }
+        let value_bytes = match value {
+            Value::Bytes(bytes) => bytes.len(),
+            Value::Tombstone => 0,
+        };
+        self.build_estimate = self.build_estimate.saturating_add(
+            (key.len() + value_bytes)
+                .saturating_mul(4)
+                .saturating_add(256),
+        );
+        self.reclaimable |=
+            value == Value::Tombstone || (self.record_count > 0 && self.last_key == key);
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.last_seq = seq;
@@ -124,15 +139,6 @@ impl RunBuilder {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.record_count == 0
-    }
-    /// Stored bytes so far, excluding the buffered raw segment.
-    pub fn stored_len(&self) -> usize {
-        self.storage.frames_len
-            + self.storage.dictionaries_len
-            + self.segments.len()
-            + self.table.len()
-            + self.keys.len()
-            + FOOTER_LEN
     }
     pub(super) fn limit_segment_len(&mut self, bytes: usize) {
         self.segment_len = bytes.clamp(RAW_BLOCK_CAP, SEGMENT_RAW_LEN);
@@ -172,6 +178,8 @@ impl RunBuilder {
             RunData::Segmented(self.storage.finish(data.into_boxed_slice())),
             self.key_hashes.finish(),
             self.max_seq,
+            self.reclaimable,
+            self.build_estimate,
         )
     }
     fn cut_segment(&mut self) {
