@@ -465,13 +465,15 @@ fn compressed_frames_match_independent_codec_output() {
         let dictionary = dictionary_of(run.as_bytes(), frame);
         let decoded = decode_frame(frame, dictionary);
         let mut expected = Vec::with_capacity(zstd_safe::compress_bound(decoded.len()));
-        zstd_safe::CCtx::create()
-            .compress_using_cdict(
-                &mut expected,
-                &decoded,
-                &zstd_safe::CDict::create(dictionary, 3),
-            )
+        let mut context = zstd_safe::CCtx::create();
+        context
+            .set_parameter(zstd_safe::CParameter::CompressionLevel(1))
             .unwrap();
+        context
+            .set_parameter(zstd_safe::CParameter::SrcSizeHint(512))
+            .unwrap();
+        context.load_dictionary(dictionary).unwrap();
+        context.compress2(&mut expected, &decoded).unwrap();
         assert_eq!(&frame[HEADER..], expected);
     }
 }

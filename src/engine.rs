@@ -522,7 +522,7 @@ impl Default for EngineOptions {
     /// 64 MiB memtables, 4 GiB of runs (and at most 65,536 of them),
     /// background compaction
     /// with [`CompactionOptions::default`], the default snapshot limits, and
-    /// Zstandard level 3 with segment dictionaries and a 1 KiB compressed target.
+    /// Zstandard level 1 with segment dictionaries and a 1 KiB compressed target.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -682,7 +682,7 @@ impl std::error::Error for ConfigError {}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
-    /// Zstandard level 3, with segment dictionaries and adaptive blocks.
+    /// Zstandard level 1, with segment dictionaries and adaptive blocks.
     #[default]
     Zstd,
     /// Fixed 16 KiB raw blocks, read in place.

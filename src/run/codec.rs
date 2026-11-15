@@ -1,18 +1,18 @@
-use zstd_safe::{CCtx, CDict, DCtx};
+use zstd_safe::{CCtx, CDict, CParameter, DCtx};
 
 /// Block compression used by a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Codec {
     /// Read blocks directly from the run.
     None,
-    /// Zstandard level 3 with a raw-content segment dictionary.
+    /// Zstandard level 1 with a raw-content segment dictionary.
     #[default]
     Zstd,
 }
 
-pub(super) const ZSTD_LEVEL: i32 = 3;
+pub(super) const ZSTD_LEVEL: i32 = 1;
 
-/// Conservative allowance for level-3 prepared tables and their dictionary copy.
+/// Conservative allowance for prepared tables and their dictionary copy.
 pub(super) const CDICT_ALLOWANCE: usize = 2 << 20;
 
 impl Codec {
@@ -51,10 +51,22 @@ impl Compressor {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)
     }
     pub(super) fn prepare_dictionary(&self, dictionary: &[u8]) -> Option<CDict<'static>> {
-        self.zstd
-            .as_ref()
-            .map(|_| CDict::create(dictionary, ZSTD_LEVEL))
+        self.zstd.as_ref().map(|_| CDict::create(dictionary, 3))
     }
+    /// Cache a dictionary whose tables are sized for the estimated raw block.
+    /// load_dictionary lazily constructs one CDict from these parameters on
+    /// the first compress2 call; subsequent frames reuse it and the CCtx.
+    pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize) {
+        if let Some(ctx) = &mut self.zstd {
+            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
+                .expect("supported level");
+            ctx.set_parameter(CParameter::SrcSizeHint(block_len as u32))
+                .expect("bounded block size hint");
+            ctx.load_dictionary(dictionary)
+                .expect("raw segment dictionary");
+        }
+    }
+
     pub(super) fn compress(
         &mut self,
         block: &[u8],
@@ -70,13 +82,12 @@ impl Compressor {
         out.resize(start + bound, 0);
         let output = &mut out[start..];
         let written = match &mut self.zstd {
-            Some(ctx) => ctx
-                .compress_using_cdict(
-                    output,
-                    block,
-                    dictionary.expect("prepared segment dictionary"),
-                )
-                .expect("codec worst-case output bound"),
+            Some(ctx) => match dictionary {
+                // Keep the level-3 ratio probe and therefore block cuts stable.
+                Some(dictionary) => ctx.compress_using_cdict(output, block, dictionary),
+                None => ctx.compress2(output, block),
+            }
+            .expect("codec worst-case output bound"),
             None => {
                 output.copy_from_slice(block);
                 block.len()
@@ -147,7 +158,9 @@ mod tests {
             // Reuse exactly the same prepared dictionary for multiple blocks.
             for input in [&block[..1024], block.as_slice()] {
                 let mut stored = Vec::new();
-                compressor.compress(input, Some(&prepared), &mut stored);
+                compressor.begin_segment(raw, input.len());
+                compressor.compress(input, None, &mut stored);
+                assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
                 let mut decoded = vec![0; input.len()];
                 assert_eq!(
                     decompressor.decompress(Codec::Zstd, &stored, &mut decoded, raw),

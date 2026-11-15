@@ -9,7 +9,6 @@ use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, Value, cmp_internal,
 };
 use std::fmt;
-use zstd_safe::CDict;
 
 /// Encodes sorted records, buffering at most one raw segment before compressing.
 /// Rejected records leave the builder unchanged. A single oversized record is
@@ -204,6 +203,7 @@ impl RunBuilder {
                 .unwrap_or(1)
                 .clamp(1, RAW_BLOCK_CAP)
         });
+        self.compressor.begin_segment(&dictionary, target);
         let view = BlockView::open(&raw).expect("builder's segment");
         let mut cursor = BlockPosition::new();
         let mut block = BlockBuilder::new();
@@ -228,23 +228,17 @@ impl RunBuilder {
                 projected > target
             };
             if !block.is_empty() && cut {
-                self.cut_block(&mut block, &mut uncompressed, prepared.as_ref(), reference);
+                self.cut_block(&mut block, &mut uncompressed, reference);
             }
             block
                 .append(record.key, record.seq, record.value)
                 .expect("one record fits a block");
         }
         if !block.is_empty() {
-            self.cut_block(&mut block, &mut uncompressed, prepared.as_ref(), reference);
+            self.cut_block(&mut block, &mut uncompressed, reference);
         }
     }
-    fn cut_block(
-        &mut self,
-        block: &mut BlockBuilder,
-        raw: &mut Vec<u8>,
-        dictionary: Option<&CDict<'_>>,
-        reference: u32,
-    ) {
+    fn cut_block(&mut self, block: &mut BlockBuilder, raw: &mut Vec<u8>, reference: u32) {
         let offset = self.frames.len();
         let len = block.encoded_len();
         let codec = self.compressor.codec();
@@ -254,7 +248,7 @@ impl RunBuilder {
         } else {
             raw.clear();
             block.flush_into(raw);
-            self.compressor.compress(raw, dictionary, &mut self.frames);
+            self.compressor.compress(raw, None, &mut self.frames);
         }
         frame::seal(&mut self.frames[offset..], codec, len, reference);
         self.keys.extend_from_slice(block.last_key());

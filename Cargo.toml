@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 crc32fast = "1"
-zstd-safe = { version = "8", default-features = false, features = ["std", "vendored"] }
+zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "experimental"] }
 
 # Tests run in a container and are not stepped through in a debugger, so
 # line tables, which keep file and line numbers in panics and backtraces,
