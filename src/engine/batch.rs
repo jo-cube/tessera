@@ -57,7 +57,7 @@ impl WriteBatch {
         start..self.bytes.len()
     }
 
-    fn records(&self) -> impl ExactSizeIterator<Item = (&[u8], Value<'_>)> + Clone {
+    pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (&[u8], Value<'_>)> + Clone {
         self.operations.iter().map(|op| {
             (
                 &self.bytes[op.key.clone()],
@@ -69,14 +69,16 @@ impl WriteBatch {
     }
 }
 
-impl Core {
-    pub(super) fn write_batch(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
-        if batch.len() == 1 {
-            let (key, value) = batch.records().next().unwrap();
-            return self.update(key, value);
-        }
+impl WriteBatch {
+    pub(super) fn is_sorted(&self) -> bool {
+        self.operations
+            .windows(2)
+            .all(|pair| self.bytes[pair[0].key.clone()] < self.bytes[pair[1].key.clone()])
+    }
+
+    pub(super) fn validate(&self, budget: usize) -> Result<usize, UpdateError> {
         let mut charge = 0usize;
-        for (key, value) in batch.records() {
+        for (key, value) in self.records() {
             let len = match value {
                 Value::Bytes(bytes) => bytes.len(),
                 Value::Tombstone => 0,
@@ -90,13 +92,30 @@ impl Core {
                 return Err(UpdateError::Rejected(WriteError::ValueTooLong { len }));
             }
             let record = key.len() + len + ENTRY_OVERHEAD;
-            if record > self.memtable_budget {
+            if record > budget {
                 return Err(UpdateError::Rejected(WriteError::RecordExceedsBudget {
                     charge: record,
-                    budget: self.memtable_budget,
+                    budget,
                 }));
             }
             charge = charge.saturating_add(record);
+        }
+        Ok(charge)
+    }
+}
+
+impl Core {
+    pub(super) fn write_batch(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
+        let charge = batch.validate(self.memtable_budget)?;
+        let sorted = batch.is_sorted();
+        if !batch.is_empty()
+            && (sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget)
+        {
+            return self.ingest_batch(batch, sorted);
+        }
+        if batch.len() == 1 {
+            let (key, value) = batch.records().next().unwrap();
+            return self.update(key, value);
         }
         let mut state = self.write_state();
         loop {
@@ -111,12 +130,7 @@ impl Core {
                 sum.saturating_add(state.active.write_charge(key, value))
             });
             let memory = state.active.memory();
-            if needed <= memory.budget.saturating_sub(memory.charged)
-                || state.active.is_empty() && charge > self.memtable_budget
-            {
-                if charge > memory.budget {
-                    state.active.raise_budget(charge);
-                }
+            if needed <= memory.budget.saturating_sub(memory.charged) {
                 for (key, value) in batch.records() {
                     self.write(&mut state, key, value)
                         .expect("preflight admitted every batch operation");

@@ -273,7 +273,8 @@
 //! Each memtable has [`EngineOptions::memtable_budget`] charged bytes, including
 //! snapshot-pinned history. The active table and up to
 //! [`EngineOptions::max_frozen_memtables`] frozen tables may coexist. An atomic
-//! batch exceeding one budget temporarily uses a table sized for the batch.
+//! batch exceeding one budget uses the ingestion path (unsorted input is
+//! staged in a private table sized for that batch).
 //! Long-lived snapshots make rotations come sooner.
 //!
 //! Published runs are limited by a byte total, [`EngineOptions::max_run_bytes`],
@@ -388,6 +389,7 @@ mod batch;
 mod checkpoint;
 mod directory;
 mod flusher;
+mod ingest;
 mod levels;
 mod worker;
 
@@ -467,6 +469,9 @@ pub struct EngineOptions {
     pub memtable_budget: usize,
     /// Maximum frozen tables awaiting background flush, at least one (default 2).
     pub max_frozen_memtables: usize,
+    /// Minimum charged input bytes for automatic sorted ingestion. `None`
+    /// selects half the memtable budget; `Some(0)` ingests any sorted batch.
+    pub bulk_ingest_min: Option<usize>,
     /// Bytes of memtable records per run a flush writes, so that a large
     /// flush writes several runs with disjoint key ranges: from 1 to 1 GiB.
     /// A run holds at least one record.
@@ -521,6 +526,7 @@ impl Default for EngineOptions {
         Self {
             memtable_budget: 64 << 20,
             max_frozen_memtables: 2,
+            bulk_ingest_min: None,
             target_run_len: TARGET_RUN_LEN,
             max_runs: DEFAULT_MAX_RUNS,
             max_run_bytes: DEFAULT_MAX_RUN_BYTES,
@@ -753,6 +759,8 @@ impl std::error::Error for SnapshotError {}
 /// [Automatic flushing](self#automatic-flushing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
+    /// Sorted ingestion requires strictly ascending keys without duplicates.
+    BatchNotSorted,
     /// The key exceeds [`MAX_KEY_LEN`].
     KeyTooLong {
         /// Length of the rejected key.
@@ -777,6 +785,7 @@ pub enum WriteError {
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::BatchNotSorted => f.write_str("ingestion requires strictly sorted, unique keys"),
             Self::KeyTooLong { len } => {
                 write!(f, "key of {len} bytes exceeds the limit of {MAX_KEY_LEN}")
             }
@@ -972,6 +981,7 @@ pub struct EngineStats {
 
 struct State {
     last_seq: u64,
+    pending_ingests: usize,
     active: Memtable,
     /// Oldest first. Each table's sequence numbers are above the runs' and
     /// those of the tables before it, and below `active`'s. Only flushes
@@ -1146,6 +1156,7 @@ struct Core {
     memtable_budget: usize,
     max_frozen_memtables: usize,
     flush_signal: flusher::Signal,
+    bulk_ingest_min: usize,
     target_run_len: usize,
     /// The codec of the runs this engine builds.
     codec: Codec,
@@ -1172,6 +1183,8 @@ struct Core {
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Merges that failed at the output limit after reading their inputs.
     #[cfg(test)]
     overflows: std::sync::atomic::AtomicUsize,
@@ -1290,6 +1303,24 @@ impl Engine {
     /// sequence number without changing state.
     pub fn write(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         self.core.write_batch(batch)
+    }
+
+    /// Builds a strictly key-sorted, duplicate-free batch directly into runs
+    /// outside the state lock and publishes it atomically. Returns its last
+    /// sequence number; rejects unsorted or repeated keys without changes.
+    /// Overlapping memtables are flushed before publication. Concurrent writes
+    /// are ordered after the sequence reservation and remain newer.
+    /// A failed build/publication can leave a gap in sequence numbers.
+    pub fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
+        if !batch.is_sorted() {
+            return Err(UpdateError::Rejected(WriteError::BatchNotSorted));
+        }
+        batch.validate(self.memtable_budget())?;
+        self.core.ingest_batch(batch, true)
+    }
+
+    fn memtable_budget(&self) -> usize {
+        self.core.memtable_budget
     }
 
     /// Returns the latest value of `key`, or `None` if it is absent or
@@ -1413,6 +1444,7 @@ impl Core {
         Self {
             state: RwLock::new(State {
                 last_seq: options.last_seq,
+                pending_ingests: 0,
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
                 frozen: Vec::new(),
                 runs: Vec::new(),
@@ -1447,6 +1479,9 @@ impl Core {
             memtable_budget: options.memtable_budget,
             max_frozen_memtables: options.max_frozen_memtables,
             flush_signal: flusher::Signal::new(),
+            bulk_ingest_min: options
+                .bulk_ingest_min
+                .unwrap_or(options.memtable_budget / 2),
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
             target_block_compressed: options.target_block_compressed,
@@ -1463,6 +1498,8 @@ impl Core {
             after_build: Mutex::new(None),
             #[cfg(test)]
             before_flush_build: Mutex::new(None),
+            #[cfg(test)]
+            after_ingest_build: Mutex::new(None),
             #[cfg(test)]
             overflows: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1965,8 +2002,10 @@ impl Core {
         // Logical reads resolve overlapping runs by sequence. Preserve it if
         // any unselected run could compete, even above the bottom level.
         // A snapshot taken after selection retains the original input runs.
+        let keep_all_tombstones = state.pending_ingests > 0;
         let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth())
             && others.is_empty()
+            && state.pending_ingests == 0
             && Arc::strong_count(&self.snapshots) == 1;
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
@@ -1980,6 +2019,7 @@ impl Core {
             level,
             dest,
             zero_seq,
+            keep_all_tombstones,
             cuts,
             cursor,
             refusal: split,
@@ -2046,6 +2086,7 @@ impl Core {
             .max()
             .unwrap_or(0);
         let others = Self::others(&state, &inputs);
+        let state_pending = state.pending_ingests > 0;
         drop(state);
         Ok(CompactionJob {
             engine: self,
@@ -2058,6 +2099,7 @@ impl Core {
             level: deepest,
             dest: Dest::Anywhere(deepest),
             zero_seq: false,
+            keep_all_tombstones: state_pending,
             cuts: OutputCuts::default(),
             cursor: None,
             refusal: None,
@@ -2695,6 +2737,7 @@ struct CompactionJob<'e> {
     dest: Dest,
     /// Settled output with no competing unselected run or pre-existing snapshot.
     zero_seq: bool,
+    keep_all_tombstones: bool,
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.
     cursor: Option<Cursor>,
@@ -2741,9 +2784,10 @@ impl<'e> CompactionJob<'e> {
             .map(|run| run.run.key_range().expect(NOT_EMPTY))
             .collect();
         let keep_tombstone = |key: &[u8]| {
-            ranges
-                .iter()
-                .any(|range| range.min <= key && key <= range.max)
+            self.keep_all_tombstones
+                || ranges
+                    .iter()
+                    .any(|range| range.min <= key && key <= range.max)
         };
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
