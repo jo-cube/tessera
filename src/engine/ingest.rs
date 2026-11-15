@@ -33,6 +33,7 @@ impl Core {
             builder
                 .get_or_insert_with(|| {
                     RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.chunks)
+                        .with_min_block_raw(self.min_block_raw)
                 })
                 .add(key, 0, value)
                 .expect("validated unique sorted records");

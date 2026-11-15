@@ -101,7 +101,10 @@ impl Store {
         if let Ok(threads) = std::env::var("TESSERA_BENCH_BACKGROUND_THREADS") {
             options.background_threads = threads.parse().expect("integer builder count");
         }
-        eprintln!("Tessera: level_ratio={}, background_threads={}", options.level_ratio, options.background_threads);
+        if let Ok(floor) = std::env::var("TESSERA_BENCH_MIN_BLOCK_RAW") {
+            options.min_block_raw = floor.parse().expect("integer raw block floor");
+        }
+        eprintln!("Tessera: level_ratio={}, background_threads={}, min_block_raw={}", options.level_ratio, options.background_threads, options.min_block_raw);
         Self::T(Engine::new(options).unwrap())
     }
     pub fn rocks(dir: &str, cache: u64) -> Self {

@@ -205,3 +205,36 @@ fn raw_cuts_count_encoded_prefixes_and_restart_keys() {
     }
     Run::new(run.as_bytes()).unwrap();
 }
+
+#[test]
+fn raw_floor_controls_cuts_with_short_final_blocks_and_the_existing_cap() {
+    let mut previous_blocks = usize::MAX;
+    for floor in [0, 4 << 10, 8 << 10, 16 << 10, RAW_BLOCK_CAP, usize::MAX] {
+        let mut builder =
+            RunBuilder::with_target_block_compressed(Codec::Zstd, 1).with_min_block_raw(floor);
+        for i in 0..2000u32 {
+            builder
+                .add(
+                    &i.to_be_bytes(),
+                    u64::from(i) + 1,
+                    Value::Bytes(&vec![(i % 19) as u8; 512]),
+                )
+                .unwrap();
+        }
+        let run = builder.finish();
+        assert!(run.block_count() <= previous_blocks);
+        previous_blocks = run.block_count();
+        if floor > 0 {
+            let target = floor.min(RAW_BLOCK_CAP);
+            for i in 0..run.block_count() {
+                let len = run.view().frame(i).unwrap().decoded_len;
+                assert!(len <= target, "{floor}: {len}");
+                if i + 1 < run.block_count() {
+                    assert!(len >= target - 1024);
+                }
+            }
+        }
+        check(&run, 2000, 512);
+        check(&Run::new(run.as_bytes()).unwrap(), 2000, 512);
+    }
+}

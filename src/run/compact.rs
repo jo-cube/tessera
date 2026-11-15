@@ -37,6 +37,8 @@ pub struct CompactLimits {
     pub codec: Codec,
     /// Estimated compressed bytes per output block.
     pub target_block_compressed: usize,
+    /// Minimum raw block target, capped at 256 KiB.
+    pub min_block_raw: usize,
     /// Erase sequences in settled output whose older views retain their own runs.
     pub zero_seq: bool,
 }
@@ -640,7 +642,8 @@ impl<'c> Output<'c> {
                 self.limits.codec,
                 self.limits.target_block_compressed,
                 &self.pool,
-            );
+            )
+            .with_min_block_raw(self.limits.min_block_raw);
             builder.limit_segment_len(self.segment_len);
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder

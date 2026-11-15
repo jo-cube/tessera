@@ -680,6 +680,7 @@ fn write_runs(
     while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
         let open = builder.get_or_insert_with(|| {
             RunBuilder::in_pool(core.codec, core.target_block_compressed, &core.chunks)
+                .with_min_block_raw(core.min_block_raw)
         });
         // Keys and values came from runs and memtables that held them.
         open.add(record.key, record.seq, Value::Bytes(record.value))

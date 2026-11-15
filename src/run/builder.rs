@@ -17,6 +17,7 @@ use std::fmt;
 /// stored in its own block and, if necessary, its own segment.
 pub struct RunBuilder {
     target: usize,
+    min_block_raw: usize,
     segment_len: usize,
     raw_target: Option<usize>,
     compressor: Compressor,
@@ -49,6 +50,7 @@ impl RunBuilder {
     pub fn with_target_block_compressed(codec: Codec, target: usize) -> Self {
         Self {
             target: target.clamp(1, RAW_BLOCK_CAP),
+            min_block_raw: 0,
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
             compressor: Compressor::new(codec),
@@ -74,6 +76,12 @@ impl RunBuilder {
         let mut builder = Self::with_target_block_compressed(codec, target);
         builder.storage = Packing::new(pool);
         builder
+    }
+    /// Sets a raw block target floor, capped at 256 KiB. Record boundaries
+    /// and singleton oversized records still determine actual block lengths.
+    pub(crate) fn with_min_block_raw(mut self, bytes: usize) -> Self {
+        self.min_block_raw = bytes.min(RAW_BLOCK_CAP);
+        self
     }
     /// Fixed targets used by physical reader tests, including tiny blocks.
     #[cfg(test)]
@@ -225,6 +233,7 @@ impl RunBuilder {
                 .unwrap_or(1)
                 .clamp(1, RAW_BLOCK_CAP)
         });
+        let target = target.max(self.min_block_raw).min(RAW_BLOCK_CAP);
         self.compressor.begin_segment(&dictionary, target);
         let view = BlockView::open(&raw).expect("builder's segment");
         let mut cursor = BlockPosition::new();

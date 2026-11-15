@@ -1051,6 +1051,7 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
     for compression in [Compression::Zstd, Compression::Uncompressed] {
         let options = EngineOptions {
             compression,
+            min_block_raw: 16 << 10,
             ..manual()
         };
         let scratch = Scratch::new(&format!("multi-segment-{compression:?}"));
@@ -1068,9 +1069,13 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
         let recovered = Engine::recover(&scratch.0, options).unwrap();
         let stats = recovered.stats();
         assert_eq!(stats.runs, 1);
-        assert!(stats.pool_in_use_bytes >= 1 << 20);
-        assert_eq!(stats.pool_reserve_bytes, 0);
-        assert_eq!(stats.pool_reserve_limit, 64 << 20);
+        if compression == Compression::Zstd {
+            assert_eq!(stats.pool_in_use_bytes, 0);
+        } else {
+            assert!(stats.pool_in_use_bytes >= 1 << 20);
+        }
+        assert_eq!(stats.pool_reserve_bytes, 1 << 20);
+        assert_eq!(stats.pool_reserve_limit, 32 << 20);
         let mut workspace = EngineWorkspace::new();
         let guard = recovered.read();
         let mut scan = guard.scan(&mut workspace);

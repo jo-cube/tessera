@@ -43,6 +43,7 @@ const UNLIMITED: CompactLimits = CompactLimits {
     max_workspace_bytes: usize::MAX,
     codec: Codec::Zstd,
     target_block_compressed: crate::run::TARGET_BLOCK_LEN,
+    min_block_raw: 0,
     zero_seq: false,
 };
 
@@ -242,6 +243,7 @@ fn measured_codec_contexts_fit_their_allowance() {
         let mut workspace = MergeWorkspace::new();
         let limits = CompactLimits {
             target_block_compressed: target,
+            min_block_raw: 0,
             ..UNLIMITED
         };
         compact(&views, |_| true, limits, &mut workspace).unwrap();

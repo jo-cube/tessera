@@ -71,6 +71,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
                 max_workspace_bytes: options.max_workspace_bytes,
                 codec: engine.core.codec,
                 target_block_compressed: engine.core.target_block_compressed,
+                min_block_raw: engine.core.min_block_raw,
                 zero_seq: job.zero_seq,
             },
             &job.cuts,

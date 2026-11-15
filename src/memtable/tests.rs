@@ -1218,6 +1218,7 @@ fn split_flush(tables: &[&FrozenMemtable], target: usize, cuts: &FlushCuts) -> V
         target,
         Codec::None,
         TARGET_BLOCK_LEN,
+        0,
         cuts,
         &crate::chunk::ChunkPool::new(0),
     );

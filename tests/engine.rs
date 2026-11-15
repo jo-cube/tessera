@@ -1039,6 +1039,7 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
             snapshots: SnapshotLimits::default(),
             compression: [Compression::Zstd, Compression::Uncompressed][rng.below(2)],
             target_block_compressed: [64, 2 << 10, 16 << 10][rng.below(3)],
+            min_block_raw: [0, 4 << 10, 16 << 10][rng.below(3)],
         })
         .unwrap();
         let mut model = Model::new();
@@ -1233,6 +1234,13 @@ fn each_setting_out_of_range_is_refused_by_name() {
             256 << 10,
         ),
         (
+            engine(|o| o.min_block_raw = (256 << 10) + 1),
+            "EngineOptions::min_block_raw",
+            (256 << 10) + 1,
+            0,
+            256 << 10,
+        ),
+        (
             compaction(|c| c.max_overlap = 0),
             "CompactionOptions::max_overlap",
             0,
@@ -1294,6 +1302,8 @@ fn each_setting_out_of_range_is_refused_by_name() {
         engine(|o| o.max_run_bytes = 1),
         engine(|o| o.target_block_compressed = 1),
         engine(|o| o.target_block_compressed = 256 << 10),
+        engine(|o| o.min_block_raw = 0),
+        engine(|o| o.min_block_raw = 256 << 10),
         engine(|o| o.background_compaction = None),
         engine(|o| {
             o.snapshots = SnapshotLimits {
