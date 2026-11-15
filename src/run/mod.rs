@@ -159,14 +159,11 @@ pub use reader::{Run, RunView};
 #[cfg(test)]
 pub use compact::{CONTEXT_ALLOWANCE, compact};
 #[cfg(test)]
-pub(crate) use logical::LookupInput;
-#[cfg(test)]
 pub use logical::RunSet;
 #[cfg(test)]
 pub use reader::{KeyRange, ReadWorkspace, RunCursor};
 
-/// Encoded block length that [`RunBuilder::new`] aims for. Provisional: see
-/// `docs/benchmarks.md` for the measurements behind it.
+/// Encoded block length that [`RunBuilder::new`] aims for.
 pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 
 /// Largest target accepted by [`RunBuilder::with_target_block_len`]. Staying

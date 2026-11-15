@@ -9,9 +9,6 @@
 //! tag can only change what compaction does next, never what a read returns.
 //! Nothing here is persisted: recovery puts a checkpoint's runs, which are
 //! disjoint, into the last level.
-//!
-//! See `docs/capacity-design.md`, sections 4 and 5, for the policy and its
-//! invariants.
 
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -377,8 +374,7 @@ impl Levels {
     }
 
     /// Where a flush is split: at the smallest keys of level 1's runs, so
-    /// that each piece's level-0 job meets fewer of them. See
-    /// `docs/capacity-design.md`, section 8.
+    /// that each piece's level-0 job meets fewer of them.
     pub(super) fn flush_cuts(&self, target_run_len: usize) -> FlushCuts {
         FlushCuts {
             at: self.levels[1]
@@ -580,50 +576,6 @@ impl Levels {
             .clamp(1, target)
     }
 
-    /// Each level's target bytes under `fit`, 0 for level 0 and the last
-    /// level, which have none: for measurements.
-    #[cfg(test)]
-    pub(super) fn targets(&self, fit: &Fit) -> Vec<usize> {
-        let base = BASE_SEGMENTS.saturating_mul(self.segment(fit));
-        let last = self.levels.len() - 1;
-        (0..=last)
-            .map(|level| match level {
-                0 => 0,
-                level if level == last => 0,
-                level => self.target(level, base),
-            })
-            .collect()
-    }
-
-    /// Each live source's allowance and the output that set it, with the
-    /// source's level, bytes, and the bytes of the smallest run below it
-    /// that it overlaps: for measurements.
-    #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub(super) fn allowances(&self) -> Vec<(usize, usize, Option<usize>, usize, Option<usize>)> {
-        self.outgrown
-            .iter()
-            .filter_map(|outgrown| {
-                let source = outgrown.source.upgrade()?;
-                let level = self.level_of(&source);
-                let smallest = level.and_then(|level| {
-                    let below = self.levels.get(level + 1)?;
-                    below[overlapping(below, min_of(&source), max_of(&source))]
-                        .iter()
-                        .map(bytes_of)
-                        .min()
-                });
-                Some((
-                    outgrown.max_bytes,
-                    outgrown.output_bytes,
-                    level,
-                    bytes_of(&source),
-                    smallest,
-                ))
-            })
-            .collect()
-    }
-
     /// The sources holding an output allowance, (live, retired but not yet
     /// pruned): for measurements.
     #[cfg(test)]
@@ -679,8 +631,7 @@ impl Levels {
         // below over its target goes first. Scored by its flushes, a level
         // 0 backlog (the worker behind the writers) let level 1 grow to the
         // backlog's multiple of its target, and every level-0 merge then
-        // rewrote that much more of it (`docs/capacity-design.md`, section
-        // 17).
+        // rewrote that much more of it.
         if flushes >= trigger {
             due.push((0, 1, 1));
         }

@@ -237,9 +237,7 @@
 //! A scan merges one input per group: each reads its runs in key order
 //! through one decoded block and one decompression context, after a binary
 //! search for where to start. The memory a scan holds therefore grows with
-//! the overlap, not with the number of runs. How much a directory saves
-//! depends on how the runs were written and compacted: see
-//! `docs/benchmarks.md`.
+//! the overlap, not with the number of runs.
 //!
 //! # Background compaction
 //!
@@ -423,11 +421,7 @@ mod levels;
 mod worker;
 
 #[cfg(test)]
-mod alpha_tests;
-#[cfg(test)]
 mod capacity_tests;
-#[cfg(test)]
-mod directory_tests;
 #[cfg(test)]
 mod leveled_tests;
 #[cfg(test)]
@@ -470,14 +464,6 @@ type SharedRun = Arc<Published>;
 #[derive(Debug)]
 struct Published {
     run: Run<Vec<u8>>,
-    /// Whether this was the last run of its flush or compaction, the only one
-    /// that can be below the target length. Only the flat selector that
-    /// preceded levels, kept for tests, reads it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the tests' flat selector")
-    )]
-    tail: bool,
     /// The decoded length of its largest block, for sizing a compaction's
     /// workspace before reading anything.
     largest_block: usize,
@@ -485,16 +471,11 @@ struct Published {
 
 /// Wraps the runs of one flush or compaction, in key order, for publication.
 fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
-    let last = runs.len().saturating_sub(1);
-    runs.into_iter().enumerate().map(move |(index, run)| {
+    runs.into_iter().map(|run| {
         // A run that cannot report its blocks is damaged, which the merge
         // that reads it reports; until then it is sized as one empty block.
         let largest_block = run.view().largest_block_len().unwrap_or(0);
-        Arc::new(Published {
-            run,
-            tail: index == last,
-            largest_block,
-        })
+        Arc::new(Published { run, largest_block })
     })
 }
 
@@ -554,8 +535,8 @@ pub struct EngineOptions {
     /// flushes, compactions and checkpoints build: 16 KiB by default. Every
     /// run read decodes one block, so smaller blocks make lookups and the
     /// first record of a scan cheaper, and cost memory: each block compresses
-    /// on its own and adds an index entry and a frame header (see
-    /// `docs/benchmarks.md`). Blocks are cut at record boundaries, so a
+    /// on its own and adds an index entry and a frame header. Blocks are
+    /// cut at record boundaries, so a
     /// record larger than this is a block of its own. From 1 (a block per
     /// record, at about 20 bytes of index and frame header a block) to
     /// 64 KiB, which keeps compression contexts within the compaction
@@ -724,14 +705,10 @@ impl std::error::Error for ConfigError {}
 ///
 /// Every read of a run, a lookup or a scan's first record in it, decodes a
 /// block ([`EngineOptions::target_block_len`], 16 KiB by default), so the
-/// codec sets most of a run read's cost; reading from
-/// the memtables costs the same under all three. In the measurements in
-/// `docs/benchmarks.md`, a lookup in a run took about 8 µs
-/// with Zstandard, 2 µs with LZ4 and 0.5 µs uncompressed, and runs of
-/// JSON-like values held 26%, 45% and 100% of their logical size.
+/// codec affects decoding. Reading from memtables is independent of it.
 ///
 /// Each block records its codec, so an engine reads runs of every codec
-/// whatever this is set to: a checkpoint or log written under one setting
+/// whatever this is set to: a checkpoint written under one setting
 /// recovers under another, and compaction rewrites runs it merges with the
 /// current one. [`EngineOptions::max_run_bytes`] and
 /// [`CheckpointOptions::max_bytes`] count stored bytes, so less compression
@@ -749,15 +726,6 @@ impl std::error::Error for ConfigError {}
 /// Every valid block length is accepted and kept as requested; at any
 /// length, the check below decides per rewrite whether the output uses the
 /// dictionary.
-/// On JSON-like values through the engine (`docs/benchmarks.md`), 4 KiB
-/// blocks with a dictionary held 10% less run memory than 16 KiB plain
-/// blocks and 27% less than 4 KiB plain blocks, and lookups that reached a
-/// run took 3.9–5.7 µs, against 13.8 µs at 16 KiB and 5.9–6.0 µs at 4 KiB
-/// plain. Within that range a lookup is slower the more distinct
-/// dictionaries the runs use (each compaction trains its own) and the less
-/// of their tables is in cache. On small repetitive records they gained
-/// nothing, and the check below leaves those plain.
-///
 /// Only runs that are rewritten get a dictionary. Runs that no compaction
 /// merges, such as the disjoint runs of keys written in ascending order,
 /// stay plain until a checkpoint rewrites them.
@@ -1301,90 +1269,12 @@ struct Core {
     /// writer is blocked.
     #[cfg(test)]
     level0_waits: std::sync::atomic::AtomicUsize,
-    /// Nanoseconds those flushes waited.
-    #[cfg(test)]
-    level0_wait_nanos: std::sync::atomic::AtomicU64,
     /// Runs between building a compaction and returning it.
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Every compaction step's outcome, while `Some`: for measurements.
-    #[cfg(test)]
-    step_log: Mutex<Option<Vec<StepRecord>>>,
     /// Merges that failed at the output limit after reading their inputs.
     #[cfg(test)]
     overflows: std::sync::atomic::AtomicUsize,
-    /// Every flush's phases, while `Some`: for measurements.
-    #[cfg(test)]
-    flush_log: Mutex<Option<Vec<FlushRecord>>>,
-}
-
-/// One flush's phases in nanoseconds, as the thread that ran it saw them:
-/// waiting for level 0, freezing the active table, building the runs
-/// (encoding records and compressing blocks, then finishing the runs'
-/// last blocks, indexes and filters), and publication with taking the
-/// state lock and freeing the flushed tables.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FlushRecord {
-    pub(crate) wait: u64,
-    pub(crate) freeze: u64,
-    pub(crate) encode: u64,
-    pub(crate) finish: u64,
-    pub(crate) publish: u64,
-    /// The part of `publish` spent holding the state lock.
-    pub(crate) locked: u64,
-    pub(crate) runs: usize,
-    pub(crate) bytes: usize,
-    pub(crate) refused: bool,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The phases of the flush this thread is running so far.
-    static FLUSH_PHASES: std::cell::RefCell<FlushRecord> =
-        std::cell::RefCell::new(FlushRecord::default());
-}
-
-#[cfg(test)]
-fn flush_phase(add: impl FnOnce(&mut FlushRecord)) {
-    FLUSH_PHASES.with(|phases| add(&mut phases.borrow_mut()));
-}
-
-/// Reports the nanoseconds since its start when dropped.
-#[cfg(test)]
-struct Timed<F: FnMut(u64)>(std::time::Instant, F);
-
-#[cfg(test)]
-impl<F: FnMut(u64)> Drop for Timed<F> {
-    fn drop(&mut self) {
-        (self.1)(self.0.elapsed().as_nanos() as u64);
-    }
-}
-
-/// One compaction step as [`Core::compact`] saw it, for measurements.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct StepRecord {
-    pub(crate) kind: Option<CompactionKind>,
-    pub(crate) level: usize,
-    /// Inputs taken from level 0, and from the level below the source.
-    pub(crate) level0_inputs: usize,
-    pub(crate) lower_inputs: usize,
-    /// Stored bytes of the inputs from the level below the source.
-    pub(crate) lower_bytes: usize,
-    pub(crate) input_bytes: usize,
-    pub(crate) output_bytes: usize,
-    /// Filter and dictionary bytes of the inputs and of the output.
-    pub(crate) input_held: usize,
-    pub(crate) output_held: usize,
-    /// Level-0 runs overlapping the inputs that the job left out.
-    pub(crate) level0_left: usize,
-    /// Level-0 flushes, and each level's (runs, bytes), before the step.
-    pub(crate) level0_flushes: usize,
-    pub(crate) shape: Vec<(usize, usize)>,
-    pub(crate) error: Option<CompactionError>,
-    /// From selection to publication or failure.
-    pub(crate) nanos: u64,
 }
 
 /// A key-value engine. See the [module documentation](self) for its
@@ -1648,15 +1538,9 @@ impl Core {
             #[cfg(test)]
             level0_waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
-            level0_wait_nanos: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
             after_build: Mutex::new(None),
             #[cfg(test)]
-            step_log: Mutex::new(None),
-            #[cfg(test)]
             overflows: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            flush_log: Mutex::new(None),
         }
     }
 
@@ -1759,38 +1643,7 @@ impl Core {
         #[cfg(test)]
         self.level0_waits
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        #[cfg(test)]
-        let start = std::time::Instant::now();
         let waited = signal.wait_for(|| !full(&self.read_state()));
-        #[cfg(test)]
-        self.level0_wait_nanos.fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        #[cfg(test)]
-        flush_phase(|phases| phases.wait += start.elapsed().as_nanos() as u64);
-        #[cfg(test)]
-        if waited != Ok(true)
-            && let Some(log) = self.step_log.lock().unwrap().as_mut()
-        {
-            let shape = self.read_state().levels.shape();
-            log.push(StepRecord {
-                kind: None,
-                level: usize::MAX,
-                level0_inputs: 0,
-                lower_inputs: 0,
-                lower_bytes: 0,
-                input_bytes: 0,
-                output_bytes: 0,
-                input_held: 0,
-                output_held: 0,
-                level0_left: 0,
-                level0_flushes: self.read_state().levels.level0_flushes(),
-                shape,
-                error: signal.status().last_failure,
-                nanos: 0,
-            });
-        }
         let mut state = self.write_state();
         if full(&state) {
             state.blocked = waited.err();
@@ -1881,10 +1734,6 @@ impl Core {
 
     /// Freezes the active table and replaces it, in constant time.
     fn freeze_active(&self, state: &mut State) {
-        #[cfg(test)]
-        let start = std::time::Instant::now();
-        #[cfg(test)]
-        let _timed = Timed(start, |nanos| flush_phase(|phases| phases.freeze += nanos));
         let frozen = state.frozen_charged() + state.active.memory().charged;
         let successor = Memtable::new(self.active_budget(frozen), Some(state.last_seq));
         let table = std::mem::replace(&mut state.active, successor).freeze();
@@ -2013,93 +1862,11 @@ impl Core {
         options
             .validate(self.target_run_len, self.target_block_len)
             .map_err(CompactionError::Config)?;
-        #[cfg(test)]
-        if self.step_log.lock().unwrap().is_some() {
-            return self.compact_logged(options, workspace);
-        }
         match self.begin_compaction(options)? {
             Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
         }
-    }
-
-    /// [`Core::compact`], recording the step in `step_log`.
-    #[cfg(test)]
-    fn compact_logged(
-        &self,
-        options: CompactionOptions,
-        workspace: &mut MergeWorkspace,
-    ) -> Result<Option<CompactionReport>, CompactionError> {
-        let (level0_flushes, shape) = {
-            let state = self.read_state();
-            (state.levels.level0_flushes(), state.levels.shape())
-        };
-        let mut record = StepRecord {
-            kind: None,
-            level: 0,
-            level0_inputs: 0,
-            lower_inputs: 0,
-            lower_bytes: 0,
-            input_bytes: 0,
-            output_bytes: 0,
-            input_held: 0,
-            output_held: 0,
-            level0_left: 0,
-            level0_flushes,
-            shape,
-            error: None,
-            nanos: 0,
-        };
-        let start = std::time::Instant::now();
-        let result = match self.begin_compaction(options) {
-            Ok(Some(Begun::Job(job))) => {
-                {
-                    let state = self.read_state();
-                    let level_of = |run: &SharedRun| state.levels.level_of(run);
-                    record.level0_inputs = job
-                        .inputs
-                        .iter()
-                        .filter(|run| level_of(run) == Some(0))
-                        .count();
-                    let lower = job
-                        .inputs
-                        .iter()
-                        .filter(|run| level_of(run) == Some(job.level + 1));
-                    record.lower_inputs = lower.clone().count();
-                    record.lower_bytes = lower.map(|run| run.run.as_bytes().len()).sum();
-                    record.level0_left = job
-                        .others
-                        .iter()
-                        .filter(|run| level_of(run) == Some(0))
-                        .count();
-                }
-                record.level = job.level;
-                record.input_bytes = job.input_bytes;
-                job.build(workspace)
-                    .and_then(BuiltCompaction::publish)
-                    .map(Some)
-            }
-            Ok(Some(Begun::Done(report))) => Ok(Some(report)),
-            Ok(None) => Ok(None),
-            Err(error) => Err(error),
-        };
-        match &result {
-            Ok(Some(report)) => {
-                record.kind = Some(report.kind);
-                record.level = report.level;
-                record.output_bytes = report.output_bytes;
-                record.input_held = report.input_held_bytes;
-                record.output_held = report.output_held_bytes;
-            }
-            Ok(None) => return result,
-            Err(error) => record.error = Some(error.clone()),
-        }
-        record.nanos = start.elapsed().as_nanos() as u64;
-        if let Some(log) = self.step_log.lock().unwrap().as_mut() {
-            log.push(record);
-        }
-        result
     }
 
     /// Chooses the next step from the levels, under the exclusive lock
@@ -2514,10 +2281,6 @@ impl<'e> FlushJob<'e> {
     /// Builds the runs, compressing without the state lock. Several tables
     /// are merged as one, keeping each key's newest update.
     fn build(self) -> BuiltFlush<'e> {
-        #[cfg(test)]
-        let start = std::time::Instant::now();
-        #[cfg(test)]
-        let finished = crate::memtable::FINISH_NANOS.with(std::cell::Cell::take);
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
         let runs = flush_merged(
             &tables,
@@ -2526,15 +2289,6 @@ impl<'e> FlushJob<'e> {
             self.engine.target_block_len,
             &self.cuts,
         );
-        #[cfg(test)]
-        {
-            let finish = crate::memtable::FINISH_NANOS.with(|nanos| nanos.replace(finished));
-            let total = start.elapsed().as_nanos() as u64;
-            flush_phase(|phases| {
-                phases.finish += finish;
-                phases.encode += total.saturating_sub(finish);
-            });
-        }
         BuiltFlush { job: self, runs }
     }
 
@@ -2565,25 +2319,6 @@ impl BuiltFlush<'_> {
     /// On a [`RunLimitError`] the built runs are dropped and the tables stay
     /// frozen and readable.
     fn publish(self) -> Result<FlushReport, RunLimitError> {
-        #[cfg(test)]
-        let (engine, start) = (self.job.engine, std::time::Instant::now());
-        let published = self.publish_untimed();
-        #[cfg(test)]
-        {
-            let mut record = FLUSH_PHASES.with(std::cell::RefCell::take);
-            record.publish = start.elapsed().as_nanos() as u64;
-            match &published {
-                Ok(report) => (record.runs, record.bytes) = (report.runs, report.run_bytes),
-                Err(_) => record.refused = true,
-            }
-            if let Some(log) = engine.flush_log.lock().unwrap().as_mut() {
-                log.push(record);
-            }
-        }
-        published
-    }
-
-    fn publish_untimed(self) -> Result<FlushReport, RunLimitError> {
         let Self { job, runs } = self;
         let report = FlushReport {
             tables: job.tables.len(),
@@ -2594,8 +2329,6 @@ impl BuiltFlush<'_> {
             filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
         let mut state = job.engine.write_state();
-        #[cfg(test)]
-        let locked = std::time::Instant::now();
         let total_runs = state.runs.len() + report.runs;
         let total_bytes = state.run_bytes + state.held_bytes + report.run_bytes + report.held_bytes;
         let flushes = state.levels.level0_flushes() + 1;
@@ -2655,8 +2388,6 @@ impl BuiltFlush<'_> {
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
-        #[cfg(test)]
-        flush_phase(|phases| phases.locked = locked.elapsed().as_nanos() as u64);
         job.engine.notify_worker();
         Ok(report)
     }
@@ -2724,9 +2455,7 @@ pub struct CompactionOptions {
 impl Default for CompactionOptions {
     /// 32 inputs, 256 MiB in and out, 64 MiB of workspace (room for a
     /// dictionary's training beside a merge of 32 inputs), and level 0
-    /// compacted at 4 flushes. `docs/capacity-design.md` derives the
-    /// input count; fewer inputs make level-0 jobs rewrite level 1 more
-    /// often.
+    /// compacted at 4 flushes.
     fn default() -> Self {
         Self {
             max_inputs: 32,
@@ -2997,162 +2726,6 @@ pub struct CompactionReport {
     pub stats: CompactStats,
     /// The workspace estimate checked before merging.
     pub workspace_bytes: usize,
-}
-
-/// A run as the flat selector that preceded levels saw it. That selector
-/// is kept, for tests only, to measure against.
-#[cfg(test)]
-struct Candidate<'a> {
-    min: &'a [u8],
-    max: &'a [u8],
-    bytes: usize,
-    tail: bool,
-}
-
-/// Each published run as the selector sees it, in the same order.
-#[cfg(test)]
-fn candidates(runs: &[SharedRun]) -> Vec<Candidate<'_>> {
-    runs.iter()
-        .map(|run| {
-            let range = run.run.key_range().expect(NOT_EMPTY);
-            Candidate {
-                min: range.min,
-                max: range.max,
-                bytes: run.run.as_bytes().len(),
-                tail: run.tail,
-            }
-        })
-        .collect()
-}
-
-/// The disjoint runs above which the flat selector merged adjacent tails:
-/// its old `disjoint_runs_above` default.
-#[cfg(test)]
-pub(crate) const FLAT_DISJOINT_RUNS_ABOVE: usize = 16;
-
-/// Chooses run indices to compact as the engine did before levels (5AT):
-/// the most deeply overlapped runs while any key is in more than
-/// `max_overlap`, then windows of adjacent tails beyond
-/// [`FLAT_DISJOINT_RUNS_ABOVE`] disjoint runs. Quadratic in the number of
-/// runs.
-#[cfg(test)]
-fn select(
-    runs: &[Candidate<'_>],
-    options: CompactionOptions,
-) -> Result<Option<Vec<usize>>, CompactionError> {
-    select_with(runs, options, FLAT_DISJOINT_RUNS_ABOVE)
-}
-
-/// [`select`], merging tails beyond `disjoint_above` disjoint runs.
-#[cfg(test)]
-fn select_with(
-    runs: &[Candidate<'_>],
-    options: CompactionOptions,
-    disjoint_above: usize,
-) -> Result<Option<Vec<usize>>, CompactionError> {
-    let bytes = |set: &[usize]| set.iter().map(|&index| runs[index].bytes).sum::<usize>();
-    // The deepest overlap is at some run's smallest key, so the stacks of runs
-    // covering those keys include every deepest one.
-    let mut stacks: Vec<(&[u8], Vec<usize>)> = runs
-        .iter()
-        .map(|point| {
-            let covering = (0..runs.len())
-                .filter(|&index| runs[index].min <= point.min && point.min <= runs[index].max)
-                .collect();
-            (point.min, covering)
-        })
-        .collect();
-    let deepest = stacks
-        .iter()
-        .map(|(_, stack)| stack.len())
-        .max()
-        .unwrap_or(0);
-
-    let limit = options.max_overlap;
-    if deepest > limit {
-        stacks.retain(|(_, stack)| stack.len() > limit);
-        stacks.sort_by(|(a, x), (b, y)| (y.len(), bytes(x), *a).cmp(&(x.len(), bytes(y), *b)));
-        let mut smallest_pair = usize::MAX;
-        for (_, mut stack) in stacks {
-            stack.sort_by_key(|&index| (runs[index].bytes, index));
-            let mut picked = fill(&stack, runs, options);
-            if picked.len() >= 2 {
-                // Merging k runs lowers this stack by k - 1. Take the fewest
-                // that bring it within the allowance, then each next run no
-                // larger than all taken so far.
-                let need = (stack.len() - limit + 1).clamp(2, picked.len());
-                let mut total = bytes(&picked[..need]);
-                let mut keep = need;
-                while keep < picked.len() && runs[picked[keep]].bytes <= total {
-                    total += runs[picked[keep]].bytes;
-                    keep += 1;
-                }
-                picked.truncate(keep);
-                return Ok(Some(picked));
-            }
-            smallest_pair = smallest_pair.min(bytes(&stack[..2]));
-        }
-        return Err(input_limit(smallest_pair, options));
-    }
-    if deepest > 1 || runs.len() <= disjoint_above {
-        return Ok(None);
-    }
-
-    // No two runs overlap. Stretches of tails with no full run between them,
-    // in key order.
-    let mut order: Vec<usize> = (0..runs.len()).collect();
-    order.sort_by_key(|&index| runs[index].min);
-    let stretches = order
-        .split(|&index| !runs[index].tail)
-        .filter(|stretch| stretch.len() >= 2);
-    let mut best: Option<Vec<usize>> = None;
-    let mut smallest_pair = None;
-    for stretch in stretches {
-        for start in 0..stretch.len() - 1 {
-            let window = fill(&stretch[start..], runs, options);
-            let key = |window: &[usize]| (window.len(), std::cmp::Reverse(bytes(window)));
-            if window.len() >= 2 && best.as_deref().is_none_or(|best| key(&window) > key(best)) {
-                best = Some(window);
-            }
-        }
-        let pair = stretch.windows(2).map(bytes).min().expect("two tails");
-        smallest_pair = Some(smallest_pair.map_or(pair, |smallest: usize| smallest.min(pair)));
-    }
-    match (best, smallest_pair) {
-        (Some(window), _) => Ok(Some(window)),
-        (None, Some(pair)) => Err(input_limit(pair, options)),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Takes runs from the front of `candidates` while they fit the limits.
-#[cfg(test)]
-fn fill(candidates: &[usize], runs: &[Candidate<'_>], options: CompactionOptions) -> Vec<usize> {
-    let mut picked = Vec::new();
-    let mut total = 0;
-    for &index in candidates {
-        if picked.len() == options.max_inputs || total + runs[index].bytes > options.max_input_bytes
-        {
-            break;
-        }
-        total += runs[index].bytes;
-        picked.push(index);
-    }
-    picked
-}
-
-#[cfg(test)]
-fn input_limit(input_bytes: usize, options: CompactionOptions) -> CompactionError {
-    CompactionError::JobLimit {
-        level: 0,
-        inputs: 2,
-        input_bytes,
-        workspace_bytes: 0,
-        max_inputs: options.max_inputs,
-        max_input_bytes: options.max_input_bytes,
-        max_output_bytes: options.max_output_bytes,
-        max_workspace_bytes: options.max_workspace_bytes,
-    }
 }
 
 /// A compaction whose inputs are chosen and whose output is not built yet.
@@ -3734,62 +3307,10 @@ impl Engine {
     }
 }
 
-/// A published run as the compaction selector sees it, for the tests'
-/// selection measurements (5AJ).
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct RunShape {
-    pub(crate) min: Vec<u8>,
-    pub(crate) max: Vec<u8>,
-    pub(crate) bytes: usize,
-    pub(crate) tail: bool,
-    pub(crate) max_seq: u64,
-    pub(crate) dictionary: bool,
-}
-
-/// A merge built and abandoned: what publishing it would have changed.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct DryCompaction {
-    pub(crate) input_bytes: usize,
-    pub(crate) output_bytes: usize,
-    pub(crate) stats: CompactStats,
-    /// The output runs' key ranges.
-    pub(crate) ranges: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-/// For the tests' selection measurements (5AJ). Indices are into
-/// [`Engine::run_shapes`], valid while nothing else changes the runs.
+/// Helpers for compaction correctness tests. Picks are indices into the
+/// published runs, valid while nothing else changes them.
 #[cfg(test)]
 impl Engine {
-    pub(crate) fn run_shapes(&self) -> Vec<RunShape> {
-        let state = self.core.read_state();
-        state
-            .runs
-            .iter()
-            .map(|run| {
-                let range = run.run.key_range().expect(NOT_EMPTY);
-                RunShape {
-                    min: range.min.to_vec(),
-                    max: range.max.to_vec(),
-                    bytes: run.run.as_bytes().len(),
-                    tail: run.tail,
-                    max_seq: run.run.max_seq(),
-                    dictionary: run.run.dictionary_parts().is_some(),
-                }
-            })
-            .collect()
-    }
-
-    /// What the flat selector that preceded levels would compact now.
-    pub(crate) fn selection(
-        &self,
-        options: CompactionOptions,
-    ) -> Result<Option<Vec<usize>>, CompactionError> {
-        let state = self.core.read_state();
-        select(&candidates(&state.runs), options)
-    }
-
     /// Compacts `picks` through the production job: the same tombstone
     /// rule, limits, build and publication, with the output placed as
     /// [`Core::begin_picked`] says.
@@ -3805,43 +3326,14 @@ impl Engine {
             .publish()
     }
 
-    /// Changes the level-0 stop, so that tests can drive the flat selector
-    /// with every run in level 0.
+    /// Changes the level-0 stop for backpressure correctness tests.
     pub(crate) fn set_level0_stop(&self, stop: usize) {
         self.core.write_state().level0_stop = stop;
     }
 
-    /// Turns flush splitting on or off, to compare.
+    /// Turns flush splitting on or off for correctness comparisons.
     pub(crate) fn set_split_flushes(&self, split: bool) {
         self.core.write_state().split_flushes = split;
-    }
-
-    /// Builds the merge of `picks` as [`Engine::compact_picked`] would, and
-    /// abandons it.
-    pub(crate) fn dry_compact(
-        &self,
-        options: CompactionOptions,
-        picks: Vec<usize>,
-        workspace: &mut MergeWorkspace,
-    ) -> Result<DryCompaction, CompactionError> {
-        let job = self.core.begin_picked(options, picks)?;
-        let input_bytes = job.input_bytes;
-        let built = job.build(workspace)?;
-        let ranges = built
-            .output
-            .runs
-            .iter()
-            .map(|run| {
-                let range = run.key_range().expect(NOT_EMPTY);
-                (range.min.to_vec(), range.max.to_vec())
-            })
-            .collect();
-        Ok(DryCompaction {
-            input_bytes,
-            output_bytes: built.output.output_bytes,
-            stats: built.output.stats,
-            ranges,
-        })
     }
 }
 
@@ -3969,15 +3461,6 @@ mod tests {
         assert!(Arc::ptr_eq(&held, &frozen_handle(&engine)));
     }
 
-    fn candidate(min: &'static str, max: &'static str, bytes: usize) -> Candidate<'static> {
-        Candidate {
-            min: min.as_bytes(),
-            max: max.as_bytes(),
-            bytes,
-            tail: true,
-        }
-    }
-
     fn options(max_inputs: usize, max_input_bytes: usize) -> CompactionOptions {
         CompactionOptions {
             max_inputs,
@@ -3985,97 +3468,6 @@ mod tests {
             max_overlap: 1,
             ..CompactionOptions::default()
         }
-    }
-
-    #[test]
-    fn selection_takes_the_smallest_runs_covering_the_deepest_key() {
-        let runs = [
-            candidate("a", "z", 50),
-            candidate("b", "c", 1),
-            candidate("m", "p", 2),
-            candidate("n", "o", 3),
-            candidate("o", "q", 4),
-            candidate("x", "y", 5),
-        ];
-        // "o" lies in runs 0, 2, 3 and 4; everything else in at most two.
-        assert_eq!(select(&runs, options(8, 100)), Ok(Some(vec![2, 3, 4, 0])));
-        assert_eq!(select(&runs, options(2, 100)), Ok(Some(vec![2, 3])));
-        assert_eq!(select(&runs, options(8, 49)), Ok(Some(vec![2, 3, 4])));
-        // Within the overlap allowed, or the deepest stack does not fit.
-        let tolerant = CompactionOptions {
-            max_overlap: 4,
-            ..options(8, 100)
-        };
-        assert_eq!(select(&runs, tolerant), Ok(None));
-        let narrow = CompactionOptions {
-            max_overlap: 3,
-            ..options(8, 2)
-        };
-        assert_eq!(select(&runs, narrow), Err(input_limit(5, narrow)));
-    }
-
-    #[test]
-    fn selection_rewrites_a_large_run_only_once_comparable_data_covers_it() {
-        let allow = |max_overlap| CompactionOptions {
-            max_overlap,
-            ..options(8, 1_000)
-        };
-        // Five runs over one key: a large one and four small. Two inputs bring
-        // the stack within 4; the other small runs are no larger than those
-        // taken, but the large one is.
-        let mut runs = vec![
-            candidate("a", "z", 100),
-            candidate("a", "z", 1),
-            candidate("b", "y", 1),
-            candidate("c", "x", 1),
-            candidate("d", "w", 1),
-        ];
-        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4])));
-        // Deeper, more inputs are needed, but the large run still waits until
-        // those taken add up to it.
-        runs.extend((0..3).map(|_| candidate("e", "v", 3)));
-        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4, 5, 6, 7])));
-        runs.truncate(5);
-        runs[0].bytes = 4;
-        assert_eq!(select(&runs, allow(4)), Ok(Some(vec![1, 2, 3, 4, 0])));
-        // The fewest needed are always taken, even when larger than the rest.
-        runs[0].bytes = 100;
-        assert_eq!(select(&runs, allow(1)), Ok(Some(vec![1, 2, 3, 4, 0])));
-        assert_eq!(select(&runs, allow(2)), Ok(Some(vec![1, 2, 3, 4])));
-        runs[4].bytes = 50;
-        assert_eq!(select(&runs, allow(3)), Ok(Some(vec![1, 2, 3])));
-        assert_eq!(select(&runs, allow(5)), Ok(None));
-    }
-
-    #[test]
-    fn selection_merges_adjacent_tails_only_above_the_disjoint_threshold() {
-        let mut runs = vec![
-            candidate("a", "b", 5),
-            candidate("c", "d", 1),
-            candidate("e", "f", 1),
-            candidate("g", "h", 1),
-        ];
-        assert_eq!(select_with(&runs[..2], options(8, 100), 2), Ok(None));
-        assert_eq!(
-            select_with(&runs, options(8, 100), 2),
-            Ok(Some(vec![0, 1, 2, 3]))
-        );
-        // Prefer more runs, then fewer bytes.
-        assert_eq!(select_with(&runs, options(2, 100), 2), Ok(Some(vec![1, 2])));
-        // A full run separates tails, and is never rewritten.
-        runs[2].tail = false;
-        assert_eq!(select_with(&runs, options(8, 100), 2), Ok(Some(vec![0, 1])));
-        runs[0].tail = false;
-        assert_eq!(select_with(&runs, options(8, 100), 2), Ok(None));
-        // Any overlap within the allowance disables tail merging.
-        runs[0].tail = true;
-        runs[2] = candidate("a", "a", 1);
-        let tolerant = CompactionOptions {
-            max_overlap: 2,
-            ..options(8, 100)
-        };
-        assert_eq!(select_with(&runs, tolerant, 2), Ok(None));
-        assert_eq!(select_with(&runs[..1], options(8, 100), 2), Ok(None));
     }
 
     fn overlapping_runs(engine: &Engine) {

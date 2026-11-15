@@ -25,8 +25,7 @@ pub const DICTIONARY_LEN: usize = 16 << 10;
 /// before allocating anything for it.
 pub const MAX_DICTIONARY_LEN: usize = 64 << 10;
 
-/// Decoded input sampled for training, at most: 100 times the dictionary, the
-/// ratio measured in `docs/benchmarks.md` (5AD).
+/// Decoded input sampled for training, at most: 100 times the dictionary.
 pub const SAMPLE_BUDGET: usize = 100 * DICTIONARY_LEN;
 
 /// The least decoded input a rewrite must hold for a dictionary to be trained:

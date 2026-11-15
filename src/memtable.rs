@@ -55,8 +55,7 @@
 //!
 //! The charge is an estimate of what the table allocates, not a limit on
 //! resident memory: allocator rounding and headers are not charged, and
-//! replacing a value briefly holds both values. `docs/benchmarks.md` compares
-//! the charge with measured memory.
+//! replacing a value briefly holds both values.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -609,9 +608,7 @@ impl fmt::Debug for Table {
 pub struct MemoryUsage {
     /// Key and value bytes of the table's entries.
     pub payload: usize,
-    /// Bytes charged against the budget, pinned bytes included, which exceed
-    /// it only by one batch of updates a durable engine logged before the
-    /// budget shrank (see `src/engine/group.rs`).
+    /// Bytes charged against the budget, pinned bytes included.
     pub charged: usize,
     /// The part of `charged` that only snapshots of the table still need:
     /// nodes and values its writes copied or replaced since the oldest live
@@ -927,22 +924,9 @@ pub(crate) struct FlushCuts {
     pub(crate) max_pieces: usize,
 }
 
-/// Finishes a flush's run: its last block, index and filter. In a test
-/// build the time it takes is added to this thread's `FINISH_NANOS`.
+/// Finishes a flush's run: its last block, index and filter.
 fn finish(builder: RunBuilder) -> Run<Vec<u8>> {
-    #[cfg(test)]
-    let start = std::time::Instant::now();
-    let run = builder.finish();
-    #[cfg(test)]
-    FINISH_NANOS.with(|nanos| nanos.set(nanos.get() + start.elapsed().as_nanos() as u64));
-    run
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Nanoseconds this thread's flushes spent finishing runs, for the
-    /// engine's flush measurements.
-    pub(crate) static FINISH_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    builder.finish()
 }
 
 /// Builds runs from several frozen tables as if they were one, splitting

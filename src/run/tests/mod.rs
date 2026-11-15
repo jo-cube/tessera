@@ -10,5 +10,3 @@ mod logical;
 mod merge;
 mod ranges;
 mod seek;
-mod selection;
-mod sustained;
