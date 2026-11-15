@@ -11,7 +11,8 @@ bundled Zstandard library.
 
 ## Supported operations
 
-- Byte-string keys and values, puts, deletes and point lookups.
+- Byte-string keys and values, atomic write batches, sorted bulk ingestion,
+  point lookups and batched multi-get.
 - Ordered scans and prefix scans in bytewise key order.
 - Consistent in-memory snapshots that remain readable after the engine closes.
 - Automatic memtable flushing and background leveled compaction; manual
@@ -24,7 +25,7 @@ bundled Zstandard library.
   These account for estimated bytes; they do not cap process resident memory.
 
 There is no write-ahead log, per-write durability, automatic checkpointing,
-transaction support, multi-key atomic write, replication or disk tier.
+transactions beyond atomic batches, replication or disk tier.
 Closing or dropping an engine writes nothing. Every update after the last
 checkpoint is lost when the process ends unless rebuilt upstream.
 
@@ -32,7 +33,7 @@ checkpoint is lost when the process ends unless rebuilt upstream.
 
 ```rust
 use tessera::engine::{
-    CheckpointOptions, Engine, EngineOptions, EngineWorkspace,
+    CheckpointOptions, Engine, EngineOptions, EngineWorkspace, WriteBatch,
 };
 
 let engine = Engine::new(EngineOptions::default())?;
@@ -40,15 +41,28 @@ engine.put(b"user/1", b"ada")?;
 engine.put(b"user/2", b"grace")?;
 engine.delete(b"user/1")?;
 
+let mut batch = WriteBatch::new();
+batch.put(b"user/3", b"katherine");
+batch.put(b"user/4", b"dorothy");
+engine.write(&batch)?; // One atomic visibility change; later duplicate keys win.
+batch.clear(); // Keeps its capacity.
+
 // Reuse one workspace per reading thread.
 let mut workspace = EngineWorkspace::new();
 assert!(engine.get(b"user/1", &mut workspace)?.is_none());
 assert_eq!(engine.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
 
+engine.multi_get(&[b"user/2", b"user/1"], &mut workspace, |index, value| {
+    // Called in input order, including misses and duplicate keys.
+    assert_eq!(value.is_some(), index == 0);
+})?;
+
 // Snapshots hold no lock while readers scan them.
 let snapshot = engine.snapshot()?;
 let mut scan = snapshot.scan_prefix(b"user/", &mut workspace);
 assert_eq!(scan.next_record()?.unwrap().value, b"grace");
+assert_eq!(scan.next_record()?.unwrap().value, b"katherine");
+assert_eq!(scan.next_record()?.unwrap().value, b"dorothy");
 assert_eq!(scan.next_record()?, None);
 drop(scan);
 
@@ -62,6 +76,33 @@ assert_eq!(recovered.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
 # std::fs::remove_dir_all(&dir)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`Engine::write(&WriteBatch) -> Result<u64, UpdateError>` returns the batch's
+last sequence number. Its operations take a contiguous sequence range and
+become visible together. An empty batch returns the current ceiling.
+`put` and `delete` share the memtable update path. A dedicated flush thread
+builds runs while reads and writes continue; writers wait when the frozen-table
+limit or level-0 stop is reached. `max_frozen_memtables` defaults to 2, in
+addition to one active table, each with `memtable_budget` charged bytes.
+`flush()` waits until all earlier writes are in runs. Refused or failed builds
+leave frozen tables readable and surface through the existing flush errors.
+
+Strictly key-sorted, unique batches use the direct run path when their charged
+input reaches `bulk_ingest_min: Option<usize>` (`None` means half the memtable
+budget). `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
+duplicate keys. Overlapping memtables are flushed before atomic publication
+into level 0. Builds release the state lock, so concurrent writes proceed and
+receive newer sequences. Pending ingests preserve compaction sequences and
+tombstones. A failed ingest can consume its reserved sequence range. An
+oversized unsorted batch stages its records in a private memtable and publishes
+through the same run path, preserving the last duplicate operation.
+
+`multi_get(keys, workspace, |index, value| ...) -> Result<(), ReadError>` is
+available on `Engine`, `ReadGuard` and `Snapshot`. It sees one consistent state
+and reports borrowed values in input order. Indices are sorted once when needed;
+run groups probe Bloom filters and decode each needed block once. Workspaces
+reuse the index, result, value and decode buffers; warm calls allocate nothing
+on the Rust heap. Callbacks run only after a successful read.
 
 `EngineOptions::compression` is `Compression::Zstd` by default; the other
 choice is `Compression::Uncompressed`. Zstandard buffers roughly 4 MiB of raw

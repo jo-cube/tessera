@@ -59,7 +59,7 @@ impl fmt::Display for BackgroundError {
         match self {
             Self::Disabled => f.write_str("the engine has no background compaction"),
             Self::Panicked(message) => {
-                write!(f, "the background compaction worker panicked: {message}")
+                write!(f, "the background worker panicked: {message}")
             }
             Self::Failed(error) => write!(f, "background compaction failed: {error}"),
         }

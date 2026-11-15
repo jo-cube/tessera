@@ -103,8 +103,9 @@ pub use reader::{Run, RunView};
 pub use compact::{CONTEXT_ALLOWANCE, compact};
 #[cfg(test)]
 pub use logical::RunSet;
+pub(crate) use reader::ReadWorkspace;
 #[cfg(test)]
-pub use reader::{KeyRange, ReadWorkspace, RunCursor};
+pub use reader::{KeyRange, RunCursor};
 
 /// Default estimated compressed block target.
 pub const TARGET_BLOCK_COMPRESSED: usize = 1024;

@@ -66,6 +66,13 @@ fn readers_and_snapshots_see_whole_batches() {
         });
         let mut ws = EngineWorkspace::new();
         for _ in 0..500 {
+            let mut values = Vec::new();
+            engine
+                .multi_get(&[b"a", b"b", b"c"], &mut ws, |_, value| {
+                    values.push(value.map(<[u8]>::to_vec))
+                })
+                .unwrap();
+            assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
             let snapshot = engine.snapshot().unwrap();
             let a = snapshot
                 .get(b"a", &mut ws)
@@ -186,4 +193,222 @@ fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
             .value,
         b"last"
     );
+}
+
+#[test]
+fn multi_get_preserves_order_duplicates_misses_and_deletes_in_every_view() {
+    let engine = Engine::new(EngineOptions::default()).unwrap();
+    for (key, value) in [(b"a", b"old"), (b"b", b"old"), (b"c", b"old")] {
+        engine.put(key, value).unwrap();
+    }
+    engine.flush().unwrap();
+    engine.delete(b"b").unwrap();
+    engine.put(b"c", b"new").unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    engine.put(b"a", b"later").unwrap();
+    let keys: &[&[u8]] = &[b"c", b"missing", b"a", b"b", b"c", b"", b"a"];
+    let mut ws = EngineWorkspace::new();
+    let expected: Vec<_> = keys
+        .iter()
+        .map(|key| engine.get(key, &mut ws).unwrap().map(|x| x.value.to_vec()))
+        .collect();
+    let mut actual = Vec::new();
+    engine
+        .multi_get(keys, &mut ws, |index, value| {
+            assert_eq!(index, actual.len());
+            actual.push(value.map(<[u8]>::to_vec));
+        })
+        .unwrap();
+    assert_eq!(actual, expected);
+    actual.clear();
+    engine
+        .read()
+        .multi_get(keys, &mut ws, |_, value| {
+            actual.push(value.map(<[u8]>::to_vec))
+        })
+        .unwrap();
+    assert_eq!(actual, expected);
+    let expected: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            snapshot
+                .get(key, &mut ws)
+                .unwrap()
+                .map(|x| x.value.to_vec())
+        })
+        .collect();
+    actual.clear();
+    snapshot
+        .multi_get(keys, &mut ws, |_, value| {
+            actual.push(value.map(<[u8]>::to_vec))
+        })
+        .unwrap();
+    assert_eq!(actual, expected);
+    let before = ws.blocks_loaded();
+    engine
+        .multi_get(&[b"a"; 100], &mut ws, |_, value| {
+            assert_eq!(value, Some(&b"later"[..]))
+        })
+        .unwrap();
+    assert_eq!(ws.blocks_loaded(), before, "memtable hits read no runs");
+    engine.flush().unwrap();
+    let before = ws.blocks_loaded();
+    engine
+        .multi_get(&[b"c"; 100], &mut ws, |_, value| {
+            assert_eq!(value, Some(&b"new"[..]))
+        })
+        .unwrap();
+    assert_eq!(
+        ws.blocks_loaded() - before,
+        1,
+        "duplicate probes decode a block only once"
+    );
+    engine
+        .multi_get::<&[u8]>(&[], &mut ws, |_, _| panic!("empty input"))
+        .unwrap();
+}
+
+#[test]
+fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
+    use std::collections::BTreeMap;
+    use tessera::engine::{CompactionOptions, Compression, MergeWorkspace};
+    for seed in 1..=12u64 {
+        let mut rng = seed;
+        let mut next = |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound
+        };
+        let engine = Engine::new(EngineOptions {
+            memtable_budget: 2048,
+            target_run_len: 512,
+            bulk_ingest_min: Some(512),
+            compression: if seed % 2 == 0 {
+                Compression::Zstd
+            } else {
+                Compression::Uncompressed
+            },
+            ..EngineOptions::default()
+        })
+        .unwrap();
+        let mut model = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut snapshots = Vec::new();
+        let mut ws = EngineWorkspace::new();
+        let mut merge = MergeWorkspace::new();
+        for round in 0..250u64 {
+            match next(9) {
+                0 => {
+                    let key = next(80).to_be_bytes().to_vec();
+                    let value = round.to_le_bytes().to_vec();
+                    engine.put(&key, &value).unwrap();
+                    model.insert(key, value);
+                }
+                1 => {
+                    let key = next(80).to_be_bytes().to_vec();
+                    engine.delete(&key).unwrap();
+                    model.remove(&key);
+                }
+                2..=4 => {
+                    let mut operations = Vec::new();
+                    for _ in 0..2 + next(18) {
+                        let key = next(80).to_be_bytes().to_vec();
+                        let value =
+                            (next(4) != 0).then(|| vec![round as u8; (next(160) + 1) as usize]);
+                        operations.push((key, value));
+                    }
+                    let sorted = next(2) == 0;
+                    if sorted {
+                        operations.sort_by(|a, b| a.0.cmp(&b.0));
+                        operations.dedup_by(|a, b| a.0 == b.0);
+                    }
+                    let mut batch = WriteBatch::new();
+                    for (key, value) in &operations {
+                        match value {
+                            Some(value) => batch.put(key, value),
+                            None => batch.delete(key),
+                        }
+                    }
+                    if sorted {
+                        engine.ingest_sorted(&batch).unwrap();
+                    } else {
+                        engine.write(&batch).unwrap();
+                    }
+                    for (key, value) in operations {
+                        match value {
+                            Some(value) => {
+                                model.insert(key, value);
+                            }
+                            None => {
+                                model.remove(&key);
+                            }
+                        }
+                    }
+                }
+                5 => {
+                    if snapshots.len() == 4 {
+                        snapshots.remove(0);
+                    }
+                    snapshots.push((engine.snapshot().unwrap(), model.clone()));
+                }
+                6 => {
+                    engine.flush().unwrap();
+                }
+                7 => {
+                    engine
+                        .compact(CompactionOptions::default(), &mut merge)
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let mut keys: Vec<_> = (0..20).map(|_| next(100).to_be_bytes().to_vec()).collect();
+            keys.push(keys[0].clone());
+            keys.push(Vec::new());
+            if round % 2 == 0 {
+                keys.sort();
+            }
+            let expected: Vec<_> = keys.iter().map(|key| model.get(key).cloned()).collect();
+            let gets: Vec<_> = keys
+                .iter()
+                .map(|key| engine.get(key, &mut ws).unwrap().map(|v| v.value.to_vec()))
+                .collect();
+            assert_eq!(gets, expected, "seed {seed} round {round}");
+            let mut actual = Vec::new();
+            engine
+                .multi_get(&keys, &mut ws, |_, value| {
+                    actual.push(value.map(<[u8]>::to_vec))
+                })
+                .unwrap();
+            assert_eq!(actual, expected, "seed {seed} round {round}");
+            actual.clear();
+            engine
+                .read()
+                .multi_get(&keys, &mut ws, |_, value| {
+                    actual.push(value.map(<[u8]>::to_vec))
+                })
+                .unwrap();
+            assert_eq!(actual, expected);
+            for (snapshot, model) in &snapshots {
+                actual.clear();
+                snapshot
+                    .multi_get(&keys, &mut ws, |_, value| {
+                        actual.push(value.map(<[u8]>::to_vec))
+                    })
+                    .unwrap();
+                let expected: Vec<_> = keys.iter().map(|key| model.get(key).cloned()).collect();
+                assert_eq!(actual, expected);
+            }
+            if round % 25 == 0 {
+                let snapshot = engine.snapshot().unwrap();
+                let mut scan = snapshot.scan(&mut ws);
+                let mut actual = BTreeMap::new();
+                while let Some(record) = scan.next_record().unwrap() {
+                    actual.insert(record.key.to_vec(), record.value.to_vec());
+                }
+                assert_eq!(actual, model);
+            }
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+    }
 }

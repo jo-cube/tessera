@@ -384,7 +384,7 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     loop {
         engine.put(&key(written % 200), &[1; 100]).unwrap();
         let stats = engine.stats();
-        if stats.runs > 0 {
+        if stats.frozen_tables > 0 || stats.runs > 0 {
             break;
         }
         (written, full) = (written + 1, stats);
@@ -395,6 +395,7 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     // Every key was overwritten at most once: the leaves and values the
     // snapshot shares are pinned once each.
     assert!(written <= 200, "{written}");
+    engine.flush().unwrap();
     let stats = engine.stats();
     assert_eq!((stats.frozen_tables, stats.active.pinned), (0, 0));
     assert_eq!(scanned(&snapshot, b"k").len(), 200);

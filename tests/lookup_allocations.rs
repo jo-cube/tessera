@@ -150,5 +150,24 @@ fn warm_lookups_allocate_nothing_and_decode_one_block() {
             4_000,
             "{compression:?}"
         );
+        let keys: Vec<_> = (0..100).map(|i| key(i * 31)).collect();
+        for _ in 0..2 {
+            engine
+                .multi_get(&keys, &mut workspace, |_, value| {
+                    std::hint::black_box(value);
+                })
+                .unwrap();
+        }
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        engine
+            .multi_get(&keys, &mut workspace, |_, value| {
+                std::hint::black_box(value);
+            })
+            .unwrap();
+        assert_eq!(
+            ALLOCATIONS.load(Ordering::Relaxed) - before,
+            0,
+            "warm multi-get"
+        );
     }
 }

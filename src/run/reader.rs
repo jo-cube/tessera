@@ -977,6 +977,44 @@ impl<'a> RunView<'a> {
         Ok(found.map(|(_, version)| version))
     }
 
+    /// Probes sorted indices, loading each candidate block once. Callbacks
+    /// borrow a block only until the next callback or decode.
+    pub(crate) fn get_many<K: AsRef<[u8]>>(
+        self,
+        keys: &[K],
+        indices: &[usize],
+        workspace: &mut ReadWorkspace,
+        mut found: impl FnMut(usize, Option<Version<'_>>),
+    ) -> Result<(), CorruptRun> {
+        let mut next = 0;
+        while next < indices.len() {
+            let key = keys[indices[next]].as_ref();
+            if key < self.min_key {
+                found(indices[next], None);
+                next += 1;
+                continue;
+            }
+            let Some(block) = self.locate(key)? else {
+                break;
+            };
+            let last = self.last_key(block)?;
+            let start = next;
+            while next < indices.len() && keys[indices[next]].as_ref() <= last {
+                next += 1;
+            }
+            let frame = self.frame(block)?;
+            let bytes = workspace.load(&frame)?;
+            let view = BlockView::open(bytes).map_err(|error| frame.block_error(error))?;
+            for &index in &indices[start..next] {
+                let version = view
+                    .get(keys[index].as_ref())
+                    .map_err(|error| frame.block_error(error))?;
+                found(index, version);
+            }
+        }
+        Ok(())
+    }
+
     /// [`get`](Self::get), with the buffer, context and block count given
     /// separately. Also returns the block the version is in.
     fn find<'r>(

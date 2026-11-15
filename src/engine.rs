@@ -391,6 +391,7 @@ mod directory;
 mod flusher;
 mod ingest;
 mod levels;
+mod multi;
 mod worker;
 
 #[cfg(test)]
@@ -871,7 +872,8 @@ pub struct RunLimitError {
     /// ([`BackgroundError::Failed`]), which retrying meets again until what
     /// it names changes (snapshots dropped, limits raised), or the worker's
     /// panic ([`BackgroundError::Panicked`]), after which only
-    /// [`Engine::compact`] makes room. `None` for any other refusal.
+    /// [`Engine::compact`] makes room. Also carries a flush-worker panic;
+    /// its frozen tables remain readable, and that worker is not restarted.
     pub background: Option<Box<BackgroundError>>,
 }
 
@@ -897,6 +899,12 @@ impl fmt::Display for RunLimitError {
                 Some(error) => write!(f, ", and {error}"),
                 None => f.write_str("; compaction drains it"),
             };
+        }
+        if self.runs <= self.max_runs
+            && self.run_bytes <= self.max_run_bytes
+            && let Some(error) = &self.background
+        {
+            return write!(f, "background flush failed: {error}");
         }
         write!(
             f,
@@ -1789,12 +1797,14 @@ impl Core {
         if !state.active.is_empty() {
             self.freeze_active(&mut state);
         }
-        let target = state.frozen.last().cloned();
+        let target = state.frozen.last().and_then(|table| table.last_seq());
         self.flush_signal.request();
-        while target
-            .as_ref()
-            .is_some_and(|target| state.frozen.iter().any(|table| Arc::ptr_eq(table, target)))
-        {
+        while target.is_some_and(|target| {
+            state
+                .frozen
+                .first()
+                .is_some_and(|table| table.last_seq().is_some_and(|seq| seq <= target))
+        }) {
             if let Some(error) = self.flush_error(&state) {
                 return Err(error);
             }
@@ -2954,6 +2964,7 @@ pub struct EngineWorkspace {
     logical: LogicalWorkspace,
     value: Vec<u8>,
     prefix: Vec<u8>,
+    multi: multi::Workspace,
 }
 
 impl EngineWorkspace {
@@ -2968,7 +2979,7 @@ impl EngineWorkspace {
     /// one per group of key-disjoint runs they have merged, at most the
     /// largest [`EngineStats::max_overlap`] they have read.
     pub fn capacity(&self) -> usize {
-        self.logical.capacity()
+        self.logical.capacity() + self.multi.capacity()
     }
 
     /// Returns the bytes held by Zstandard decompression contexts, as
@@ -2979,12 +2990,12 @@ impl EngineWorkspace {
     /// These bytes are allocated outside the Rust heap, are not part of
     /// [`capacity`](Self::capacity), and are charged against no limit.
     pub fn context_bytes(&self) -> usize {
-        self.logical.context_bytes()
+        self.logical.context_bytes() + self.multi.context_bytes()
     }
 
     /// Returns how many run blocks reads through this workspace have loaded.
     pub fn blocks_loaded(&self) -> u64 {
-        self.logical.blocks_loaded()
+        self.logical.blocks_loaded() + self.multi.blocks_loaded()
     }
 }
 
