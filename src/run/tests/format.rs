@@ -466,7 +466,11 @@ fn compressed_frames_match_independent_codec_output() {
         let decoded = decode_frame(frame, dictionary);
         let mut expected = Vec::with_capacity(zstd_safe::compress_bound(decoded.len()));
         zstd_safe::CCtx::create()
-            .compress_using_dict(&mut expected, &decoded, dictionary, 3)
+            .compress_using_cdict(
+                &mut expected,
+                &decoded,
+                &zstd_safe::CDict::create(dictionary, 3),
+            )
             .unwrap();
         assert_eq!(&frame[HEADER..], expected);
     }

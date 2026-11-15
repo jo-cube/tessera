@@ -1248,12 +1248,12 @@ fn each_setting_out_of_range_is_refused_by_name() {
             u64::MAX,
         ),
         (
-            compaction(|c| c.max_workspace_bytes = 13_713_407),
+            compaction(|c| c.max_workspace_bytes = 15_810_559),
             "CompactionOptions::max_workspace_bytes",
-            13_713_407,
+            15_810_559,
             // Two raw-cap input blocks and decoder contexts, plus segment,
-            // block and compression buffers for the output.
-            13_713_408,
+            // block and compression buffers and a prepared dictionary for the output.
+            15_810_560,
             u64::MAX,
         ),
     ];
@@ -1291,7 +1291,7 @@ fn each_setting_out_of_range_is_refused_by_name() {
         compaction(|c| c.max_overlap = 1),
         compaction(|c| c.max_inputs = 2),
         compaction(|c| c.max_input_bytes = 128 << 20),
-        compaction(|c| c.max_workspace_bytes = 13_713_408),
+        compaction(|c| c.max_workspace_bytes = 15_810_560),
     ];
     for options in accepted {
         Engine::new(options).unwrap();

@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::block::{Record, Value};
 
+use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
 use super::logical::conflict;
 use super::{
@@ -42,7 +43,8 @@ pub struct CompactLimits {
 pub const CONTEXT_ALLOWANCE: usize = 2 << 20;
 
 /// Upper estimate beside the output: a block and context per input, plus
-/// segment and block buffers and a compression context for the builder.
+/// segment and block buffers, a compression context and one prepared segment
+/// dictionary for the builder.
 /// Checks frame metadata and dictionaries without decoding. Previously retained
 /// workspace capacity is excluded.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
@@ -57,7 +59,7 @@ pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
 /// the engine keeps for every published run so that it can size a job
 /// before reading any of it.
 pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> usize {
-    let mut total = CONTEXT_ALLOWANCE;
+    let mut total = CONTEXT_ALLOWANCE + CDICT_ALLOWANCE;
     let mut largest = 0;
     for block in largest_blocks {
         largest = largest.max(block);

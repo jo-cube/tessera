@@ -1028,10 +1028,17 @@ fn output_growth_past_the_headroom_does_not_repeat_a_job() {
         overflows <= 4 * runs,
         "{overflows} merges failed at the output limit, {steps} steps, {runs} runs"
     );
-    assert!(
-        matches!(last, None | Some(CompactionError::OutputLimit { .. })),
-        "{last:?}"
-    );
+    match last {
+        None | Some(CompactionError::OutputLimit { .. }) => {}
+        Some(CompactionError::JobLimit { input_bytes, .. }) => {
+            // Codec output sizes can leave the smallest remaining job above
+            // the admission limit, which reserves output headroom. It must
+            // then be refused before building, rather than overflow again.
+            let admitted = limits.max_output_bytes - limits.max_output_bytes / OUTPUT_HEADROOM;
+            assert!(input_bytes > admitted, "{input_bytes} <= {admitted}");
+        }
+        other => panic!("{other:?}"),
+    }
     level_ids(&engine);
     assert_eq!(scan(&engine.snapshot().unwrap()), model);
 }

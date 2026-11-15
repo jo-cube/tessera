@@ -9,6 +9,7 @@ use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, Value, cmp_internal,
 };
 use std::fmt;
+use zstd_safe::CDict;
 
 /// Encodes sorted records, buffering at most one raw segment before compressing.
 /// Rejected records leave the builder unchanged. A single oversized record is
@@ -167,6 +168,9 @@ impl RunBuilder {
         } else {
             Vec::new()
         };
+        // Prepared once for the sample and every block, then dropped before
+        // the next segment. Only the raw dictionary is stored in the run.
+        let prepared = self.compressor.prepare_dictionary(&dictionary);
         let reference = if codec == Codec::Zstd {
             let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
             assert!(id < 1 << 24, "segment reference fits in 24 bits");
@@ -193,7 +197,7 @@ impl RunBuilder {
             let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
             let mut compressed = Vec::new();
             self.compressor
-                .compress(sample, &dictionary, &mut compressed);
+                .compress(sample, prepared.as_ref(), &mut compressed);
             self.target
                 .saturating_mul(sample.len())
                 .checked_div(compressed.len())
@@ -224,21 +228,21 @@ impl RunBuilder {
                 projected > target
             };
             if !block.is_empty() && cut {
-                self.cut_block(&mut block, &mut uncompressed, &dictionary, reference);
+                self.cut_block(&mut block, &mut uncompressed, prepared.as_ref(), reference);
             }
             block
                 .append(record.key, record.seq, record.value)
                 .expect("one record fits a block");
         }
         if !block.is_empty() {
-            self.cut_block(&mut block, &mut uncompressed, &dictionary, reference);
+            self.cut_block(&mut block, &mut uncompressed, prepared.as_ref(), reference);
         }
     }
     fn cut_block(
         &mut self,
         block: &mut BlockBuilder,
         raw: &mut Vec<u8>,
-        dictionary: &[u8],
+        dictionary: Option<&CDict<'_>>,
         reference: u32,
     ) {
         let offset = self.frames.len();

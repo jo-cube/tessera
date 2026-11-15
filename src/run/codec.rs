@@ -1,4 +1,4 @@
-use zstd_safe::{CCtx, DCtx};
+use zstd_safe::{CCtx, CDict, DCtx};
 
 /// Block compression used by a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -11,6 +11,9 @@ pub enum Codec {
 }
 
 pub(super) const ZSTD_LEVEL: i32 = 3;
+
+/// Conservative allowance for level-3 prepared tables and their dictionary copy.
+pub(super) const CDICT_ALLOWANCE: usize = 2 << 20;
 
 impl Codec {
     pub(super) fn to_byte(self) -> u8 {
@@ -47,7 +50,17 @@ impl Compressor {
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)
     }
-    pub(super) fn compress(&mut self, block: &[u8], dictionary: &[u8], out: &mut Vec<u8>) {
+    pub(super) fn prepare_dictionary(&self, dictionary: &[u8]) -> Option<CDict<'static>> {
+        self.zstd
+            .as_ref()
+            .map(|_| CDict::create(dictionary, ZSTD_LEVEL))
+    }
+    pub(super) fn compress(
+        &mut self,
+        block: &[u8],
+        dictionary: Option<&CDict<'_>>,
+        out: &mut Vec<u8>,
+    ) {
         let start = out.len();
         let bound = if self.codec == Codec::None {
             block.len()
@@ -58,7 +71,11 @@ impl Compressor {
         let output = &mut out[start..];
         let written = match &mut self.zstd {
             Some(ctx) => ctx
-                .compress_using_dict(output, block, dictionary, ZSTD_LEVEL)
+                .compress_using_cdict(
+                    output,
+                    block,
+                    dictionary.expect("prepared segment dictionary"),
+                )
                 .expect("codec worst-case output bound"),
             None => {
                 output.copy_from_slice(block);
@@ -104,5 +121,45 @@ impl Decompressor {
                 .ok(),
             Codec::None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_dictionaries_fit_the_build_allowance_and_round_trip() {
+        let dictionary: Vec<_> = (0..super::super::dictionary::DICTIONARY_LEN)
+            .map(|i| (i.wrapping_mul(37) ^ (i >> 8)) as u8)
+            .collect();
+        let block: Vec<_> = dictionary.iter().copied().cycle().take(64 << 10).collect();
+        let mut compressor = Compressor::new(Codec::Zstd);
+        let mut decompressor = Decompressor::default();
+        for len in [0, 1, 256, dictionary.len()] {
+            let raw = &dictionary[..len];
+            let prepared = compressor.prepare_dictionary(raw).unwrap();
+            assert!(
+                prepared.sizeof() <= CDICT_ALLOWANCE,
+                "{} at {len}",
+                prepared.sizeof()
+            );
+            // Reuse exactly the same prepared dictionary for multiple blocks.
+            for input in [&block[..1024], block.as_slice()] {
+                let mut stored = Vec::new();
+                compressor.compress(input, Some(&prepared), &mut stored);
+                let mut decoded = vec![0; input.len()];
+                assert_eq!(
+                    decompressor.decompress(Codec::Zstd, &stored, &mut decoded, raw),
+                    Some(input.len())
+                );
+                assert_eq!(decoded, input);
+            }
+        }
+        assert!(
+            Compressor::new(Codec::None)
+                .prepare_dictionary(&dictionary)
+                .is_none()
+        );
     }
 }

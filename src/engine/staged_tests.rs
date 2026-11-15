@@ -570,6 +570,9 @@ mod compaction {
                                     .map(|range| (range.min.to_vec(), range.max.to_vec()))
                                     .collect();
                                 assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+                                // Even manual engines have a flush worker. Keep
+                                // its publications outside this accounting pair.
+                                let _flush = (!background).then(|| engine.core.serialize_flush());
                                 let before = engine.stats();
                                 let report = built.publish().unwrap();
                                 let after = engine.stats();
