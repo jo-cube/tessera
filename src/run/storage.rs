@@ -3,35 +3,121 @@ use std::ops::Range;
 
 use super::CorruptRun;
 use super::reader::RunView;
+use crate::chunk::{CHUNK_BYTES, Chunk, ChunkPool};
 
-/// One exact allocation: encoded frames followed by their raw dictionary.
+/// Consecutive logical bytes within one allocation. Adjacent frames coalesce;
+/// a frame and a dictionary are always appended atomically, never split.
 #[derive(Clone, Debug)]
-pub(super) struct Segment {
-    pub frame_start: usize,
-    pub dictionary_start: usize,
-    pub frames_len: usize,
-    pub bytes: Box<[u8]>,
+pub(super) struct Piece {
+    pub start: usize,
+    pub allocation: usize,
+    pub range: Range<usize>,
 }
-impl Segment {
-    pub fn frames(&self) -> &[u8] {
-        &self.bytes[..self.frames_len]
+
+#[derive(Debug)]
+pub(super) struct Packing {
+    pool: ChunkPool,
+    allocations: Vec<Chunk>,
+    active: Option<(usize, usize)>,
+    frames: Vec<Piece>,
+    dictionaries: Vec<Piece>,
+    pub frames_len: usize,
+    pub dictionaries_len: usize,
+}
+
+impl Packing {
+    pub fn new(pool: &ChunkPool) -> Self {
+        Self {
+            pool: pool.clone(),
+            allocations: Vec::new(),
+            active: None,
+            frames: Vec::new(),
+            dictionaries: Vec::new(),
+            frames_len: 0,
+            dictionaries_len: 0,
+        }
     }
-    pub fn dictionary(&self) -> &[u8] {
-        &self.bytes[self.frames_len..]
+
+    fn append(&mut self, bytes: &[u8], dictionary: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        let (allocation, range) = if bytes.len() > CHUNK_BYTES {
+            let at = self.allocations.len();
+            self.allocations.push(Chunk::exact(bytes));
+            (at, 0..bytes.len())
+        } else {
+            let (at, used) = match self.active {
+                Some((at, used)) if used + bytes.len() <= CHUNK_BYTES => (at, used),
+                _ => {
+                    let at = self.allocations.len();
+                    self.allocations.push(self.pool.take());
+                    (at, 0)
+                }
+            };
+            let range = used..used + bytes.len();
+            self.allocations[at].bytes_mut()[range.clone()].copy_from_slice(bytes);
+            self.active = Some((at, range.end));
+            (at, range)
+        };
+        let (pieces, len) = if dictionary {
+            (&mut self.dictionaries, &mut self.dictionaries_len)
+        } else {
+            (&mut self.frames, &mut self.frames_len)
+        };
+        if let Some(last) = pieces.last_mut()
+            && last.allocation == allocation
+            && last.range.end == range.start
+        {
+            last.range.end = range.end;
+        } else {
+            pieces.push(Piece {
+                start: *len,
+                allocation,
+                range,
+            });
+        }
+        *len += bytes.len();
+    }
+
+    pub fn frame(&mut self, bytes: &[u8]) {
+        self.append(bytes, false);
+    }
+    pub fn dictionary(&mut self, bytes: &[u8]) {
+        self.append(bytes, true);
+    }
+
+    pub fn finish(self, tail: Box<[u8]>) -> Segmented {
+        Segmented {
+            allocations: self.allocations.into_boxed_slice(),
+            frames: self.frames.into_boxed_slice(),
+            dictionaries: self.dictionaries.into_boxed_slice(),
+            tail,
+            frames_len: self.frames_len,
+            dictionaries_len: self.dictionaries_len,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct Segmented {
-    pub segments: Box<[Segment]>,
+    pub allocations: Box<[Chunk]>,
+    pub frames: Box<[Piece]>,
+    pub dictionaries: Box<[Piece]>,
     /// Segment entries, block table, keys and footer, in their file order.
     pub tail: Box<[u8]>,
     pub frames_len: usize,
     pub dictionaries_len: usize,
 }
 
+impl Segmented {
+    fn bytes(&self, piece: &Piece) -> &[u8] {
+        &self.allocations[piece.allocation].bytes()[piece.range.clone()]
+    }
+}
+
 /// Borrowed storage remains useful for validation and format tests; builders
-/// and recovery use Segmented and never retain a contiguous run buffer.
+/// and recovery fill chunks and retain only exact index/footer buffers beside them.
 #[derive(Clone, Debug)]
 pub(super) enum RunData<B> {
     Contiguous(B),
@@ -56,26 +142,31 @@ impl<B: AsRef<[u8]>> RunData<B> {
             Self::Segmented(data) => data.frames_len + data.dictionaries_len + data.tail.len(),
         }
     }
+    /// Metadata beside serialized bytes. Pool capacity, including padding and
+    /// the free reserve, is reported separately by the engine's pool counters.
     pub fn held_bytes(&self) -> usize {
         match self {
             Self::Contiguous(_) => 0,
-            Self::Segmented(data) => size_of_val(&*data.segments),
+            Self::Segmented(data) => {
+                size_of_val(&*data.allocations)
+                    + size_of_val(&*data.frames)
+                    + size_of_val(&*data.dictionaries)
+            }
         }
     }
     /// The v5 file layout: all frames, all dictionaries, then the index/footer.
     pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
         let count = match self {
             Self::Contiguous(_) => 1,
-            Self::Segmented(data) => 2 * data.segments.len() + 1,
+            Self::Segmented(data) => data.frames.len() + data.dictionaries.len() + 1,
         };
         (0..count).map(move |at| match self {
             Self::Contiguous(data) => data.as_ref(),
             Self::Segmented(data) => {
-                let n = data.segments.len();
-                if at < n {
-                    data.segments[at].frames()
-                } else if at < 2 * n {
-                    data.segments[at - n].dictionary()
+                if at < data.frames.len() {
+                    data.bytes(&data.frames[at])
+                } else if let Some(piece) = data.dictionaries.get(at - data.frames.len()) {
+                    data.bytes(piece)
                 } else {
                     &data.tail
                 }
@@ -84,8 +175,7 @@ impl<B: AsRef<[u8]>> RunData<B> {
     }
 }
 
-/// A logical region whose ranges must lie in a single physical segment.
-/// Index entries already delimit frames, so readers need only this lookup.
+/// A logical region whose requested ranges must lie in a single chunk.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Region<'a> {
     Contiguous(&'a [u8]),
@@ -107,27 +197,17 @@ impl<'a> Region<'a> {
         match self {
             Self::Contiguous(bytes) => bytes.get(range),
             Self::Frames(data) | Self::Dictionaries(data) => {
-                let frames = matches!(self, Self::Frames(_));
-                let start = |s: &Segment| {
-                    if frames {
-                        s.frame_start
-                    } else {
-                        s.dictionary_start
-                    }
-                };
-                let at = data
-                    .segments
-                    .partition_point(|s| start(s) <= range.start)
-                    .checked_sub(1)?;
-                let segment = &data.segments[at];
-                let bytes = if frames {
-                    segment.frames()
+                let pieces = if matches!(self, Self::Frames(_)) {
+                    &data.frames
                 } else {
-                    segment.dictionary()
+                    &data.dictionaries
                 };
-                bytes.get(
-                    range.start.checked_sub(start(segment))?
-                        ..range.end.checked_sub(start(segment))?,
+                let at = pieces
+                    .partition_point(|p| p.start <= range.start)
+                    .checked_sub(1)?;
+                let piece = &pieces[at];
+                data.bytes(piece).get(
+                    range.start.checked_sub(piece.start)?..range.end.checked_sub(piece.start)?,
                 )
             }
         }
@@ -139,8 +219,46 @@ impl<'a> Region<'a> {
         };
         match self {
             Self::Contiguous(bytes) => within(bytes),
-            Self::Frames(data) => data.segments.iter().find_map(|s| within(s.frames())),
-            Self::Dictionaries(data) => data.segments.iter().find_map(|s| within(s.dictionary())),
+            Self::Frames(data) => data.frames.iter().find_map(|p| within(data.bytes(p))),
+            Self::Dictionaries(data) => {
+                data.dictionaries.iter().find_map(|p| within(data.bytes(p)))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packing_shares_chunks_but_never_splits_a_frame_or_dictionary() {
+        let pool = ChunkPool::new(CHUNK_BYTES);
+        let mut packing = Packing::new(&pool);
+        packing.frame(&vec![1; CHUNK_BYTES - 32]);
+        packing.dictionary(&[2; 16]);
+        // The next segment shares the first chunk's last sixteen bytes.
+        packing.frame(&[3; 16]);
+        packing.frame(&[4; 32]);
+        packing.dictionary(&[5; 64]);
+        let data = packing.finish(Box::new([]));
+        assert_eq!(data.allocations.len(), 2);
+        assert_eq!(data.frames[1].allocation, 0);
+        assert_eq!(data.frames[2].allocation, 1);
+        assert_eq!(
+            Region::Frames(&data)
+                .get(CHUNK_BYTES - 32..CHUNK_BYTES - 16)
+                .unwrap(),
+            &[3; 16]
+        );
+        assert!(
+            Region::Frames(&data)
+                .get(CHUNK_BYTES - 17..CHUNK_BYTES - 15)
+                .is_none()
+        );
+        assert_eq!(Region::Dictionaries(&data).get(16..80).unwrap(), &[5; 64]);
+        drop(data);
+        assert_eq!(pool.stats().0, CHUNK_BYTES);
+        assert_eq!(pool.stats().1, 0);
     }
 }

@@ -373,6 +373,14 @@
 //! These limits use the memtable's estimated charges, stored run lengths and
 //! an estimate of workspace. They are not a limit on process memory.
 //!
+//! Runs pack whole frames and dictionaries into engine-owned 1 MiB chunks.
+//! Consecutive segments of a run share chunks; a larger frame has an exact
+//! allocation. Chunk padding is at most one frame/dictionary per filled chunk
+//! plus the final chunk per run. Pool capacity and its bounded free reserve
+//! are reported separately in [`EngineStats`]; stored byte limits exclude
+//! padding. The free reserve is capped at max(64 MiB, the largest compaction
+//! output allowance used so far), and is allocated only as chunks are returned.
+//!
 //! # Checkpoints
 //!
 //! [`Engine::checkpoint`] writes the state at one snapshot, its **ceiling**,
@@ -428,13 +436,14 @@ use std::sync::{
 };
 
 use crate::block::{Record, Value, Version};
+use crate::chunk::{ChunkPool, MIN_RESERVE_BYTES};
 use crate::memtable::{
     FlushCuts, FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
     Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_TARGET_RUN_LEN, OutputCuts,
-    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_parallel,
-    latest_from,
+    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED,
+    compact_parallel_in, latest_from,
 };
 
 use directory::RunDirectory;
@@ -495,8 +504,9 @@ pub struct EngineOptions {
     /// `max_run_bytes` over 64 KiB; scale it with `max_run_bytes`.
     pub max_runs: usize,
     /// The most bytes of published runs, at least 1: their stored bytes, key
-    /// filters and segment metadata together. This is the physical
-    /// limit on how much the engine holds. Exceeding it refuses flushes as
+    /// filters and chunk metadata together. Chunk padding and the free pool
+    /// reserve are separate, reported in [`EngineStats::pool_in_use_bytes`]
+    /// and [`EngineStats::pool_reserve_bytes`]. Exceeding it refuses flushes as
     /// for `max_runs`; a compaction may exceed it only by publishing less
     /// than it replaces.
     pub max_run_bytes: usize,
@@ -985,6 +995,14 @@ pub struct EngineStats {
     /// Key filters and physical segment metadata beside `run_bytes`. Dictionaries are
     /// stored inside the runs. [`EngineOptions::max_run_bytes`] limits both.
     pub held_bytes: usize,
+    /// Unused 1 MiB chunks available for reuse by this engine.
+    pub pool_reserve_bytes: usize,
+    /// Capacity of checked-out pool chunks, including padding and chunks held
+    /// by builders, memtables or snapshots. Oversized exact allocations are excluded.
+    pub pool_in_use_bytes: usize,
+    /// Maximum free reserve: at least 64 MiB, raised to the largest compaction
+    /// output allowance used so far. The pool does not preallocate this amount.
+    pub pool_reserve_limit: usize,
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes, and
     /// the number of groups in the run directory, each one input of a scan.
@@ -1176,6 +1194,7 @@ impl State {
 
 /// Everything an engine shares with its background worker.
 struct Core {
+    chunks: ChunkPool,
     state: RwLock<State>,
     /// Gives writers priority. A writer holds it while waiting for the state
     /// lock, and a reader passes through it first, so new readers cannot keep
@@ -1480,7 +1499,12 @@ impl Engine {
 
 impl Core {
     fn new(options: &EngineOptions) -> Self {
+        Self::with_pool(options, ChunkPool::new(MIN_RESERVE_BYTES))
+    }
+
+    fn with_pool(options: &EngineOptions, chunks: ChunkPool) -> Self {
         Self {
+            chunks,
             state: RwLock::new(State {
                 last_seq: options.last_seq,
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
@@ -2156,7 +2180,11 @@ impl Core {
     fn stats(&self) -> EngineStats {
         let state = self.read_state();
         let retained = state.retained();
+        let (pool_reserve_bytes, pool_in_use_bytes, pool_reserve_limit) = self.chunks.stats();
         EngineStats {
+            pool_reserve_bytes,
+            pool_in_use_bytes,
+            pool_reserve_limit,
             last_seq: state.last_seq,
             active: state.active.memory(),
             frozen: state
@@ -2305,6 +2333,7 @@ impl<'e> FlushJob<'e> {
             self.engine.codec,
             self.engine.target_block_compressed,
             &self.cuts,
+            &self.engine.chunks,
         );
         BuiltFlush { job: self, runs }
     }
@@ -2442,7 +2471,7 @@ pub struct CompactionOptions {
     /// only if its input leaves a thirty-second of this limit free for what
     /// output runs add (footers, filters, blocks packed differently), so
     /// that a job chosen is not refused here and then chosen again. It counts bytes
-    /// written in exact segment allocations; the builder's reusable encoding
+    /// stored in chunks, excluding their padding; the builder's reusable encoding
     /// scratch is charged to `max_workspace_bytes`.
     pub max_output_bytes: usize,
     /// The most estimated workspace bytes: one block and a decompression
@@ -2810,6 +2839,9 @@ impl<'e> CompactionJob<'e> {
     /// published later come from flushes and hold only newer updates. On an
     /// error nothing is built and the engine is unchanged.
     fn build(self, workspace: &mut MergeWorkspace) -> Result<BuiltCompaction<'e>, CompactionError> {
+        self.engine
+            .chunks
+            .reserve_for(self.options.max_output_bytes);
         let views: Vec<RunView<'_>> = self.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = self
             .others
@@ -2829,14 +2861,14 @@ impl<'e> CompactionJob<'e> {
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
         };
-        let output = match compact_parallel(
+        let output = match compact_parallel_in(
             &views,
             keep_tombstone,
             limits,
             &self.cuts,
             self.engine.background_threads,
             self.estimated_run_bytes,
-            workspace,
+            (workspace, &self.engine.chunks),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -3681,7 +3713,14 @@ mod tests {
         let mut built = job.build(&mut MergeWorkspace::new()).unwrap();
         built.output.output_bytes = stats.run_bytes + stats.held_bytes + 1;
         assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
-        assert_eq!(engine.stats(), stats);
+        assert_eq!(
+            engine.stats(),
+            EngineStats {
+                pool_reserve_bytes: crate::chunk::CHUNK_BYTES,
+                pool_reserve_limit: CompactionOptions::default().max_output_bytes,
+                ..stats
+            }
+        );
 
         let report = begin()
             .build(&mut MergeWorkspace::new())

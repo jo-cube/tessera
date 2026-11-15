@@ -62,6 +62,7 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
+use crate::chunk::ChunkPool;
 use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder, TARGET_BLOCK_COMPRESSED};
 
 #[cfg(test)]
@@ -895,6 +896,7 @@ impl FrozenMemtable {
     ) -> Flush<'_> {
         Flush {
             records: self.iter(),
+            pool: ChunkPool::new(0),
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
             codec,
             target_block_compressed,
@@ -939,11 +941,12 @@ pub(crate) fn flush_merged(
     codec: Codec,
     target_block_compressed: usize,
     cuts: &FlushCuts,
+    pool: &ChunkPool,
 ) -> Vec<Run<Vec<u8>>> {
     if let ([table], []) = (tables, cuts.at.as_slice()) {
-        return table
-            .flush_with(target_run_len, codec, target_block_compressed)
-            .collect();
+        let mut flush = table.flush_with(target_run_len, codec, target_block_compressed);
+        flush.pool = pool.clone();
+        return flush.collect();
     }
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
     // Input still to come, for the rule that a cut leaves a piece after it:
@@ -989,9 +992,7 @@ pub(crate) fn flush_merged(
             pieces += 1;
         }
         builder
-            .get_or_insert_with(|| {
-                RunBuilder::with_target_block_compressed(codec, target_block_compressed)
-            })
+            .get_or_insert_with(|| RunBuilder::in_pool(codec, target_block_compressed, pool))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
         let len = input_len(&record);
@@ -1061,6 +1062,7 @@ impl fmt::Debug for Records<'_> {
 
 /// The runs of a [`FrozenMemtable`], built as they are requested.
 pub struct Flush<'a> {
+    pool: ChunkPool,
     records: Records<'a>,
     target: usize,
     codec: Codec,
@@ -1072,8 +1074,7 @@ impl Iterator for Flush<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut record = self.records.next()?;
-        let mut builder =
-            RunBuilder::with_target_block_compressed(self.codec, self.target_block_compressed);
+        let mut builder = RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.pool);
         let mut input = 0;
         loop {
             builder

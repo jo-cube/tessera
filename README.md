@@ -117,6 +117,13 @@ estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
 record gets its own block. Segments use level 1; block sizing retains its
 level-3 ratio probe.
 Uncompressed runs use a fixed 16 KiB raw target.
+Frames and dictionaries share engine-owned 1 MiB chunks, including across
+segments of the same run. A frame larger than a chunk has an exact allocation.
+Retired chunks return to a shared pool, whose free reserve is capped at the
+larger of 64 MiB and the largest compaction output allowance used so far.
+`EngineStats` reports free reserve, its cap and checked-out chunk capacity,
+including padding and snapshots. Stored run limits exclude chunk padding;
+index, footer and filter buffers remain exact allocations.
 Compaction builds disjoint key ranges of one selected job in parallel, using up
 to `background_threads` builders (default half the available CPUs, capped at 4,
 at least 1). Segment buffers shrink to share the existing workspace limit;

@@ -54,6 +54,7 @@
 #![warn(unnameable_types)]
 
 mod block;
+mod chunk;
 pub mod engine;
 mod memtable;
 mod run;

@@ -32,10 +32,7 @@ impl Core {
         for (key, value) in records {
             builder
                 .get_or_insert_with(|| {
-                    RunBuilder::with_target_block_compressed(
-                        self.codec,
-                        self.target_block_compressed,
-                    )
+                    RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.chunks)
                 })
                 .add(key, 0, value)
                 .expect("validated unique sorted records");

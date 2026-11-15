@@ -200,6 +200,12 @@ impl Store {
             Self::R(_) => None,
         }
     }
+    pub fn pool_stats(&self) -> Option<(usize, usize, usize)> {
+        if let Self::T(e) = self {
+            let s = e.stats();
+            Some((s.pool_reserve_bytes, s.pool_in_use_bytes, s.pool_reserve_limit))
+        } else { None }
+    }
     /// Flush bytes written, compaction bytes written, stored run/SST bytes.
     pub fn counters(&self) -> [u64; 3] {
         match self {

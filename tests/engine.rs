@@ -179,7 +179,15 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
         "{refused:?}"
     );
     assert_eq!(engine.put(b"c", &[0; 40]), refused);
-    assert_eq!(engine.stats(), before);
+    // The failed background flush may have returned its unpublished chunks.
+    let after = engine.stats();
+    assert_eq!(
+        after,
+        tessera::engine::EngineStats {
+            pool_reserve_bytes: after.pool_reserve_bytes,
+            ..before
+        }
+    );
     assert_eq!(value_of(&engine, b"c"), None);
     // Raising the limits lets the next write flush both tables.
     engine.set_run_limits(64, usize::MAX).unwrap();

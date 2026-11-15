@@ -1170,7 +1170,14 @@ fn a_snapshot_pins_only_what_later_writes_replace() {
 /// Flushes `tables` with `cuts` and returns each run's records, checking
 /// that together they are the merged tables' newest records in order.
 fn split_flush(tables: &[&FrozenMemtable], target: usize, cuts: &FlushCuts) -> Vec<Vec<Entry>> {
-    let runs = flush_merged(tables, target, Codec::None, TARGET_BLOCK_LEN, cuts);
+    let runs = flush_merged(
+        tables,
+        target,
+        Codec::None,
+        TARGET_BLOCK_LEN,
+        cuts,
+        &crate::chunk::ChunkPool::new(0),
+    );
     let pieces: Vec<Vec<Entry>> = runs.iter().map(run_contents).collect();
     let mut newest: std::collections::BTreeMap<Vec<u8>, Entry> = Default::default();
     for table in tables {

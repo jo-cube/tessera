@@ -1,7 +1,7 @@
 use super::codec::{Codec, Compressor};
 use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
-use super::storage::{RunData, Segment, Segmented};
+use super::storage::{Packing, RunData};
 use super::{
     FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
     TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
@@ -9,6 +9,7 @@ use super::{
 use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, Value, cmp_internal,
 };
+use crate::chunk::ChunkPool;
 use std::fmt;
 
 /// Encodes sorted records, buffering at most one raw segment before compressing.
@@ -24,9 +25,7 @@ pub struct RunBuilder {
     last_seq: u64,
     pending_key_bytes: usize,
     frames: Vec<u8>,
-    stored_segments: Vec<Segment>,
-    frames_len: usize,
-    dictionaries_len: usize,
+    storage: Packing,
     raw: Vec<u8>,
     uncompressed: Vec<u8>,
     block: BlockBuilder,
@@ -58,9 +57,7 @@ impl RunBuilder {
             last_seq: 0,
             pending_key_bytes: 0,
             frames: Vec::new(),
-            stored_segments: Vec::new(),
-            frames_len: 0,
-            dictionaries_len: 0,
+            storage: Packing::new(&ChunkPool::new(0)),
             raw: Vec::new(),
             uncompressed: Vec::new(),
             block: BlockBuilder::new(),
@@ -72,6 +69,11 @@ impl RunBuilder {
             max_seq: 0,
             key_hashes: KeyHashes::new(),
         }
+    }
+    pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
+        let mut builder = Self::with_target_block_compressed(codec, target);
+        builder.storage = Packing::new(pool);
+        builder
     }
     /// Fixed targets used by physical reader tests, including tiny blocks.
     #[cfg(test)]
@@ -125,8 +127,8 @@ impl RunBuilder {
     }
     /// Stored bytes so far, excluding the buffered raw segment.
     pub fn stored_len(&self) -> usize {
-        self.frames_len
-            + self.dictionaries_len
+        self.storage.frames_len
+            + self.storage.dictionaries_len
             + self.segments.len()
             + self.table.len()
             + self.keys.len()
@@ -144,8 +146,9 @@ impl RunBuilder {
     }
     pub fn finish(mut self) -> Run<Vec<u8>> {
         self.cut_segment();
-        let dictionaries_offset = self.frames_len;
-        let index_offset = dictionaries_offset + self.dictionaries_len + self.segments.len();
+        let dictionaries_offset = self.storage.frames_len;
+        let index_offset =
+            dictionaries_offset + self.storage.dictionaries_len + self.segments.len();
         // Segment offsets were relative to the dictionary region while building.
         for entry in self.segments.as_chunks_mut::<SEGMENT_ENTRY_LEN>().0 {
             let offset = u64::from_le_bytes(entry[..8].try_into().expect("offset"))
@@ -166,12 +169,7 @@ impl RunBuilder {
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         Run::from_builder(
-            RunData::Segmented(Segmented {
-                segments: self.stored_segments.into_boxed_slice(),
-                tail: data.into_boxed_slice(),
-                frames_len: self.frames_len,
-                dictionaries_len: self.dictionaries_len,
-            }),
+            RunData::Segmented(self.storage.finish(data.into_boxed_slice())),
             self.key_hashes.finish(),
             self.max_seq,
         )
@@ -199,7 +197,7 @@ impl RunBuilder {
             let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
             assert!(id < 1 << 24, "segment reference fits in 24 bits");
             self.segments
-                .extend_from_slice(&(self.dictionaries_len as u64).to_le_bytes());
+                .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
             self.segments
                 .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
             self.segments
@@ -261,19 +259,7 @@ impl RunBuilder {
         if !block.is_empty() {
             self.cut_block(&mut block, &mut uncompressed, reference);
         }
-        let frames_len = self.frames.len();
-        self.frames.extend_from_slice(&dictionary);
-        // Copy, rather than shrinking a grown Vec: the output allocation is exact
-        // and the bounded encoding scratch is reused for the next segment.
-        self.stored_segments.push(Segment {
-            frame_start: self.frames_len,
-            dictionary_start: self.dictionaries_len,
-            frames_len,
-            bytes: self.frames.as_slice().into(),
-        });
-        self.frames_len += frames_len;
-        self.dictionaries_len += dictionary.len();
-        retain_scratch(&mut self.frames, 2 * self.segment_len);
+        self.storage.dictionary(&dictionary);
         retain_scratch(&mut raw, 2 * self.segment_len);
         retain_scratch(&mut uncompressed, 2 * RAW_BLOCK_CAP);
         block.trim_empty(2 * RAW_BLOCK_CAP);
@@ -282,10 +268,11 @@ impl RunBuilder {
         self.block = block;
     }
     fn cut_block(&mut self, block: &mut BlockBuilder, raw: &mut Vec<u8>, reference: u32) {
-        let offset = self.frames.len();
+        self.frames.clear();
+        let offset = self.storage.frames_len;
         let len = block.encoded_len();
         let codec = self.compressor.codec();
-        self.frames.resize(offset + frame::HEADER_LEN, 0);
+        self.frames.resize(frame::HEADER_LEN, 0);
         if codec == Codec::None {
             block.flush_into(&mut self.frames);
         } else {
@@ -293,10 +280,11 @@ impl RunBuilder {
             block.flush_into(raw);
             self.compressor.compress(raw, None, &mut self.frames);
         }
-        frame::seal(&mut self.frames[offset..], codec, len, reference);
+        frame::seal(&mut self.frames, codec, len, reference);
+        self.storage.frame(&self.frames);
+        retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
         self.keys.extend_from_slice(block.last_key());
-        self.table
-            .extend_from_slice(&((self.frames_len + offset) as u64).to_le_bytes());
+        self.table.extend_from_slice(&(offset as u64).to_le_bytes());
         self.table
             .extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
     }

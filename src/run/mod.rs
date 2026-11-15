@@ -85,12 +85,12 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
-pub(crate) use compact::CompactError;
+#[cfg(test)]
+pub(crate) use compact::compact_parallel;
 #[cfg(test)]
 pub(crate) use compact::compact_with;
-pub use compact::{
-    CompactLimits, CompactStats, Compacted, OutputCuts, compact_parallel, workspace_estimate,
-};
+pub(crate) use compact::{CompactError, compact_parallel_in};
+pub use compact::{CompactLimits, CompactStats, Compacted, OutputCuts, workspace_estimate};
 pub(crate) use group::RunList;
 #[cfg(test)]
 pub(crate) use logical::latest_in;

@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::block::{Record, Value};
+use crate::chunk::ChunkPool;
 
 use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
@@ -233,12 +234,31 @@ pub fn compact<'a>(
 }
 
 /// [`compact`], with output runs also cut as `cuts` asks.
+#[cfg(test)]
 pub(crate) fn compact_with<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    workspace: &'a mut MergeWorkspace,
+) -> Result<Compacted, CompactError> {
+    compact_with_in(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        &ChunkPool::new(0),
+    )
+}
+
+fn compact_with_in<'a>(
     inputs: &[RunView<'a>],
     mut keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
+    pool: &ChunkPool,
 ) -> Result<Compacted, CompactError> {
     compact_range(
         inputs,
@@ -247,6 +267,7 @@ pub(crate) fn compact_with<'a>(
         cuts,
         workspace,
         BuildRange {
+            pool,
             start: None,
             end: None,
             segment_len: SEGMENT_RAW_LEN,
@@ -258,6 +279,7 @@ pub(crate) fn compact_with<'a>(
 
 /// Builds disjoint key ranges of one selected job, under the same total limits.
 /// Single-output neighbour merges and small jobs retain the serial path.
+#[cfg(test)]
 pub fn compact_parallel<'a>(
     inputs: &[RunView<'a>],
     keep_tombstone: impl Fn(&[u8]) -> bool + Sync,
@@ -267,6 +289,27 @@ pub fn compact_parallel<'a>(
     estimated_run_bytes: usize,
     workspace: &'a mut MergeWorkspace,
 ) -> Result<Compacted, CompactError> {
+    compact_parallel_in(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        threads,
+        estimated_run_bytes,
+        (workspace, &ChunkPool::new(0)),
+    )
+}
+
+pub(crate) fn compact_parallel_in<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl Fn(&[u8]) -> bool + Sync,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    threads: usize,
+    estimated_run_bytes: usize,
+    build: (&'a mut MergeWorkspace, &ChunkPool),
+) -> Result<Compacted, CompactError> {
+    let (workspace, pool) = build;
     let needed = workspace_bytes(inputs)?;
     if needed > limits.max_workspace_bytes {
         return Err(CompactError::WorkspaceLimit {
@@ -281,14 +324,14 @@ pub fn compact_parallel<'a>(
     let full_runs = stored / estimated_run_bytes;
     let threads = threads.min(full_runs).min(stored / (256 << 10)).max(1);
     if threads == 1 || cuts.single {
-        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
     // Borrow sparse-index keys, weighted by compressed input bytes. Equal user
     // keys stay together even when their versions span several input blocks.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
     let metadata = count.saturating_mul(size_of::<(&[u8], usize)>());
     if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
-        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
     let mut boundaries = Vec::with_capacity(count);
     for input in inputs {
@@ -313,12 +356,12 @@ pub fn compact_parallel<'a>(
         }
         threads -= 1;
         if threads == 1 {
-            return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+            return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
         }
     };
     let starts = partition_starts(&boundaries, estimated_run_bytes, threads);
     if starts.is_empty() {
-        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
     let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
     let total = AtomicUsize::new(0);
@@ -340,6 +383,7 @@ pub fn compact_parallel<'a>(
                         cuts,
                         &mut MergeWorkspace::new(),
                         BuildRange {
+                            pool,
                             start,
                             end,
                             segment_len,
@@ -410,6 +454,7 @@ pub(super) fn partition_starts<'a>(
 }
 
 struct BuildRange<'a> {
+    pool: &'a ChunkPool,
     start: Option<&'a [u8]>,
     end: Option<&'a [u8]>,
     segment_len: usize,
@@ -437,6 +482,7 @@ fn compact_range<'a>(
         merge.seek(start)?;
     }
     let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
+    output.pool = range.pool.clone();
     output.segment_len = range.segment_len;
     output.total = range.total;
     let mut stats = CompactStats::default();
@@ -503,6 +549,7 @@ fn collapse_copies(
 }
 
 struct Output<'c> {
+    pool: ChunkPool,
     segment_len: usize,
     total: Option<&'c AtomicUsize>,
     charged: usize,
@@ -532,6 +579,7 @@ impl<'c> Output<'c> {
             limits.target_run_len.min(MAX_TARGET_RUN_LEN)
         };
         Self {
+            pool: ChunkPool::new(0),
             limits: CompactLimits {
                 target_run_len,
                 ..limits
@@ -588,9 +636,10 @@ impl<'c> Output<'c> {
             self.overlapped = 0;
         }
         let builder = self.builder.get_or_insert_with(|| {
-            let mut builder = RunBuilder::with_target_block_compressed(
+            let mut builder = RunBuilder::in_pool(
                 self.limits.codec,
                 self.limits.target_block_compressed,
+                &self.pool,
             );
             builder.limit_segment_len(self.segment_len);
             builder.limit_filter_build_bytes(self.hash_bytes);

@@ -80,6 +80,11 @@ impl MemoryBaseline {
         out.emit(case, "live_mib", format!("{:.2}", live as f64 / MIB as f64));
         out.emit(case, "live_per_heap", format!("{:.2}", live as f64 / heap as f64));
         out.emit(case, "live_per_rss", format!("{:.2}", live as f64 / ram as f64));
+        if let Some((reserve, used, limit)) = store.pool_stats() {
+            out.emit(case, "pool_reserve_bytes", reserve);
+            out.emit(case, "pool_in_use_bytes", used);
+            out.emit(case, "pool_reserve_limit", limit);
+        }
         if let Some(accounted) = store.accounted_run_bytes() {
             out.emit(case, "accounted_run_bytes", accounted);
             assert!(heap >= accounted, "live heap {heap} below run_bytes + held_bytes {accounted} after {case}");

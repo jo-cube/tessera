@@ -1,0 +1,157 @@
+//! Engine-owned bulk allocations. Only the bounded free reserve is pooled;
+//! checked-out chunks belong to their run or memtable, including snapshots.
+use std::fmt;
+use std::sync::{Arc, Mutex, Weak};
+
+pub(crate) const CHUNK_BYTES: usize = 1 << 20;
+pub(crate) const MIN_RESERVE_BYTES: usize = 64 << 20;
+
+#[derive(Default, Debug)]
+struct State {
+    free: Vec<Box<[u8]>>,
+    in_use: usize,
+    limit: usize,
+}
+
+#[derive(Debug)]
+struct Pool(Mutex<State>);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkPool(Arc<Pool>);
+
+impl ChunkPool {
+    pub(crate) fn new(reserve_bytes: usize) -> Self {
+        Self(Arc::new(Pool(Mutex::new(State {
+            limit: reserve_bytes / CHUNK_BYTES,
+            ..State::default()
+        }))))
+    }
+
+    /// The largest job's allowance bounds reuse after its inputs are retired.
+    /// This changes the cap, never preallocates the reserve.
+    pub(crate) fn reserve_for(&self, bytes: usize) {
+        let mut state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.limit = state.limit.max(bytes / CHUNK_BYTES);
+    }
+
+    pub(crate) fn take(&self) -> Chunk {
+        let bytes = {
+            let mut state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.in_use += 1;
+            state.free.pop()
+        }
+        .unwrap_or_else(|| vec![0; CHUNK_BYTES].into_boxed_slice());
+        Chunk {
+            bytes,
+            pool: Arc::downgrade(&self.0),
+        }
+    }
+
+    /// (free reserve bytes, checked-out bytes, reserve cap bytes).
+    pub(crate) fn stats(&self) -> (usize, usize, usize) {
+        let state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            state.free.len() * CHUNK_BYTES,
+            state.in_use * CHUNK_BYTES,
+            state.limit * CHUNK_BYTES,
+        )
+    }
+}
+
+pub(crate) struct Chunk {
+    bytes: Box<[u8]>,
+    pool: Weak<Pool>,
+}
+
+impl Chunk {
+    pub(crate) fn exact(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.into(),
+            pool: Weak::new(),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
+impl Clone for Chunk {
+    fn clone(&self) -> Self {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut copy = ChunkPool(pool).take();
+            copy.bytes.copy_from_slice(&self.bytes);
+            copy
+        } else {
+            Self::exact(&self.bytes)
+        }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut state = pool.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.in_use -= 1;
+            if state.free.len() < state.limit {
+                state.free.push(std::mem::take(&mut self.bytes));
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Chunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chunk")
+            .field("bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reuse_returns_the_same_allocation_and_only_keeps_the_reserve() {
+        let pool = ChunkPool::new(CHUNK_BYTES);
+        let mut first = pool.take();
+        first.bytes_mut()[7] = 91;
+        let address = first.bytes().as_ptr();
+        let second = pool.take();
+        assert_eq!(pool.stats(), (0, 2 * CHUNK_BYTES, CHUNK_BYTES));
+        drop(first);
+        drop(second);
+        assert_eq!(pool.stats(), (CHUNK_BYTES, 0, CHUNK_BYTES));
+        let reused = pool.take();
+        assert_eq!(reused.bytes().as_ptr(), address);
+        assert_eq!(reused.bytes()[7], 91);
+        assert_eq!(pool.stats(), (0, CHUNK_BYTES, CHUNK_BYTES));
+    }
+
+    #[test]
+    fn job_allowances_only_raise_the_cap_and_exact_allocations_are_not_pooled() {
+        let pool = ChunkPool::new(0);
+        pool.reserve_for(2 * CHUNK_BYTES + 3);
+        pool.reserve_for(CHUNK_BYTES);
+        let chunks = [pool.take(), pool.take(), pool.take()];
+        let oversized = Chunk::exact(&vec![4; CHUNK_BYTES + 1]);
+        drop(chunks);
+        assert_eq!(pool.stats(), (2 * CHUNK_BYTES, 0, 2 * CHUNK_BYTES));
+        drop(oversized);
+        assert_eq!(pool.stats(), (2 * CHUNK_BYTES, 0, 2 * CHUNK_BYTES));
+    }
+
+    #[test]
+    fn the_last_owner_can_outlive_the_engine_pool() {
+        let pool = ChunkPool::new(CHUNK_BYTES);
+        let mut chunk = pool.take();
+        chunk.bytes_mut()[0] = 42;
+        drop(pool);
+        assert_eq!(chunk.bytes()[0], 42);
+        drop(chunk);
+    }
+}

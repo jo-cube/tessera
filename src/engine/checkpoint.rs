@@ -115,6 +115,8 @@
 //! lengths within the run limits), so a damaged file cannot make recovery
 //! allocate more than the checkpoint it should hold.
 
+use crate::chunk::{ChunkPool, MIN_RESERVE_BYTES};
+
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
@@ -677,7 +679,7 @@ fn write_runs(
     let mut input = 0;
     while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
         let open = builder.get_or_insert_with(|| {
-            RunBuilder::with_target_block_compressed(core.codec, core.target_block_compressed)
+            RunBuilder::in_pool(core.codec, core.target_block_compressed, &core.chunks)
         });
         // Keys and values came from runs and memtables that held them.
         open.add(record.key, record.seq, Value::Bytes(record.value))
@@ -907,6 +909,7 @@ pub(super) fn lock_existing(dir: &Path) -> Result<File, OpenError> {
 pub(super) struct Loaded {
     pub(super) ceiling: u64,
     runs: Vec<Run<Vec<u8>>>,
+    pool: ChunkPool,
     run_bytes: usize,
     held_bytes: usize,
 }
@@ -915,7 +918,7 @@ impl Loaded {
     /// A core holding the checkpoint's runs, whose sequence continues after
     /// `options.last_seq`.
     pub(super) fn into_core(self, options: &EngineOptions) -> Core {
-        let core = Core::new(options);
+        let core = Core::with_pool(options, self.pool);
         {
             let mut state = core.write_state();
             state.runs.extend(published(self.runs));
@@ -1019,6 +1022,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 background: None,
             }));
         }
+        let pool = ChunkPool::new(MIN_RESERVE_BYTES);
         let mut runs: Vec<Run<Vec<u8>>> = Vec::with_capacity(manifest.runs.len());
         let mut records = 0u64;
         for (index, &(len, sum)) in manifest.runs.iter().enumerate() {
@@ -1037,7 +1041,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 return Err(corrupt(&file, Damage::Checksum));
             }
             let (run, max_seq) =
-                Run::recover(data).map_err(|error| corrupt(&file, Damage::Run(error)))?;
+                Run::recover_in(data, &pool).map_err(|error| corrupt(&file, Damage::Run(error)))?;
             if max_seq > manifest.last_seq {
                 return Err(corrupt(
                     &file,
@@ -1086,6 +1090,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
 
         Ok(Loaded {
             ceiling: manifest.last_seq,
+            pool,
             runs,
             run_bytes,
             held_bytes,

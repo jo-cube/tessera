@@ -7,15 +7,16 @@ use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::dictionary::DICTIONARY_LEN;
 use super::filter::{self as key_filter, KeyFilter, KeyHashes};
 use super::frame::{self, Frame};
-use super::storage::{Region, RunData, Segment, Segmented};
+use super::storage::{Packing, Region, RunData, Segmented};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, SEGMENT_ENTRY_LEN,
     TABLE_ENTRY_LEN, read_u32, read_u64,
 };
+use crate::chunk::ChunkPool;
 
 /// A valid run over any byte storage, such as `Vec<u8>`, `Arc<[u8]>` or
-/// `&[u8]`. Built and recovered runs instead own exact per-segment
-/// allocations plus a small index; the serialized format is the same.
+/// `&[u8]`. Built and recovered runs own pooled chunks plus an exact
+/// index/footer buffer; the serialized format is the same.
 ///
 /// Holding a `Run` is proof of validity: it comes from
 /// [`RunBuilder::finish`](super::RunBuilder::finish) or from a full check by
@@ -157,15 +158,10 @@ impl<B: AsRef<[u8]>> Run<B> {
             RunData::Contiguous(bytes) => bytes[offset] ^= 0xFF,
             RunData::Segmented(parts) => {
                 let mut remaining = offset;
-                let n = parts.segments.len();
                 let mut changed = false;
-                for at in 0..2 * n {
-                    let segment = &mut parts.segments[at % n];
-                    let bytes = if at < n {
-                        &mut segment.bytes[..segment.frames_len]
-                    } else {
-                        &mut segment.bytes[segment.frames_len..]
-                    };
+                for piece in parts.frames.iter().chain(parts.dictionaries.iter()) {
+                    let bytes =
+                        &mut parts.allocations[piece.allocation].bytes_mut()[piece.range.clone()];
                     if remaining < bytes.len() {
                         bytes[remaining] ^= 0xFF;
                         changed = true;
@@ -309,7 +305,12 @@ impl Run<Vec<u8>> {
     /// more to rebuild the key filter a builder would have made, returning
     /// the run and its largest sequence number (0 if empty). For runs read
     /// back from storage.
+    #[cfg(test)]
     pub(crate) fn recover(data: Vec<u8>) -> Result<(Self, u64), CorruptRun> {
+        Self::recover_in(data, &ChunkPool::new(0))
+    }
+
+    pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
         let max_seq = validate(&data)?;
         let mut hashes = KeyHashes::new();
         {
@@ -321,65 +322,20 @@ impl Run<Vec<u8>> {
             }
         }
         let view = RunView::open(&data)?;
-        let mut segments = Vec::new();
-        let mut start_block = 0;
-        let mut frame_start = 0;
-        let mut dictionary_start = 0;
-        while start_block < view.block_count() {
-            let first = view.frame(start_block)?;
-            let mut end_block = start_block + 1;
-            let mut raw_len = first.decoded_len;
-            while end_block < view.block_count() {
-                let next = view.frame(end_block)?;
-                if next.dictionary_ref != first.dictionary_ref
-                    || (first.codec == Codec::None
-                        && raw_len + next.decoded_len > super::dictionary::SEGMENT_RAW_LEN)
-                {
-                    break;
-                }
-                raw_len += next.decoded_len;
-                end_block += 1;
-            }
-            let frame_end = view
+        let mut packing = Packing::new(pool);
+        for block in 0..view.block_count() {
+            let start = frame_offset(view.table[block]);
+            let end = view
                 .table
-                .get(end_block)
+                .get(block + 1)
                 .map_or(view.frames.len(), |&e| frame_offset(e));
-            let frames = &data[frame_start..frame_end];
-            let dictionary = if segments.len() < view.segments.len() {
-                view.dictionary((segments.len() + 1) as u32)?
-            } else {
-                &[]
-            };
-            let mut bytes = Vec::with_capacity(frames.len() + dictionary.len());
-            bytes.extend_from_slice(frames);
-            bytes.extend_from_slice(dictionary);
-            segments.push(Segment {
-                frame_start,
-                dictionary_start,
-                frames_len: frames.len(),
-                bytes: bytes.into_boxed_slice(),
-            });
-            frame_start = frame_end;
-            dictionary_start += dictionary.len();
-            start_block = end_block;
+            packing.frame(&data[start..end]);
         }
-        while segments.len() < view.segments.len() {
-            let dictionary = view.dictionary((segments.len() + 1) as u32)?;
-            segments.push(Segment {
-                frame_start,
-                dictionary_start,
-                frames_len: 0,
-                bytes: dictionary.into(),
-            });
-            dictionary_start += dictionary.len();
+        for index in 0..view.segments.len() {
+            packing.dictionary(view.dictionary((index + 1) as u32)?);
         }
         let tail_start = view.frames.len() + view.dictionaries.len();
-        let parts = Segmented {
-            segments: segments.into_boxed_slice(),
-            tail: data[tail_start..].into(),
-            frames_len: view.frames.len(),
-            dictionaries_len: view.dictionaries.len(),
-        };
+        let parts = packing.finish(data[tail_start..].into());
         let run = Self::from_builder(RunData::Segmented(parts), hashes.finish(), max_seq);
         Ok((run, max_seq))
     }

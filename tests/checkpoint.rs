@@ -1066,7 +1066,11 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
         assert_eq!((report.runs, report.records), (1, 9_000));
         assert_eq!(run_versions(&scratch.0), vec![5]);
         let recovered = Engine::recover(&scratch.0, options).unwrap();
-        assert_eq!(recovered.stats().runs, 1);
+        let stats = recovered.stats();
+        assert_eq!(stats.runs, 1);
+        assert!(stats.pool_in_use_bytes >= 1 << 20);
+        assert_eq!(stats.pool_reserve_bytes, 0);
+        assert_eq!(stats.pool_reserve_limit, 64 << 20);
         let mut workspace = EngineWorkspace::new();
         let guard = recovered.read();
         let mut scan = guard.scan(&mut workspace);

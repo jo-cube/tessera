@@ -26,12 +26,20 @@ fn parts(run: &Run<Vec<u8>>) -> &Segmented {
 fn multiple_allocations_preserve_serialization_and_all_read_paths() {
     for codec in [Codec::None, Codec::Zstd] {
         let run = build(codec);
-        assert_eq!(parts(&run).segments.len(), 3);
+        assert_eq!(
+            run.view().segments.len(),
+            if codec == Codec::Zstd { 3 } else { 0 }
+        );
+        if codec == Codec::Zstd {
+            assert_eq!(parts(&run).allocations.len(), 1);
+        } else {
+            assert!(parts(&run).allocations.len() >= 9);
+        }
         let bytes = run.as_bytes().into_owned();
         assert_eq!(bytes.len(), run.stored_len());
         let (recovered, max) = Run::recover(bytes.clone()).unwrap();
         assert_eq!(max, 9_000);
-        assert!(parts(&recovered).segments.len() >= 3);
+        assert_eq!(recovered.view().block_count(), run.view().block_count());
         assert_eq!(recovered.as_bytes(), bytes);
         let mut workspace = ReadWorkspace::new();
         for candidate in [&run, &recovered] {
@@ -64,7 +72,7 @@ fn a_segment_exactly_at_the_raw_boundary_ends_before_the_next_record() {
         builder.add(b"a", 1, Value::Bytes(&value)).unwrap();
         builder.add(b"b", 2, Value::Bytes(b"next")).unwrap();
         let run = builder.finish();
-        assert_eq!(parts(&run).segments.len(), 2);
+        assert_eq!(run.view().block_count(), 2);
         assert_eq!(run.view().frame(0).unwrap().decoded_len, SEGMENT_RAW_LEN);
         let mut workspace = ReadWorkspace::new();
         assert_eq!(
@@ -80,11 +88,9 @@ fn a_segment_exactly_at_the_raw_boundary_ends_before_the_next_record() {
 #[test]
 fn damage_in_one_segment_leaves_other_segments_readable() {
     let run = build(Codec::Zstd);
-    let middle = &parts(&run).segments[1];
     let view = run.view();
-    let block = view
-        .table
-        .partition_point(|entry| frame_offset(*entry) < middle.frame_start);
+    let block = view.block_count() / 2;
+    let middle_start = frame_offset(view.table[block]);
     let frame = view.frame(block).unwrap();
     let mut workspace = ReadWorkspace::new();
     let decoded = workspace.load(&frame).unwrap();
@@ -95,7 +101,7 @@ fn damage_in_one_segment_leaves_other_segments_readable() {
         .unwrap()
         .key
         .to_vec();
-    let damaged = run.damaged_at(middle.frame_start + frame::HEADER_LEN);
+    let damaged = run.damaged_at(middle_start + frame::HEADER_LEN);
     assert_eq!(
         damaged.get(&key, &mut workspace).unwrap_err().kind,
         RunCorruption::ChecksumMismatch
@@ -119,4 +125,68 @@ fn damage_in_one_segment_leaves_other_segments_readable() {
         Run::new(damaged.as_bytes()).unwrap_err().kind,
         RunCorruption::ChecksumMismatch
     );
+}
+
+#[test]
+fn every_frame_and_dictionary_stays_in_one_allocation_including_oversized_frames() {
+    use crate::chunk::{CHUNK_BYTES, ChunkPool};
+    for codec in [Codec::None, Codec::Zstd] {
+        let pool = ChunkPool::new(4 * CHUNK_BYTES);
+        let mut builder = RunBuilder::in_pool(codec, 1024, &pool);
+        for i in 0..6000u32 {
+            builder
+                .add(&i.to_be_bytes(), i as u64 + 1, Value::Bytes(&[3; 1024]))
+                .unwrap();
+        }
+        let big = vec![7; CHUNK_BYTES + 211];
+        builder
+            .add(&6000u32.to_be_bytes(), 6001, Value::Bytes(&big))
+            .unwrap();
+        let run = builder.finish();
+        let storage = parts(&run);
+        let contains = |bytes: &[u8]| {
+            storage.allocations.iter().any(|chunk| {
+                let offset = bytes
+                    .as_ptr()
+                    .addr()
+                    .checked_sub(chunk.bytes().as_ptr().addr());
+                offset.is_some_and(|offset| offset + bytes.len() <= chunk.bytes().len())
+            })
+        };
+        let view = run.view();
+        for block in 0..view.block_count() {
+            let start = frame_offset(view.table[block]);
+            let end = view
+                .table
+                .get(block + 1)
+                .map_or(view.frames.len(), |&e| frame_offset(e));
+            assert!(contains(view.frames.get(start..end).unwrap()));
+        }
+        for segment in 0..view.segments.len() {
+            assert!(contains(view.dictionary((segment + 1) as u32).unwrap()));
+        }
+        if codec == Codec::None {
+            assert!(
+                storage
+                    .allocations
+                    .iter()
+                    .any(|chunk| chunk.bytes().len() > CHUNK_BYTES)
+            );
+        }
+        let mut workspace = ReadWorkspace::new();
+        assert_eq!(
+            run.get(&6000u32.to_be_bytes(), &mut workspace)
+                .unwrap()
+                .unwrap()
+                .value,
+            Value::Bytes(&big)
+        );
+        let bytes = run.as_bytes().into_owned();
+        assert_eq!(
+            storage.frames_len + storage.dictionaries_len + storage.tail.len(),
+            bytes.len()
+        );
+        let (restored, _) = Run::recover_in(bytes.clone(), &pool).unwrap();
+        assert_eq!(restored.as_bytes(), bytes);
+    }
 }
