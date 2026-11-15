@@ -1019,6 +1019,7 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
             max_frozen_memtables: 2,
             bulk_ingest_min: None,
             background_threads: 1 + rng.below(4),
+            level_ratio: [2, 4, 10][rng.below(3)],
             target_run_len: [1, 512, 1 << 20][rng.below(3)],
             max_runs: 100_000,
             max_run_bytes: usize::MAX,

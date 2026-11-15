@@ -921,7 +921,7 @@ impl Loaded {
             state.runs.extend(published(self.runs));
             // A checkpoint is one sorted scan, so its runs are disjoint: the
             // last level. Compaction inserts levels above it as it needs.
-            state.levels = Levels::recovered(&state.runs);
+            state.levels = Levels::recovered(&state.runs, options.level_ratio);
             state.order_runs();
             state.run_bytes = self.run_bytes;
             state.held_bytes = self.held_bytes;

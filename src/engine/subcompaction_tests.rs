@@ -126,3 +126,50 @@ fn background_thread_option_accepts_one_and_rejects_zero() {
         }))
     ));
 }
+
+#[test]
+fn non_default_ratios_preserve_updates_and_deletes() {
+    for ratio in [2, 10, usize::MAX] {
+        let engine = Engine::new(EngineOptions {
+            level_ratio: ratio,
+            background_threads: 1,
+            target_run_len: 4096,
+            memtable_budget: 16 << 10,
+            ..EngineOptions::default()
+        })
+        .unwrap();
+        for round in 0..4u8 {
+            for at in 0..600u64 {
+                if round == 3 && at % 3 == 0 {
+                    engine.delete(&at.to_be_bytes()).unwrap();
+                } else {
+                    engine.put(&at.to_be_bytes(), &[round; 80]).unwrap();
+                }
+            }
+            engine.flush().unwrap();
+            engine.wait_for_compaction().unwrap();
+        }
+        let mut workspace = EngineWorkspace::new();
+        for at in 0..600u64 {
+            assert_eq!(
+                engine
+                    .get(&at.to_be_bytes(), &mut workspace)
+                    .unwrap()
+                    .map(|v| v.value),
+                (at % 3 != 0).then_some([3; 80].as_slice())
+            );
+        }
+    }
+    for ratio in [0, 1] {
+        assert!(matches!(
+            Engine::new(EngineOptions {
+                level_ratio: ratio,
+                ..EngineOptions::default()
+            }),
+            Err(OpenError::Config(ConfigError {
+                setting: "EngineOptions::level_ratio",
+                ..
+            }))
+        ));
+    }
+}

@@ -508,6 +508,9 @@ pub struct EngineOptions {
     /// Defaults to half the available CPUs, capped at 4 and at least 1.
     /// Small jobs and tight workspace budgets use fewer builders.
     pub background_threads: usize,
+    /// Size multiplier between adjacent levels, at least 2 (default 4).
+    /// Dynamic level targets and the bounds on overlap use this ratio.
+    pub level_ratio: usize,
     /// Limits on [`Engine::snapshot`]. Zero is valid for both and refuses
     /// every snapshot (`max_live`) or every snapshot and compaction while a
     /// snapshot retains anything (`max_retained_bytes`).
@@ -537,6 +540,7 @@ impl Default for EngineOptions {
             max_run_bytes: DEFAULT_MAX_RUN_BYTES,
             last_seq: 0,
             background_compaction: Some(CompactionOptions::default()),
+            level_ratio: 4,
             background_threads: std::thread::available_parallelism()
                 .map_or(1, |cpus| (cpus.get() / 2).clamp(1, 4)),
             snapshots: SnapshotLimits::default(),
@@ -583,6 +587,13 @@ impl EngineOptions {
             1,
             usize::MAX as u64,
             "at least one builder is required",
+        )?;
+        ConfigError::check(
+            "EngineOptions::level_ratio",
+            self.level_ratio as u64,
+            2,
+            usize::MAX as u64,
+            "level sizes must grow by at least two",
         )?;
         ConfigError::check_run_limits(self.max_runs, self.max_run_bytes)?;
         ConfigError::check(
@@ -1169,6 +1180,7 @@ struct Core {
     /// removed by one compaction at a time.
     compacting: Mutex<()>,
     background_threads: usize,
+    level_ratio: usize,
     /// Held by a checkpoint, so that checkpoints run one at a time.
     checkpointing: Mutex<()>,
     memtable_budget: usize,
@@ -1470,7 +1482,7 @@ impl Core {
                 directory: Arc::new(RunDirectory::empty()),
                 run_bytes: 0,
                 held_bytes: 0,
-                levels: Levels::new(),
+                levels: Levels::new(options.level_ratio),
                 // The stop is the worker's backpressure. Without one, the
                 // application compacts when it chooses, and only the run
                 // limits bound level 0.
@@ -1495,6 +1507,7 @@ impl Core {
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             background_threads: options.background_threads,
+            level_ratio: options.level_ratio,
             checkpointing: Mutex::new(()),
             memtable_budget: options.memtable_budget,
             max_frozen_memtables: options.max_frozen_memtables,
@@ -1948,9 +1961,9 @@ impl Core {
                     Cursor::After(sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
                 let cuts = OutputCuts {
                     overlapped: below,
-                    // A run reaching `RATIO` runs below has crossed the
+                    // A run reaching `level_ratio` runs below has crossed the
                     // starts of all but the first.
-                    max_overlapped: levels::RATIO - 1,
+                    max_overlapped: self.level_ratio - 1,
                     ..OutputCuts::default()
                 };
                 let inputs = sources.into_iter().chain(dests).collect();

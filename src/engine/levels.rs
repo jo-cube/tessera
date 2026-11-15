@@ -18,9 +18,6 @@ use crate::run::workspace_estimate;
 
 use super::{NOT_EMPTY, SharedRun};
 
-/// Each level's size target is this many times the one above it.
-pub(super) const RATIO: usize = 4;
-
 /// Level 1's least target, in segments.
 const BASE_SEGMENTS: usize = 4;
 
@@ -160,6 +157,7 @@ pub(super) enum Dest {
 pub(super) struct Stale;
 
 pub(super) struct Levels {
+    ratio: usize,
     /// `levels[0]` in publication order; the rest sorted and disjoint.
     levels: Vec<Vec<SharedRun>>,
     /// The flush each level-0 run came from, beside `levels[0]`. A flush's
@@ -212,8 +210,9 @@ fn workspace(runs: &[&SharedRun]) -> usize {
 
 impl Levels {
     /// Level 0 and one empty level below it.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(ratio: usize) -> Self {
         Self {
+            ratio,
             levels: vec![Vec::new(), Vec::new()],
             flushes: Vec::new(),
             next_flush: 0,
@@ -226,8 +225,8 @@ impl Levels {
     }
 
     /// Recovered runs, sorted and disjoint, as the last level.
-    pub(super) fn recovered(runs: &[SharedRun]) -> Self {
-        let mut levels = Self::new();
+    pub(super) fn recovered(runs: &[SharedRun], ratio: usize) -> Self {
+        let mut levels = Self::new(ratio);
         levels.bytes[1] = runs.iter().map(bytes_of).sum();
         levels.levels[1] = runs.to_vec();
         levels
@@ -590,7 +589,7 @@ impl Levels {
 
     fn target(&self, level: usize, base: usize) -> usize {
         let last = self.levels.len() - 1;
-        let shrink = RATIO.saturating_pow((last - level) as u32);
+        let shrink = self.ratio.saturating_pow((last - level) as u32);
         (self.bytes[last] / shrink).max(base)
     }
 
@@ -602,8 +601,8 @@ impl Levels {
         let mut added = 0;
         loop {
             let last = self.levels.len() - 1;
-            let shrink = RATIO.saturating_pow(last as u32 - 1);
-            if self.bytes[last] / shrink <= base.saturating_mul(RATIO) {
+            let shrink = self.ratio.saturating_pow(last as u32 - 1);
+            if self.bytes[last] / shrink <= base.saturating_mul(self.ratio) {
                 return added;
             }
             self.levels.insert(1, Vec::new());
@@ -804,7 +803,7 @@ impl Levels {
     }
 
     /// Two adjacent runs of a level below 0, both under half a segment,
-    /// whose merged range overlaps at most [`RATIO`] segments' bytes below.
+    /// whose merged range overlaps at most `ratio` segments' bytes below.
     fn plan_neighbours(&self, fit: &Fit, segment: usize) -> Option<Plan> {
         let small = segment / 2;
         let last = self.levels.len() - 1;
@@ -824,7 +823,7 @@ impl Levels {
                     let below = &self.levels[level + 1];
                     let range = overlapping(below, min_of(a), max_of(b));
                     below[range].iter().map(bytes_of).sum::<usize>()
-                        <= RATIO.saturating_mul(segment)
+                        <= self.ratio.saturating_mul(segment)
                 };
                 if bounded {
                     return Some(Plan::Neighbours {
@@ -900,7 +899,7 @@ mod tests {
     }
 
     fn with(source: &SharedRun, below: &SharedRun) -> Levels {
-        let mut levels = Levels::new();
+        let mut levels = Levels::new(4);
         levels.levels = vec![
             Vec::new(),
             vec![Arc::clone(source)],
@@ -993,7 +992,7 @@ mod tests {
             level0_stop: 12,
             target_run_len: 1 << 20,
         };
-        let mut levels = Levels::new();
+        let mut levels = Levels::new(4);
         levels.levels = vec![Vec::new(), vec![Arc::clone(&source)], below.clone()];
         levels.bytes = vec![0, bytes_of(&source), below.iter().map(bytes_of).sum()];
         levels.cursors = vec![Vec::new(); 3];
@@ -1014,5 +1013,33 @@ mod tests {
             "{:?}",
             levels.plan_level(1, &fit)
         );
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::*;
+
+    #[test]
+    fn non_default_ratios_control_dynamic_depth_and_targets() {
+        for ratio in [2usize, 10] {
+            let fit = Fit {
+                max_inputs: 32,
+                max_bytes: usize::MAX,
+                max_workspace_bytes: usize::MAX,
+                trigger: 4,
+                level0_stop: 12,
+                target_run_len: 1 << 20,
+            };
+            let base = BASE_SEGMENTS * fit.target_run_len;
+            let mut levels = Levels::new(ratio);
+            levels.bytes[1] = base * ratio * ratio;
+            assert_eq!(levels.insert_levels(&fit), 1);
+            assert_eq!(levels.depth(), 2);
+            assert_eq!(levels.target(1, base), base * ratio);
+            assert_eq!(levels.insert_levels(&fit), 0);
+            let recovered = Levels::recovered(&[], ratio);
+            assert_eq!(recovered.ratio, ratio);
+        }
     }
 }
