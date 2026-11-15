@@ -2036,11 +2036,11 @@ impl Core {
         let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth())
             && others.is_empty()
             && Arc::strong_count(&self.snapshots) == 1;
+        let estimated_run_bytes = state.levels.segment(&fit);
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
             engine: self,
             _serial: serial,
-            input_bytes: inputs.iter().map(|run| run.run.stored_len()).sum(),
             inputs,
             others,
             options,
@@ -2051,6 +2051,7 @@ impl Core {
             cuts,
             cursor,
             refusal: split,
+            estimated_run_bytes,
         })))
     }
 
@@ -2114,11 +2115,13 @@ impl Core {
             .max()
             .unwrap_or(0);
         let others = Self::others(&state, &inputs);
+        let estimated_run_bytes = state
+            .levels
+            .segment(&options.fit(self.target_run_len, state.level0_stop));
         drop(state);
         Ok(CompactionJob {
             engine: self,
             _serial: serial,
-            input_bytes: inputs.iter().map(|run| run.run.stored_len()).sum(),
             inputs,
             others,
             options,
@@ -2129,6 +2132,7 @@ impl Core {
             cuts: OutputCuts::default(),
             cursor: None,
             refusal: None,
+            estimated_run_bytes,
         })
     }
 
@@ -2754,7 +2758,6 @@ struct CompactionJob<'e> {
     /// Unselected runs whose key ranges overlap the inputs' span. They may
     /// hold older versions that the inputs' tombstones hide.
     others: Vec<SharedRun>,
-    input_bytes: usize,
     options: CompactionOptions,
     kind: CompactionKind,
     level: usize,
@@ -2768,6 +2771,8 @@ struct CompactionJob<'e> {
     /// For a split, the job it stands in for: refused if the split leaves
     /// fewer than two pieces, so that a split always makes progress.
     refusal: Option<CompactionError>,
+    /// Stored size of a full target-length run, using the planner estimate.
+    estimated_run_bytes: usize,
 }
 
 /// How a published job moves its source level's cursor.
@@ -2788,6 +2793,10 @@ enum Begun<'e> {
 }
 
 impl<'e> CompactionJob<'e> {
+    fn input_bytes(&self) -> usize {
+        self.inputs.iter().map(|run| run.run.stored_len()).sum()
+    }
+
     /// Returns whether no other run overlaps the inputs, so that every
     /// tombstone can be dropped.
     fn is_complete(&self) -> bool {
@@ -2826,6 +2835,7 @@ impl<'e> CompactionJob<'e> {
             limits,
             &self.cuts,
             self.engine.background_threads,
+            self.estimated_run_bytes,
             workspace,
         ) {
             Ok(output) => output,
@@ -2861,7 +2871,7 @@ impl fmt::Debug for CompactionJob<'_> {
             .field("kind", &self.kind)
             .field("level", &self.level)
             .field("inputs", &self.inputs.len())
-            .field("input_bytes", &self.input_bytes)
+            .field("input_bytes", &self.input_bytes())
             .field("others", &self.others.len())
             .finish_non_exhaustive()
     }
@@ -2897,7 +2907,7 @@ impl BuiltCompaction<'_> {
             kind: job.kind,
             level: job.level,
             inputs: job.inputs.len(),
-            input_bytes: job.input_bytes,
+            input_bytes: job.input_bytes(),
             input_held_bytes: job.inputs.iter().map(|run| run.run.held_bytes()).sum(),
             outputs: output.runs.len(),
             output_bytes: output.output_bytes,

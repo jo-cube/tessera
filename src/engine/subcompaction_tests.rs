@@ -23,13 +23,16 @@ fn physical(runs: &[Run<Vec<u8>>]) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
 
 #[test]
 fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
-    for snapshot_at in [0, 1, 2] {
+    for (snapshot_at, target_run_len) in [0, 1, 2]
+        .into_iter()
+        .flat_map(|at| [256 << 10, 4 << 20].map(|target| (at, target)))
+    {
         let engine = Engine::new(EngineOptions {
             background_threads: 4,
             background_compaction: None,
             compression: Compression::Uncompressed,
             memtable_budget: 8 << 20,
-            target_run_len: 4 << 20,
+            target_run_len,
             ..EngineOptions::default()
         })
         .unwrap();
@@ -51,7 +54,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             ..CompactionOptions::default()
         };
         let job = engine.core.begin_job(options).unwrap().unwrap();
-        assert_eq!(job.zero_seq, snapshot_at != 1);
+        assert_eq!(job.zero_seq, target_run_len == 4 << 20 && snapshot_at != 1);
         let late = (snapshot_at == 2).then(|| engine.snapshot().unwrap());
         let views: Vec<_> = job.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = job
@@ -78,7 +81,12 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
         drop(views);
         let built = job.build(&mut MergeWorkspace::new()).unwrap();
         assert_eq!(physical(&serial.runs), physical(&built.output.runs));
-        assert!(built.output.runs.len() > serial.runs.len());
+        if target_run_len == 4 << 20 {
+            assert_eq!(built.output.runs.len(), serial.runs.len());
+            assert_eq!(built.output.workspace_bytes, serial.workspace_bytes);
+        } else {
+            assert!(built.output.workspace_bytes > serial.workspace_bytes);
+        }
         built.publish().unwrap();
         let mut workspace = EngineWorkspace::new();
         for at in 0..6000u64 {

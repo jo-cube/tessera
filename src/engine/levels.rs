@@ -558,7 +558,7 @@ impl Levels {
     /// run length; before that (after recovery), the largest run below
     /// level 0, or level 0's. At most the run length. It sizes level 1 and
     /// decides which runs are small.
-    fn segment(&self, fit: &Fit) -> usize {
+    pub(super) fn segment(&self, fit: &Fit) -> usize {
         let target = fit.target_run_len.max(1);
         if self.flushed_logical >= target as u64 {
             let scaled =

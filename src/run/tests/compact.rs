@@ -469,6 +469,7 @@ fn subcompactions_match_serial_versions_tombstones_sequences_and_cuts() {
                 limits,
                 &cuts,
                 threads,
+                limits.target_run_len,
                 &mut MergeWorkspace::new(),
             )
             .unwrap();
@@ -517,6 +518,7 @@ fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
         limits,
         &OutputCuts::default(),
         4,
+        limits.target_run_len,
         &mut MergeWorkspace::new(),
     )
     .unwrap();
@@ -534,6 +536,7 @@ fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
             limits,
             &OutputCuts::default(),
             4,
+            limits.target_run_len,
             &mut MergeWorkspace::new()
         ),
         Err(CompactError::OutputLimit { .. })
@@ -549,6 +552,7 @@ fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
             UNLIMITED,
             &single,
             4,
+            limits.target_run_len,
             &mut MergeWorkspace::new()
         )
         .unwrap()
@@ -556,4 +560,61 @@ fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
         .len(),
         1
     );
+}
+
+#[test]
+fn subcompaction_splits_balance_whole_runs_and_leave_one_tail() {
+    use super::super::compact::partition_starts;
+    let keys: Vec<_> = (0..111u64).map(u64::to_be_bytes).collect();
+    let boundaries: Vec<_> = keys.iter().map(|key| (key.as_slice(), 10)).collect();
+    // Eleven full 100-byte runs and a 10-byte tail: 2, 3, 3, 3+tail.
+    assert_eq!(
+        partition_starts(&boundaries, 100, 4),
+        [
+            keys[19].as_slice(),
+            keys[49].as_slice(),
+            keys[79].as_slice()
+        ]
+    );
+    let repeated = [
+        (b"a".as_slice(), 80),
+        (b"b".as_slice(), 60),
+        (b"b".as_slice(), 60),
+        (b"c".as_slice(), 20),
+    ];
+    assert_eq!(partition_starts(&repeated, 100, 2), [b"b".as_slice()]);
+}
+
+#[test]
+fn fewer_than_two_estimated_full_runs_use_the_serial_builder() {
+    let runs = parallel_inputs();
+    let views: Vec<_> = runs.iter().map(Run::view).collect();
+    let stored: usize = views.iter().map(|v| v.frame_bytes()).sum();
+    for target in [stored, stored / 2 + 1] {
+        let limits = CompactLimits {
+            max_workspace_bytes: 64 << 20,
+            ..UNLIMITED
+        };
+        let serial = compact_with(
+            &views,
+            |_| true,
+            limits,
+            &OutputCuts::default(),
+            &mut MergeWorkspace::new(),
+        )
+        .unwrap();
+        let parallel = super::super::compact_parallel(
+            &views,
+            |_| true,
+            limits,
+            &OutputCuts::default(),
+            4,
+            target,
+            &mut MergeWorkspace::new(),
+        )
+        .unwrap();
+        assert_eq!(parallel.workspace_bytes, serial.workspace_bytes);
+        assert_eq!(parallel.runs.len(), serial.runs.len());
+        assert_eq!(merged(&parallel), merged(&serial));
+    }
 }

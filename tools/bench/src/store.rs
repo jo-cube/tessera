@@ -97,6 +97,9 @@ impl Store {
         if let Ok(ratio) = std::env::var("TESSERA_BENCH_LEVEL_RATIO") {
             options.level_ratio = ratio.parse().expect("integer level ratio");
         }
+        if let Ok(threads) = std::env::var("TESSERA_BENCH_BACKGROUND_THREADS") {
+            options.background_threads = threads.parse().expect("integer builder count");
+        }
         eprintln!("Tessera: level_ratio={}, background_threads={}", options.level_ratio, options.background_threads);
         Self::T(Engine::new(options).unwrap())
     }

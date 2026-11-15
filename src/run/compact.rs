@@ -264,6 +264,7 @@ pub fn compact_parallel<'a>(
     limits: CompactLimits,
     cuts: &OutputCuts,
     threads: usize,
+    estimated_run_bytes: usize,
     workspace: &'a mut MergeWorkspace,
 ) -> Result<Compacted, CompactError> {
     let needed = workspace_bytes(inputs)?;
@@ -274,7 +275,11 @@ pub fn compact_parallel<'a>(
         });
     }
     let stored: usize = inputs.iter().map(|input| input.frame_bytes()).sum();
-    let threads = threads.min(stored / (256 << 10)).max(1);
+    // Use the planner's flush-derived stored/logical ratio: a builder must
+    // have at least one full target-length run to build. Ignore the final tail.
+    let estimated_run_bytes = estimated_run_bytes.max(1);
+    let full_runs = stored / estimated_run_bytes;
+    let threads = threads.min(full_runs).min(stored / (256 << 10)).max(1);
     if threads == 1 || cuts.single {
         return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
     }
@@ -292,7 +297,6 @@ pub fn compact_parallel<'a>(
         }
     }
     boundaries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let weight: usize = boundaries.iter().map(|(_, bytes)| bytes).sum();
     let largest = inputs
         .iter()
         .map(|input| input.largest_block_len())
@@ -312,23 +316,9 @@ pub fn compact_parallel<'a>(
             return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
         }
     };
-    let mut starts = Vec::with_capacity(threads - 1);
-    let mut seen = 0;
-    for (key, bytes) in &boundaries {
-        seen += bytes;
-        if starts.len() < threads - 1
-            && seen as u128 * threads as u128 >= weight as u128 * (starts.len() + 1) as u128
-            && starts.last().is_none_or(|last| last != key)
-            && inputs.iter().any(|input| {
-                input
-                    .key_range()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|r| r.min < *key)
-            })
-        {
-            starts.push(*key);
-        }
+    let starts = partition_starts(&boundaries, estimated_run_bytes, threads);
+    if starts.is_empty() {
+        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
     }
     let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
     let total = AtomicUsize::new(0);
@@ -388,6 +378,35 @@ pub fn compact_parallel<'a>(
         out.stats.tombstones_dropped += part.stats.tombstones_dropped;
     }
     Ok(out)
+}
+
+/// Approximate serial run boundaries with the same size estimate as planning.
+/// Balance whole runs, not arbitrary byte fractions: the final partial run
+/// belongs to the last builder. Repeated index keys always stay together.
+pub(super) fn partition_starts<'a>(
+    boundaries: &[(&'a [u8], usize)],
+    target: usize,
+    threads: usize,
+) -> Vec<&'a [u8]> {
+    let full_runs = boundaries.iter().map(|(_, bytes)| bytes).sum::<usize>() / target;
+    let mut starts = Vec::with_capacity(threads - 1);
+    let mut seen = 0;
+    let mut at = 0;
+    while at < boundaries.len() && starts.len() < threads - 1 {
+        let key = boundaries[at].0;
+        while at < boundaries.len() && boundaries[at].0 == key {
+            seen += boundaries[at].1;
+            at += 1;
+        }
+        let split_run = (full_runs as u128 * (starts.len() + 1) as u128 / threads as u128) as usize;
+        if seen >= split_run * target && at < boundaries.len() {
+            // Splitting before the first key would create an empty builder.
+            if key != boundaries[0].0 {
+                starts.push(key);
+            }
+        }
+    }
+    starts
 }
 
 struct BuildRange<'a> {
