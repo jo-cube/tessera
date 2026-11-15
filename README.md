@@ -17,7 +17,7 @@ bundled Zstandard library.
 - Consistent in-memory snapshots that remain readable after the engine closes.
 - Automatic memtable flushing and background leveled compaction; manual
   maintenance is also available.
-- Zstandard level 1 with raw segment dictionaries and adaptive blocks, or
+- Adaptive Zstandard level 1 or 3 with raw segment dictionaries and adaptive blocks, or
   uncompressed blocks.
 - Explicit full checkpoints and recovery of the latest committed checkpoint,
   including format, checksum and corruption checks.

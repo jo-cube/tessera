@@ -208,16 +208,16 @@ impl RunBuilder {
         } else {
             0
         };
+        let start = if raw.len() <= SAMPLE_LEN {
+            0
+        } else {
+            raw.len() / 2
+        };
+        let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
         let target = self.raw_target.unwrap_or_else(|| {
             if codec == Codec::None {
                 return TARGET_BLOCK_LEN;
             }
-            let start = if raw.len() <= SAMPLE_LEN {
-                0
-            } else {
-                raw.len() / 2
-            };
-            let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
             let mut compressed = Vec::new();
             self.compressor
                 .compress(sample, prepared.as_ref(), &mut compressed);
@@ -227,7 +227,11 @@ impl RunBuilder {
                 .unwrap_or(1)
                 .clamp(1, RAW_BLOCK_CAP)
         });
-        self.compressor.begin_segment(&dictionary, target);
+        drop(prepared);
+        if codec == Codec::Zstd {
+            self.compressor
+                .select_level(sample, &dictionary, &raw[..target.min(raw.len())]);
+        }
         let view = BlockView::open(&raw).expect("builder's segment");
         let mut cursor = BlockPosition::new();
         let mut block = std::mem::take(&mut self.block);
@@ -335,6 +339,39 @@ mod tests {
     use super::*;
 
     const LIMIT: usize = u32::MAX as usize;
+
+    #[test]
+    fn segment_builds_choose_levels_from_redundancy() {
+        for redundant in [true, false] {
+            let mut builder = RunBuilder::default();
+            let mut rng = 12345u64;
+            for at in 0..1024u64 {
+                let base: Vec<u8> = (0..180)
+                    .map(|_| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        if redundant {
+                            b'a' + rng as u8 % 2
+                        } else {
+                            rng as u8
+                        }
+                    })
+                    .collect();
+                let value = if redundant { base.repeat(3) } else { base };
+                builder
+                    .add(&at.to_be_bytes(), at + 1, Value::Bytes(&value))
+                    .unwrap();
+            }
+            builder.cut_segment();
+            assert_eq!(
+                builder.compressor.selected_level,
+                if redundant { 3 } else { 1 }
+            );
+            let run = builder.finish();
+            Run::new(run.as_bytes()).unwrap();
+        }
+    }
 
     #[test]
     fn block_count_stops_with_room_for_two_more_blocks() {

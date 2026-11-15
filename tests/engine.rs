@@ -521,15 +521,18 @@ fn concurrent_writers_flush_full_tables_once_and_snapshots_stay_coherent() {
     let mut sorted = seqs.clone();
     sorted.sort_unstable();
     assert_eq!(sorted, (1..=total).collect::<Vec<_>>());
+    // Drain before counting publications: writers may leave frozen tables,
+    // and one background flush can coalesce up to two of them.
+    engine.flush().unwrap();
     let stats = engine.stats();
     assert_eq!(stats.last_seq, total);
-    // Each flush took a full table, at least half of it records (the rest
-    // history the snapshots pinned): not one flush per writer that found the
-    // table full.
+    assert_eq!(stats.frozen_tables, 0);
+    // Full tables hold at least half records (the rest can be pinned history).
+    // The last publication may contain a partial table.
     let charge = (5 + 100 + ENTRY_OVERHEAD) as u64;
     let full_tables = total * charge / BUDGET as u64;
-    assert!(stats.flushes >= full_tables - 1, "{stats:?}");
-    assert!(stats.flushes <= 2 * full_tables + 1, "{stats:?}");
+    assert!(stats.flushes >= full_tables.div_ceil(2), "{stats:?}");
+    assert!(stats.flushes <= 2 * full_tables + 2, "{stats:?}");
     assert_eq!(stats.runs as u64, stats.flushes);
     let mut workspace = EngineWorkspace::new();
     for writer in 0..WRITERS {

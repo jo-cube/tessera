@@ -5,12 +5,24 @@ use zstd_safe::{CCtx, CDict, CParameter, DCtx};
 pub enum Codec {
     /// Read blocks directly from the run.
     None,
-    /// Zstandard level 1 with a raw-content segment dictionary.
+    /// Adaptive Zstandard level 1 or 3 with a raw-content segment dictionary.
     #[default]
     Zstd,
 }
 
-pub(super) const ZSTD_LEVEL: i32 = 1;
+#[cfg(feature = "compression-stats")]
+static SEGMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "compression-stats")]
+static LEVEL3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "compression-stats")]
+pub(crate) fn compression_build_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        SEGMENTS.load(Ordering::Relaxed),
+        LEVEL3.load(Ordering::Relaxed),
+    )
+}
 
 /// Conservative allowance for prepared tables and their dictionary copy.
 pub(super) const CDICT_ALLOWANCE: usize = 2 << 20;
@@ -34,6 +46,8 @@ impl Codec {
 pub(super) struct Compressor {
     codec: Codec,
     zstd: Option<CCtx<'static>>,
+    #[cfg(test)]
+    pub(super) selected_level: i32,
 }
 
 impl Compressor {
@@ -41,6 +55,8 @@ impl Compressor {
         Self {
             codec,
             zstd: (codec == Codec::Zstd).then(CCtx::create),
+            #[cfg(test)]
+            selected_level: 1,
         }
     }
     pub(super) fn codec(&self) -> Codec {
@@ -56,15 +72,53 @@ impl Compressor {
     /// Cache a dictionary whose tables are sized for the estimated raw block.
     /// load_dictionary lazily constructs one CDict from these parameters on
     /// the first compress2 call; subsequent frames reuse it and the CCtx.
-    pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize) {
+    pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize, level: i32) {
         if let Some(ctx) = &mut self.zstd {
-            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
+            ctx.set_parameter(CParameter::CompressionLevel(level))
                 .expect("supported level");
             ctx.set_parameter(CParameter::SrcSizeHint(block_len as u32))
                 .expect("bounded block size hint");
             ctx.load_dictionary(dictionary)
                 .expect("raw segment dictionary");
         }
+    }
+
+    /// Compare the same sample using the dictionary parameters of real blocks.
+    /// Leave the context configured for the chosen level; no level is persisted.
+    pub(super) fn select_level(&mut self, sample: &[u8], dictionary: &[u8], prime: &[u8]) -> i32 {
+        // The first frame prepares the cached dictionary. Give it the real
+        // block length: SrcSizeHint alone loses to a known 64 KiB sample size.
+        let block_len = prime.len();
+        let mut compressed = Vec::new();
+        self.begin_segment(dictionary, block_len, 1);
+        self.compress(prime, None, &mut compressed);
+        compressed.clear();
+        self.compress(sample, None, &mut compressed);
+        let level1 = compressed.len();
+        self.begin_segment(dictionary, block_len, 3);
+        compressed.clear();
+        self.compress(prime, None, &mut compressed);
+        compressed.clear();
+        self.compress(sample, None, &mut compressed);
+        let level = if compressed.len() * 100 <= level1 * 95 {
+            3
+        } else {
+            1
+        };
+        if level == 1 {
+            self.begin_segment(dictionary, block_len, 1);
+        }
+        #[cfg(test)]
+        {
+            self.selected_level = level;
+        }
+        #[cfg(feature = "compression-stats")]
+        {
+            use std::sync::atomic::Ordering;
+            SEGMENTS.fetch_add(1, Ordering::Relaxed);
+            LEVEL3.fetch_add(u64::from(level == 3), Ordering::Relaxed);
+        }
+        level
     }
 
     pub(super) fn compress(
@@ -140,6 +194,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redundant_segments_choose_three_and_random_segments_choose_one() {
+        let mut rng = 12345u64;
+        let mut random = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u8
+        };
+        let incompressible: Vec<u8> = (0..64 << 10).map(|_| random()).collect();
+        let mut compressor = Compressor::new(Codec::Zstd);
+        let mut redundant = Vec::new();
+        for i in 0..1024 {
+            let base: String = (0..180).map(|_| (b'a' + random() % 2) as char).collect();
+            redundant.extend_from_slice(format!("{i}: {base} {base} {base}\n").as_bytes());
+        }
+        let sample = &redundant[redundant.len() / 2..redundant.len() / 2 + (64 << 10)];
+        assert_eq!(
+            compressor.select_level(sample, &redundant[..16 << 10], &redundant[..4096]),
+            3
+        );
+        assert_eq!(
+            compressor.select_level(
+                &incompressible,
+                &incompressible[..16 << 10],
+                &incompressible[..4096]
+            ),
+            1
+        );
+        let mut stored = Vec::new();
+        compressor.compress(&incompressible, None, &mut stored);
+        let mut decoded = vec![0; incompressible.len()];
+        assert_eq!(
+            Decompressor::default().decompress(
+                Codec::Zstd,
+                &stored,
+                &mut decoded,
+                &incompressible[..16 << 10]
+            ),
+            Some(incompressible.len())
+        );
+        assert_eq!(decoded, incompressible);
+    }
+
+    #[test]
     fn prepared_dictionaries_fit_the_build_allowance_and_round_trip() {
         let dictionary: Vec<_> = (0..super::super::dictionary::DICTIONARY_LEN)
             .map(|i| (i.wrapping_mul(37) ^ (i >> 8)) as u8)
@@ -158,7 +256,7 @@ mod tests {
             // Reuse exactly the same prepared dictionary for multiple blocks.
             for input in [&block[..1024], block.as_slice()] {
                 let mut stored = Vec::new();
-                compressor.begin_segment(raw, input.len());
+                compressor.begin_segment(raw, input.len(), 1);
                 compressor.compress(input, None, &mut stored);
                 assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
                 let mut decoded = vec![0; input.len()];

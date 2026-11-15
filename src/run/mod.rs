@@ -85,6 +85,8 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::Codec;
+#[cfg(feature = "compression-stats")]
+pub(crate) use codec::compression_build_counts;
 pub(crate) use compact::CompactError;
 #[cfg(test)]
 pub(crate) use compact::compact_with;
