@@ -6,6 +6,13 @@ disk. It writes `results.csv`, `summary.md`, `environment.txt` and the RocksDB
 OPTIONS files to `.work/bench/<date>-<sha>/`. `TESSERA_BENCH_SCALE=32` divides
 the dataset sizes for a quick smoke run.
 
+Options select a subset, for example
+`run.sh --dataset B --engine tessera,r-small --case update`. Cases are
+`load,update,reads,scan,mixed,bulk`. Reads, scans and the mixed case run on
+the updated DB, so they also run the load and update. A filtered run writes
+to a time-suffixed directory, and without Tessera in it the mixed case offers
+70% of the engine's own update rate.
+
 It links the RocksDB 11.13.2 static library cached in
 `~/.cache/tessera-bench/rocksdb-11.13.2/`, built from the `v11.13.2` tag with
 `make static_lib DEBUG_LEVEL=0 PORTABLE=1 USE_RTTI=1` against Homebrew LZ4 and

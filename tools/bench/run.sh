@@ -10,7 +10,7 @@ export MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion | cut -d. -f1).0
 cargo build --release --locked --quiet --manifest-path "$root/tools/bench/Cargo.toml"
 
 sha=$(git -C "$root" rev-parse --short HEAD)
-out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}
+out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
 mkdir -p "$out"
 [ ! -e /Volumes/tessbench ] || { echo "/Volumes/tessbench already exists" >&2; exit 1; }
 dev=$(hdiutil attach -nomount ram://8388608 | awk '{print $1}')
@@ -25,4 +25,4 @@ diskutil erasevolume APFS tessbench "$dev" >/dev/null
   echo "power: $(pmset -g batt | head -1)"
   echo "rocksdb: $rocks (librocksdb.a sha256 $(shasum -a 256 "$rocks/librocksdb.a" | cut -c1-16))"
 } > "$out/environment.txt"
-"$CARGO_TARGET_DIR/release/tessera-bench" all "$out"
+"$CARGO_TARGET_DIR/release/tessera-bench" all "$out" "$@"

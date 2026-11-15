@@ -27,9 +27,9 @@ const MISS: u32 = u32::MAX;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("all") => all(&args[2]),
-        Some("case") => case(args[2].chars().next().unwrap(), &args[3], &args[4], args[5].parse().unwrap()),
-        _ => panic!("usage: bench all OUTDIR | bench case DATASET ENGINE OUTDIR RATE"),
+        Some("all") => all(&args[2], &Filter::parse(&args[3..])),
+        Some("case") => case(args[2].chars().next().unwrap(), &args[3], &args[4], args[5].parse().unwrap(), &args[6]),
+        _ => panic!("usage: bench all OUTDIR [--dataset A,B] [--engine E,..] [--case C,..]"),
     }
 }
 
@@ -103,18 +103,49 @@ impl Span {
 
 // ---- orchestrator ----
 
-fn all(outdir: &str) {
+const CASES: &str = "load,update,reads,scan,mixed,bulk";
+
+/// Comma-separated selections; each defaults to everything.
+struct Filter {
+    datasets: String,
+    engines: String,
+    cases: String,
+}
+impl Filter {
+    fn parse(args: &[String]) -> Self {
+        let mut f = Self { datasets: "A,B".into(), engines: ENGINES.join(","), cases: CASES.into() };
+        for pair in args.chunks(2) {
+            let value = pair.get(1).cloned().expect("a filter needs a value");
+            match pair[0].as_str() {
+                "--dataset" => f.datasets = value,
+                "--engine" => f.engines = value,
+                "--case" => f.cases = value,
+                other => panic!("unknown option {other}"),
+            }
+        }
+        for c in f.cases.split(',') {
+            assert!(wants(CASES, c), "unknown case {c}; cases are {CASES}");
+        }
+        f
+    }
+}
+
+fn wants(list: &str, item: &str) -> bool {
+    list.split(',').any(|c| c == item)
+}
+
+fn all(outdir: &str, filter: &Filter) {
     let started = Instant::now();
     let exe = std::env::current_exe().unwrap();
     let mut csv = fs::File::create(format!("{outdir}/results.csv")).unwrap();
     writeln!(csv, "dataset,engine,case,metric,value").unwrap();
     let mut rows: Vec<[String; 5]> = Vec::new();
-    for ds in ["A", "B"] {
+    for ds in ["A", "B"].into_iter().filter(|d| wants(&filter.datasets, d)) {
         let mut rate = 0.0;
-        for engine in ENGINES {
+        for engine in ENGINES.into_iter().filter(|e| wants(&filter.engines, e)) {
             eprintln!("[{:>5.0}s] {ds} {engine}", started.elapsed().as_secs_f64());
             let mut child = Command::new(&exe)
-                .args(["case", ds, engine, outdir, &rate.to_string()])
+                .args(["case", ds, engine, outdir, &rate.to_string(), &filter.cases])
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -178,7 +209,13 @@ fn summary(rows: &[[String; 5]], total: f64) -> String {
 
 // ---- one dataset × engine ----
 
-fn case(ds: char, engine: &str, outdir: &str, rate: f64) {
+/// Runs the selected cases. Reads, scans and the mixed case run on the
+/// updated DB, so they also run the update, which runs the load. Without
+/// Tessera's update rate, the mixed case offers 70% of the engine's own.
+fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
+    let on_updated = ["reads", "scan", "mixed"].iter().any(|c| wants(cases, c));
+    let update = on_updated || wants(cases, "update");
+    let load = update || wants(cases, "load");
     let out = Out { prefix: format!("{ds},{engine}") };
     let t = Instant::now();
     let mut data = generate(ds);
@@ -222,68 +259,76 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64) {
     };
 
     // 1. Shuffled load in 256-record batches, drained.
-    let store = open("db");
-    if engine != "tessera" {
-        copy_options(&format!("{dir}/db"), &format!("{outdir}/OPTIONS-{ds}-{engine}"));
-    }
-    let span = Span::new();
-    let mut b = store.batch();
-    for chunk in perm.chunks(256) {
-        for &i in chunk {
-            b.push(&data.recs[i as usize].key, Some(data.value(i as usize)));
+    if load {
+        let store = open("db");
+        if engine != "tessera" {
+            copy_options(&format!("{dir}/db"), &format!("{outdir}/OPTIONS-{ds}-{engine}"));
         }
-        store.write(&mut b);
-    }
-    store.drain();
-    span.finish(&out, "load", n, data.raw);
-    let c = store.counters();
-    amplification(&out, "load", [0; 3], c);
-    mem(&out, "load", &data);
-    gate(&store, &data, &mut rng, &out, "load");
+        let span = Span::new();
+        let mut b = store.batch();
+        for chunk in perm.chunks(256) {
+            for &i in chunk {
+                b.push(&data.recs[i as usize].key, Some(data.value(i as usize)));
+            }
+            store.write(&mut b);
+        }
+        store.drain();
+        span.finish(&out, "load", n, data.raw);
+        let c = store.counters();
+        amplification(&out, "load", [0; 3], c);
+        mem(&out, "load", &data);
+        gate(&store, &data, &mut rng, &out, "load");
 
-    // 3. Update half the keys, then delete 2%, drained.
-    let c0 = store.counters();
-    let span = Span::new();
-    let mut bytes = 0;
-    for chunk in data.updates.chunks(256) {
-        for &i in chunk {
-            let v = data.update(i as usize);
-            bytes += 16 + v.len();
-            b.push(&data.recs[i as usize].key, Some(v));
-        }
-        store.write(&mut b);
-    }
-    for chunk in data.deletes.chunks(256) {
-        for &i in chunk {
-            b.push(&data.recs[i as usize].key, None);
-        }
-        store.write(&mut b);
-    }
-    store.drain();
-    let ops = data.updates.len() + data.deletes.len();
-    let update_rate = span.finish(&out, "update", ops, bytes);
-    amplification(&out, "update", c0, store.counters());
-    for &i in &data.updates {
-        data.state[i as usize] = UPDATED;
-    }
-    for &i in &data.deletes {
-        data.state[i as usize] = DELETED;
-    }
-    mem(&out, "update", &data);
-    gate(&store, &data, &mut rng, &out, "update");
+        if update {
+            // 3. Update half the keys, then delete 2%, drained.
+            let c0 = store.counters();
+            let span = Span::new();
+            let mut bytes = 0;
+            for chunk in data.updates.chunks(256) {
+                for &i in chunk {
+                    let v = data.update(i as usize);
+                    bytes += 16 + v.len();
+                    b.push(&data.recs[i as usize].key, Some(v));
+                }
+                store.write(&mut b);
+            }
+            for chunk in data.deletes.chunks(256) {
+                for &i in chunk {
+                    b.push(&data.recs[i as usize].key, None);
+                }
+                store.write(&mut b);
+            }
+            store.drain();
+            let ops = data.updates.len() + data.deletes.len();
+            let update_rate = span.finish(&out, "update", ops, bytes);
+            amplification(&out, "update", c0, store.counters());
+            for &i in &data.updates {
+                data.state[i as usize] = UPDATED;
+            }
+            for &i in &data.deletes {
+                data.state[i as usize] = DELETED;
+            }
+            mem(&out, "update", &data);
+            gate(&store, &data, &mut rng, &out, "update");
 
-    // 4–6. Reads, scans and the mixed workload on the updated DB.
-    reads(&store, &data, &mut rng, &out);
-    scans(&store, &data, &mut rng, &out);
-    if engine != "r-large" {
-        let rate = if rate > 0.0 { rate } else { 0.7 * update_rate };
-        mixed(&store, &data, &mut rng, &out, rate);
+            // 4–6. Reads, scans and the mixed workload on the updated DB.
+            if wants(cases, "reads") {
+                reads(&store, &data, &mut rng, &out);
+            }
+            if wants(cases, "scan") {
+                scans(&store, &data, &mut rng, &out);
+            }
+            if engine != "r-large" && wants(cases, "mixed") {
+                let rate = if rate > 0.0 { rate } else { 0.7 * update_rate };
+                mixed(&store, &data, &mut rng, &out, rate);
+            }
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
     }
-    drop(store);
-    let _ = fs::remove_dir_all(&dir);
 
     // 2. Sorted bulk load in ~64 MiB batches into a fresh DB, drained.
-    if engine != "r-large" {
+    if engine != "r-large" && wants(cases, "bulk") {
         data.state.fill(ORIGINAL);
         let store = open("bulk");
         fs::create_dir_all(format!("{dir}/sst")).unwrap();
