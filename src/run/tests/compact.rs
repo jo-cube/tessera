@@ -414,3 +414,144 @@ fn outputs_end_where_they_would_overlap_too_many_runs_below() {
     assert_eq!(firsts, ["k00", "k06", "k12", "k18"]);
     assert_eq!(merged(&out), records(&input));
 }
+
+fn parallel_inputs() -> Vec<Run<Vec<u8>>> {
+    (0..2)
+        .map(|round| {
+            let mut builder = RunBuilder::with_raw_block_target(Codec::None, 4096);
+            for at in 0..12_000u64 {
+                let key = format!("k{at:05}");
+                let bytes = [at as u8; 128];
+                let value = if round == 1 && at % 7 == 0 {
+                    Value::Tombstone
+                } else {
+                    Value::Bytes(&bytes)
+                };
+                builder
+                    .add(key.as_bytes(), at + 1 + round * 12_000, value)
+                    .unwrap();
+                // Versions of the same key can straddle input block boundaries.
+                builder
+                    .add(key.as_bytes(), at + round * 12_000, Value::Bytes(&bytes))
+                    .unwrap();
+            }
+            builder.finish()
+        })
+        .collect()
+}
+
+#[test]
+fn subcompactions_match_serial_versions_tombstones_sequences_and_cuts() {
+    let runs = parallel_inputs();
+    let views: Vec<_> = runs.iter().map(Run::view).collect();
+    let cuts = OutputCuts {
+        at: vec![b"k03000".to_vec(), b"k09000".to_vec()],
+        overlapped: (0..12)
+            .map(|i| format!("k{:05}", i * 1000).into_bytes())
+            .collect(),
+        max_overlapped: 1,
+        single: false,
+    };
+    for zero_seq in [false, true] {
+        let limits = CompactLimits {
+            target_run_len: 256 << 10,
+            max_workspace_bytes: 64 << 20,
+            zero_seq,
+            ..UNLIMITED
+        };
+        let keep = |key: &[u8]| key < b"k06000".as_slice();
+        let serial = compact_with(&views, keep, limits, &cuts, &mut MergeWorkspace::new()).unwrap();
+        for threads in [1, 4] {
+            let parallel = super::super::compact_parallel(
+                &views,
+                keep,
+                limits,
+                &cuts,
+                threads,
+                &mut MergeWorkspace::new(),
+            )
+            .unwrap();
+            assert_eq!(merged(&serial), merged(&parallel));
+            assert_eq!(serial.stats, parallel.stats);
+            assert!(parallel.workspace_bytes <= limits.max_workspace_bytes);
+            if threads == 4 {
+                assert!(parallel.workspace_bytes > serial.workspace_bytes);
+            }
+            for pair in parallel.runs.windows(2) {
+                assert!(pair[0].key_range().unwrap().max < pair[1].key_range().unwrap().min);
+            }
+            for run in &parallel.runs {
+                let range = run.key_range().unwrap();
+                assert!(
+                    !cuts
+                        .at
+                        .iter()
+                        .any(|cut| range.min < cut.as_slice() && cut.as_slice() <= range.max)
+                );
+                assert!(
+                    cuts.overlapped
+                        .iter()
+                        .filter(|key| range.min < key.as_slice() && key.as_slice() <= range.max)
+                        .count()
+                        <= cuts.max_overlapped
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn subcompactions_share_limits_and_fall_back_with_tight_workspace() {
+    let runs = parallel_inputs();
+    let views: Vec<_> = runs.iter().map(Run::view).collect();
+    let needed = super::super::compact::workspace_bytes(&views).unwrap();
+    let limits = CompactLimits {
+        max_workspace_bytes: needed,
+        ..UNLIMITED
+    };
+    let out = super::super::compact_parallel(
+        &views,
+        |_| true,
+        limits,
+        &OutputCuts::default(),
+        4,
+        &mut MergeWorkspace::new(),
+    )
+    .unwrap();
+    assert_eq!(out.workspace_bytes, needed);
+    let limits = CompactLimits {
+        max_output_bytes: 1 << 20,
+        max_workspace_bytes: 64 << 20,
+        codec: Codec::None,
+        ..UNLIMITED
+    };
+    assert!(matches!(
+        super::super::compact_parallel(
+            &views,
+            |_| true,
+            limits,
+            &OutputCuts::default(),
+            4,
+            &mut MergeWorkspace::new()
+        ),
+        Err(CompactError::OutputLimit { .. })
+    ));
+    let single = OutputCuts {
+        single: true,
+        ..OutputCuts::default()
+    };
+    assert_eq!(
+        super::super::compact_parallel(
+            &views,
+            |_| true,
+            UNLIMITED,
+            &single,
+            4,
+            &mut MergeWorkspace::new()
+        )
+        .unwrap()
+        .runs
+        .len(),
+        1
+    );
+}

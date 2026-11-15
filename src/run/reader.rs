@@ -1040,6 +1040,19 @@ impl<'a> RunView<'a> {
         self.record_count
     }
 
+    /// Compressed frame bytes, excluding dictionaries and the index.
+    pub(super) fn frame_bytes(self) -> usize {
+        self.frames.len()
+    }
+
+    pub(super) fn block_bytes(self, block: usize) -> usize {
+        let end = self
+            .table
+            .get(block + 1)
+            .map_or(self.frames.len(), |entry| frame_offset(*entry));
+        end.saturating_sub(frame_offset(self.table[block]))
+    }
+
     /// Returns the number of blocks.
     pub fn block_count(self) -> usize {
         self.table.len()
@@ -1218,7 +1231,7 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns a block's index key. `block` must be below the block count.
-    fn last_key(self, block: usize) -> Result<&'a [u8], CorruptRun> {
+    pub(super) fn last_key(self, block: usize) -> Result<&'a [u8], CorruptRun> {
         let start = match block.checked_sub(1) {
             Some(previous) => key_end(self.table[previous]),
             None => self.min_key.len(),

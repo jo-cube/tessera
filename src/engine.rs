@@ -426,7 +426,7 @@ use crate::memtable::{
 };
 use crate::run::{
     Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_TARGET_RUN_LEN, OutputCuts,
-    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_with,
+    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_parallel,
     latest_from,
 };
 
@@ -504,6 +504,10 @@ pub struct EngineOptions {
     /// flushes, and the writes that need them, are refused. See
     /// [Background compaction](self#background-compaction).
     pub background_compaction: Option<CompactionOptions>,
+    /// Maximum parallel builders within one compaction job, at least 1.
+    /// Defaults to half the available CPUs, capped at 4 and at least 1.
+    /// Small jobs and tight workspace budgets use fewer builders.
+    pub background_threads: usize,
     /// Limits on [`Engine::snapshot`]. Zero is valid for both and refuses
     /// every snapshot (`max_live`) or every snapshot and compaction while a
     /// snapshot retains anything (`max_retained_bytes`).
@@ -533,6 +537,8 @@ impl Default for EngineOptions {
             max_run_bytes: DEFAULT_MAX_RUN_BYTES,
             last_seq: 0,
             background_compaction: Some(CompactionOptions::default()),
+            background_threads: std::thread::available_parallelism()
+                .map_or(1, |cpus| (cpus.get() / 2).clamp(1, 4)),
             snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
             target_block_compressed: TARGET_BLOCK_COMPRESSED,
@@ -570,6 +576,13 @@ impl EngineOptions {
             1,
             usize::MAX as u64,
             "at least one frozen table must be allowed",
+        )?;
+        ConfigError::check(
+            "EngineOptions::background_threads",
+            self.background_threads as u64,
+            1,
+            usize::MAX as u64,
+            "at least one builder is required",
         )?;
         ConfigError::check_run_limits(self.max_runs, self.max_run_bytes)?;
         ConfigError::check(
@@ -1155,6 +1168,7 @@ struct Core {
     /// Held by a compaction from selection to publication, so that runs are
     /// removed by one compaction at a time.
     compacting: Mutex<()>,
+    background_threads: usize,
     /// Held by a checkpoint, so that checkpoints run one at a time.
     checkpointing: Mutex<()>,
     memtable_budget: usize,
@@ -1480,6 +1494,7 @@ impl Core {
             gate: Mutex::new(()),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
+            background_threads: options.background_threads,
             checkpointing: Mutex::new(()),
             memtable_budget: options.memtable_budget,
             max_frozen_memtables: options.max_frozen_memtables,
@@ -2408,7 +2423,9 @@ pub struct CompactionOptions {
     pub max_output_bytes: usize,
     /// The most estimated workspace bytes: one block and a decompression
     /// context per input, plus the builder's segment and block buffers and
-    /// compression context. A job exceeding this is refused before decoding.
+    /// compression context. Parallel builders share this cap: segment buffers
+    /// shrink with their count, and high fan-in jobs use fewer builders.
+    /// A job exceeding this is refused before decoding.
     /// Remaining room bounds key hashes; an output needing more hashes gets
     /// no filter. At least the estimate for two 256 KiB input blocks.
     pub max_workspace_bytes: usize,
@@ -2783,7 +2800,14 @@ impl<'e> CompactionJob<'e> {
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
         };
-        let output = match compact_with(&views, keep_tombstone, limits, &self.cuts, workspace) {
+        let output = match compact_parallel(
+            &views,
+            keep_tombstone,
+            limits,
+            &self.cuts,
+            self.engine.background_threads,
+            workspace,
+        ) {
             Ok(output) => output,
             Err(error) => {
                 if let CompactError::OutputLimit { output_bytes, .. } = error {
@@ -3964,3 +3988,6 @@ mod tests {
         assert_eq!(engine.wait_for_compaction(), Err(BackgroundError::Disabled));
     }
 }
+
+#[cfg(test)]
+mod subcompaction_tests;

@@ -1,6 +1,7 @@
 //! Merging runs into fewer runs that hold only what can still be read.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::block::{Record, Value};
 
@@ -59,6 +60,13 @@ pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
 /// the engine keeps for every published run so that it can size a job
 /// before reading any of it.
 pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> usize {
+    workspace_for_segment(largest_blocks, SEGMENT_RAW_LEN)
+}
+
+fn workspace_for_segment(
+    largest_blocks: impl IntoIterator<Item = usize>,
+    segment_len: usize,
+) -> usize {
     let mut total = CONTEXT_ALLOWANCE + CDICT_ALLOWANCE;
     let mut largest = 0;
     for block in largest_blocks {
@@ -71,7 +79,7 @@ pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> us
     total
         // Segment builder (up to 2x growth), raw scratch (2x), encoded
         // segment scratch (2x), plus reusable raw block and block builder.
-        .saturating_add(largest.max(SEGMENT_RAW_LEN).saturating_mul(6))
+        .saturating_add(largest.max(segment_len).saturating_mul(6))
         .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(4))
         .saturating_add(super::dictionary::DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)
 }
@@ -225,11 +233,37 @@ pub fn compact<'a>(
 }
 
 /// [`compact`], with output runs also cut as `cuts` asks.
-pub fn compact_with<'a>(
+pub(crate) fn compact_with<'a>(
     inputs: &[RunView<'a>],
     mut keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
     cuts: &OutputCuts,
+    workspace: &'a mut MergeWorkspace,
+) -> Result<Compacted, CompactError> {
+    compact_range(
+        inputs,
+        &mut keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        BuildRange {
+            start: None,
+            end: None,
+            segment_len: SEGMENT_RAW_LEN,
+            needed: workspace_bytes(inputs)?,
+            total: None,
+        },
+    )
+}
+
+/// Builds disjoint key ranges of one selected job, under the same total limits.
+/// Single-output neighbour merges and small jobs retain the serial path.
+pub fn compact_parallel<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl Fn(&[u8]) -> bool + Sync,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    threads: usize,
     workspace: &'a mut MergeWorkspace,
 ) -> Result<Compacted, CompactError> {
     let needed = workspace_bytes(inputs)?;
@@ -239,13 +273,161 @@ pub fn compact_with<'a>(
             max_workspace_bytes: limits.max_workspace_bytes,
         });
     }
+    let stored: usize = inputs.iter().map(|input| input.frame_bytes()).sum();
+    let threads = threads.min(stored / (256 << 10)).max(1);
+    if threads == 1 || cuts.single {
+        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+    }
+    // Borrow sparse-index keys, weighted by compressed input bytes. Equal user
+    // keys stay together even when their versions span several input blocks.
+    let count: usize = inputs.iter().map(|input| input.block_count()).sum();
+    let metadata = count.saturating_mul(size_of::<(&[u8], usize)>());
+    if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
+        return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+    }
+    let mut boundaries = Vec::with_capacity(count);
+    for input in inputs {
+        for block in 0..input.block_count() {
+            boundaries.push((input.last_key(block)?, input.block_bytes(block)));
+        }
+    }
+    boundaries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let weight: usize = boundaries.iter().map(|(_, bytes)| bytes).sum();
+    let largest = inputs
+        .iter()
+        .map(|input| input.largest_block_len())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut threads = threads.min(boundaries.len());
+    // Keep selection's workspace limit. Divide the segment allowance rather
+    // than multiplying a full-size builder by N; reduce N for high fan-in.
+    let (segment_len, per_builder) = loop {
+        let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
+        let builder = workspace_for_segment(largest.iter().copied(), segment);
+        let allowance = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+        if builder <= allowance {
+            break (segment, allowance);
+        }
+        threads -= 1;
+        if threads == 1 {
+            return compact_with(inputs, keep_tombstone, limits, cuts, workspace);
+        }
+    };
+    let mut starts = Vec::with_capacity(threads - 1);
+    let mut seen = 0;
+    for (key, bytes) in &boundaries {
+        seen += bytes;
+        if starts.len() < threads - 1
+            && seen as u128 * threads as u128 >= weight as u128 * (starts.len() + 1) as u128
+            && starts.last().is_none_or(|last| last != key)
+            && inputs.iter().any(|input| {
+                input
+                    .key_range()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.min < *key)
+            })
+        {
+            starts.push(*key);
+        }
+    }
+    let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
+    let total = AtomicUsize::new(0);
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..=starts.len())
+            .map(|at| {
+                let start = at.checked_sub(1).map(|i| starts[i]);
+                let end = starts.get(at).copied();
+                let keep = &keep_tombstone;
+                let total = &total;
+                scope.spawn(move || {
+                    compact_range(
+                        inputs,
+                        keep,
+                        CompactLimits {
+                            max_workspace_bytes: per_builder,
+                            ..limits
+                        },
+                        cuts,
+                        &mut MergeWorkspace::new(),
+                        BuildRange {
+                            start,
+                            end,
+                            segment_len,
+                            needed: builder_workspace,
+                            total: Some(total),
+                        },
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut out = Compacted {
+        runs: Vec::new(),
+        output_bytes: 0,
+        held_bytes: 0,
+        workspace_bytes: metadata,
+        stats: CompactStats::default(),
+    };
+    for part in parts {
+        out.runs.extend(part.runs);
+        out.output_bytes += part.output_bytes;
+        out.held_bytes += part.held_bytes;
+        out.workspace_bytes += part.workspace_bytes;
+        out.stats.records_read += part.stats.records_read;
+        out.stats.records_written += part.stats.records_written;
+        out.stats.versions_dropped += part.stats.versions_dropped;
+        out.stats.copies_collapsed += part.stats.copies_collapsed;
+        out.stats.tombstones_dropped += part.stats.tombstones_dropped;
+    }
+    Ok(out)
+}
+
+struct BuildRange<'a> {
+    start: Option<&'a [u8]>,
+    end: Option<&'a [u8]>,
+    segment_len: usize,
+    needed: usize,
+    total: Option<&'a AtomicUsize>,
+}
+
+fn compact_range<'a>(
+    inputs: &[RunView<'a>],
+    mut keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    workspace: &'a mut MergeWorkspace,
+    range: BuildRange<'_>,
+) -> Result<Compacted, CompactError> {
+    let needed = range.needed;
+    if needed > limits.max_workspace_bytes {
+        return Err(CompactError::WorkspaceLimit {
+            workspace_bytes: needed,
+            max_workspace_bytes: limits.max_workspace_bytes,
+        });
+    }
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
+    if let Some(start) = range.start {
+        merge.seek(start)?;
+    }
     let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
+    output.segment_len = range.segment_len;
+    output.total = range.total;
     let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
 
     while let Some(record) = merge.next_record()? {
+        if range.end.is_some_and(|end| record.key >= end) {
+            break;
+        }
         stats.records_read += 1;
         let newest = !has_key || record.key != key.as_slice();
         if newest {
@@ -302,6 +484,9 @@ fn collapse_copies(
 }
 
 struct Output<'c> {
+    segment_len: usize,
+    total: Option<&'c AtomicUsize>,
+    charged: usize,
     limits: CompactLimits,
     cuts: &'c OutputCuts,
     /// The next of `cuts.at` not yet passed.
@@ -333,6 +518,9 @@ impl<'c> Output<'c> {
                 ..limits
             },
             cuts,
+            segment_len: SEGMENT_RAW_LEN,
+            total: None,
+            charged: 0,
             next_cut: 0,
             next_overlapped: 0,
             overlapped: 0,
@@ -385,6 +573,7 @@ impl<'c> Output<'c> {
                 self.limits.codec,
                 self.limits.target_block_compressed,
             );
+            builder.limit_segment_len(self.segment_len);
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder
         });
@@ -400,7 +589,20 @@ impl<'c> Output<'c> {
         Ok(())
     }
 
-    fn check(&self, output_bytes: usize) -> Result<(), CompactError> {
+    fn check(&mut self, output_bytes: usize) -> Result<(), CompactError> {
+        let output_bytes = if let Some(total) = self.total {
+            let delta = output_bytes.saturating_sub(self.charged);
+            self.charged = self.charged.max(output_bytes);
+            if delta == 0 {
+                total.load(Ordering::Relaxed)
+            } else {
+                total
+                    .fetch_add(delta, Ordering::Relaxed)
+                    .saturating_add(delta)
+            }
+        } else {
+            output_bytes
+        };
         if output_bytes > self.limits.max_output_bytes {
             return Err(CompactError::OutputLimit {
                 output_bytes,

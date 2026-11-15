@@ -16,6 +16,7 @@ use std::fmt;
 /// stored in its own block and, if necessary, its own segment.
 pub struct RunBuilder {
     target: usize,
+    segment_len: usize,
     raw_target: Option<usize>,
     compressor: Compressor,
     segment: BlockBuilder,
@@ -49,6 +50,7 @@ impl RunBuilder {
     pub fn with_target_block_compressed(codec: Codec, target: usize) -> Self {
         Self {
             target: target.clamp(1, RAW_BLOCK_CAP),
+            segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
             compressor: Compressor::new(codec),
             segment: BlockBuilder::new(),
@@ -95,7 +97,7 @@ impl RunBuilder {
             return Err(BuildError::RunFull);
         }
         if !self.segment.is_empty()
-            && self.segment.encoded_len_after(key, seq, value) > SEGMENT_RAW_LEN
+            && self.segment.encoded_len_after(key, seq, value) > self.segment_len
         {
             self.cut_segment();
         }
@@ -129,6 +131,9 @@ impl RunBuilder {
             + self.table.len()
             + self.keys.len()
             + FOOTER_LEN
+    }
+    pub(super) fn limit_segment_len(&mut self, bytes: usize) {
+        self.segment_len = bytes.clamp(RAW_BLOCK_CAP, SEGMENT_RAW_LEN);
     }
     pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
         self.key_hashes.limit_to(bytes / size_of::<u64>());
@@ -180,7 +185,7 @@ impl RunBuilder {
         let mut raw = std::mem::take(&mut self.raw);
         raw.clear();
         self.segment.flush_into(&mut raw);
-        self.segment.trim_empty(2 * SEGMENT_RAW_LEN);
+        self.segment.trim_empty(2 * self.segment_len);
         let codec = self.compressor.codec();
         let dictionary = if codec == Codec::Zstd {
             dictionary::sample(&raw, count)
@@ -268,8 +273,8 @@ impl RunBuilder {
         });
         self.frames_len += frames_len;
         self.dictionaries_len += dictionary.len();
-        retain_scratch(&mut self.frames, 2 * SEGMENT_RAW_LEN);
-        retain_scratch(&mut raw, 2 * SEGMENT_RAW_LEN);
+        retain_scratch(&mut self.frames, 2 * self.segment_len);
+        retain_scratch(&mut raw, 2 * self.segment_len);
         retain_scratch(&mut uncompressed, 2 * RAW_BLOCK_CAP);
         block.trim_empty(2 * RAW_BLOCK_CAP);
         self.raw = raw;
