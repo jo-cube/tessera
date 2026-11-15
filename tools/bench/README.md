@@ -1,0 +1,36 @@
+# Tessera vs RocksDB comparison
+
+`tools/bench/run.sh` builds the harness, attaches a 4 GiB APFS RAM disk at
+`/Volumes/tessbench`, runs every case once (about 3 minutes) and detaches the
+disk. It writes `results.csv`, `summary.md`, `environment.txt` and the RocksDB
+OPTIONS files to `.work/bench/<date>-<sha>/`. `TESSERA_BENCH_SCALE=32` divides
+the dataset sizes for a quick smoke run.
+
+It links the RocksDB 11.13.2 static library cached in
+`~/.cache/tessera-bench/rocksdb-11.13.2/`, built from the `v11.13.2` tag with
+`make static_lib DEBUG_LEVEL=0 PORTABLE=1 USE_RTTI=1` against Homebrew LZ4 and
+Zstandard. `native.cc` is a small C adapter over its C++ API.
+
+One child process runs per dataset and engine; each aborts if its RSS plus
+RAM-disk use exceeds 8 GiB, and the parent kills any child after 300 s.
+
+- Datasets (spike-04 generators): A, 1 GiB of grouped JSON; B, 512 MiB of
+  weak-locality JSON. Both are generated in memory before timing starts.
+- Engines: Tessera with `EngineOptions::default()`; RocksDB with WAL off and
+  syncs suppressed, 4 background jobs, leveled compaction with dynamic level
+  bytes, 2 × 64 MiB write buffers, LZ4 upper levels, ZSTD with a 16 KiB
+  dictionary at the bottom, 16 KiB blocks, Bloom 10 bits/key, partitioned
+  index and filters with the top level pinned, HyperClockCache of 128 MiB
+  (`r-small`) or 1.25 × the raw dataset (`r-large`).
+- Cases: shuffled load in 256-record batches; sorted bulk load in 64 MiB
+  batches (`ingest_sorted`, or SST files plus `IngestExternalFile`); updating
+  50% of the keys and then deleting 2%; 220k point reads (10% misses) with
+  1 and 4 threads and with `multi_get` batches of 100 random or 100 adjacent
+  sorted keys; 20k prefix scans of about 100 records; 20 s of four readers
+  against a writer that offers 70% of Tessera's update rate in 1 s bursts.
+  `r-large` skips the bulk and mixed cases. Write cases include the drain.
+- Memory is RSS (plus RAM-disk bytes for RocksDB) after a drain, minus the
+  RSS measured with the dataset generated and no engine open. Write
+  amplification is (flush + compaction bytes written) ÷ flush bytes.
+- After every load and update, 20k sampled keys and 200 group scans are
+  checked against an in-harness oracle.
