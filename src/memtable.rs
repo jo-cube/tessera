@@ -897,7 +897,6 @@ impl FrozenMemtable {
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
             codec,
             target_block_compressed,
-            min_block_raw: 0,
         }
     }
 }
@@ -938,14 +937,12 @@ pub(crate) fn flush_merged(
     target_run_len: usize,
     codec: Codec,
     target_block_compressed: usize,
-    min_block_raw: usize,
     cuts: &FlushCuts,
     pool: &ChunkPool,
 ) -> Vec<Run<Vec<u8>>> {
     if let ([table], []) = (tables, cuts.at.as_slice()) {
         let mut flush = table.flush_with(target_run_len, codec, target_block_compressed);
         flush.pool = pool.clone();
-        flush.min_block_raw = min_block_raw;
         return flush.collect();
     }
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
@@ -992,10 +989,7 @@ pub(crate) fn flush_merged(
             pieces += 1;
         }
         builder
-            .get_or_insert_with(|| {
-                RunBuilder::in_pool(codec, target_block_compressed, pool)
-                    .with_min_block_raw(min_block_raw)
-            })
+            .get_or_insert_with(|| RunBuilder::in_pool(codec, target_block_compressed, pool))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
         let len = input_len(&record);
@@ -1071,7 +1065,6 @@ pub struct Flush<'a> {
     target: usize,
     codec: Codec,
     target_block_compressed: usize,
-    min_block_raw: usize,
 }
 
 impl Iterator for Flush<'_> {
@@ -1079,8 +1072,7 @@ impl Iterator for Flush<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut record = self.records.next()?;
-        let mut builder = RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.pool)
-            .with_min_block_raw(self.min_block_raw);
+        let mut builder = RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.pool);
         let mut input = 0;
         loop {
             builder

@@ -376,11 +376,11 @@
 //!
 //! Runs pack whole frames and dictionaries into engine-owned 1 MiB chunks.
 //! Consecutive segments of a run share chunks; a larger frame has an exact
-//! allocation. A finished run's partial final chunk becomes an exact allocation;
-//! other chunk padding is at most one frame/dictionary per filled chunk.
-//! Pool capacity and its bounded free reserve are reported separately in
-//! [`EngineStats`]; stored byte limits exclude padding. The free reserve is
-//! capped at 32 MiB, independent of job size, and grows only as chunks return.
+//! allocation. Chunk padding is at most one frame/dictionary per filled chunk
+//! plus the final chunk per run. Pool capacity and its bounded free reserve
+//! are reported separately in [`EngineStats`]; stored byte limits exclude
+//! padding. The free reserve is capped at max(64 MiB, the largest compaction
+//! output allowance used so far), and is allocated only as chunks are returned.
 //!
 //! # Checkpoints
 //!
@@ -539,14 +539,8 @@ pub struct EngineOptions {
     /// Estimated compressed bytes per Zstandard block, 1024 by default, from
     /// 1 to 256 KiB. Each segment estimates its ratio from a 64 KiB sample.
     /// Blocks end at record boundaries, with a 256 KiB raw cap; a larger
-    /// record has its own block. Uncompressed runs use a 16 KiB target
-    /// before applying [`min_block_raw`](Self::min_block_raw).
+    /// record has its own block. Uncompressed runs use a fixed 16 KiB target.
     pub target_block_compressed: usize,
-    /// Minimum raw block target, 4 KiB by default, from 0 (disabled) to
-    /// 256 KiB. The target is
-    /// max(this floor, the ratio-based target), capped at 256 KiB. Blocks end
-    /// at record boundaries; a larger record still has its own block.
-    pub min_block_raw: usize,
 }
 
 impl Default for EngineOptions {
@@ -570,7 +564,6 @@ impl Default for EngineOptions {
             snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
             target_block_compressed: TARGET_BLOCK_COMPRESSED,
-            min_block_raw: 4 << 10,
         }
     }
 }
@@ -627,13 +620,6 @@ impl EngineOptions {
             1,
             RAW_BLOCK_CAP as u64,
             "compressed targets are from 1 byte to the 256 KiB raw cap",
-        )?;
-        ConfigError::check(
-            "EngineOptions::min_block_raw",
-            self.min_block_raw as u64,
-            0,
-            RAW_BLOCK_CAP as u64,
-            "raw block floors are from 0 to the 256 KiB cap",
         )?;
         if let Some(compaction) = &self.background_compaction {
             compaction.validate(self.target_run_len, self.target_block_compressed)?;
@@ -1233,7 +1219,6 @@ struct Core {
     codec: Codec,
     /// The estimated compressed block target of the runs this engine builds.
     target_block_compressed: usize,
-    min_block_raw: usize,
     snapshot_limits: SnapshotLimits,
     /// Cloned by every snapshot, so that its count is the live snapshots.
     snapshots: Arc<()>,
@@ -1566,7 +1551,6 @@ impl Core {
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
             target_block_compressed: options.target_block_compressed,
-            min_block_raw: options.min_block_raw,
             snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
             background: options.background_compaction.map(|_| worker::Signal::new()),
@@ -2351,7 +2335,6 @@ impl<'e> FlushJob<'e> {
             self.engine.target_run_len,
             self.engine.codec,
             self.engine.target_block_compressed,
-            self.engine.min_block_raw,
             &self.cuts,
             &self.engine.chunks,
         );
@@ -2876,7 +2859,6 @@ impl<'e> CompactionJob<'e> {
             max_workspace_bytes: self.options.max_workspace_bytes,
             codec: self.engine.codec,
             target_block_compressed: self.engine.target_block_compressed,
-            min_block_raw: self.engine.min_block_raw,
             zero_seq: self.zero_seq,
         };
         let output = match compact_parallel_in(
@@ -4059,51 +4041,6 @@ mod tests {
         let core = Arc::clone(&engine.core);
         drop(engine);
         assert_eq!(Arc::strong_count(&core), 1);
-    }
-
-    #[test]
-    fn the_raw_floor_reaches_flush_ingestion_and_compaction_outputs() {
-        for floor in [0, 4 << 10, 16 << 10] {
-            let engine = Engine::new(EngineOptions {
-                target_block_compressed: 1,
-                min_block_raw: floor,
-                ..manual()
-            })
-            .unwrap();
-            let check = || {
-                let state = engine.core.read_state();
-                for run in &state.runs {
-                    let view = run.run.view();
-                    assert!(view.block_count() > 1);
-                    let len = view.largest_block_len().unwrap();
-                    if floor > 0 {
-                        assert!((floor - 1024..=floor).contains(&len));
-                    } else {
-                        assert!(len < 4 << 10);
-                    }
-                }
-            };
-            for i in 0..2000u32 {
-                engine.put(&i.to_be_bytes(), &[3; 512]).unwrap();
-            }
-            engine.flush().unwrap();
-            check();
-            let mut batch = WriteBatch::new();
-            for i in 0..2000u32 {
-                batch.put(&i.to_be_bytes(), &[4; 512]);
-            }
-            engine.ingest_sorted(&batch).unwrap();
-            check();
-            let mut workspace = MergeWorkspace::new();
-            while engine
-                .compact(options(8, usize::MAX), &mut workspace)
-                .unwrap()
-                .is_some()
-            {}
-            assert_eq!(engine.stats().runs, 1);
-            check();
-            assert_eq!(value(&engine, &7u32.to_be_bytes()).unwrap(), vec![4; 512]);
-        }
     }
 
     #[test]

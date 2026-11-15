@@ -116,7 +116,7 @@ encoded records per segment and stores one sampled raw dictionary of up to
 estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
 record gets its own block. Segments use level 1; block sizing retains its
 level-3 ratio probe.
-Uncompressed runs use a 16 KiB raw target before applying the raw floor.
+Uncompressed runs use a fixed 16 KiB raw target.
 Frames and dictionaries share engine-owned 1 MiB chunks, including across
 segments of the same run. A frame larger than a chunk has an exact allocation.
 A finished run copies its partial final chunk into an exact allocation.
@@ -144,7 +144,6 @@ manifest version 2 replace earlier formats without backward compatibility.
 - `target_block_compressed` defaults to 1024 bytes. Larger blocks reduce index
   and frame overhead, using less memory, but point reads decode more data and
   become slower. Smaller blocks trade memory for faster point reads.
-- `min_block_raw` defaults to 4 KiB (0 disables it): a floor on the ratio-based raw block target, capped at 256 KiB.
 - `background_threads` limits builders within a selected compaction job. The
   default is half the available CPUs, capped at 4 and at least 1. More builders
   can accelerate large jobs at greater CPU cost; small jobs and tight workspace

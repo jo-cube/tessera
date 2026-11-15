@@ -84,5 +84,3 @@ RAM-disk setup and run entirely in memory. `TESSERA_BENCH_LEVEL_RATIO=4`
 overrides Tessera's level ratio without rebuilding; the selected ratio and
 builder count are logged. `TESSERA_BENCH_BACKGROUND_THREADS=1` overrides the
 builder limit for controlled serial/parallel comparisons.
-
-`TESSERA_BENCH_MIN_BLOCK_RAW` overrides the raw block floor in bytes for controlled comparisons without rebuilding.
