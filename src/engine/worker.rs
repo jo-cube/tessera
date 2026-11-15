@@ -113,6 +113,17 @@ impl Signal {
         self.lock().status.clone()
     }
 
+    /// Waits for all already-requested passes without requesting another one.
+    #[cfg(test)]
+    pub(super) fn wait_until_idle(&self) {
+        let mut progress = self.lock();
+        while progress.status.running
+            && (progress.status.busy || progress.finished < progress.requested)
+        {
+            progress = self.wait_on(progress);
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn stop_requested(&self) -> bool {
         self.lock().stop

@@ -1182,6 +1182,9 @@ fn an_impossible_job_refuses_flushes_after_one_pass_each() {
         ),
         "{refused:?}"
     );
+    // A refused flush may return before a coalesced pass finishes. Observe
+    // settled counters without requesting an extra pass (which changes them).
+    engine.core.background.as_ref().unwrap().wait_until_idle();
     let status = engine.background_status().unwrap();
     assert!(
         matches!(status.last_failure, Some(CompactionError::JobLimit { .. })),
@@ -1191,6 +1194,7 @@ fn an_impossible_job_refuses_flushes_after_one_pass_each() {
     for _ in 0..5 {
         assert!(engine.flush().is_err());
     }
+    engine.core.background.as_ref().unwrap().wait_until_idle();
     let status = engine.background_status().unwrap();
     assert!(status.passes <= passes + 5, "{status:?}");
     assert!(!status.busy);
