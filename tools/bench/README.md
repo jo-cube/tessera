@@ -36,8 +36,11 @@ RAM-disk use exceeds 8 GiB, and the parent kills any child after 300 s.
   sorted keys; 20k prefix scans of about 100 records; 20 s of four readers
   against a writer that offers 70% of Tessera's update rate in 1 s bursts.
   `r-large` skips the bulk and mixed cases. Write cases include the drain.
-- Memory is RSS (plus RAM-disk bytes for RocksDB) after a drain, minus the
-  RSS measured with the dataset generated and no engine open. Write
-  amplification is (flush + compaction bytes written) ÷ flush bytes.
+- Memory reports both RSS (`engine_ram_mib`) and physical footprint
+  (`engine_footprint_mib`) after a drain, minus their respective baselines
+  measured with the dataset generated and no engine open. Footprint comes
+  from macOS `proc_pid_rusage(RUSAGE_INFO_V2).ri_phys_footprint` and excludes
+  allocator pages marked reusable. Both columns add RAM-disk bytes for
+  RocksDB. Write amplification is (flush + compaction bytes written) ÷ flush bytes.
 - After every load and update, 20k sampled keys and 200 group scans are
   checked against an in-harness oracle.

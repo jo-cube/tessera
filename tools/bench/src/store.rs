@@ -26,6 +26,7 @@ unsafe extern "C" {
     fn tb_drain(p: *mut c_void);
     fn tb_stats(p: *mut c_void, a: *mut u64);
     pub fn tb_rss() -> u64;
+    pub fn tb_footprint() -> u64;
 }
 
 pub fn rocksdb_version() -> String {

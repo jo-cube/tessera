@@ -39,6 +39,10 @@ fn rss() -> u64 {
     unsafe { store::tb_rss() }
 }
 
+fn footprint() -> u64 {
+    unsafe { store::tb_footprint() }
+}
+
 fn disk_used() -> u64 {
     let p = std::ffi::CString::new(MOUNT).unwrap();
     let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -226,8 +230,9 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     out.emit("setup", "records", n);
     out.emit("setup", "raw_mib", format!("{:.0}", data.raw as f64 / MIB as f64));
     out.emit("setup", "generate_s", format!("{:.1}", t.elapsed().as_secs_f64()));
-    let (base_rss, base_disk) = (rss(), disk_used());
+    let (base_rss, base_footprint, base_disk) = (rss(), footprint(), disk_used());
     out.emit("setup", "baseline_rss_mib", base_rss >> 20);
+    out.emit("setup", "baseline_footprint_mib", base_footprint >> 20);
     thread::spawn(|| {
         loop {
             let used = rss() + disk_used();
@@ -250,12 +255,16 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     };
     let mem = |out: &Out, case: &str, data: &Data| {
         let disk = disk_used().saturating_sub(base_disk);
-        let ram = rss().saturating_sub(base_rss) + if engine == "tessera" { 0 } else { disk };
+        let engine_disk = if engine == "tessera" { 0 } else { disk };
+        let ram = rss().saturating_sub(base_rss) + engine_disk;
+        let physical = footprint().saturating_sub(base_footprint) + engine_disk;
         let live = data.live_bytes();
         out.emit(case, "engine_ram_mib", ram >> 20);
+        out.emit(case, "engine_footprint_mib", physical >> 20);
         out.emit(case, "ram_disk_mib", disk >> 20);
         out.emit(case, "live_mib", live >> 20);
         out.emit(case, "live_per_ram", format!("{:.2}", live as f64 / ram as f64));
+        out.emit(case, "live_per_footprint", format!("{:.2}", live as f64 / physical as f64));
     };
 
     // 1. Shuffled load in 256-record batches, drained.
@@ -371,6 +380,7 @@ fn amplification(out: &Out, case: &str, before: [u64; 3], after: [u64; 3]) {
     out.emit(case, "compaction_mib", compact >> 20);
     out.emit(case, "write_amp", format!("{:.2}", (flush + compact) as f64 / flush as f64));
     out.emit(case, "stored_mib", after[2] >> 20);
+    out.emit(case, "stored_bytes", after[2]);
 }
 
 /// Checks 20k sampled keys and 200 group scans against the oracle.

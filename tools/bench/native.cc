@@ -12,6 +12,9 @@
 #include <rocksdb/version.h>
 #include <rocksdb/write_batch.h>
 #include <mach/mach.h>
+#include <libproc.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -61,6 +64,13 @@ uint64_t tb_rss() {
   mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
   task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&m, &n);
   return m.resident_size;
+}
+uint64_t tb_footprint() {
+  rusage_info_v2 info{};
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&info)) != 0) {
+    perror("proc_pid_rusage"); abort();
+  }
+  return info.ri_phys_footprint;
 }
 const char* tb_version() { static std::string v = GetRocksVersionAsString(true); return v.c_str(); }
 
