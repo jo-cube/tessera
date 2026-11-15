@@ -437,7 +437,7 @@ use std::sync::{
 };
 
 use crate::block::{Record, Value, Version};
-use crate::chunk::{ChunkPool, MIN_RESERVE_BYTES};
+use crate::chunk::{ChunkPool, RESERVE_BYTES};
 use crate::memtable::{
     FlushCuts, FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
@@ -999,10 +999,10 @@ pub struct EngineStats {
     /// Unused 1 MiB chunks available for reuse by this engine.
     pub pool_reserve_bytes: usize,
     /// Capacity of checked-out pool chunks, including padding and chunks held
-    /// by builders, memtables or snapshots. Oversized exact allocations are excluded.
+    /// by builders, memtables or snapshots. Exact run tails and oversized allocations are excluded.
     pub pool_in_use_bytes: usize,
-    /// Maximum free reserve: at least 64 MiB, raised to the largest compaction
-    /// output allowance used so far. The pool does not preallocate this amount.
+    /// Maximum free reserve: 32 MiB, independent of job size. The pool does
+    /// not preallocate this amount. Reserve bytes are resident engine memory.
     pub pool_reserve_limit: usize,
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes, and
@@ -1500,7 +1500,7 @@ impl Engine {
 
 impl Core {
     fn new(options: &EngineOptions) -> Self {
-        Self::with_pool(options, ChunkPool::new(MIN_RESERVE_BYTES))
+        Self::with_pool(options, ChunkPool::new(RESERVE_BYTES))
     }
 
     fn with_pool(options: &EngineOptions, chunks: ChunkPool) -> Self {
@@ -2842,9 +2842,6 @@ impl<'e> CompactionJob<'e> {
     /// published later come from flushes and hold only newer updates. On an
     /// error nothing is built and the engine is unchanged.
     fn build(self, workspace: &mut MergeWorkspace) -> Result<BuiltCompaction<'e>, CompactionError> {
-        self.engine
-            .chunks
-            .reserve_for(self.options.max_output_bytes);
         let views: Vec<RunView<'_>> = self.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = self
             .others
@@ -3716,14 +3713,7 @@ mod tests {
         let mut built = job.build(&mut MergeWorkspace::new()).unwrap();
         built.output.output_bytes = stats.run_bytes + stats.held_bytes + 1;
         assert!(matches!(built.publish(), Err(CompactionError::RunLimit(_))));
-        assert_eq!(
-            engine.stats(),
-            EngineStats {
-                pool_reserve_bytes: crate::chunk::CHUNK_BYTES,
-                pool_reserve_limit: CompactionOptions::default().max_output_bytes,
-                ..stats
-            }
-        );
+        assert_eq!(engine.stats(), stats);
 
         let report = begin()
             .build(&mut MergeWorkspace::new())

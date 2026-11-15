@@ -119,8 +119,9 @@ level-3 ratio probe.
 Uncompressed runs use a fixed 16 KiB raw target.
 Frames and dictionaries share engine-owned 1 MiB chunks, including across
 segments of the same run. A frame larger than a chunk has an exact allocation.
+A finished run copies its partial final chunk into an exact allocation.
 Retired chunks return to a shared pool, whose free reserve is capped at the
-larger of 64 MiB and the largest compaction output allowance used so far.
+fixed 32 MiB, independent of job size.
 `EngineStats` reports free reserve, its cap and checked-out chunk capacity,
 including padding and snapshots. Stored run limits exclude chunk padding;
 index, footer and filter buffers remain exact allocations.

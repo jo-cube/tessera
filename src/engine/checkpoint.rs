@@ -115,7 +115,7 @@
 //! lengths within the run limits), so a damaged file cannot make recovery
 //! allocate more than the checkpoint it should hold.
 
-use crate::chunk::{ChunkPool, MIN_RESERVE_BYTES};
+use crate::chunk::{ChunkPool, RESERVE_BYTES};
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -1022,7 +1022,7 @@ pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenEr
                 background: None,
             }));
         }
-        let pool = ChunkPool::new(MIN_RESERVE_BYTES);
+        let pool = ChunkPool::new(RESERVE_BYTES);
         let mut runs: Vec<Run<Vec<u8>>> = Vec::with_capacity(manifest.runs.len());
         let mut records = 0u64;
         for (index, &(len, sum)) in manifest.runs.iter().enumerate() {

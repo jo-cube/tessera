@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) const CHUNK_BYTES: usize = 1 << 20;
-pub(crate) const MIN_RESERVE_BYTES: usize = 64 << 20;
+pub(crate) const RESERVE_BYTES: usize = 32 << 20;
 
 #[derive(Default, Debug)]
 struct State {
@@ -25,13 +25,6 @@ impl ChunkPool {
             limit: reserve_bytes / CHUNK_BYTES,
             ..State::default()
         }))))
-    }
-
-    /// The largest job's allowance bounds reuse after its inputs are retired.
-    /// This changes the cap, never preallocates the reserve.
-    pub(crate) fn reserve_for(&self, bytes: usize) {
-        let mut state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
-        state.limit = state.limit.max(bytes / CHUNK_BYTES);
     }
 
     pub(crate) fn take(&self) -> Chunk {
@@ -143,16 +136,14 @@ mod tests {
     }
 
     #[test]
-    fn job_allowances_only_raise_the_cap_and_exact_allocations_are_not_pooled() {
-        let pool = ChunkPool::new(0);
-        pool.reserve_for(2 * CHUNK_BYTES + 3);
-        pool.reserve_for(CHUNK_BYTES);
+    fn exact_allocations_do_not_raise_or_fill_the_reserve() {
+        let pool = ChunkPool::new(CHUNK_BYTES);
         let chunks = [pool.take(), pool.take(), pool.take()];
         let oversized = Chunk::exact(&vec![4; CHUNK_BYTES + 1]);
         drop(chunks);
-        assert_eq!(pool.stats(), (2 * CHUNK_BYTES, 0, 2 * CHUNK_BYTES));
+        assert_eq!(pool.stats(), (CHUNK_BYTES, 0, CHUNK_BYTES));
         drop(oversized);
-        assert_eq!(pool.stats(), (2 * CHUNK_BYTES, 0, 2 * CHUNK_BYTES));
+        assert_eq!(pool.stats(), (CHUNK_BYTES, 0, CHUNK_BYTES));
     }
 
     #[test]

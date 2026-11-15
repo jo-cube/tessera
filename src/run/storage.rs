@@ -87,7 +87,14 @@ impl Packing {
         self.append(bytes, true);
     }
 
-    pub fn finish(self, tail: Box<[u8]>) -> Segmented {
+    pub fn finish(mut self, tail: Box<[u8]>) -> Segmented {
+        // Finished runs never pin a mostly empty final pool chunk. Piece
+        // offsets stay valid because only unused bytes after the tail go away.
+        if let Some((at, used)) = self.active
+            && used < CHUNK_BYTES
+        {
+            self.allocations[at] = Chunk::exact(&self.allocations[at].bytes()[..used]);
+        }
         Segmented {
             allocations: self.allocations.into_boxed_slice(),
             frames: self.frames.into_boxed_slice(),
@@ -232,6 +239,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_partial_tail_before_an_oversized_frame_is_exact_and_cloneable() {
+        let pool = ChunkPool::new(CHUNK_BYTES);
+        let mut packing = Packing::new(&pool);
+        packing.frame(&[7; 13]);
+        packing.frame(&vec![9; CHUNK_BYTES + 1]);
+        let data = packing.finish(Box::new([]));
+        assert_eq!(data.allocations[0].bytes(), &[7; 13]);
+        assert_eq!(data.allocations[1].bytes().len(), CHUNK_BYTES + 1);
+        assert_eq!(pool.stats(), (CHUNK_BYTES, 0, CHUNK_BYTES));
+        let copy = data.clone();
+        drop(data);
+        assert_eq!(Region::Frames(&copy).get(0..13).unwrap(), &[7; 13]);
+        assert_eq!(pool.stats(), (CHUNK_BYTES, 0, CHUNK_BYTES));
+    }
+
+    #[test]
     fn packing_shares_chunks_but_never_splits_a_frame_or_dictionary() {
         let pool = ChunkPool::new(CHUNK_BYTES);
         let mut packing = Packing::new(&pool);
@@ -243,6 +266,9 @@ mod tests {
         packing.dictionary(&[5; 64]);
         let data = packing.finish(Box::new([]));
         assert_eq!(data.allocations.len(), 2);
+        assert_eq!(data.allocations[0].bytes().len(), CHUNK_BYTES);
+        assert_eq!(data.allocations[1].bytes().len(), 96);
+        assert_eq!(pool.stats(), (CHUNK_BYTES, CHUNK_BYTES, CHUNK_BYTES));
         assert_eq!(data.frames[1].allocation, 0);
         assert_eq!(data.frames[2].allocation, 1);
         assert_eq!(
