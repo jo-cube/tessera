@@ -106,7 +106,7 @@ fn ingestion_drains_overlapping_tables_and_keeps_snapshots() {
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"ingested");
     batch.delete(b"c");
-    assert_eq!(engine.ingest_sorted(&batch), Ok(4));
+    assert_eq!(engine.ingest_sorted(&batch), Ok(3));
     assert_eq!(engine.stats().active.charged, 0);
     assert!(engine.stats().frozen.is_none());
     let mut ws = EngineWorkspace::new();
@@ -163,7 +163,7 @@ fn sorted_validation_and_automatic_ingestion() {
     batch.clear();
     batch.put(b"a", b"v");
     batch.put(b"b", b"w");
-    assert_eq!(engine.write(&batch), Ok(2));
+    assert_eq!(engine.write(&batch), Ok(1));
     assert_eq!(engine.stats().active.charged, 0);
     assert_eq!(engine.stats().runs, 1);
 }
@@ -181,7 +181,7 @@ fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
     }
     batch.delete(&7u64.to_be_bytes());
     batch.put(&3u64.to_be_bytes(), b"last");
-    assert_eq!(engine.write(&batch), Ok(42));
+    assert_eq!(engine.write(&batch), Ok(1));
     assert_eq!(engine.stats().active.charged, 0);
     let mut ws = EngineWorkspace::new();
     assert!(engine.get(&7u64.to_be_bytes(), &mut ws).unwrap().is_none());
@@ -443,5 +443,5 @@ fn rejected_batches_and_refused_ingestion_leave_no_partial_data_or_sequences() {
     batch.clear();
     batch.put(b"a", b"value");
     batch.put(b"b", b"value");
-    assert_eq!(engine.ingest_sorted(&batch), Ok(2));
+    assert_eq!(engine.ingest_sorted(&batch), Ok(1));
 }

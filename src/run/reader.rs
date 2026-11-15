@@ -35,10 +35,12 @@ pub struct Run<B> {
     data: B,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
-    /// The largest sequence number of any record, 0 if there are none. Not
-    /// stored: every record carries its sequence number, so the builder and
-    /// validation derive it.
+    /// The largest stored sequence number, 0 if there are none. The builder
+    /// and validation derive it; `seq_override` supplies the effective bound.
     max_seq: u64,
+    /// Publication sequence of a unique-key ingestion built with placeholders.
+    /// Set only while the run is private; materialized when it is rewritten.
+    seq_override: Option<u64>,
     /// Where the smallest and largest user keys lie in `data`, or `None` for
     /// an empty run, found once so that a lookup can rule the run out
     /// without opening it.
@@ -94,6 +96,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             filter: None,
             max_seq,
+            seq_override: None,
             bounds,
         })
     }
@@ -104,6 +107,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             filter: filter.map(Box::new),
             max_seq,
+            seq_override: None,
             bounds,
         }
     }
@@ -111,7 +115,14 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the largest sequence number of any record in the run, or 0
     /// if it has none. No record in the run is newer.
     pub fn max_seq(&self) -> u64 {
-        self.max_seq
+        self.seq_override.unwrap_or(self.max_seq)
+    }
+
+    /// Assigns the effective sequence once, before a placeholder run is shared.
+    /// A valid run whose stored sequences are all zero has unique user keys.
+    pub(crate) fn set_seq_override(&mut self, seq: u64) {
+        assert!(self.seq_override.is_none() && self.max_seq == 0);
+        self.seq_override = Some(seq);
     }
 
     /// Returns the bytes of the run's key filter, held beside the stored
@@ -140,6 +151,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             filter: self.filter.clone(),
             max_seq: self.max_seq,
+            seq_override: self.seq_override,
             bounds: self.bounds.clone(),
         }
     }
@@ -233,12 +245,15 @@ impl<B: AsRef<[u8]>> Run<B> {
         self.view().cursor(workspace)
     }
 
-    /// Returns a view of this run's bytes.
+    /// Returns a view with this run's effective sequences.
     pub fn view(&self) -> RunView<'_> {
-        RunView::open(self.data.as_ref()).expect(VALIDATED)
+        RunView {
+            seq_override: self.seq_override,
+            ..RunView::open(self.data.as_ref()).expect(VALIDATED)
+        }
     }
 
-    /// Returns the run's serialized bytes.
+    /// Returns the run's serialized bytes, without any sequence override.
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_ref()
     }
@@ -664,7 +679,7 @@ impl<'a> RunCursor<'a> {
             return Ok(());
         };
         let head = Head {
-            seq: record.seq,
+            seq: self.view.seq_override.unwrap_or(record.seq),
             value_len: match record.value {
                 Value::Bytes(bytes) => Some(bytes.len()),
                 Value::Tombstone => None,
@@ -784,6 +799,7 @@ pub struct RunView<'a> {
     keys: &'a [u8],
     min_key: &'a [u8],
     record_count: usize,
+    seq_override: Option<u64>,
 }
 
 impl<'a> RunView<'a> {
@@ -831,6 +847,7 @@ impl<'a> RunView<'a> {
             keys,
             min_key,
             record_count,
+            seq_override: None,
         };
         match (view.table.first(), view.table.last()) {
             (Some(&first), Some(&last)) => {
@@ -1009,7 +1026,7 @@ impl<'a> RunView<'a> {
                 let version = view
                     .get(keys[index].as_ref())
                     .map_err(|error| frame.block_error(error))?;
-                found(index, version);
+                found(index, version.map(|version| self.effective(version)));
             }
         }
         Ok(())
@@ -1039,7 +1056,14 @@ impl<'a> RunView<'a> {
         let version = BlockView::open(bytes)
             .and_then(|view| view.get(target))
             .map_err(|error| frame.block_error(error))?;
-        Ok(version.map(|version| (bytes, version)))
+        Ok(version.map(|version| (bytes, self.effective(version))))
+    }
+
+    fn effective(self, version: Version<'_>) -> Version<'_> {
+        Version {
+            seq: self.seq_override.unwrap_or(version.seq),
+            ..version
+        }
     }
 
     /// Returns a cursor positioned before the first record.

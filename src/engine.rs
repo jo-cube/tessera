@@ -1304,17 +1304,19 @@ impl Engine {
 
     /// Applies every operation atomically and returns the last sequence number.
     /// Later operations on the same key win. An empty batch returns the current
-    /// sequence number without changing state.
+    /// sequence number without changing state. Batches built directly into runs
+    /// take one publication sequence; memtable batches take one per operation.
     pub fn write(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         self.core.write_batch(batch)
     }
 
     /// Builds a strictly key-sorted, duplicate-free batch directly into runs
-    /// outside the state lock and publishes it atomically. Returns its last
-    /// sequence number; rejects unsorted or repeated keys without changes.
-    /// Overlapping memtables are flushed before publication. Sequences are
-    /// assigned at publication, after every existing write. A concurrent write
-    /// during the build causes a rebuild outside the lock.
+    /// outside the state lock and publishes it atomically. Returns the single
+    /// publication sequence of the whole batch; an empty batch returns the
+    /// current ceiling. Rejects unsorted or repeated keys without changes.
+    /// Tables sharing an actual batch key are flushed before publication.
+    /// Runs are built once; concurrent writes to other keys cause no retries.
+    /// Writes completed before publication are older than the ingested data.
     pub fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         if !batch.is_sorted() {
             return Err(UpdateError::Rejected(WriteError::BatchNotSorted));

@@ -78,8 +78,9 @@ assert_eq!(recovered.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
 ```
 
 `Engine::write(&WriteBatch) -> Result<u64, UpdateError>` returns the batch's
-last sequence number. Its operations take a contiguous sequence range and
-become visible together. An empty batch returns the current ceiling.
+last sequence number. Memtable batches take a contiguous sequence range;
+batches built directly into runs take one publication sequence. In either case
+all operations become visible together. An empty batch returns the current ceiling.
 `put` and `delete` share the memtable update path. A dedicated flush thread
 builds runs while reads and writes continue; writers wait when the frozen-table
 limit or level-0 stop is reached. `max_frozen_memtables` defaults to 2, in
@@ -90,12 +91,16 @@ leave frozen tables readable and surface through the existing flush errors.
 Strictly key-sorted, unique batches use the direct run path when their charged
 input reaches `bulk_ingest_min: Option<usize>` (`None` means half the memtable
 budget). `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
-duplicate keys. Overlapping memtables are flushed before atomic publication
-into level 0. Builds release the state lock, so concurrent writes proceed and
-commit normally. Ingestion assigns sequences and publishes under one lock,
-after every existing write. It rebuilds outside the lock if concurrent writes
-change the sequence ceiling while it builds or waits. An oversized unsorted batch stages its records in a private memtable and publishes
-through the same run path, preserving the last duplicate operation.
+duplicate keys. Tables sharing an actual batch key are flushed before atomic
+publication into level 0; range overlap alone causes no wait. Builds release the
+state lock, so concurrent writes proceed. Each ingestion builds once with stored
+placeholders, then assigns one shared sequence at publication, after all
+previous writes. A run-level override supplies this effective sequence to readers
+and merges; compaction and checkpoints write it into ordinary run records.
+An oversized unsorted batch stages its records in a private memtable and uses
+the same single-sequence run path, preserving the last duplicate operation.
+Snapshots and checkpoints taken during a build exclude its unpublished runs;
+a failed or panicked build consumes no sequence.
 
 `multi_get(keys, workspace, |index, value| ...) -> Result<(), ReadError>` is
 available on `Engine`, `ReadGuard` and `Snapshot`. It sees one consistent state

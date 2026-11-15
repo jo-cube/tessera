@@ -723,10 +723,6 @@ impl Memtable {
     }
 
     /// Returns each key's latest update, in ascending key order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
     pub fn iter(&self) -> Records<'_> {
         self.0.iter_from(&[])
     }
