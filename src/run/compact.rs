@@ -43,7 +43,8 @@ pub const CONTEXT_ALLOWANCE: usize = 2 << 20;
 
 /// Upper estimate beside the output: a block and context per input, plus
 /// segment and block buffers and a compression context for the builder.
-/// Reads only frame headers. Previously retained workspace capacity is excluded.
+/// Checks frame metadata and dictionaries without decoding. Previously retained
+/// workspace capacity is excluded.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     let blocks = inputs
         .iter()

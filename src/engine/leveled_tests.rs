@@ -1189,3 +1189,128 @@ fn an_impossible_job_refuses_flushes_after_one_pass_each() {
     assert!(!status.busy);
     engine.close().unwrap();
 }
+
+#[test]
+fn settled_sequences_are_zero_and_a_snapshot_during_build_keeps_its_sequences() {
+    let engine = Engine::new(options()).unwrap();
+    let limits = CompactionOptions {
+        max_overlap: 1,
+        ..compaction()
+    };
+    engine.put(b"a", b"first").unwrap();
+    engine.put(b"stable", b"base").unwrap();
+    engine.put(b"deleted", b"live").unwrap();
+    engine.flush().unwrap();
+    settle_with(&engine, limits, &mut Steps::default());
+    engine.put(b"a", b"second").unwrap();
+    engine.delete(b"deleted").unwrap();
+    engine.flush().unwrap();
+    let ceiling = engine.stats().last_seq;
+    let mut reads = EngineWorkspace::new();
+    let original = engine.get(b"a", &mut reads).unwrap().unwrap().seq;
+    assert!(original > 0);
+    let job = engine.core.begin_job(limits).unwrap().unwrap();
+    assert!(job.zero_seq);
+    // This snapshot is taken after eligibility was decided. Its own runs
+    // keep the original sequences even though the new output erases them.
+    let snapshot = engine.snapshot().unwrap();
+    job.build(&mut MergeWorkspace::new())
+        .unwrap()
+        .publish()
+        .unwrap();
+    let value = engine.get(b"a", &mut reads).unwrap().unwrap();
+    assert_eq!((value.seq, value.value), (0, &b"second"[..]));
+    assert_eq!(engine.get(b"stable", &mut reads).unwrap().unwrap().seq, 0);
+    assert_eq!(engine.get(b"deleted", &mut reads).unwrap(), None);
+    let value = snapshot.get(b"a", &mut reads).unwrap().unwrap();
+    assert_eq!((value.seq, value.value), (original, &b"second"[..]));
+    assert_eq!(snapshot.get(b"stable", &mut reads).unwrap().unwrap().seq, 2);
+    assert_eq!(snapshot.last_seq(), ceiling);
+    drop(snapshot);
+    let dir = std::env::temp_dir().join(format!("tessera-seq-zero-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    engine
+        .checkpoint(&dir, CheckpointOptions::default())
+        .unwrap();
+    let recovered = Engine::recover(&dir, options()).unwrap();
+    assert_eq!(recovered.stats().last_seq, ceiling);
+    assert_eq!(recovered.get(b"a", &mut reads).unwrap().unwrap().seq, 0);
+    recovered.put(b"a", b"third").unwrap();
+    assert_eq!(
+        recovered.get(b"a", &mut reads).unwrap().unwrap().seq,
+        ceiling + 1
+    );
+    assert_eq!(
+        scan(&recovered.snapshot().unwrap()).get(&b"a"[..]),
+        Some(&b"third".to_vec())
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshots_before_compaction_and_snapshots_of_seq_zero_data_stay_visible() {
+    let engine = Engine::new(options()).unwrap();
+    let limits = CompactionOptions {
+        max_overlap: 1,
+        ..compaction()
+    };
+    let drain = || settle_with(&engine, limits, &mut Steps::default());
+    engine.put(b"key", b"one").unwrap();
+    engine.flush().unwrap();
+    drain();
+    let before = engine.snapshot().unwrap();
+    engine.put(b"key", b"two").unwrap();
+    engine.flush().unwrap();
+    drain();
+    let mut reads = EngineWorkspace::new();
+    let found = before.get(b"key", &mut reads).unwrap().unwrap();
+    assert_eq!((found.seq, found.value), (1, &b"one"[..]));
+    assert!(engine.get(b"key", &mut reads).unwrap().unwrap().seq > 0);
+    drop(before);
+    engine.put(b"key", b"three").unwrap();
+    engine.flush().unwrap();
+    drain();
+    assert_eq!(engine.get(b"key", &mut reads).unwrap().unwrap().seq, 0);
+    let settled = engine.snapshot().unwrap();
+    engine.delete(b"key").unwrap();
+    engine.flush().unwrap();
+    drain();
+    assert_eq!(engine.get(b"key", &mut reads).unwrap(), None);
+    let found = settled.get(b"key", &mut reads).unwrap().unwrap();
+    assert_eq!((found.seq, found.value), (0, &b"three"[..]));
+    assert_eq!(scan(&settled).get(&b"key"[..]), Some(&b"three".to_vec()));
+    drop(settled);
+    engine.put(b"key", b"four").unwrap();
+    engine.flush().unwrap();
+    drain();
+    assert_eq!(get(&engine, b"key"), Some(b"four".to_vec()));
+}
+
+#[test]
+fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
+    let engine = Engine::new(options()).unwrap();
+    let limits = CompactionOptions {
+        max_inputs: 2,
+        max_overlap: 1,
+        ..compaction()
+    };
+    engine.put(b"key", b"one").unwrap();
+    engine.flush().unwrap();
+    settle_with(&engine, limits, &mut Steps::default());
+    engine.put(b"key", b"two").unwrap();
+    engine.flush().unwrap();
+    engine.put(b"key", b"three").unwrap();
+    engine.flush().unwrap();
+    let job = engine.core.begin_job(limits).unwrap().unwrap();
+    assert!(!job.others.is_empty());
+    assert!(!job.zero_seq);
+    job.build(&mut MergeWorkspace::new())
+        .unwrap()
+        .publish()
+        .unwrap();
+    assert_eq!(get(&engine, b"key"), Some(b"three".to_vec()));
+    settle_with(&engine, limits, &mut Steps::default());
+    let mut reads = EngineWorkspace::new();
+    let found = engine.get(b"key", &mut reads).unwrap().unwrap();
+    assert_eq!((found.seq, found.value), (0, &b"three"[..]));
+}

@@ -15,7 +15,8 @@ use super::reader::{Found, LookupWorkspace, Run, RunView};
 /// older versions and whatever order the runs are given in. Nothing can change
 /// under a reader, because the runs are immutable and borrowed for its life.
 ///
-/// A user key and sequence number name one logical update. Runs may hold
+/// A user key and nonzero sequence number name one logical update. Sequence
+/// zero denotes settled data with no competing older version. Runs may hold
 /// identical copies of a record, which count once. Copies that differ in value
 /// or in kind have no correct winner, so the read returns
 /// [`ReadError::ConflictingCopies`] rather than letting run order choose. A
@@ -46,7 +47,8 @@ pub struct LogicalWorkspace {
 /// The latest live value of a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveValue<'a> {
-    /// The sequence number of the version that decided the key's state.
+    /// The deciding version's sequence, or 0 when bottom-level compaction
+    /// erased it from settled data. This is not a stable update identifier.
     pub seq: u64,
     /// The value, borrowed from a decoded block or the run itself.
     pub value: &'a [u8],
@@ -57,7 +59,8 @@ pub struct LiveValue<'a> {
 pub struct LiveRecord<'a> {
     /// The user key.
     pub key: &'a [u8],
-    /// The sequence number of the version that decided the key's state.
+    /// The deciding version's sequence, or 0 when bottom-level compaction
+    /// erased it from settled data. This is not a stable update identifier.
     pub seq: u64,
     /// The value, borrowed from a decoded block or the run itself.
     pub value: &'a [u8],

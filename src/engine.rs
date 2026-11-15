@@ -1938,6 +1938,12 @@ impl Core {
             }
         };
         let others = Self::others(&state, &inputs);
+        // Logical reads resolve overlapping runs by sequence. Preserve it if
+        // any unselected run could compete, even above the bottom level.
+        // A snapshot taken after selection retains the original input runs.
+        let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth())
+            && others.is_empty()
+            && Arc::strong_count(&self.snapshots) == 1;
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
             engine: self,
@@ -1949,7 +1955,7 @@ impl Core {
             kind,
             level,
             dest,
-            zero_seq: false,
+            zero_seq,
             cuts,
             cursor,
             refusal: split,
@@ -2660,6 +2666,7 @@ struct CompactionJob<'e> {
     level: usize,
     /// Where the output goes.
     dest: Dest,
+    /// Settled output with no competing unselected run or pre-existing snapshot.
     zero_seq: bool,
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.

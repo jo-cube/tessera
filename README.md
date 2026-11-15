@@ -69,6 +69,9 @@ encoded records per segment and stores one sampled raw dictionary of up to
 16 KiB. `target_block_compressed` defaults to 1024 bytes: a 64 KiB sample
 estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
 record gets its own block. Uncompressed runs use a fixed 16 KiB raw target.
+Bottom-level compaction can erase settled sequence numbers to zero when no
+snapshot or overlapping unselected run needs them. Snapshot views keep their
+records and visibility, and checkpoint recovery preserves the write ceiling.
 Readers reuse one context and borrow dictionary bytes from the run; there is
 no prepared dictionary or decoded-block cache. Run format 5 and checkpoint
 manifest version 2 replace earlier formats without backward compatibility.

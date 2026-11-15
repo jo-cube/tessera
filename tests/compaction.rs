@@ -426,6 +426,12 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
     });
 
     flush_waiting(&engine);
+    // Give the worker work after the manual compactor has stopped, so its
+    // participation does not depend on winning their mutex race.
+    for _ in 0..3 {
+        engine.put(&key(0, 0), &ROUNDS.to_be_bytes()).unwrap();
+        flush_waiting(&engine);
+    }
     engine.wait_for_compaction().unwrap();
     assert!(engine.stats().max_overlap <= 2);
     assert!(engine.background_status().unwrap().compactions > 0);

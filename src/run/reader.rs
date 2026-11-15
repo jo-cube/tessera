@@ -895,8 +895,8 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns the decoded length of the largest block, which is the most a
-    /// reader of this run must hold for one block. Reads each frame header and
-    /// decodes nothing.
+    /// reader of this run must hold for one block. Checks frame metadata and
+    /// referenced dictionaries without decoding.
     pub fn largest_block_len(self) -> Result<usize, CorruptRun> {
         (0..self.table.len()).try_fold(0, |largest, block| {
             Ok(largest.max(self.frame(block)?.decoded_len))
