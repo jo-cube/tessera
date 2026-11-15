@@ -1,12 +1,10 @@
 //! Merging runs into fewer runs that hold only what can still be read.
 
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
 
 use crate::block::{Record, Value};
 
-use super::dictionary::{self, DictionaryChoice, Trained};
+use super::dictionary::SEGMENT_RAW_LEN;
 use super::logical::conflict;
 use super::{
     Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
@@ -34,35 +32,18 @@ pub struct CompactLimits {
     pub max_workspace_bytes: usize,
     /// How the output runs store their blocks.
     pub codec: Codec,
-    /// Bytes per output block before compression, as for
-    /// [`RunBuilder::with_target_block_len`].
-    pub target_block_len: usize,
-    /// Whether the output may be compressed with a dictionary trained for it,
-    /// as [`dictionary::choose`] decides before the merge starts. Only with
-    /// [`Codec::Zstd`]; otherwise ignored.
-    pub dictionary: bool,
+    /// Estimated compressed bytes per output block.
+    pub target_block_compressed: usize,
+    /// Erase sequences in settled output whose older views retain their own runs.
+    pub zero_seq: bool,
 }
 
-/// Bytes allowed for one Zstandard context, compressing 16 KiB blocks at level
-/// 3 or decompressing them. Measured contexts are well below this; a test
-/// checks it.
-pub const CONTEXT_ALLOWANCE: usize = 1 << 20;
+/// Conservative allowance for a Zstandard compression or decompression context.
+pub const CONTEXT_ALLOWANCE: usize = 2 << 20;
 
-/// The largest block length the engine builds. A Zstandard compression
-/// context grows with the block it compresses: at level 3 it measured
-/// 0.28 MB for 16 KiB blocks, 0.66 MB for 64 KiB and 1.3 MB from 256 KiB,
-/// so beyond this a context would outgrow [`CONTEXT_ALLOWANCE`] and the
-/// workspace estimate would understate it. A test checks it.
-pub const MAX_ENGINE_BLOCK_LEN: usize = 64 << 10;
-
-/// Returns an upper estimate of what compacting `inputs` needs beside its
-/// output: per input, a decoded copy of its largest block and a decompression
-/// context; for the builder, two copies of the largest block and a compression
-/// context. Reads every frame header and decodes nothing.
-///
-/// The builder's open block holds records of the inputs' blocks, so it is no
-/// larger than the largest of them. Retained capacity from earlier use of a
-/// workspace is not counted.
+/// Upper estimate beside the output: a block and context per input, plus
+/// segment and block buffers and a compression context for the builder.
+/// Reads only frame headers. Previously retained workspace capacity is excluded.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     let blocks = inputs
         .iter()
@@ -79,9 +60,15 @@ pub fn workspace_estimate(largest_blocks: impl IntoIterator<Item = usize>) -> us
     let mut largest = 0;
     for block in largest_blocks {
         largest = largest.max(block);
-        total = total.saturating_add(block.saturating_add(CONTEXT_ALLOWANCE));
+        total = total.saturating_add(block.saturating_add(1 << 20));
     }
-    total.saturating_add(largest.saturating_mul(2))
+    // One encoded segment plus its builder storage; output blocks can grow
+    // to the raw cap even when all input blocks are small. Oversized records
+    // need corresponding buffers as well. Include bounded dictionary scratch.
+    total
+        .saturating_add(largest.max(SEGMENT_RAW_LEN).saturating_mul(2))
+        .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(2))
+        .saturating_add(super::dictionary::DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)
 }
 
 /// Where a compaction's output runs end, beside the target length.
@@ -121,11 +108,6 @@ pub struct CompactStats {
     pub copies_collapsed: usize,
     /// Newest versions that were tombstones and were not kept.
     pub tombstones_dropped: usize,
-    /// Whether the output was compressed with a dictionary, and why not.
-    pub dictionary: DictionaryChoice,
-    /// Time spent deciding: sampling, training and estimating. Zero unless
-    /// dictionaries were enabled.
-    pub dictionary_time: Duration,
 }
 
 /// The runs a compaction built.
@@ -136,11 +118,9 @@ pub struct Compacted {
     /// Their total stored length.
     pub output_bytes: usize,
     /// The total bytes they hold beside that, [`Run::held_bytes`]: key filters
-    /// and prepared dictionaries.
+    /// only.
     pub held_bytes: usize,
-    /// The estimate from [`workspace_bytes`] that was checked, plus
-    /// [`DICTIONARY_WORKSPACE`](dictionary::DICTIONARY_WORKSPACE) if a
-    /// dictionary was trained.
+    /// The workspace estimate checked before decoding.
     pub workspace_bytes: usize,
     /// What was read and written.
     pub stats: CompactStats,
@@ -222,12 +202,7 @@ impl std::error::Error for CompactError {}
 /// described on [`CompactLimits`], and on any error the partial output is
 /// dropped.
 ///
-/// With [`CompactLimits::dictionary`], whether every output run uses one
-/// trained dictionary is decided once, after the workspace check and before
-/// the merge, and is never revisited: a run that would not benefit, or a
-/// workspace limit without room for [`DICTIONARY_WORKSPACE`](dictionary::DICTIONARY_WORKSPACE)
-/// beside the merge, gets plain Zstandard. Each output run stores its own
-/// copy of the dictionary. Output runs end before a record that would
+/// Output runs end before a record that would
 /// take them past the target length, unless they hold no record yet.
 #[cfg(test)]
 pub fn compact<'a>(
@@ -260,25 +235,9 @@ pub fn compact_with<'a>(
             max_workspace_bytes: limits.max_workspace_bytes,
         });
     }
-    let choice = if limits.dictionary && limits.codec == Codec::Zstd {
-        let room = limits.max_workspace_bytes - needed;
-        dictionary::choose(inputs, limits.target_block_len, room)?
-    } else {
-        dictionary::Choice::default()
-    };
-    let needed = needed + choice.workspace_bytes;
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
-    let mut output = Output::new(
-        limits,
-        limits.max_workspace_bytes - needed,
-        choice.trained,
-        cuts,
-    );
-    let mut stats = CompactStats {
-        dictionary: choice.outcome,
-        dictionary_time: choice.time,
-        ..CompactStats::default()
-    };
+    let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
+    let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
 
@@ -302,7 +261,10 @@ pub fn compact_with<'a>(
             stats.tombstones_dropped += 1;
             continue;
         }
-        output.add(record)?;
+        output.add(Record {
+            seq: if limits.zero_seq { 0 } else { record.seq },
+            ..record
+        })?;
         stats.records_written += 1;
     }
     output.finish_run()?;
@@ -346,8 +308,6 @@ struct Output<'c> {
     overlapped: usize,
     /// The most bytes the open builder may hold for key hashes.
     hash_bytes: usize,
-    /// The dictionary every output run is compressed with, if any.
-    dictionary: Option<Arc<Trained>>,
     builder: Option<RunBuilder>,
     input: usize,
     runs: Vec<Run<Vec<u8>>>,
@@ -357,12 +317,7 @@ struct Output<'c> {
 }
 
 impl<'c> Output<'c> {
-    fn new(
-        limits: CompactLimits,
-        hash_bytes: usize,
-        dictionary: Option<Arc<Trained>>,
-        cuts: &'c OutputCuts,
-    ) -> Self {
+    fn new(limits: CompactLimits, hash_bytes: usize, cuts: &'c OutputCuts) -> Self {
         let target_run_len = if cuts.single {
             MAX_TARGET_RUN_LEN
         } else {
@@ -378,7 +333,6 @@ impl<'c> Output<'c> {
             next_overlapped: 0,
             overlapped: 0,
             hash_bytes,
-            dictionary,
             builder: None,
             input: 0,
             runs: Vec::new(),
@@ -423,11 +377,10 @@ impl<'c> Output<'c> {
             self.overlapped = 0;
         }
         let builder = self.builder.get_or_insert_with(|| {
-            let target = self.limits.target_block_len;
-            let mut builder = match &self.dictionary {
-                Some(dictionary) => RunBuilder::with_dictionary(Arc::clone(dictionary), target),
-                None => RunBuilder::with_target_block_len(self.limits.codec, target),
-            };
+            let mut builder = RunBuilder::with_target_block_compressed(
+                self.limits.codec,
+                self.limits.target_block_compressed,
+            );
             builder.limit_filter_build_bytes(self.hash_bytes);
             builder
         });

@@ -4,7 +4,7 @@
 //!
 //! Zstandard's own allocations go through `malloc` and are not visible here:
 //! a lookup reuses the workspace's decompression context, and decoding with
-//! a prepared dictionary allocates nothing in Zstandard 1.5.
+//! loading raw-content dictionaries allocates nothing in Zstandard 1.5.
 //!
 //! The counting allocator sees every thread, so this binary holds one test,
 //! and the engine runs no worker.
@@ -13,8 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tessera::engine::{
-    CompactionOptions, Compression, DictionaryChoice, Engine, EngineOptions, EngineWorkspace,
-    MergeWorkspace,
+    CompactionOptions, Compression, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
 };
 
 /// The defaults without the background worker: these tests flush and
@@ -87,10 +86,10 @@ fn value(index: u32) -> Vec<u8> {
 }
 
 /// An engine of overlapping flushed runs consolidated by compaction, and the
-/// dictionary choice of each compaction.
-fn consolidated(compression: Compression) -> (Engine, Vec<DictionaryChoice>) {
+/// resulting engine after compactions.
+fn consolidated(compression: Compression) -> Engine {
     let engine = Engine::new(EngineOptions {
-        target_block_len: 4 << 10,
+        target_block_compressed: 4 << 10,
         compression,
         max_runs: usize::MAX,
         max_run_bytes: usize::MAX,
@@ -113,27 +112,15 @@ fn consolidated(compression: Compression) -> (Engine, Vec<DictionaryChoice>) {
         ..CompactionOptions::default()
     };
     let mut workspace = MergeWorkspace::new();
-    let mut choices = Vec::new();
-    while let Some(report) = engine.compact(options, &mut workspace).unwrap() {
-        // A move rewrites nothing and so chooses no dictionary.
-        if report.kind != tessera::engine::CompactionKind::Move {
-            choices.push(report.stats.dictionary);
-        }
-    }
-    (engine, choices)
+    while engine.compact(options, &mut workspace).unwrap().is_some() {}
+    engine
 }
 
 #[test]
 fn warm_lookups_allocate_nothing_and_decode_one_block() {
-    for compression in [Compression::Zstd, Compression::ZstdDictionary] {
-        let (engine, choices) = consolidated(compression);
+    for compression in [Compression::Zstd, Compression::Zstd] {
+        let engine = consolidated(compression);
         assert_eq!(engine.stats().max_overlap, 1);
-        if compression == Compression::ZstdDictionary {
-            assert!(
-                matches!(choices.as_slice(), [DictionaryChoice::Used { .. }]),
-                "{choices:?}"
-            );
-        }
         let lookups = |workspace: &mut EngineWorkspace, from: u32| {
             for j in from..from + 4_000 {
                 let index = j.wrapping_mul(104_729) % RECORDS;

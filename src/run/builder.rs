@@ -1,52 +1,29 @@
-use std::fmt;
-use std::sync::Arc;
-
-use crate::block::{BlockBuilder, BuildError, MAX_KEY_LEN, Value};
-
 use super::codec::{Codec, Compressor};
-use super::dictionary::Trained;
+use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
-use super::frame;
-use super::reader::Run;
 use super::{
-    DICTIONARY_FOOTER_LEN, DICTIONARY_VERSION, FOOTER_LEN, FORMAT_VERSION, MAGIC,
-    MAX_TARGET_BLOCK_LEN, TABLE_ENTRY_LEN, TARGET_BLOCK_LEN,
+    FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
+    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
 };
+use crate::block::{
+    BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, Value, cmp_internal,
+};
+use std::fmt;
 
-/// Encodes records, supplied in internal-key order, into an immutable [`Run`].
-///
-/// Records must arrive by user key ascending, then sequence number descending,
-/// across the whole run. A rejected [`add`](Self::add) changes nothing, and
-/// the result does not depend on rejected records.
-///
-/// Each block is compressed independently as it is cut, so the builder holds
-/// at most one uncompressed block beside the frames already written. Block
-/// boundaries depend only on uncompressed sizes, so they are the same for
-/// every codec.
-///
-/// The builder also hashes each distinct user key, 8 bytes per key until
-/// [`finish`](Self::finish), for the run's in-memory key filter; see
-/// [`Run::filter_bytes`]. The hash buffer doubles as needed and stays below
-/// 16 bytes per distinct key; a run of more than 2^24 distinct keys gets no
-/// filter.
-///
-/// # Block boundaries
-///
-/// A block is cut before a record, which keeps the builder streaming:
-///
-/// - A new user key starts a new block once the block has reached the target,
-///   with the record's midpoint deciding which side of the target is closer.
-/// - A further version of the current key cuts only at twice the target, so
-///   ordinary version chains stay whole and exceptionally long ones span
-///   blocks of bounded size.
-/// - A record at least as large as the target always starts a new block.
+/// Encodes sorted records, buffering at most one raw segment before compressing.
+/// Rejected records leave the builder unchanged. A single oversized record is
+/// stored in its own block and, if necessary, its own segment.
 pub struct RunBuilder {
     target: usize,
+    raw_target: Option<usize>,
     compressor: Compressor,
-    block: BlockBuilder,
-    /// One finished block awaiting compression. Unused without a codec.
-    uncompressed: Vec<u8>,
+    segment: BlockBuilder,
+    last_key: Vec<u8>,
+    last_seq: u64,
+    pending_key_bytes: usize,
     frames: Vec<u8>,
+    dictionaries: Vec<u8>,
+    segments: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
     min_key_len: usize,
@@ -54,46 +31,27 @@ pub struct RunBuilder {
     max_seq: u64,
     key_hashes: KeyHashes,
 }
-
 impl Default for RunBuilder {
-    /// A builder with the default codec and [`TARGET_BLOCK_LEN`].
     fn default() -> Self {
         Self::new(Codec::default())
     }
 }
-
 impl RunBuilder {
-    /// Creates a builder aiming for blocks of [`TARGET_BLOCK_LEN`] bytes
-    /// before compression.
     pub fn new(codec: Codec) -> Self {
-        Self::with_target_block_len(codec, TARGET_BLOCK_LEN)
+        Self::with_target_block_compressed(codec, TARGET_BLOCK_COMPRESSED)
     }
-
-    /// Creates a builder aiming for blocks of `target` bytes before
-    /// compression, reduced to [`MAX_TARGET_BLOCK_LEN`] if larger.
-    ///
-    /// # Panics
-    ///
-    /// If `codec` is [`Codec::ZstdDictionary`], which needs
-    /// [`with_dictionary`](Self::with_dictionary).
-    pub fn with_target_block_len(codec: Codec, target: usize) -> Self {
-        Self::with_compressor(Compressor::new(codec), target)
-    }
-
-    /// Creates a builder like [`with_target_block_len`](Self::with_target_block_len)
-    /// whose blocks are Zstandard frames compressed with `dictionary`. The run
-    /// stores a copy of the dictionary and is written in version 4.
-    pub(crate) fn with_dictionary(dictionary: Arc<Trained>, target: usize) -> Self {
-        Self::with_compressor(Compressor::with_dictionary(dictionary), target)
-    }
-
-    fn with_compressor(compressor: Compressor, target: usize) -> Self {
+    pub fn with_target_block_compressed(codec: Codec, target: usize) -> Self {
         Self {
-            target: target.min(MAX_TARGET_BLOCK_LEN),
-            compressor,
-            block: BlockBuilder::new(),
-            uncompressed: Vec::new(),
+            target: target.clamp(1, RAW_BLOCK_CAP),
+            raw_target: None,
+            compressor: Compressor::new(codec),
+            segment: BlockBuilder::new(),
+            last_key: Vec::new(),
+            last_seq: 0,
+            pending_key_bytes: 0,
             frames: Vec::new(),
+            dictionaries: Vec::new(),
+            segments: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
             min_key_len: 0,
@@ -102,168 +60,201 @@ impl RunBuilder {
             key_hashes: KeyHashes::new(),
         }
     }
-
-    /// Appends one record.
-    pub fn add(&mut self, user_key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
-        self.block.check(user_key, seq, value)?;
-
-        let cut = self.should_cut(user_key, value);
-        if (cut || self.block.is_empty()) && !self.has_room_for_block() {
+    /// Fixed targets used by physical reader tests, including tiny blocks.
+    #[cfg(test)]
+    pub fn with_raw_block_target(codec: Codec, target: usize) -> Self {
+        let mut builder = Self::new(codec);
+        builder.raw_target = Some(target.clamp(1, RAW_BLOCK_CAP));
+        builder
+    }
+    pub fn add(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
+        self.segment.check(key, seq, value)?;
+        if self.record_count > 0 {
+            match cmp_internal(&self.last_key, self.last_seq, key, seq) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return Err(BuildError::DuplicateKey),
+                std::cmp::Ordering::Greater => return Err(BuildError::OutOfOrder),
+            }
+        }
+        // Reserve index room even for a segment made entirely of singleton blocks.
+        if !index_has_room(
+            self.table.len() / TABLE_ENTRY_LEN + self.segment.len(),
+            self.keys.len().saturating_add(self.pending_key_bytes),
+        ) {
             return Err(BuildError::RunFull);
         }
-        if cut {
-            self.cut_block();
+        if !self.segment.is_empty()
+            && self.segment.encoded_len_after(key, seq, value) > SEGMENT_RAW_LEN
+        {
+            self.cut_segment();
         }
-
-        // A record joins a non-empty block only if the block is below twice
-        // the target and the record is below the target. The target is at most
-        // a quarter of the block limit, so BlockFull cannot occur here.
-        self.block.append(user_key, seq, value)?;
+        self.segment.append(key, seq, value)?;
         if self.record_count == 0 {
-            // Records arrive in key order, so the first is the smallest.
-            self.keys.extend_from_slice(user_key);
-            self.min_key_len = user_key.len();
+            self.keys.extend_from_slice(key);
+            self.min_key_len = key.len();
         }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.last_seq = seq;
+        self.pending_key_bytes += key.len();
         self.record_count += 1;
         self.max_seq = self.max_seq.max(seq);
-        self.key_hashes.add(user_key);
+        self.key_hashes.add(key);
         Ok(())
     }
-
-    /// Returns the number of records added so far.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.record_count
     }
-
-    /// Returns whether no records have been added.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.record_count == 0
     }
-
-    /// Returns the length the run would have if finished now, not counting
-    /// the open block.
+    /// Stored bytes so far, excluding the buffered raw segment.
     pub fn stored_len(&self) -> usize {
-        let (dictionary, footer) = match self.compressor.dictionary() {
-            Some(dictionary) => (dictionary.bytes().len(), DICTIONARY_FOOTER_LEN),
-            None => (0, FOOTER_LEN),
-        };
-        self.frames.len() + dictionary + self.table.len() + self.keys.len() + footer
+        self.frames.len()
+            + self.dictionaries.len()
+            + self.segments.len()
+            + self.table.len()
+            + self.keys.len()
+            + FOOTER_LEN
     }
-
-    /// Builds the run without a filter if its distinct keys would need more
-    /// than `bytes` of hash buffer.
     pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
         self.key_hashes.limit_to(bytes / size_of::<u64>());
     }
-
-    /// Returns the bytes held by a compression context, which Zstandard
-    /// allocates outside the Rust heap.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn context_bytes(&self) -> usize {
         self.compressor.context_bytes()
     }
-
-    /// Writes the index and footer and returns the finished run, which is
-    /// valid by construction and is not walked again. A dictionary run also
-    /// stores its dictionary and prepares its own decoding form of it.
     pub fn finish(mut self) -> Run<Vec<u8>> {
-        if !self.block.is_empty() {
-            self.cut_block();
+        self.cut_segment();
+        let dictionaries_offset = self.frames.len();
+        let index_offset = dictionaries_offset + self.dictionaries.len() + self.segments.len();
+        // Segment offsets were relative to the dictionary region while building.
+        for entry in self.segments.as_chunks_mut::<SEGMENT_ENTRY_LEN>().0 {
+            let offset = u64::from_le_bytes(entry[..8].try_into().expect("offset"))
+                + dictionaries_offset as u64;
+            entry[..8].copy_from_slice(&offset.to_le_bytes());
         }
-
-        let block_count = self.table.len() / TABLE_ENTRY_LEN;
-        let dictionary = self.compressor.dictionary().map(Trained::bytes);
-        let dictionary_len = dictionary.map_or(0, <[u8]>::len);
-        let index_offset = self.frames.len() + dictionary_len;
         let mut data = self.frames;
-        data.reserve_exact(
-            dictionary_len + self.table.len() + self.keys.len() + DICTIONARY_FOOTER_LEN,
-        );
-        if let Some(dictionary) = dictionary {
-            data.extend_from_slice(dictionary);
-        }
+        data.extend_from_slice(&self.dictionaries);
+        data.extend_from_slice(&self.segments);
         data.extend_from_slice(&self.table);
         data.extend_from_slice(&self.keys);
         data.extend_from_slice(&(index_offset as u64).to_le_bytes());
         data.extend_from_slice(&(self.record_count as u64).to_le_bytes());
-        // has_room_for_block keeps the block count within u32.
-        data.extend_from_slice(&(block_count as u32).to_le_bytes());
-        // A key is at most MAX_KEY_LEN.
+        data.extend_from_slice(&((self.table.len() / TABLE_ENTRY_LEN) as u32).to_le_bytes());
         data.extend_from_slice(&(self.min_key_len as u32).to_le_bytes());
-        let prepared = match dictionary {
-            None => {
-                data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-                None
-            }
-            Some(dictionary) => {
-                // A trained dictionary is at most DICTIONARY_LEN.
-                data.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
-                data.extend_from_slice(&crc32fast::hash(dictionary).to_le_bytes());
-                data.extend_from_slice(&DICTIONARY_VERSION.to_le_bytes());
-                let trained = self.compressor.dictionary().expect("a dictionary run");
-                Some(Arc::clone(trained.prepared()))
-            }
-        };
+        data.extend_from_slice(&(dictionaries_offset as u64).to_le_bytes());
+        data.extend_from_slice(&((self.segments.len() / SEGMENT_ENTRY_LEN) as u32).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         data.shrink_to_fit();
-        Run::from_builder(data, self.key_hashes.finish(), self.max_seq, prepared)
+        Run::from_builder(data, self.key_hashes.finish(), self.max_seq)
     }
-
-    fn should_cut(&self, user_key: &[u8], value: Value<'_>) -> bool {
-        if self.block.is_empty() {
-            return false;
+    fn cut_segment(&mut self) {
+        if self.segment.is_empty() {
+            return;
         }
-        let value_len = match value {
-            Value::Bytes(bytes) => bytes.len(),
-            Value::Tombstone => 0,
-        };
-        let record_len = user_key.len() + value_len;
-        if record_len >= self.target {
-            return true;
-        }
-        let limit = if self.block.last_key() == user_key {
-            2 * self.target
-        } else {
-            self.target
-        };
-        self.block.encoded_len() + record_len / 2 >= limit
-    }
-
-    fn has_room_for_block(&self) -> bool {
-        index_has_room(self.table.len() / TABLE_ENTRY_LEN, self.keys.len())
-    }
-
-    fn cut_block(&mut self) {
-        let frame_offset = self.frames.len();
-        let block_len = self.block.encoded_len();
+        let count = self.segment.len();
+        self.pending_key_bytes = 0;
+        let mut raw = Vec::new();
+        self.segment.flush_into(&mut raw);
         let codec = self.compressor.codec();
-
-        self.frames.resize(frame_offset + frame::HEADER_LEN, 0);
-        if codec == Codec::None {
-            self.block.flush_into(&mut self.frames);
+        let dictionary = if codec == Codec::Zstd {
+            dictionary::sample(&raw, count)
         } else {
-            self.uncompressed.clear();
-            self.block.flush_into(&mut self.uncompressed);
+            Vec::new()
+        };
+        let reference = if codec == Codec::Zstd {
+            let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
+            assert!(id < 1 << 24, "segment reference fits in 24 bits");
+            self.segments
+                .extend_from_slice(&(self.dictionaries.len() as u64).to_le_bytes());
+            self.segments
+                .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
+            self.segments
+                .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
+            self.dictionaries.extend_from_slice(&dictionary);
+            id as u32
+        } else {
+            0
+        };
+        let target = self.raw_target.unwrap_or_else(|| {
+            if codec == Codec::None {
+                return TARGET_BLOCK_LEN;
+            }
+            let start = if raw.len() <= SAMPLE_LEN {
+                0
+            } else {
+                raw.len() / 2
+            };
+            let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
+            let mut compressed = Vec::new();
             self.compressor
-                .compress(&self.uncompressed, &mut self.frames);
+                .compress(sample, &dictionary, &mut compressed);
+            self.target
+                .saturating_mul(sample.len())
+                .checked_div(compressed.len())
+                .unwrap_or(1)
+                .clamp(1, RAW_BLOCK_CAP)
+        });
+        let view = BlockView::open(&raw).expect("builder's segment");
+        let mut cursor = BlockPosition::new();
+        let mut block = BlockBuilder::new();
+        let mut uncompressed = Vec::new();
+        while let Some(record) = cursor.next_record(view).expect("builder's record") {
+            let projected = block.encoded_len_after(record.key, record.seq, record.value);
+            let cut = if self.raw_target.is_some() {
+                let record_len = record.key.len()
+                    + match record.value {
+                        Value::Bytes(v) => v.len(),
+                        Value::Tombstone => 0,
+                    };
+                let limit = if block.last_key() == record.key {
+                    2 * target
+                } else {
+                    target
+                };
+                record_len >= target
+                    || block.encoded_len() + record_len / 2 >= limit
+                    || projected > RAW_BLOCK_CAP
+            } else {
+                projected > target
+            };
+            if !block.is_empty() && cut {
+                self.cut_block(&mut block, &mut uncompressed, &dictionary, reference);
+            }
+            block
+                .append(record.key, record.seq, record.value)
+                .expect("one record fits a block");
         }
-        frame::seal(&mut self.frames[frame_offset..], codec, block_len);
-
-        self.keys.extend_from_slice(self.block.last_key());
-        self.table
-            .extend_from_slice(&(frame_offset as u64).to_le_bytes());
-        // has_room_for_block admitted this block with its key space reserved.
+        if !block.is_empty() {
+            self.cut_block(&mut block, &mut uncompressed, &dictionary, reference);
+        }
+    }
+    fn cut_block(
+        &mut self,
+        block: &mut BlockBuilder,
+        raw: &mut Vec<u8>,
+        dictionary: &[u8],
+        reference: u32,
+    ) {
+        let offset = self.frames.len();
+        let len = block.encoded_len();
+        let codec = self.compressor.codec();
+        self.frames.resize(offset + frame::HEADER_LEN, 0);
+        if codec == Codec::None {
+            block.flush_into(&mut self.frames);
+        } else {
+            raw.clear();
+            block.flush_into(raw);
+            self.compressor.compress(raw, dictionary, &mut self.frames);
+        }
+        frame::seal(&mut self.frames[offset..], codec, len, reference);
+        self.keys.extend_from_slice(block.last_key());
+        self.table.extend_from_slice(&(offset as u64).to_le_bytes());
         self.table
             .extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
     }

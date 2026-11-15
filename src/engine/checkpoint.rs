@@ -100,12 +100,9 @@
 //! [`SnapshotLimits`](super::SnapshotLimits) as retained bytes, like any
 //! snapshot's. Beside them it holds one run being built (input up to the
 //! engine's `target_run_len`), one decoded block per run it reads, and no
-//! copy of the database. With
-//! [`Compression::ZstdDictionary`](super::Compression::ZstdDictionary) it
-//! first samples the snapshot's runs and trains a dictionary, as a compaction
-//! does, before writing any file: about 21 MiB while training, and the
-//! trained dictionary until the last run is written.
-//! No limit is applied to that, as none is to the rest of a checkpoint's
+//! copy of the database. The builder buffers one roughly 4 MiB segment for
+//! its raw dictionary and adaptive block estimate. No limit is applied to
+//! that, as none is to the rest of a checkpoint's
 //! memory. On disk it needs the new checkpoint beside the
 //! previous one until the previous is removed, and
 //! [`CheckpointOptions::max_bytes`] bounds the new one.
@@ -128,8 +125,7 @@ use crc32fast::Hasher;
 
 use crate::block::Value;
 use crate::run::{
-    CorruptRun, DICTIONARY_WORKSPACE, DictionaryChoice, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD,
-    ReadError, Run, RunBuilder, RunView, choose_dictionary,
+    CorruptRun, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD, ReadError, Run, RunBuilder,
 };
 
 use super::levels::{LEVEL0_STOP, Levels};
@@ -146,7 +142,7 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 /// Magic, version, flags, generation, ceiling, records and run count.
 const MANIFEST_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4;
 const MANIFEST_ENTRY_LEN: usize = 12;
@@ -186,9 +182,6 @@ pub struct CheckpointReport {
     pub bytes: u64,
     /// The largest run, the most run bytes held in memory at once.
     pub largest_run_bytes: usize,
-    /// Whether its runs were compressed with a dictionary, and why not; see
-    /// [`Compression::ZstdDictionary`](super::Compression::ZstdDictionary).
-    pub dictionary: DictionaryChoice,
     /// Older checkpoint directories removed: the previous one and leftovers
     /// of interrupted attempts.
     pub reclaimed: usize,
@@ -626,15 +619,12 @@ struct Written {
     manifest: Manifest,
     bytes: u64,
     largest_run_bytes: usize,
-    dictionary: DictionaryChoice,
 }
 
 /// Streams the snapshot's live keys into run files in `path`, then writes
 /// the manifest, syncing each file and the directory.
 ///
-/// With dictionaries enabled, one is first chosen from samples of the
-/// snapshot's runs, as for a compaction, with the training workspace
-/// allowed in full; the memtables' records are not sampled.
+/// Run builders sample raw dictionaries from the records being written.
 fn write_runs(
     core: &Core,
     snapshot: &super::Snapshot,
@@ -652,21 +642,6 @@ fn write_runs(
         },
         bytes: 0,
         largest_run_bytes: 0,
-        dictionary: DictionaryChoice::Off,
-    };
-    let trained = if core.dictionary {
-        let views: Vec<RunView<'_>> = snapshot
-            .runs
-            .runs()
-            .iter()
-            .map(|run| run.run.view())
-            .collect();
-        let choice = choose_dictionary(&views, core.target_block_len, DICTIONARY_WORKSPACE)
-            .map_err(|error| CheckpointError::Read(ReadError::Corrupt(error)))?;
-        written.dictionary = choice.outcome;
-        choice.trained
-    } else {
-        None
     };
     let emit = |run: Run<Vec<u8>>, written: &mut Written| -> Result<(), Failure> {
         let bytes = run.as_bytes();
@@ -695,11 +670,8 @@ fn write_runs(
     let mut builder: Option<RunBuilder> = None;
     let mut input = 0;
     while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
-        let open = builder.get_or_insert_with(|| match &trained {
-            Some(trained) => {
-                RunBuilder::with_dictionary(Arc::clone(trained), core.target_block_len)
-            }
-            None => RunBuilder::with_target_block_len(core.codec, core.target_block_len),
+        let open = builder.get_or_insert_with(|| {
+            RunBuilder::with_target_block_compressed(core.codec, core.target_block_compressed)
         });
         // Keys and values came from runs and memtables that held them.
         open.add(record.key, record.seq, Value::Bytes(record.value))
@@ -855,7 +827,6 @@ impl Engine {
             manifest,
             bytes,
             largest_run_bytes,
-            dictionary,
         } = written;
         Ok(CheckpointReport {
             generation,
@@ -864,7 +835,6 @@ impl Engine {
             runs: manifest.runs.len(),
             bytes,
             largest_run_bytes,
-            dictionary,
             reclaimed,
             unreclaimed,
         })

@@ -19,14 +19,14 @@ type Owned = (Vec<u8>, u64, Option<Vec<u8>>);
 type Newest = (u64, Option<Vec<u8>>);
 type Model = BTreeMap<(Vec<u8>, Reverse<u64>), Option<Vec<u8>>>;
 
-const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
-const COMPRESSED: [Codec; 2] = [Codec::Lz4, Codec::Zstd];
+const CODECS: [Codec; 2] = [Codec::None, Codec::Zstd];
+const COMPRESSED: [Codec; 1] = [Codec::Zstd];
 const RECORD_BOUND: usize = 200_000;
 /// Bounds retained bytes too, since values can be megabytes long.
 const RETAINED_BOUND: usize = 512 << 20;
 const HEADER: usize = 12;
 const ENTRY: usize = 12;
-const FOOTER: usize = 32;
+const FOOTER: usize = 48;
 
 fn rec(key: &[u8], seq: u64, value: Option<&[u8]>) -> Owned {
     (key.to_vec(), seq, value.map(<[u8]>::to_vec))
@@ -55,7 +55,7 @@ fn owned(record: Record<'_>) -> Owned {
 }
 
 fn build(codec: Codec, records: &[Owned], target: usize) -> Run<Vec<u8>> {
-    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(codec, target);
     for (key, seq, value) in records {
         builder.add(key, *seq, as_value(value)).unwrap();
     }
@@ -139,7 +139,7 @@ fn frame_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
             let end = if i + 1 < l.block_count {
                 u64_at(bytes, l.table + (i + 1) * ENTRY) as usize
             } else {
-                l.table
+                u64_at(bytes, l.footer + 24) as usize
             };
             (start, end)
         })
@@ -165,51 +165,50 @@ fn reseal(bytes: &mut [u8]) {
 fn codec_byte(codec: Codec) -> u8 {
     match codec {
         Codec::None => 0,
-        Codec::Lz4 => 1,
-        Codec::Zstd => 2,
-        Codec::ZstdDictionary => 3,
+        Codec::Zstd => 1,
     }
 }
-
 fn compress(codec: Codec, block: &[u8]) -> Vec<u8> {
-    match codec {
-        Codec::None => block.to_vec(),
-        Codec::Lz4 => {
-            let mut out = vec![0; lz4_flex::block::get_maximum_output_size(block.len())];
-            let written = lz4_flex::block::compress_into(block, &mut out).unwrap();
-            out.truncate(written);
-            out
-        }
-        Codec::Zstd => {
-            let mut out = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
-            zstd_safe::compress(&mut out, block, 3).unwrap();
-            out
-        }
-        Codec::ZstdDictionary => unreachable!("needs a dictionary: see tests::dictionary"),
+    if codec == Codec::None {
+        return block.to_vec();
     }
+    let mut out = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
+    zstd_safe::compress(&mut out, block, 3).unwrap();
+    out
 }
-
-fn decode_frame(frame: &[u8]) -> Vec<u8> {
+fn decode_frame(frame: &[u8], dictionary: &[u8]) -> Vec<u8> {
     let stored = &frame[HEADER..];
     let mut out = vec![0; u32_at(frame, 4) as usize];
     match frame[0] {
         0 => out.copy_from_slice(stored),
         1 => {
-            lz4_flex::block::decompress_into(stored, &mut out).unwrap();
-        }
-        2 => {
-            zstd_safe::decompress(&mut out[..], stored).unwrap();
+            zstd_safe::DCtx::create()
+                .decompress_using_dict(&mut out[..], stored, dictionary)
+                .unwrap();
         }
         other => panic!("codec {other}"),
     }
     out
+}
+fn dictionary_of<'a>(bytes: &'a [u8], frame: &[u8]) -> &'a [u8] {
+    if frame[0] == 0 {
+        return &[];
+    }
+    let footer = bytes.len() - FOOTER;
+    let segments = u64_at(bytes, footer) as usize - u32_at(bytes, footer + 32) as usize * 16;
+    let reference = u32::from_le_bytes([frame[1], frame[2], frame[3], 0]) as usize;
+    let entry = segments + (reference - 1) * 16;
+    let start = u64_at(bytes, entry) as usize;
+    &bytes[start..start + u32_at(bytes, entry + 8) as usize]
 }
 
 /// Returns each decoded block's bytes.
 fn decoded_blocks(bytes: &[u8]) -> Vec<Vec<u8>> {
     frame_ranges(bytes)
         .into_iter()
-        .map(|(start, end)| decode_frame(&bytes[start..end]))
+        .map(|(start, end)| {
+            decode_frame(&bytes[start..end], dictionary_of(bytes, &bytes[start..end]))
+        })
         .collect()
 }
 
@@ -304,7 +303,7 @@ fn assemble_frames_with_min(
     let mut keys = min_key.to_vec();
     for ((codec, decoded_len, stored), key) in frames.iter().zip(last_keys) {
         table.extend_from_slice(&(run.len() as u64).to_le_bytes());
-        let mut header = vec![*codec, 0, 0, 0];
+        let mut header = vec![*codec, u8::from(*codec == 1), 0, 0];
         header.extend_from_slice(&decoded_len.to_le_bytes());
         let sum = checksum(&header, stored);
         run.extend_from_slice(&header);
@@ -313,6 +312,14 @@ fn assemble_frames_with_min(
         keys.extend_from_slice(key);
         table.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     }
+    let dictionaries_offset = run.len() as u64;
+    let has_dictionary = frames.iter().any(|f| f.0 == 1);
+    if has_dictionary {
+        run.push(0);
+        run.extend_from_slice(&dictionaries_offset.to_le_bytes());
+        run.extend_from_slice(&1u32.to_le_bytes());
+        run.extend_from_slice(&crc32fast::hash(&[0]).to_le_bytes());
+    }
     let index_offset = run.len() as u64;
     run.extend_from_slice(&table);
     run.extend_from_slice(&keys);
@@ -320,7 +327,10 @@ fn assemble_frames_with_min(
     run.extend_from_slice(&record_count.to_le_bytes());
     run.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     run.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
-    run.extend_from_slice(&3u32.to_le_bytes());
+    run.extend_from_slice(&dictionaries_offset.to_le_bytes());
+    run.extend_from_slice(&u32::from(has_dictionary).to_le_bytes());
+    run.extend_from_slice(&0u32.to_le_bytes());
+    run.extend_from_slice(&5u32.to_le_bytes());
     run.extend_from_slice(b"TSRA");
     run
 }
@@ -437,7 +447,9 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
         &[2, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0],
         &[1, 0, 0, 0],
-        &[3, 0, 0, 0],
+        &[51, 0, 0, 0, 0, 0, 0, 0],
+        &[0; 8],
+        &[5, 0, 0, 0],
         b"TSRA",
     ]
     .concat();
@@ -447,18 +459,16 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
 #[test]
 fn compressed_frames_match_independent_codec_output() {
     let records = sample_records(200);
-    for codec in COMPRESSED {
-        let run = build(codec, &records, 512);
-        let decoded = decoded_blocks(run.as_bytes());
-        let last_keys: Vec<Vec<u8>> = blocks(&run)
-            .iter()
-            .map(|block| block.last().unwrap().0.clone())
-            .collect();
-        let key_refs: Vec<&[u8]> = last_keys.iter().map(Vec::as_slice).collect();
-        assert_eq!(
-            run.as_bytes(),
-            assemble(codec, &decoded, &key_refs, records.len() as u64)
-        );
+    let run = build(Codec::Zstd, &records, 512);
+    for (start, end) in frame_ranges(run.as_bytes()) {
+        let frame = &run.as_bytes()[start..end];
+        let dictionary = dictionary_of(run.as_bytes(), frame);
+        let decoded = decode_frame(frame, dictionary);
+        let mut expected = Vec::with_capacity(zstd_safe::compress_bound(decoded.len()));
+        zstd_safe::CCtx::create()
+            .compress_using_dict(&mut expected, &decoded, dictionary, 3)
+            .unwrap();
+        assert_eq!(&frame[HEADER..], expected);
     }
 }
 
@@ -496,52 +506,21 @@ fn block_boundaries_do_not_depend_on_the_codec() {
     }
 }
 
-/// Encodes a valid one-record block as an LZ4 stream using the longest possible
-/// match, which is the most the format can expand. Returns the stored bytes and
-/// the decoded length.
-fn maximal_lz4_block(value_len: usize) -> (Vec<u8>, usize) {
-    let mut literals = Vec::new();
-    leb128(0, &mut literals); // shared
-    leb128(1, &mut literals); // suffix_len
-    leb128(value_len as u64 + 1, &mut literals); // value_tag
-    leb128(1, &mut literals); // seq
-    literals.extend_from_slice(b"ax"); // key, then the first value byte
-    let directory = [0, 0, 0, 0, 1, 0, 0, 0];
-
-    let extension = value_len - 1 - 19;
-    let mut stored = vec![(literals.len() as u8) << 4 | 15];
-    stored.extend_from_slice(&literals);
-    stored.extend_from_slice(&[1, 0]); // Copy the previous byte.
-    stored.resize(stored.len() + extension / 255, 255);
-    stored.push((extension % 255) as u8);
-    stored.push((directory.len() as u8) << 4);
-    stored.extend_from_slice(&directory);
-
-    (stored, literals.len() + value_len - 1 + directory.len())
-}
-
-#[test]
-fn maximal_lz4_expansion_is_accepted() {
-    let value_len = 8 << 20;
-    let (stored, decoded_len) = maximal_lz4_block(value_len);
-    assert!(decoded_len > 254 * stored.len(), "ratio is not extreme");
-    assert!(decoded_len < 255 * stored.len());
-
-    let frames = [(1, decoded_len as u32, stored)];
-    let bytes = assemble_frames(&frames, &[b"a"], 1);
-    let run = Run::new(bytes.as_slice()).unwrap();
-    assert_eq!(newest(&run, b"a"), Some((1, Some(vec![b'x'; value_len]))));
-}
-
+/// Very high compression ratios remain valid, including oversized records.
 #[test]
 fn highly_repetitive_data_round_trips_at_extreme_ratios() {
     let value_len = 8 << 20;
     let values = [vec![0; value_len], b"abcd".repeat(value_len / 4)];
     for value in &values {
         let records = vec![rec(b"a", 2, Some(value)), rec(b"b", 1, Some(value))];
-        for (codec, least_ratio) in [(Codec::Lz4, 200), (Codec::Zstd, 1000)] {
+        {
+            let (codec, least_ratio) = (Codec::Zstd, 1000);
             let run = build(codec, &records, TARGET_BLOCK_LEN);
-            let ratio = 2 * value_len / run.as_bytes().len();
+            let stored: usize = frame_ranges(run.as_bytes())
+                .iter()
+                .map(|(a, b)| b - a - HEADER)
+                .sum();
+            let ratio = 2 * value_len / stored;
             assert!(ratio >= least_ratio, "{codec:?} ratio {ratio}");
             let validated = Run::new(run.as_bytes()).unwrap();
             assert_eq!(all(&validated), records);
@@ -615,7 +594,7 @@ fn multiple_blocks_preserve_order_and_every_key() {
 #[test]
 fn locate_selects_the_only_candidate_block() {
     let records = sample_records(1000);
-    let run = build(Codec::Lz4, &records, 512);
+    let run = build(Codec::Zstd, &records, 512);
     let view = run.view();
     for (index, block) in blocks(&run).iter().enumerate() {
         for (key, ..) in block {
@@ -931,7 +910,7 @@ fn builder_rejects_invalid_ordering() {
 fn ordering_is_enforced_across_block_boundaries() {
     for codec in CODECS {
         // A target of 1 cuts on every record.
-        let mut builder = RunBuilder::with_target_block_len(codec, 1);
+        let mut builder = RunBuilder::with_raw_block_target(codec, 1);
         builder.add(b"k", 5, Value::Bytes(b"xx")).unwrap();
         builder.add(b"l", 5, Value::Bytes(b"xx")).unwrap();
         for (key, seq, error) in [
@@ -946,7 +925,7 @@ fn ordering_is_enforced_across_block_boundaries() {
 
 #[test]
 fn limit_rejections_are_reported() {
-    let mut builder = RunBuilder::new(Codec::Lz4);
+    let mut builder = RunBuilder::new(Codec::Zstd);
     let key = vec![b'k'; crate::block::MAX_KEY_LEN + 1];
     assert_eq!(
         builder.add(&key, 1, Value::Tombstone),
@@ -960,7 +939,7 @@ fn rejected_records_do_not_change_the_layout() {
     let records = sample_records(300);
     for codec in CODECS {
         let clean = build(codec, &records, 128);
-        let mut builder = RunBuilder::with_target_block_len(codec, 128);
+        let mut builder = RunBuilder::with_raw_block_target(codec, 128);
         for (key, seq, value) in &records {
             // A large out-of-order record would force a cut if it were not
             // rejected first.
@@ -1000,12 +979,12 @@ fn runs_work_over_shared_and_borrowed_storage() {
 }
 
 /// Beside its storage a run holds two pointers, to the key filter its
-/// builder made and to its prepared dictionary, if any, its largest
+/// builder made, its largest
 /// sequence number, and the four offsets of its smallest and largest keys
 /// with a word saying whether it has any.
 #[test]
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
-    let extra = 2 * size_of::<usize>() + size_of::<u64>() + 5 * size_of::<usize>();
+    let extra = size_of::<usize>() + size_of::<u64>() + 5 * size_of::<usize>();
     assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<Vec<u8>>() + extra);
     assert_eq!(size_of::<Run<&[u8]>>(), size_of::<&[u8]>() + extra);
 }
@@ -1070,9 +1049,9 @@ fn one_workspace_serves_runs_of_every_codec() {
         .collect();
     let runs = [
         build(Codec::Zstd, &large, 8192),
-        build(Codec::Lz4, &small, 128),
+        build(Codec::Zstd, &small, 128),
         build(Codec::None, &small, 128),
-        build(Codec::Lz4, &large, 8192),
+        build(Codec::Zstd, &large, 8192),
         build(Codec::Zstd, &small, 128),
     ];
     let mut workspace = ReadWorkspace::new();
@@ -1173,9 +1152,9 @@ fn malformed_structures_are_rejected() {
 
     #[rustfmt::skip]
     let cases: &[(&str, Mutation, RunCorruption)] = &[
-        ("magic", |b, l| b[l.footer + 31] ^= 1, InvalidMagic),
-        ("version 2", |b, l| put_u32(b, l.footer + 24, 2), UnsupportedVersion),
-        ("version 5", |b, l| put_u32(b, l.footer + 24, 5), UnsupportedVersion),
+        ("magic", |b, l| b[l.footer + 47] ^= 1, InvalidMagic),
+        ("version 2", |b, l| put_u32(b, l.footer + 40, 2), UnsupportedVersion),
+        ("version 5", |b, l| put_u32(b, l.footer + 40, 6), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),
         ("block count too large", |b, l| put_u32(b, l.footer + 16, u32::MAX), InvalidFooter),
@@ -1215,39 +1194,38 @@ fn malformed_structures_are_rejected() {
 type HeaderMutation = fn(&mut Vec<u8>);
 
 /// Header damage behind a correct checksum, so the checks behind it run. The
-/// expected kinds are for uncompressed, LZ4 and Zstandard frames.
+/// expected kinds are for uncompressed and Zstandard frames.
 #[test]
 fn invalid_frame_headers_are_rejected_behind_a_valid_checksum() {
     use RunCorruption::*;
 
-    let cases: [(&str, HeaderMutation, [RunCorruption; 3]); 6] = [
-        ("unknown codec", |b| b[0] = 4, [UnsupportedCodec; 3]),
+    let cases: [(&str, HeaderMutation, [RunCorruption; 2]); 5] = [
+        ("unknown codec", |b| b[0] = 4, [UnsupportedCodec; 2]),
         (
-            "dictionary codec in a run without one",
-            |b| b[0] = 3,
-            [MissingDictionary; 3],
+            "dictionary reference",
+            |b| b[2] = 1,
+            [InvalidFrame, MissingDictionary],
         ),
-        ("reserved", |b| b[2] = 1, [InvalidFrame; 3]),
         (
             "decoded length over the limit",
             |b| put_u32(b, 4, MAX_BLOCK_LEN as u32 + 1),
-            [InvalidFrame; 3],
+            [InvalidFrame; 2],
         ),
         (
             "decoded length one too long",
             |b| {
-                let len = u32_at(b, 4);
-                put_u32(b, 4, len + 1);
+                let n = u32_at(b, 4);
+                put_u32(b, 4, n + 1);
             },
-            [InvalidFrame, CorruptPayload, InvalidFrame],
+            [InvalidFrame; 2],
         ),
         (
             "decoded length one too short",
             |b| {
-                let len = u32_at(b, 4);
-                put_u32(b, 4, len - 1);
+                let n = u32_at(b, 4);
+                put_u32(b, 4, n - 1);
             },
-            [InvalidFrame, CorruptPayload, InvalidFrame],
+            [InvalidFrame; 2],
         ),
     ];
     for (index, codec) in CODECS.into_iter().enumerate() {
@@ -1257,7 +1235,9 @@ fn invalid_frame_headers_are_rejected_behind_a_valid_checksum() {
             reseal(&mut bytes);
             let error = Run::new(bytes.as_slice()).expect_err(name);
             assert_eq!(error.kind, kinds[index], "{codec:?} {name}");
-            assert_eq!(error.offset, 0, "{codec:?} {name}");
+            if *name != "dictionary reference" {
+                assert_eq!(error.offset, 0, "{codec:?} {name}");
+            }
             // A lookup of a key in that frame reports the same problem.
             let mut workspace = ReadWorkspace::new();
             let view = RunView::open(&bytes).unwrap();
@@ -1274,7 +1254,6 @@ fn invalid_frame_headers_are_rejected_behind_a_valid_checksum() {
 fn a_gap_between_frames_is_rejected() {
     for (codec, kind) in [
         (Codec::None, RunCorruption::InvalidFrame),
-        (Codec::Lz4, RunCorruption::ChecksumMismatch),
         (Codec::Zstd, RunCorruption::ChecksumMismatch),
     ] {
         let mut bytes = three_block_bytes(codec);
@@ -1334,7 +1313,7 @@ fn malformed_blocks_report_their_position_in_the_run() {
     // Inside a compressed block, the position is the frame's.
     let mut overrun = good.clone();
     overrun[1] = 100;
-    for (codec, offset) in [(Codec::None, HEADER), (Codec::Lz4, 0), (Codec::Zstd, 0)] {
+    for (codec, offset) in [(Codec::None, HEADER), (Codec::Zstd, 0)] {
         let bytes = assemble(codec, std::slice::from_ref(&overrun), &[b"a"], 1);
         let error = Run::new(bytes.as_slice()).unwrap_err();
         assert_eq!(error.kind, RunCorruption::Block(Corruption::Truncated));
@@ -1479,11 +1458,10 @@ fn implausible_decoded_lengths_allocate_nothing() {
     }
 }
 
-/// An LZ4 payload this long could expand past the limit, so only the limit
-/// itself stands between the declared length and a very large buffer.
+/// An excessive declared length is refused before inspecting the payload.
 #[test]
 fn decoded_lengths_over_the_block_limit_allocate_nothing() {
-    let stored = vec![0; (MAX_BLOCK_LEN + 1) / 255 + 1];
+    let stored = vec![0; 32];
     let frames = [(1, MAX_BLOCK_LEN as u32 + 1, stored)];
     let bytes = assemble_frames(&frames, &[b"a"], 1);
     let mut workspace = ReadWorkspace::new();
@@ -1498,10 +1476,8 @@ fn decoded_lengths_over_the_block_limit_allocate_nothing() {
 #[test]
 fn output_larger_than_declared_is_rejected_within_the_declared_size() {
     let zeros = vec![0; 1 << 20];
-    for (codec, kind) in [
-        (Codec::Lz4, RunCorruption::CorruptPayload),
-        (Codec::Zstd, RunCorruption::InvalidFrame),
-    ] {
+    {
+        let (codec, kind) = (Codec::Zstd, RunCorruption::InvalidFrame);
         let frames = [(codec_byte(codec), 1024, compress(codec, &zeros))];
         let bytes = assemble_frames(&frames, &[b"a"], 1);
         let mut workspace = ReadWorkspace::new();
@@ -1521,7 +1497,7 @@ fn zstd_frames_must_declare_their_content_size() {
     let mut stored = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
     context.compress2(&mut stored, &block).unwrap();
 
-    let frames = [(2, block.len() as u32, stored)];
+    let frames = [(1, block.len() as u32, stored)];
     let bytes = assemble_frames(&frames, &[b"a"], 1);
     assert_eq!(
         Run::new(bytes.as_slice()).unwrap_err().kind,
@@ -1556,7 +1532,7 @@ fn truncated_compressed_payloads_are_rejected() {
 #[test]
 fn codec_confusion_is_rejected() {
     let block = raw_block(&sample_records(40));
-    for (written, claimed) in [(Codec::Lz4, Codec::Zstd), (Codec::Zstd, Codec::Lz4)] {
+    for (written, claimed) in [(Codec::None, Codec::Zstd), (Codec::Zstd, Codec::None)] {
         let frames = [(
             codec_byte(claimed),
             block.len() as u32,
@@ -1655,7 +1631,7 @@ fn errors_format_their_offset_and_reason() {
 }
 
 #[test]
-fn the_default_builder_uses_zstandard_and_16_kib_blocks() {
+fn the_default_builder_uses_adaptive_zstandard_blocks() {
     assert_eq!(TARGET_BLOCK_LEN, 16 << 10);
     let records: Vec<Owned> = (0..4000)
         .map(|i| rec(format!("key:{i:06}").as_bytes(), 1, Some(&[7; 40])))
@@ -1666,13 +1642,17 @@ fn the_default_builder_uses_zstandard_and_16_kib_blocks() {
     }
     let run = builder.finish();
     assert_eq!(run.as_bytes()[0], codec_byte(Codec::Zstd));
-    let explicit = build(Codec::Zstd, &records, TARGET_BLOCK_LEN);
+    let mut explicit = RunBuilder::new(Codec::Zstd);
+    for (key, seq, value) in &records {
+        explicit.add(key, *seq, as_value(value)).unwrap();
+    }
+    let explicit = explicit.finish();
     assert_eq!(run.as_bytes(), explicit.as_bytes());
     let blocks = decoded_blocks(run.as_bytes());
     assert!(
         blocks
             .iter()
-            .all(|block| block.len() <= (TARGET_BLOCK_LEN * 5) / 4)
+            .all(|block| block.len() <= crate::run::RAW_BLOCK_CAP)
     );
     assert_eq!(all(&run), records);
 }

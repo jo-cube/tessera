@@ -9,7 +9,7 @@ use crate::block::{
     Value,
 };
 use crate::memtable::{Memtable, TARGET_RUN_LEN};
-use crate::run::{Codec, MAX_TARGET_BLOCK_LEN, ReadWorkspace, Run, RunBuilder};
+use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder};
 
 #[test]
 #[ignore = "large allocations; run with scripts/validate.sh limits"]
@@ -84,10 +84,10 @@ fn block_may_fill_exactly_to_the_length_limit() {
 fn run_never_reports_a_full_block() {
     let largest = vec![1; MAX_VALUE_LEN];
     // Just below the target, so these are not treated as oversized.
-    let near_target = vec![2; MAX_TARGET_BLOCK_LEN - 2];
+    let near_target = vec![2; RAW_BLOCK_CAP - 2];
 
-    for codec in [Codec::None, Codec::Lz4, Codec::Zstd] {
-        let mut builder = RunBuilder::with_target_block_len(codec, usize::MAX);
+    for codec in [Codec::None, Codec::Zstd] {
+        let mut builder = RunBuilder::with_raw_block_target(codec, usize::MAX);
         builder.add(b"a", 2, Value::Bytes(&largest)).unwrap();
         builder.add(b"a", 1, Value::Bytes(&largest)).unwrap();
         for seq in (0..3).rev() {

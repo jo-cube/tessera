@@ -14,7 +14,7 @@ use crate::run::{
 type Input = (Vec<u8>, u64, Option<Vec<u8>>);
 type Live = (Vec<u8>, u64, Vec<u8>);
 
-const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
+const CODECS: [Codec; 2] = [Codec::None, Codec::Zstd];
 const RECORD_BOUND: usize = 200_000;
 const RETAINED_BOUND: usize = 64 << 20;
 const SMALL_BLOCK: usize = 1024;
@@ -43,7 +43,7 @@ fn owned(record: LiveRecord<'_>) -> Live {
 fn build(codec: Codec, records: &[Input], target: usize) -> Run<Vec<u8>> {
     let mut sorted: Vec<&Input> = records.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(codec, target);
     for (key, seq, value) in sorted {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();
@@ -115,7 +115,7 @@ fn model_live(latest: &BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>) -> Vec<Live> {
 }
 
 fn frame_start(bytes: &[u8], frame: usize) -> usize {
-    let footer = bytes.len() - 32;
+    let footer = bytes.len() - 48;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let at = table + frame * 12;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
@@ -542,7 +542,7 @@ fn mixed_codecs_and_block_sizes_agree_with_the_model() {
     let runs: Vec<_> = inputs
         .iter()
         .enumerate()
-        .map(|(i, input)| build(CODECS[i % 3], input, [128, 1024, 8192][i % 3]))
+        .map(|(i, input)| build(CODECS[i % CODECS.len()], input, [128, 1024, 8192][i % 3]))
         .collect();
     let views = views(&runs);
     let mut workspace = LogicalWorkspace::new();
@@ -602,7 +602,7 @@ fn a_damaged_run_fails_only_lookups_that_read_it() {
     let records = numbered(600);
     let (bytes, error) = damaged(&records, 1);
     let bad = RunView::open(&bytes).unwrap();
-    let good = build(Codec::Lz4, &[put(b"zz", 1, b"elsewhere")], SMALL_BLOCK);
+    let good = build(Codec::Zstd, &[put(b"zz", 1, b"elsewhere")], SMALL_BLOCK);
     let views = [good.view(), bad];
     let set = RunSet::new(&views);
     let inside = records
@@ -689,8 +689,8 @@ fn the_workspace_reports_and_reuses_what_it_retains() {
     assert_eq!(rest(&mut set.cursor(&mut workspace)).unwrap().len(), 400);
     assert_eq!(workspace.blocks_loaded(), runs[0].block_count() as u64);
     // Codec None reads in place, so build a compressed one to see the buffer.
-    let lz4 = build(Codec::Lz4, &records, SMALL_BLOCK);
-    let views = [lz4.view()];
+    let zstd = build(Codec::Zstd, &records, SMALL_BLOCK);
+    let views = [zstd.view()];
     let set = RunSet::new(&views);
     let mut workspace = LogicalWorkspace::new();
     assert_eq!(rest(&mut set.cursor(&mut workspace)).unwrap().len(), 400);
@@ -764,7 +764,13 @@ fn logical_reads_match_a_reference_model() {
         let expected = model_live(&latest);
         let runs: Vec<_> = inputs
             .iter()
-            .map(|input| build(CODECS[rng.below(3)], input, [64, 256, 4096][rng.below(3)]))
+            .map(|input| {
+                build(
+                    CODECS[rng.below(CODECS.len())],
+                    input,
+                    [64, 256, 4096][rng.below(3)],
+                )
+            })
             .collect();
         let views = views(&runs);
         let set = RunSet::new(&views);
@@ -885,7 +891,7 @@ fn a_found_version_skips_runs_holding_only_older_ones() {
 
     // A newest tombstone ends the search the same way.
     let deleted = [
-        build(Codec::Lz4, &[del(b"k", 20)], SMALL_BLOCK),
+        build(Codec::Zstd, &[del(b"k", 20)], SMALL_BLOCK),
         build(Codec::None, &[put(b"k", 10, b"old")], SMALL_BLOCK),
     ];
     assert_eq!(get_bounded(&deleted, b"k"), (Ok(None), 1));
@@ -902,7 +908,7 @@ fn interleaved_sequence_ranges_are_read_until_no_run_can_be_newer() {
             &[put(b"k", 1, b"old"), put(b"z", 10, b"z")],
             SMALL_BLOCK,
         ),
-        build(Codec::Lz4, &[put(b"k", 5, b"new")], SMALL_BLOCK),
+        build(Codec::Zstd, &[put(b"k", 5, b"new")], SMALL_BLOCK),
         build(Codec::None, &[put(b"k", 3, b"mid")], SMALL_BLOCK),
     ];
     // The third run's bound, 3, is below 5, so it is not decoded.
@@ -931,7 +937,7 @@ fn a_copy_of_the_newest_version_is_still_checked() {
             &[put(b"k", 7, b"x"), put(b"z", 9, b"z")],
             SMALL_BLOCK,
         ),
-        build(Codec::Lz4, &[put(b"k", 7, b"x")], SMALL_BLOCK),
+        build(Codec::Zstd, &[put(b"k", 7, b"x")], SMALL_BLOCK),
     ];
     assert_eq!(
         get_bounded(&identical, b"k"),

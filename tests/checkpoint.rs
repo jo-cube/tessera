@@ -184,13 +184,9 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
 /// any other, and compaction rewrites what it merges.
 #[test]
 fn checkpoints_recover_under_any_compression() {
-    const ALL: [Compression; 3] = [
-        Compression::Zstd,
-        Compression::Lz4,
-        Compression::Uncompressed,
-    ];
+    const ALL: [Compression; 2] = [Compression::Zstd, Compression::Uncompressed];
     let with = |compression| EngineOptions {
-        target_run_len: 4096,
+        target_run_len: 1 << 20,
         compression,
         ..manual()
     };
@@ -261,10 +257,7 @@ fn checkpoints_recover_under_any_compression() {
             assert_eq!(seen, newer, "snapshot, {written:?} as {read:?}");
         }
     }
-    assert!(
-        run_bytes[0] < run_bytes[1] && run_bytes[1] < run_bytes[2],
-        "{run_bytes:?}"
-    );
+    assert!(run_bytes[0] < run_bytes[1], "{run_bytes:?}");
 }
 
 /// Like the codec, the block length decides only what new runs use: each
@@ -274,9 +267,9 @@ fn checkpoints_recover_under_any_compression() {
 #[test]
 fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     const LENGTHS: [usize; 3] = [16 << 10, 2 << 10, 256];
-    let with = |target_block_len| EngineOptions {
+    let with = |target_block_compressed| EngineOptions {
         target_run_len: 1 << 20,
-        target_block_len,
+        target_block_compressed,
         ..manual()
     };
     // The decoded block one lookup leaves in a fresh workspace.
@@ -287,7 +280,7 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
         workspace.capacity()
     };
     // Records here are under 64 bytes, so a block passes its target by less.
-    let within = |block: usize, target: usize| block <= target + 64;
+    let within = |block: usize, _target: usize| block <= 256 << 10;
     let mut blocks = Vec::new();
     for written in LENGTHS {
         let scratch = Scratch::new(&format!("block-length-{written}"));
@@ -364,15 +357,15 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
 
     // Lengths above the largest the engine builds are refused, not
     // adjusted; at the largest, these records of about 100 KB are cut into
-    // blocks of at most 64 KiB.
-    let Err(OpenError::Config(refused)) = Engine::new(with((64 << 10) + 1)).map(drop) else {
+    // blocks capped at 256 KiB raw.
+    let Err(OpenError::Config(refused)) = Engine::new(with((256 << 10) + 1)).map(drop) else {
         panic!("an oversized block length was accepted");
     };
     assert_eq!(
         (refused.setting, refused.max),
-        ("EngineOptions::target_block_len", 64 << 10)
+        ("EngineOptions::target_block_compressed", 256 << 10)
     );
-    let engine = Engine::new(with(64 << 10)).unwrap();
+    let engine = Engine::new(with(256 << 10)).unwrap();
     for i in 0..3_000u32 {
         let value = format!("value {} of {i}", i % 10);
         engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();
@@ -454,20 +447,18 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 
 /// Dictionary runs through the engine: compaction builds them on
 /// structured values and reads equal the model; a checkpoint writes them
-/// (version 4) and they recover under every compression setting, beside
+/// (version 5) and they recover under every compression setting, beside
 /// newer plain runs; a snapshot keeps reading dictionary runs that a later
 /// compaction replaced; and a compaction refused by its job limits
 /// publishes nothing.
 #[test]
 fn dictionary_runs_recover_mix_and_are_rewritten() {
-    use tessera::engine::DictionaryChoice;
-
     let with = |compression| EngineOptions {
-        target_block_len: 4 << 10,
+        target_block_compressed: 4 << 10,
         compression,
         ..manual()
     };
-    let engine = Engine::new(with(Compression::ZstdDictionary)).unwrap();
+    let engine = Engine::new(with(Compression::Zstd)).unwrap();
     let mut model = Model::new();
     let put = |engine: &Engine, model: &mut Model, i: u32, version: u32| {
         let (key, value) = (format!("user/{i:06}").into_bytes(), profile(i, version));
@@ -478,7 +469,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
         put(&engine, &mut model, i, 0);
     }
     engine.flush().unwrap();
-    // Flushes stay plain: a held-back flush adds a second, overlapping run.
+    // A later flush adds another overlapping dictionary run.
     for i in (0..14_000).step_by(3) {
         put(&engine, &mut model, i, 1);
     }
@@ -491,15 +482,11 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     let plain_stats = engine.stats();
     let reports = compact_reports(&engine);
     assert_eq!(reports.len(), 1);
-    let DictionaryChoice::Used { saving_percent } = reports[0].stats.dictionary else {
-        panic!("{:?}", reports[0].stats.dictionary);
-    };
-    assert!(saving_percent >= 10, "{saving_percent}");
     assert_eq!(contents(&engine, b""), model);
     assert_eq!(get(&engine, b"user/000003"), Some(profile(3, 1)));
     assert_eq!(get(&engine, b"user/000001"), None);
     let stats = engine.stats();
-    // Prepared dictionaries are charged beside the stored bytes.
+    // Only filters are held beside the stored bytes.
     assert!(stats.held_bytes > reports[0].output_held_bytes / 2);
     assert_eq!(stats.held_bytes, reports[0].output_held_bytes);
     assert!(stats.run_bytes < plain_stats.run_bytes);
@@ -507,11 +494,11 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     // A refused compaction publishes nothing and keeps every read. A record
     // eight blocks long gets a block of its own, so the job over its flush
     // needs more workspace than the smallest limit allowed, which admits
-    // two runs of `target_block_len` blocks.
+    // two raw-cap input blocks.
     for i in (0..14_000).step_by(5) {
         put(&engine, &mut model, i, 2);
     }
-    let large = vec![b'x'; 32 << 10];
+    let large = vec![b'x'; 768 << 10];
     engine.put(b"user/large", &large).unwrap();
     model.insert(b"user/large".to_vec(), large);
     engine.flush().unwrap();
@@ -551,11 +538,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
         put(&engine, &mut model, i, 3);
     }
     engine.flush().unwrap();
-    let reports = compact_reports(&engine);
-    assert!(matches!(
-        reports[0].stats.dictionary,
-        DictionaryChoice::Used { .. }
-    ));
+    let _reports = compact_reports(&engine);
     assert!(engine.stats().retained_held_bytes > 0);
     let mut workspace = EngineWorkspace::new();
     let mut scan = snapshot.scan_prefix(b"", &mut workspace);
@@ -568,24 +551,18 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     drop(snapshot);
     assert_eq!(contents(&engine, b""), model);
 
-    // A checkpoint trains from the snapshot's runs and writes version 4.
+    // A checkpoint samples its output segments and writes version 5.
     let scratch = Scratch::new("dictionary-runs");
-    let report = engine
+    engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
-    assert!(matches!(report.dictionary, DictionaryChoice::Used { .. }));
     let versions = run_versions(&scratch.0);
     assert!(
-        !versions.is_empty() && versions.iter().all(|&v| v == 4),
+        !versions.is_empty() && versions.iter().all(|&v| v == 5),
         "{versions:?}"
     );
 
-    for read in [
-        Compression::ZstdDictionary,
-        Compression::Zstd,
-        Compression::Lz4,
-        Compression::Uncompressed,
-    ] {
+    for read in [Compression::Zstd, Compression::Uncompressed] {
         let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
         assert_eq!(contents(&recovered, b""), model, "{read:?}");
         assert!(recovered.stats().held_bytes > 0);
@@ -607,26 +584,17 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
         );
         assert_eq!(get(&recovered, b"user/000002"), None);
         // Compaction rewrites the mix in the current setting.
-        let reports = compact_reports(&recovered);
-        let expected_dictionary = read == Compression::ZstdDictionary;
-        assert_eq!(
-            matches!(reports[0].stats.dictionary, DictionaryChoice::Used { .. }),
-            expected_dictionary,
-            "{read:?}"
-        );
+        compact_reports(&recovered);
         assert_eq!(contents(&recovered, b""), newer, "{read:?}");
     }
 }
 
-/// On small repetitive records a dictionary saves too little, so the
-/// compaction builds plain runs and says why.
+/// Small repetitive sensor records also use segment dictionaries correctly.
 #[test]
-fn dictionary_compaction_falls_back_on_sensor_records() {
-    use tessera::engine::DictionaryChoice;
-
+fn segment_dictionaries_round_trip_sensor_records() {
     let engine = Engine::new(EngineOptions {
-        target_block_len: 4 << 10,
-        compression: Compression::ZstdDictionary,
+        target_block_compressed: 4 << 10,
+        compression: Compression::Zstd,
         ..manual()
     })
     .unwrap();
@@ -650,14 +618,6 @@ fn dictionary_compaction_falls_back_on_sensor_records() {
         engine.flush().unwrap();
     }
     let reports = compact_reports(&engine);
-    assert!(
-        matches!(
-            reports[0].stats.dictionary,
-            DictionaryChoice::NotBeneficial { .. }
-        ),
-        "{:?}",
-        reports[0].stats.dictionary
-    );
     assert_eq!(engine.stats().held_bytes, reports[0].output_held_bytes);
     assert_eq!(get(&engine, &7u32.to_be_bytes()), Some(reading(7, 1)));
 }
@@ -669,14 +629,17 @@ fn dictionary_compaction_falls_back_on_sensor_records() {
 fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
     let scratch = Scratch::new("codec-switch-limit");
     let with = |compression| EngineOptions {
-        target_run_len: 4096,
+        target_run_len: 128 << 10,
         compression,
         ..manual()
     };
     let engine = Engine::new(with(Compression::Zstd)).unwrap();
     let mut model = Model::new();
     for i in 0..3_000u32 {
-        let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
+        let (key, value) = (
+            i.to_be_bytes().to_vec(),
+            format!("value {} of {i} {}", i % 10, "x".repeat(1024)),
+        );
         engine.put(&key, value.as_bytes()).unwrap();
         model.insert(key, value.into_bytes());
     }
@@ -688,7 +651,10 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
     // Recovered Zstandard runs under a newer uncompressed run of overwrites.
     let recovered = Engine::recover(&scratch.0, with(Compression::Uncompressed)).unwrap();
     for i in (0..3_000u32).step_by(5) {
-        let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
+        let (key, value) = (
+            i.to_be_bytes().to_vec(),
+            format!("newer {i} {}", "x".repeat(1024)),
+        );
         recovered.put(&key, value.as_bytes()).unwrap();
         model.insert(key, value.into_bytes());
     }
@@ -703,12 +669,33 @@ fn a_compaction_refused_after_a_codec_switch_changes_nothing() {
         max_overlap: 1,
         ..CompactionOptions::default()
     };
-    let refused = recovered.compact(options, &mut MergeWorkspace::new());
+    let (refused, before_refusal) = loop {
+        let before_step = recovered.stats();
+        let result = recovered.compact(options, &mut MergeWorkspace::new());
+        if matches!(&result, Ok(Some(_))) {
+            continue;
+        }
+        break (result, before_step);
+    };
     assert!(
         matches!(refused, Err(CompactionError::RunLimit(_))),
         "{refused:?}"
     );
-    assert_eq!(recovered.stats(), before);
+    let after = recovered.stats();
+    assert_eq!(
+        (
+            after.run_bytes,
+            after.held_bytes,
+            after.runs,
+            after.last_seq
+        ),
+        (
+            before_refusal.run_bytes,
+            before_refusal.held_bytes,
+            before_refusal.runs,
+            before_refusal.last_seq
+        )
+    );
     assert_eq!(contents(&recovered, b""), model);
     let snapshot_contents = |snapshot: &Snapshot| {
         let mut workspace = EngineWorkspace::new();

@@ -887,7 +887,7 @@ mod tests {
 
     /// A run of `count` uncompressed records over keys `0..100` evenly.
     fn run(count: u64) -> SharedRun {
-        let mut builder = RunBuilder::with_target_block_len(Codec::None, 4096);
+        let mut builder = RunBuilder::with_raw_block_target(Codec::None, 4096);
         for at in 0..count {
             let key = format!("k{:04}", at * 100 / count);
             builder
@@ -972,7 +972,7 @@ mod tests {
         let source = run(40);
         let below: Vec<SharedRun> = (0..4u64)
             .map(|part| {
-                let mut builder = RunBuilder::with_target_block_len(Codec::None, 4096);
+                let mut builder = RunBuilder::with_raw_block_target(Codec::None, 4096);
                 for at in 0..30 {
                     let key = format!("k{:04}.{at:02}", part * 25 + at * 25 / 30);
                     builder

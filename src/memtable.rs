@@ -62,7 +62,7 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
-use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder, TARGET_BLOCK_LEN};
+use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder, TARGET_BLOCK_COMPRESSED};
 
 #[cfg(test)]
 mod tests;
@@ -873,12 +873,12 @@ impl FrozenMemtable {
         expect(dead_code, reason = "tested component API the engine does not use")
     )]
     pub fn flush(&self, target_run_len: usize) -> Flush<'_> {
-        self.flush_with(target_run_len, Codec::default(), TARGET_BLOCK_LEN)
+        self.flush_with(target_run_len, Codec::default(), TARGET_BLOCK_COMPRESSED)
     }
 
     /// Returns an iterator that builds this table's runs one at a time, with
-    /// `codec` and blocks of about `target_block_len` bytes before compression
-    /// (see [`RunBuilder::with_target_block_len`]).
+    /// `codec` and an estimated compressed target of `target_block_compressed` bytes
+    /// (see [`RunBuilder::with_target_block_compressed`]).
     ///
     /// A run ends once its records reach `target_run_len` bytes of input,
     /// reduced to [`MAX_TARGET_RUN_LEN`] if larger, so runs hold disjoint key
@@ -891,13 +891,13 @@ impl FrozenMemtable {
         &self,
         target_run_len: usize,
         codec: Codec,
-        target_block_len: usize,
+        target_block_compressed: usize,
     ) -> Flush<'_> {
         Flush {
             records: self.iter(),
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
             codec,
-            target_block_len,
+            target_block_compressed,
         }
     }
 }
@@ -937,12 +937,12 @@ pub(crate) fn flush_merged(
     tables: &[&FrozenMemtable],
     target_run_len: usize,
     codec: Codec,
-    target_block_len: usize,
+    target_block_compressed: usize,
     cuts: &FlushCuts,
 ) -> Vec<Run<Vec<u8>>> {
     if let ([table], []) = (tables, cuts.at.as_slice()) {
         return table
-            .flush_with(target_run_len, codec, target_block_len)
+            .flush_with(target_run_len, codec, target_block_compressed)
             .collect();
     }
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
@@ -989,7 +989,9 @@ pub(crate) fn flush_merged(
             pieces += 1;
         }
         builder
-            .get_or_insert_with(|| RunBuilder::with_target_block_len(codec, target_block_len))
+            .get_or_insert_with(|| {
+                RunBuilder::with_target_block_compressed(codec, target_block_compressed)
+            })
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
         let len = input_len(&record);
@@ -1062,7 +1064,7 @@ pub struct Flush<'a> {
     records: Records<'a>,
     target: usize,
     codec: Codec,
-    target_block_len: usize,
+    target_block_compressed: usize,
 }
 
 impl Iterator for Flush<'_> {
@@ -1070,7 +1072,8 @@ impl Iterator for Flush<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut record = self.records.next()?;
-        let mut builder = RunBuilder::with_target_block_len(self.codec, self.target_block_len);
+        let mut builder =
+            RunBuilder::with_target_block_compressed(self.codec, self.target_block_compressed);
         let mut input = 0;
         loop {
             builder

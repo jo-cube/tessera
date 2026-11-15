@@ -1017,13 +1017,8 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
             last_seq: 0,
             background_compaction: None,
             snapshots: SnapshotLimits::default(),
-            compression: [
-                Compression::Zstd,
-                Compression::Lz4,
-                Compression::Uncompressed,
-                Compression::ZstdDictionary,
-            ][rng.below(4)],
-            target_block_len: [64, 2 << 10, 16 << 10][rng.below(3)],
+            compression: [Compression::Zstd, Compression::Uncompressed][rng.below(2)],
+            target_block_compressed: [64, 2 << 10, 16 << 10][rng.below(3)],
         })
         .unwrap();
         let mut model = Model::new();
@@ -1139,8 +1134,8 @@ fn the_defaults_compact_in_the_background() {
     );
     assert_eq!(CompactionOptions::default().max_overlap, 4);
     assert_eq!(
-        (defaults.compression, defaults.target_block_len),
-        (Compression::Zstd, 16 << 10)
+        (defaults.compression, defaults.target_block_compressed),
+        (Compression::Zstd, 1024)
     );
     let engine = Engine::new(EngineOptions {
         memtable_budget: 16 << 10,
@@ -1236,18 +1231,18 @@ fn each_setting_out_of_range_is_refused_by_name() {
             u64::MAX,
         ),
         (
-            engine(|o| o.target_block_len = 0),
-            "EngineOptions::target_block_len",
+            engine(|o| o.target_block_compressed = 0),
+            "EngineOptions::target_block_compressed",
             0,
             1,
-            64 << 10,
+            256 << 10,
         ),
         (
-            engine(|o| o.target_block_len = (64 << 10) + 1),
-            "EngineOptions::target_block_len",
-            (64 << 10) + 1,
+            engine(|o| o.target_block_compressed = (256 << 10) + 1),
+            "EngineOptions::target_block_compressed",
+            (256 << 10) + 1,
             1,
-            64 << 10,
+            256 << 10,
         ),
         (
             compaction(|c| c.max_overlap = 0),
@@ -1278,12 +1273,12 @@ fn each_setting_out_of_range_is_refused_by_name() {
             u64::MAX,
         ),
         (
-            compaction(|c| c.max_workspace_bytes = 3_211_263),
+            compaction(|c| c.max_workspace_bytes = 13_713_407),
             "CompactionOptions::max_workspace_bytes",
-            3_211_263,
-            // Two inputs of 16 KiB blocks: a context and a block each, and
-            // a context and two blocks for the output.
-            3_211_264,
+            13_713_407,
+            // Two raw-cap input blocks and decoder contexts, plus segment,
+            // block and compression buffers for the output.
+            13_713_408,
             u64::MAX,
         ),
     ];
@@ -1309,8 +1304,8 @@ fn each_setting_out_of_range_is_refused_by_name() {
         }),
         engine(|o| o.max_runs = 1),
         engine(|o| o.max_run_bytes = 1),
-        engine(|o| o.target_block_len = 1),
-        engine(|o| o.target_block_len = 64 << 10),
+        engine(|o| o.target_block_compressed = 1),
+        engine(|o| o.target_block_compressed = 256 << 10),
         engine(|o| o.background_compaction = None),
         engine(|o| {
             o.snapshots = SnapshotLimits {
@@ -1321,7 +1316,7 @@ fn each_setting_out_of_range_is_refused_by_name() {
         compaction(|c| c.max_overlap = 1),
         compaction(|c| c.max_inputs = 2),
         compaction(|c| c.max_input_bytes = 128 << 20),
-        compaction(|c| c.max_workspace_bytes = 3_211_264),
+        compaction(|c| c.max_workspace_bytes = 13_713_408),
     ];
     for options in accepted {
         Engine::new(options).unwrap();
@@ -1403,14 +1398,14 @@ fn runtime_options_are_checked_like_construction() {
 }
 
 /// Dictionary compression is accepted with any valid block length, as
-/// requested: a dictionary is trained and kept only where it saves enough,
+/// requested: segment dictionaries and adaptive cuts remain correct,
 /// whatever the length.
 #[test]
-fn dictionary_compression_accepts_every_block_length() {
-    for target_block_len in [1, 4 << 10, 16 << 10, 64 << 10] {
+fn adaptive_compression_accepts_every_compressed_target() {
+    for target_block_compressed in [1, 4 << 10, 16 << 10, 64 << 10] {
         let engine = Engine::new(EngineOptions {
-            compression: Compression::ZstdDictionary,
-            target_block_len,
+            compression: Compression::Zstd,
+            target_block_compressed,
             ..manual()
         })
         .unwrap();
@@ -1432,7 +1427,7 @@ fn dictionary_compression_accepts_every_block_length() {
         assert_eq!(
             found.unwrap().value,
             br#"{"id":7,"round":5,"name":"user 7"}"#,
-            "{target_block_len}"
+            "{target_block_compressed}"
         );
     }
 }

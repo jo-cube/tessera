@@ -13,13 +13,7 @@ publish = false
 
 [dependencies]
 crc32fast = "1"
-lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode"] }
-zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "zdict_builder"] }
-
-# Research only (5AB, 5AD; `run::tests::layouts`): dictionaries by reference,
-# for test builds. The same package; production builds keep it off.
-[dev-dependencies]
-zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "zdict_builder", "experimental"] }
+zstd-safe = { version = "8", default-features = false, features = ["std", "vendored"] }
 
 # Tests run in a container and are not stepped through in a debugger, so
 # line tables, which keep file and line numbers in panics and backtraces,

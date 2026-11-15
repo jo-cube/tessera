@@ -138,6 +138,7 @@ impl RunDirectory {
 
     /// Every run once, in directory order: a run's index here is its position
     /// in a [`ConflictingCopies`](crate::run::ConflictingCopies) report.
+    #[cfg(test)]
     pub(super) fn runs(&self) -> &[SharedRun] {
         &self.runs
     }

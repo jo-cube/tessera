@@ -436,8 +436,8 @@ pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 use crate::run::CompactError;
 pub use crate::run::{
-    CompactStats, ConflictingCopies, CorruptRun, DictionaryChoice, LiveRecord, LiveValue,
-    MergeWorkspace, ReadError, RunCorruption,
+    CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue, MergeWorkspace, ReadError,
+    RunCorruption,
 };
 
 use std::fmt;
@@ -450,9 +450,9 @@ use crate::memtable::{
     FlushCuts, FrozenMemtable, Memtable, Records, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
-    Codec, CompactLimits, DICTIONARY_LEN, DICTIONARY_WORKSPACE, LogicalCursor, LogicalWorkspace,
-    MAX_ENGINE_BLOCK_LEN, MAX_TARGET_RUN_LEN, MIN_DICTIONARY_INPUT, MIN_SAVING_PERCENT, OutputCuts,
-    RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_LEN, compact_with, latest_from,
+    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, MAX_TARGET_RUN_LEN, OutputCuts,
+    RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_with,
+    latest_from,
 };
 
 use directory::RunDirectory;
@@ -508,7 +508,7 @@ pub struct EngineOptions {
     /// `max_run_bytes` over 64 KiB; scale it with `max_run_bytes`.
     pub max_runs: usize,
     /// The most bytes of published runs, at least 1: their stored bytes, key
-    /// filters and prepared dictionaries together. This is the physical
+    /// filters together. This is the physical
     /// limit on how much the engine holds. Exceeding it refuses flushes as
     /// for `max_runs`; a compaction may exceed it only by publishing less
     /// than it replaces.
@@ -531,31 +531,18 @@ pub struct EngineOptions {
     /// How the runs this engine builds store their blocks. See
     /// [`Compression`].
     pub compression: Compression,
-    /// Bytes of records per block, before compression, in the runs that
-    /// flushes, compactions and checkpoints build: 16 KiB by default. Every
-    /// run read decodes one block, so smaller blocks make lookups and the
-    /// first record of a scan cheaper, and cost memory: each block compresses
-    /// on its own and adds an index entry and a frame header. Blocks are
-    /// cut at record boundaries, so a
-    /// record larger than this is a block of its own. From 1 (a block per
-    /// record, at about 20 bytes of index and frame header a block) to
-    /// 64 KiB, which keeps compression contexts within the compaction
-    /// workspace estimate.
-    ///
-    /// Each block records its own length, so an engine reads runs of every
-    /// block length whatever this is set to, as with [`Self::compression`]:
-    /// existing runs and checkpoints keep their blocks until compaction or a
-    /// checkpoint rewrites their records.
-    pub target_block_len: usize,
+    /// Estimated compressed bytes per Zstandard block, 1024 by default, from
+    /// 1 to 256 KiB. Each segment estimates its ratio from a 64 KiB sample.
+    /// Blocks end at record boundaries, with a 256 KiB raw cap; a larger
+    /// record has its own block. Uncompressed runs use a fixed 16 KiB target.
+    pub target_block_compressed: usize,
 }
 
 impl Default for EngineOptions {
     /// 64 MiB memtables, 4 GiB of runs (and at most 65,536 of them),
     /// background compaction
     /// with [`CompactionOptions::default`], the default snapshot limits, and
-    /// plain Zstandard in 16 KiB blocks: a general-purpose default that
-    /// favours density and scans. See [`Compression`] for the
-    /// latency-oriented alternative.
+    /// Zstandard level 3 with segment dictionaries and a 1 KiB compressed target.
     fn default() -> Self {
         Self {
             memtable_budget: 64 << 20,
@@ -566,7 +553,7 @@ impl Default for EngineOptions {
             background_compaction: Some(CompactionOptions::default()),
             snapshots: SnapshotLimits::default(),
             compression: Compression::default(),
-            target_block_len: TARGET_BLOCK_LEN,
+            target_block_compressed: TARGET_BLOCK_COMPRESSED,
         }
     }
 }
@@ -597,14 +584,14 @@ impl EngineOptions {
         )?;
         ConfigError::check_run_limits(self.max_runs, self.max_run_bytes)?;
         ConfigError::check(
-            "EngineOptions::target_block_len",
-            self.target_block_len as u64,
+            "EngineOptions::target_block_compressed",
+            self.target_block_compressed as u64,
             1,
-            MAX_ENGINE_BLOCK_LEN as u64,
-            "the compaction workspace estimate covers blocks of up to 64 KiB",
+            RAW_BLOCK_CAP as u64,
+            "compressed targets are from 1 byte to the 256 KiB raw cap",
         )?;
         if let Some(compaction) = &self.background_compaction {
-            compaction.validate(self.target_run_len, self.target_block_len)?;
+            compaction.validate(self.target_run_len, self.target_block_compressed)?;
         }
         Ok(())
     }
@@ -700,94 +687,26 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// How the runs that flushes, compactions and checkpoints build store their
-/// blocks: the trade between memory and the cost of reading a run.
-///
-/// Every read of a run, a lookup or a scan's first record in it, decodes a
-/// block ([`EngineOptions::target_block_len`], 16 KiB by default), so the
-/// codec affects decoding. Reading from memtables is independent of it.
-///
-/// Each block records its codec, so an engine reads runs of every codec
-/// whatever this is set to: a checkpoint written under one setting
-/// recovers under another, and compaction rewrites runs it merges with the
-/// current one. [`EngineOptions::max_run_bytes`] and
-/// [`CheckpointOptions::max_bytes`] count stored bytes, so less compression
-/// reaches them sooner: after a switch to a less compact setting, a
-/// compaction whose rewritten output would exceed `max_run_bytes` is
-/// refused with [`CompactionError::RunLimit`] and changes nothing.
-///
-/// # Dictionaries
-///
-/// [`Self::ZstdDictionary`] is Zstandard whose rewrites train a
-/// dictionary for their output. Small blocks compress poorly alone, and a
-/// dictionary learned from the data restores most of what they lose, so it
-/// is meant to pair with small blocks: it was measured with
-/// [`EngineOptions::target_block_len`] at 4 KiB, which is not set for you.
-/// Every valid block length is accepted and kept as requested; at any
-/// length, the check below decides per rewrite whether the output uses the
-/// dictionary.
-/// Only runs that are rewritten get a dictionary. Runs that no compaction
-/// merges, such as the disjoint runs of keys written in ascending order,
-/// stay plain until a checkpoint rewrites them.
-///
-/// - Flushes and the memtable's records are always plain Zstandard: there is
-///   no rewrite to learn from.
-/// - A compaction, and a checkpoint, first sample decoded blocks of the runs
-///   they rewrite (about 1.6 MiB, read evenly across them) and train one
-///   16 KiB dictionary, outside the engine's state lock. One block in eight
-///   is held back, and the dictionary is used for every run the rewrite
-///   builds only if it compresses those blocks at least 10% smaller than
-///   plain Zstandard at the same block length. Otherwise the output is plain.
-///   Rewrites of less than about 6.4 MiB decoded are not sampled at all.
-///   This is decided before any output is built and is never retried.
-/// - A compaction reserves about 21 MiB for training beside the merge
-///   (about 13 MiB was measured), which
-///   [`CompactionOptions::max_workspace_bytes`] must admit; a compaction
-///   whose limit leaves less room builds plain output rather than failing.
-///   A checkpoint applies no such limit. Each dictionary run stores its
-///   16 KiB dictionary and holds a prepared form of about 43 KiB beside it,
-///   which counts towards [`EngineOptions::max_run_bytes`] like a key
-///   filter: the runs of one rewrite share it but each counts it in full,
-///   and a recovered run prepares its own. Training takes roughly 0.05 s
-///   per rewrite.
-/// - [`CompactStats::dictionary`] and [`CheckpointReport::dictionary`] report
-///   each choice.
-///
-/// A dictionary run is written in a newer run format, which builds before it
-/// cannot read; plain runs are unchanged, and runs of every kind recover and
-/// mix whatever this is set to.
+/// How runs store their blocks. Zstandard uses a 16 KiB raw-content dictionary
+/// per roughly 4 MiB segment, with independently decoded adaptive blocks.
+/// Every decode loads the dictionary by reference into the reader's context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
-    /// Zstandard at level 3: the densest, and the most CPU per block read.
+    /// Zstandard level 3, with segment dictionaries and adaptive blocks.
     #[default]
     Zstd,
-    /// LZ4: about 60% of Zstandard's density on structured values, at about
-    /// a quarter of its decode cost.
-    Lz4,
-    /// Blocks are stored as they are and read in place, with no decode. A
-    /// block's checksum is then verified only when its run is loaded from a
-    /// checkpoint, not on every read.
+    /// Fixed 16 KiB raw blocks, read in place.
     Uncompressed,
-    /// Zstandard, and compactions and checkpoints compress the runs they
-    /// build with a dictionary trained for them when that saves enough. See
-    /// [Dictionaries](Self#dictionaries).
-    ZstdDictionary,
 }
-
 impl Compression {
     fn codec(self) -> Codec {
         match self {
-            Self::Zstd | Self::ZstdDictionary => Codec::Zstd,
-            Self::Lz4 => Codec::Lz4,
+            Self::Zstd => Codec::Zstd,
             Self::Uncompressed => Codec::None,
         }
     }
 }
-
-// The documentation above states these.
-const _: () = assert!(DICTIONARY_LEN == 16 << 10 && MIN_SAVING_PERCENT == 10);
-const _: () = assert!(MIN_DICTIONARY_INPUT == 6_553_600 && DICTIONARY_WORKSPACE <= 22 << 20);
 
 /// Admission limits for [`Engine::snapshot`]. A snapshot that would exceed
 /// one is refused with a [`SnapshotError`]; none is ever weakened.
@@ -1010,7 +929,7 @@ pub struct FlushReport {
     /// Stored bytes published.
     pub run_bytes: usize,
     /// Bytes the published runs hold beside their stored bytes: their key
-    /// filters. A flush builds no dictionary.
+    /// filters. Segment dictionaries are included in `run_bytes`.
     pub held_bytes: usize,
     /// The most bytes one run's filter construction held for key hashes,
     /// freed when that run was finished.
@@ -1032,11 +951,8 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
-    /// Bytes the published runs hold in memory beside `run_bytes`: their key
-    /// filters and any prepared dictionaries. [`EngineOptions::max_run_bytes`]
-    /// limits the two together. The runs one rewrite builds share a prepared
-    /// dictionary and each counts it in full, so this can overstate the
-    /// memory held by one dictionary (about 43 KiB) per such run.
+    /// Bytes of key filters held beside `run_bytes`. Segment dictionaries are
+    /// stored inside the runs. [`EngineOptions::max_run_bytes`] limits both.
     pub held_bytes: usize,
     /// The most published runs whose key ranges share one key: the most
     /// blocks a point read of a key absent from the memtables decodes, and
@@ -1055,8 +971,7 @@ pub struct EngineStats {
     /// The part of `retained_bytes` that is runs: stored bytes of runs that
     /// compaction replaced and snapshots still hold.
     pub retained_run_bytes: usize,
-    /// The part of `retained_bytes` that is those runs' filters and prepared
-    /// dictionaries.
+    /// The part of `retained_bytes` that is those runs' filters.
     pub retained_held_bytes: usize,
     /// Flushes whose runs level 0 holds: at most 12, the level-0 stop, with
     /// a background worker.
@@ -1128,7 +1043,7 @@ struct State {
 struct Retired {
     source: Weak<dyn Send + Sync>,
     bytes: usize,
-    /// For a run, its filter and prepared dictionary bytes.
+    /// For a run, its key filter bytes.
     held_bytes: Option<usize>,
 }
 
@@ -1249,10 +1164,8 @@ struct Core {
     target_run_len: usize,
     /// The codec of the runs this engine builds.
     codec: Codec,
-    /// Whether compactions and checkpoints may train dictionaries.
-    dictionary: bool,
-    /// The block length, before compression, of the runs this engine builds.
-    target_block_len: usize,
+    /// The estimated compressed block target of the runs this engine builds.
+    target_block_compressed: usize,
     snapshot_limits: SnapshotLimits,
     /// Cloned by every snapshot, so that its count is the live snapshots.
     snapshots: Arc<()>,
@@ -1526,8 +1439,7 @@ impl Core {
             memtable_budget: options.memtable_budget,
             target_run_len: options.target_run_len,
             codec: options.compression.codec(),
-            dictionary: options.compression == Compression::ZstdDictionary,
-            target_block_len: options.target_block_len,
+            target_block_compressed: options.target_block_compressed,
             snapshot_limits: options.snapshots,
             snapshots: Arc::new(()),
             background: options.background_compaction.map(|_| worker::Signal::new()),
@@ -1860,7 +1772,7 @@ impl Core {
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
         options
-            .validate(self.target_run_len, self.target_block_len)
+            .validate(self.target_run_len, self.target_block_compressed)
             .map_err(CompactionError::Config)?;
         match self.begin_compaction(options)? {
             Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
@@ -2037,6 +1949,7 @@ impl Core {
             kind,
             level,
             dest,
+            zero_seq: false,
             cuts,
             cursor,
             refusal: split,
@@ -2114,6 +2027,7 @@ impl Core {
             kind: CompactionKind::Merge,
             level: deepest,
             dest: Dest::Anywhere(deepest),
+            zero_seq: false,
             cuts: OutputCuts::default(),
             cursor: None,
             refusal: None,
@@ -2286,7 +2200,7 @@ impl<'e> FlushJob<'e> {
             &tables,
             self.engine.target_run_len,
             self.engine.codec,
-            self.engine.target_block_len,
+            self.engine.target_block_compressed,
             &self.cuts,
         );
         BuiltFlush { job: self, runs }
@@ -2407,14 +2321,14 @@ impl fmt::Debug for BuiltFlush<'_> {
 /// would exceed one is not formed. Every option is checked on its own, as
 /// below, and the byte and workspace limits also against the engine's
 /// [`EngineOptions::target_run_len`] and
-/// [`EngineOptions::target_block_len`], so that a job of two full runs
+/// [`EngineOptions::target_block_compressed`], so that a job of two full runs
 /// always fits (a [`ConfigError`] otherwise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionOptions {
     /// The most runs merged at once, at least 2.
     pub max_inputs: usize,
     /// The most bytes of input runs, stored bytes and what they hold beside
-    /// them (key filters and prepared dictionaries), at least twice
+    /// them (key filters), at least twice
     /// [`EngineOptions::target_run_len`].
     pub max_input_bytes: usize,
     /// The most bytes of output, stored bytes and key filters together,
@@ -2429,16 +2343,11 @@ pub struct CompactionOptions {
     /// doubling, so it may hold up to its own size again in unused capacity
     /// until it is finished.
     pub max_output_bytes: usize,
-    /// The most estimated workspace bytes: per input, a decoded copy of its
-    /// largest block and a decompression context, and for the output, two
-    /// copies of the largest block and a compression context. A job whose
-    /// estimate exceeds it is not formed, and a merge whose estimate exceeds
-    /// it fails before decoding anything. What the estimate leaves bounds
-    /// the buffer of key hashes for the output's key filter, and a
-    /// dictionary's training, which is skipped if it does not fit; an output
-    /// run that would need more for its filter is published without one. At
-    /// least the estimate for two inputs of
-    /// [`EngineOptions::target_block_len`] blocks.
+    /// The most estimated workspace bytes: one block and a decompression
+    /// context per input, plus the builder's segment and block buffers and
+    /// compression context. A job exceeding this is refused before decoding.
+    /// Remaining room bounds key hashes; an output needing more hashes gets
+    /// no filter. At least the estimate for two 256 KiB input blocks.
     pub max_workspace_bytes: usize,
     /// Level 0 is compacted once it holds runs of this many flushes, at
     /// least 1, which compacts every flush (level 0 is compacted at 12
@@ -2453,8 +2362,7 @@ pub struct CompactionOptions {
 }
 
 impl Default for CompactionOptions {
-    /// 32 inputs, 256 MiB in and out, 64 MiB of workspace (room for a
-    /// dictionary's training beside a merge of 32 inputs), and level 0
+    /// 32 inputs, 256 MiB in and out, 64 MiB of workspace, and level 0
     /// compacted at 4 flushes.
     fn default() -> Self {
         Self {
@@ -2479,7 +2387,11 @@ impl CompactionOptions {
     /// The one check of these options, made when an engine is built with
     /// them for its worker and by every [`Engine::compact`], against the
     /// engine's run and block lengths.
-    fn validate(&self, target_run_len: usize, target_block_len: usize) -> Result<(), ConfigError> {
+    fn validate(
+        &self,
+        target_run_len: usize,
+        _target_block_compressed: usize,
+    ) -> Result<(), ConfigError> {
         ConfigError::check(
             "CompactionOptions::max_inputs",
             self.max_inputs as u64,
@@ -2503,9 +2415,9 @@ impl CompactionOptions {
         ConfigError::check(
             "CompactionOptions::max_workspace_bytes",
             self.max_workspace_bytes as u64,
-            crate::run::workspace_estimate([target_block_len; 2]) as u64,
+            crate::run::workspace_estimate([RAW_BLOCK_CAP; 2]) as u64,
             usize::MAX as u64,
-            "a merge of two runs of EngineOptions::target_block_len blocks must fit",
+            "a merge of two runs of EngineOptions::target_block_compressed blocks must fit",
         )?;
         ConfigError::check(
             "CompactionOptions::max_overlap",
@@ -2540,7 +2452,7 @@ pub enum CompactionError {
     /// [`CompactionOptions`] accepts, so this follows runs longer than
     /// [`EngineOptions::target_run_len`] (a single record longer than it,
     /// or runs built under a larger setting) or blocks longer than
-    /// [`EngineOptions::target_block_len`]; raising the limit named lets it
+    /// [`EngineOptions::target_block_compressed`]; raising the limit named lets it
     /// proceed, and retrying unchanged meets it again.
     JobLimit {
         /// The level whose job it is.
@@ -2708,13 +2620,13 @@ pub struct CompactionReport {
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
-    /// What they held beside that: filters and prepared dictionaries.
+    /// What they held beside that: key filters.
     pub input_held_bytes: usize,
     /// Runs published in their place.
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
-    /// What they hold beside that: filters and prepared dictionaries.
+    /// What they hold beside that: key filters.
     pub output_held_bytes: usize,
     /// The most bytes one output's filter construction held for key hashes,
     /// freed when that run was finished.
@@ -2748,6 +2660,7 @@ struct CompactionJob<'e> {
     level: usize,
     /// Where the output goes.
     dest: Dest,
+    zero_seq: bool,
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.
     cursor: Option<Cursor>,
@@ -2803,8 +2716,8 @@ impl<'e> CompactionJob<'e> {
             max_output_bytes: self.options.max_output_bytes,
             max_workspace_bytes: self.options.max_workspace_bytes,
             codec: self.engine.codec,
-            target_block_len: self.engine.target_block_len,
-            dictionary: self.engine.dictionary,
+            target_block_compressed: self.engine.target_block_compressed,
+            zero_seq: self.zero_seq,
         };
         let output = match compact_with(&views, keep_tombstone, limits, &self.cuts, workspace) {
             Ok(output) => output,
@@ -3279,31 +3192,6 @@ impl Scan<'_> {
 impl fmt::Debug for Scan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Scan").finish_non_exhaustive()
-    }
-}
-
-/// For the tests' dictionary measurements (5AG).
-#[cfg(test)]
-impl Engine {
-    /// The published runs that store a dictionary, the distinct prepared
-    /// dictionaries they hold, the distinct dictionaries by content, and
-    /// those runs' stored bytes.
-    pub(crate) fn dictionary_counts(&self) -> (usize, usize, usize, usize) {
-        let state = self.core.read_state();
-        let (mut parts, mut bytes) = (Vec::new(), 0);
-        for run in &state.runs {
-            if let Some(part) = run.run.dictionary_parts() {
-                parts.push(part);
-                bytes += run.run.as_bytes().len();
-            }
-        }
-        let mut prepared: Vec<_> = parts.iter().map(|(_, p)| Arc::as_ptr(p)).collect();
-        prepared.sort_unstable();
-        prepared.dedup();
-        let mut contents: Vec<&[u8]> = parts.iter().map(|(bytes, _)| *bytes).collect();
-        contents.sort_unstable();
-        contents.dedup();
-        (parts.len(), prepared.len(), contents.len(), bytes)
     }
 }
 

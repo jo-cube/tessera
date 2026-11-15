@@ -13,8 +13,8 @@ use crate::run::{
 
 type Input = (Vec<u8>, u64, Option<Vec<u8>>);
 
-const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
-const FOOTER: usize = 32;
+const CODECS: [Codec; 2] = [Codec::None, Codec::Zstd];
+const FOOTER: usize = 48;
 const SMALL_BLOCK: usize = 512;
 const RECORD_BOUND: usize = 200_000;
 
@@ -29,7 +29,7 @@ fn del(key: &[u8], seq: u64) -> Input {
 fn build(codec: Codec, records: &[Input], target: usize) -> Run<Vec<u8>> {
     let mut sorted: Vec<&Input> = records.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(codec, target);
     for (key, seq, value) in sorted {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();
@@ -115,7 +115,7 @@ fn a_run_reports_its_smallest_and_largest_user_keys() {
 #[test]
 fn versions_and_tombstones_bound_the_range_like_any_record() {
     let run = build(
-        Codec::Lz4,
+        Codec::Zstd,
         &[
             del(b"a", 9),
             put(b"a", 1, b"x"),
@@ -187,7 +187,7 @@ fn a_minimum_key_differing_from_the_first_record_is_rejected() {
             b[at + 8] += 1
         }),
     ] {
-        let mut bytes = build(Codec::Lz4, &numbered(0..500), SMALL_BLOCK)
+        let mut bytes = build(Codec::Zstd, &numbered(0..500), SMALL_BLOCK)
             .as_bytes()
             .to_vec();
         let at = layout(&bytes).keys;
@@ -202,7 +202,7 @@ fn a_minimum_key_differing_from_the_first_record_is_rejected() {
 
 #[test]
 fn a_minimum_above_the_first_blocks_last_key_is_rejected_on_open() {
-    let mut bytes = build(Codec::Lz4, &numbered(0..500), SMALL_BLOCK)
+    let mut bytes = build(Codec::Zstd, &numbered(0..500), SMALL_BLOCK)
         .as_bytes()
         .to_vec();
     let at = layout(&bytes).keys;
@@ -214,7 +214,7 @@ fn a_minimum_above_the_first_blocks_last_key_is_rejected_on_open() {
 
 #[test]
 fn malformed_minimum_key_lengths_are_rejected_on_open() {
-    let original = build(Codec::Lz4, &numbered(0..500), SMALL_BLOCK)
+    let original = build(Codec::Zstd, &numbered(0..500), SMALL_BLOCK)
         .as_bytes()
         .to_vec();
     let l = layout(&original);
@@ -258,7 +258,7 @@ fn a_minimum_key_over_the_limit_is_rejected_even_inside_a_large_key_area() {
 
 #[test]
 fn a_shortened_minimum_key_is_rejected() {
-    let original = build(Codec::Lz4, &numbered(0..500), SMALL_BLOCK)
+    let original = build(Codec::Zstd, &numbered(0..500), SMALL_BLOCK)
         .as_bytes()
         .to_vec();
     let l = layout(&original);
@@ -269,7 +269,7 @@ fn a_shortened_minimum_key_is_rejected() {
 
 #[test]
 fn an_empty_run_with_a_stored_minimum_is_rejected() {
-    let mut bytes = build(Codec::Lz4, &[], SMALL_BLOCK).as_bytes().to_vec();
+    let mut bytes = build(Codec::Zstd, &[], SMALL_BLOCK).as_bytes().to_vec();
     put_u32(&mut bytes, 20, 1);
     let error = RunView::open(&bytes).unwrap_err();
     assert_eq!(kind_of(error), RunCorruption::InvalidFooter);
@@ -304,7 +304,7 @@ fn a_lookup_at_either_bound_still_finds_the_key() {
 fn three_disjoint() -> Vec<Run<Vec<u8>>> {
     vec![
         build(Codec::None, &numbered(0..300), SMALL_BLOCK),
-        build(Codec::Lz4, &numbered(300..600), SMALL_BLOCK),
+        build(Codec::Zstd, &numbered(300..600), SMALL_BLOCK),
         build(Codec::Zstd, &numbered(600..900), SMALL_BLOCK),
     ]
 }
@@ -380,7 +380,7 @@ fn a_waiting_run_tying_the_current_key_is_merged_before_it_is_returned() {
         &[put(b"a", 1, b"a"), put(b"m", 1, b"old")],
         SMALL_BLOCK,
     );
-    let newer = build(Codec::Lz4, &[put(b"m", 5, b"new")], SMALL_BLOCK);
+    let newer = build(Codec::Zstd, &[put(b"m", 5, b"new")], SMALL_BLOCK);
     let mut workspace = MergeWorkspace::new();
     let mut cursor = MergeCursor::new([older.view(), newer.view()], &mut workspace);
     let mut found = Vec::new();
@@ -396,7 +396,7 @@ fn a_waiting_run_tying_the_current_key_is_merged_before_it_is_returned() {
 #[test]
 fn a_tombstone_in_a_waiting_run_still_hides_an_older_value() {
     let older = build(Codec::Zstd, &numbered(0..200), SMALL_BLOCK);
-    let newer = build(Codec::Lz4, &[del(b"key:00150", 900)], SMALL_BLOCK);
+    let newer = build(Codec::Zstd, &[del(b"key:00150", 900)], SMALL_BLOCK);
     let views = [older.view(), newer.view()];
     let set = RunSet::new(&views);
     let mut workspace = LogicalWorkspace::new();
@@ -420,7 +420,7 @@ fn a_conflict_with_a_waiting_run_is_still_detected() {
         &[put(b"a", 1, b"a"), put(b"m", 5, b"one")],
         SMALL_BLOCK,
     );
-    let b = build(Codec::Lz4, &[put(b"m", 5, b"two")], SMALL_BLOCK);
+    let b = build(Codec::Zstd, &[put(b"m", 5, b"two")], SMALL_BLOCK);
     let views = [a.view(), b.view()];
     let set = RunSet::new(&views);
     let mut workspace = LogicalWorkspace::new();
@@ -476,7 +476,7 @@ fn prefixes_of_0xff_bytes_and_binary_ranges_prune_correctly() {
         SMALL_BLOCK,
     );
     let high = build(
-        Codec::Lz4,
+        Codec::Zstd,
         &[
             put(&[0xFF], 1, b"c"),
             put(&[0xFF, 0x00], 1, b"d"),
@@ -501,7 +501,7 @@ fn prefixes_of_0xff_bytes_and_binary_ranges_prune_correctly() {
 #[test]
 fn an_empty_prefix_and_the_empty_key_read_a_run_whose_minimum_is_empty() {
     let runs = vec![build(
-        Codec::Lz4,
+        Codec::Zstd,
         &[put(b"", 1, b"e"), put(b"a", 1, b"a")],
         SMALL_BLOCK,
     )];
@@ -563,7 +563,7 @@ fn a_damaged_run_is_reported_only_by_reads_its_range_admits() {
 
 #[test]
 fn a_waiting_damaged_run_fails_when_the_merge_reaches_it() {
-    let good = build(Codec::Lz4, &numbered(0..100), SMALL_BLOCK);
+    let good = build(Codec::Zstd, &numbered(0..100), SMALL_BLOCK);
     let bad_run = build(Codec::Zstd, &numbered(100..200), SMALL_BLOCK);
     let bytes = damaged(&bad_run, 0);
     let views = [good.view(), RunView::open(&bytes).unwrap()];
@@ -676,7 +676,13 @@ fn pruned_reads_match_a_reference_model_and_decode_no_excluded_run() {
             .collect();
         let runs: Vec<_> = inputs
             .iter()
-            .map(|input| build(CODECS[rng.below(3)], input, [64, 512][rng.below(2)]))
+            .map(|input| {
+                build(
+                    CODECS[rng.below(CODECS.len())],
+                    input,
+                    [64, 512][rng.below(2)],
+                )
+            })
             .collect();
         let views = views(&runs);
         let set = RunSet::new(&views);

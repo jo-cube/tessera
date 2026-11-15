@@ -2,7 +2,7 @@
 //! native decoder contexts, against its workspace estimate and output,
 //! under each codec, compressible and incompressible values, records much
 //! larger than a block, and inputs of mixed codecs (5AT, 5AU). Blocks are
-//! of the largest length the engine builds, 64 KiB, where records allow.
+//! adaptive, with the 256 KiB raw cap where records allow.
 //!
 //! Zstandard's contexts are allocated through `malloc`, not the Rust
 //! allocator: they are reported by the workspace's `context_bytes` (the
@@ -105,7 +105,7 @@ fn engine_options(compression: Compression) -> EngineOptions {
     EngineOptions {
         memtable_budget: 2 << 20,
         target_run_len: 2 << 20,
-        target_block_len: 64 << 10,
+        target_block_compressed: 64 << 10,
         compression,
         background_compaction: None,
         ..EngineOptions::default()
@@ -180,13 +180,12 @@ fn measure(case: &Case) {
     let output = report.output_bytes + report.output_held_bytes;
     let mib = |bytes: usize| bytes as f64 / (1 << 20) as f64;
     println!(
-        "MERGE MEMORY | {} | {} | {:.1} | {:.1} | {:.1} | {:?} | {:.1} | {:.1} | {:.1} |",
+        "MERGE MEMORY | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
         case.name,
         report.inputs,
         mib(report.input_bytes + report.input_held_bytes),
         mib(output),
         mib(report.workspace_bytes),
-        report.stats.dictionary,
         mib(peak),
         mib(peak.saturating_sub(output)),
         mib(workspace.context_bytes()),
@@ -215,37 +214,21 @@ fn measure(case: &Case) {
 fn merges_stay_within_their_estimate_and_output() {
     println!(
         "MERGE MEMORY | case | inputs | input MiB | output MiB (stored + held) \
-         | workspace estimate MiB | dictionary | peak Rust heap above the baseline MiB \
+         | workspace estimate MiB | peak Rust heap above the baseline MiB \
          | that minus the output MiB | native decompression contexts MiB |"
     );
     let large = |seed: u64| noise(seed, 512 << 10);
     let cases = [
         (
-            "dictionary, text",
-            Compression::ZstdDictionary,
+            "zstd, text",
+            Compression::Zstd,
             None,
             8,
             2_400,
             text as fn(u64) -> Vec<u8>,
         ),
-        (
-            "dictionary, text",
-            Compression::ZstdDictionary,
-            None,
-            16,
-            2_400,
-            text,
-        ),
-        (
-            "dictionary, text",
-            Compression::ZstdDictionary,
-            None,
-            32,
-            2_400,
-            text,
-        ),
+        ("zstd, text", Compression::Zstd, None, 16, 2_400, text),
         ("zstd, text", Compression::Zstd, None, 32, 2_400, text),
-        ("lz4, text", Compression::Lz4, None, 32, 2_400, text),
         (
             "uncompressed, text",
             Compression::Uncompressed,
@@ -263,16 +246,8 @@ fn merges_stay_within_their_estimate_and_output() {
             |seed| noise(seed, 600),
         ),
         (
-            "dictionary, incompressible",
-            Compression::ZstdDictionary,
-            None,
-            32,
-            2_400,
-            |seed| noise(seed, 600),
-        ),
-        (
-            "lz4, incompressible",
-            Compression::Lz4,
+            "uncompressed, incompressible",
+            Compression::Uncompressed,
             None,
             32,
             2_400,
@@ -287,17 +262,17 @@ fn merges_stay_within_their_estimate_and_output() {
             large,
         ),
         (
-            "zstd runs recovered as lz4",
+            "zstd runs recovered as uncompressed",
             Compression::Zstd,
-            Some(Compression::Lz4),
+            Some(Compression::Uncompressed),
             16,
             2_400,
             text,
         ),
         (
-            "dictionary runs recovered as uncompressed",
-            Compression::ZstdDictionary,
-            Some(Compression::Uncompressed),
+            "uncompressed runs recovered as zstd",
+            Compression::Uncompressed,
+            Some(Compression::Zstd),
             16,
             2_400,
             text,

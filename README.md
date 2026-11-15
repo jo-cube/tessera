@@ -16,8 +16,8 @@ bundled Zstandard library.
 - Consistent in-memory snapshots that remain readable after the engine closes.
 - Automatic memtable flushing and background leveled compaction; manual
   maintenance is also available.
-- Zstandard, LZ4 and uncompressed blocks, with optional dictionary compression
-  during rewrites.
+- Zstandard level 3 with raw segment dictionaries and adaptive blocks, or
+  uncompressed blocks.
 - Explicit full checkpoints and recovery of the latest committed checkpoint,
   including format, checksum and corruption checks.
 - Configurable admission limits for memtables, runs, snapshots and compaction.
@@ -63,6 +63,16 @@ assert_eq!(recovered.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+`EngineOptions::compression` is `Compression::Zstd` by default; the other
+choice is `Compression::Uncompressed`. Zstandard buffers roughly 4 MiB of raw
+encoded records per segment and stores one sampled raw dictionary of up to
+16 KiB. `target_block_compressed` defaults to 1024 bytes: a 64 KiB sample
+estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
+record gets its own block. Uncompressed runs use a fixed 16 KiB raw target.
+Readers reuse one context and borrow dictionary bytes from the run; there is
+no prepared dictionary or decoded-block cache. Run format 5 and checkpoint
+manifest version 2 replace earlier formats without backward compatibility.
+
 A `ReadGuard` provides a stable view while holding a shared lock and blocks
 writers for its lifetime. Use snapshots for longer reads. See the
 [`engine` module](src/engine.rs) for consistency, memory, maintenance and
@@ -79,8 +89,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 The suite includes model comparisons, corruption and format checks, snapshot
 and checkpoint correctness, compaction, allocation and retention checks.
-Large-allocation boundary tests stay ignored by default. The layout and
-dictionary research measurements also remain ignored for compression work.
+Large-allocation boundary tests stay ignored by default.
 
 For resource-limited Linux validation, use `scripts/validate.sh check`;
 `scripts/validate.sh limits` runs the large-allocation boundary tests.

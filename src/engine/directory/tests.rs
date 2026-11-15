@@ -30,7 +30,7 @@ fn run(records: &[Record]) -> SharedRun {
     let mut sorted = records.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     // Small blocks, so that runs span several and scans cross them.
-    let mut builder = RunBuilder::with_target_block_len(Codec::Zstd, 64);
+    let mut builder = RunBuilder::with_raw_block_target(Codec::Zstd, 64);
     for (key, seq, value) in &sorted {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();

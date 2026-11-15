@@ -40,80 +40,29 @@
 //! block length and dictionary always encode to the same bytes. A run
 //! contains no process pointers.
 //!
-//! Two versions share one layout. Version 3 has no dictionary; version 4
-//! stores one, between the frames and the table, and has a longer footer.
-//! Both end with `version` and `magic`, so the last 8 bytes say how to read
-//! the rest. A run without a dictionary is always written as version 3.
+//! Version 5 stores independently decodable blocks followed by raw-content
+//! segment dictionaries, a segment table, the sparse block index, keys and footer.
 //!
 //! ```text
-//! run       := frame* dictionary table key_area footer
-//!
-//! frame     := header stored
-//! header    := codec:u8 reserved:[u8; 3] decoded_len:u32 checksum:u32
-//! dictionary:= dict_bytes            dict_len bytes; none in version 3
-//!
-//! table     := entry*                one per frame, in key order
-//! entry     := frame_offset:u64 key_end:u32
-//! key_area  := min_key last_key*     min_key_len bytes, then one per block
-//!
-//! footer    := index_offset:u64 record_count:u64 block_count:u32
-//!              min_key_len:u32 version:u32 magic:u32          version 3, 32 bytes
-//!            | index_offset:u64 record_count:u64 block_count:u32
-//!              min_key_len:u32 dict_len:u32 dict_checksum:u32
-//!              version:u32 magic:u32                          version 4, 40 bytes
+//! frame := codec:u8 dictionary_ref:u24 decoded_len:u32 checksum:u32 stored
+//! segment := dictionary_offset:u64 dictionary_len:u32 dictionary_crc:u32
+//! entry := frame_offset:u64 key_end:u32
+//! footer := index_offset:u64 record_count:u64 block_count:u32 min_key_len:u32
+//!           dictionaries_offset:u64 segment_count:u32 reserved:u32
+//!           version:u32 magic:u32
 //! ```
 //!
-//! `stored` decodes to one block in the [block format](crate::block#format)
-//! with no reference to any other frame. `codec` is 0 for uncompressed, 1 for
-//! an LZ4 block, 2 for a Zstandard frame that declares its content size and 3
-//! for such a frame compressed with the run's dictionary, which names the
-//! dictionary's ID in its frame header. Codec 3 is valid only in version 4,
-//! where frames of codecs 0–2 are valid too.
-//! `decoded_len` is the block's exact length and at most
-//! [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN). `reserved` is zero.
-//! `checksum` is the CRC-32 (IEEE) of the header's first 8 bytes followed by
-//! `stored`.
+//! Codec 0 is uncompressed and has reference 0. Codec 1 is Zstandard and
+//! references segment `dictionary_ref - 1`. The segment table immediately
+//! precedes the block index; dictionary regions tile the bytes between the
+//! frames and that table. Dictionaries contain at most 16 KiB of raw content.
+//! The frame CRC covers its first eight header bytes and stored payload.
+//! Dictionary CRCs are checked before decoding. No prepared dictionaries are held.
 //!
-//! The dictionary ends at `index_offset` and is a Zstandard dictionary of
-//! `dict_len` bytes, from 1 to
-//! [`MAX_DICTIONARY_LEN`](dictionary::MAX_DICTIONARY_LEN), with its magic number
-//! and a nonzero ID; `dict_checksum` is the CRC-32 (IEEE) of its bytes.
-//!
-//! A frame's stored length is implied by the next frame's offset, or by the
-//! start of the dictionary (`index_offset` in version 3) for the last frame. Block `i`'s last user key is
-//! `key_area[key_end[i - 1]..key_end[i]]`, with `key_end[-1]` taken as
-//! `min_key_len`. The run's smallest user key is `key_area[..min_key_len]` and
-//! its largest is the last block's key, so a run's key range is read without
-//! decoding anything. The footer is last, so a run can be written as a stream.
-//!
-//! Invariants of a valid run, all checked by [`Run::new`]:
-//!
-//! - The magic and a known version match, and the frames, dictionary, table,
-//!   key area and footer exactly cover the bytes. An empty run is a footer
-//!   alone.
-//! - In version 4, `dict_len` is within its bound, the dictionary matches its
-//!   checksum and Zstandard prepares it. Every codec 3 frame names its ID.
-//!   These are checked in that order, before any frame, and before anything
-//!   is allocated from a declared length.
-//! - Frames are contiguous and start at offset 0. Every frame has a correct
-//!   checksum and decodes to exactly `decoded_len` bytes, which form a valid
-//!   block with at least one record.
-//! - Internal keys strictly increase across the entire run, including from the
-//!   last record of one block to the first record of the next.
-//! - Each block's index key equals the user key of its last record.
-//! - `min_key` equals the user key of the first record, and an empty run has
-//!   `min_key_len` zero.
-//! - `record_count` equals the total number of records.
-//!
-//! Where blocks are cut is a builder policy and is not part of the format.
-//! Versions of one user key may span blocks. The first block whose last key is
-//! at or above a target is therefore the only candidate for that target, and
-//! contains its newest version. The codec is per frame in the format, and
-//! [`RunBuilder`] uses one codec for a whole run.
-//!
-//! A dictionary is the run's own: its prepared decoding form is built once
-//! when the run is built or validated, held by the [`Run`] and shared by every
-//! reader of it, and freed with it.
+//! Validation checks all regions, checksums, record ordering, index keys,
+//! the minimum key and record count. Empty runs contain only the footer.
+//! Internal keys increase across blocks; versions of one key may span blocks.
+//! A lookup chooses the first block whose last key is at least the target.
 
 mod builder;
 mod codec;
@@ -137,13 +86,7 @@ pub use builder::RunBuilder;
 pub use codec::Codec;
 pub(crate) use compact::CompactError;
 pub use compact::{
-    CompactLimits, CompactStats, Compacted, MAX_ENGINE_BLOCK_LEN, OutputCuts, compact_with,
-    workspace_estimate,
-};
-pub(crate) use dictionary::choose as choose_dictionary;
-pub use dictionary::{
-    DICTIONARY_LEN, DICTIONARY_WORKSPACE, DictionaryChoice, MIN_DICTIONARY_INPUT,
-    MIN_SAVING_PERCENT,
+    CompactLimits, CompactStats, Compacted, OutputCuts, compact_with, workspace_estimate,
 };
 pub(crate) use group::RunList;
 #[cfg(test)]
@@ -163,13 +106,12 @@ pub use logical::RunSet;
 #[cfg(test)]
 pub use reader::{KeyRange, ReadWorkspace, RunCursor};
 
-/// Encoded block length that [`RunBuilder::new`] aims for.
+/// Default estimated compressed block target.
+pub const TARGET_BLOCK_COMPRESSED: usize = 1024;
+/// Fixed raw target for uncompressed runs.
 pub const TARGET_BLOCK_LEN: usize = 16 << 10;
-
-/// Largest target accepted by [`RunBuilder::with_target_block_len`]. Staying
-/// at a quarter of the block limit means a soft cut always happens before a
-/// block can become full.
-pub const MAX_TARGET_BLOCK_LEN: usize = crate::block::MAX_BLOCK_LEN / 4;
+/// Raw block cap, except for a single oversized record.
+pub const RAW_BLOCK_CAP: usize = 256 << 10;
 
 /// The largest input per output run accepted when flushing or compacting. It
 /// keeps every run far enough inside the format's 32-bit index limits that
@@ -181,15 +123,10 @@ pub const MAX_TARGET_RUN_LEN: usize = 1 << 30;
 pub(crate) const RECORD_INPUT_OVERHEAD: usize = 16;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
-/// The version of a run without a dictionary.
-const FORMAT_VERSION: u32 = 3;
-/// The version of a run that stores a dictionary.
-const DICTIONARY_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const TABLE_ENTRY_LEN: usize = 12;
-/// The length of a version 3 footer, the shortest.
-const FOOTER_LEN: usize = 32;
-/// The length of a version 4 footer.
-const DICTIONARY_FOOTER_LEN: usize = 40;
+const SEGMENT_ENTRY_LEN: usize = 16;
+const FOOTER_LEN: usize = 48;
 
 /// Reads a little-endian `u32` from a fixed-size structure.
 fn read_u32<const N: usize>(bytes: &[u8; N], at: usize) -> u32 {
@@ -235,13 +172,10 @@ pub enum RunCorruption {
     /// A frame's stored bytes or header fields, or the dictionary's bytes, do
     /// not match their checksum.
     ChecksumMismatch,
-    /// The stored dictionary is too long, is not a Zstandard dictionary with
-    /// an ID, or cannot be prepared.
+    /// A raw dictionary region or reference is invalid.
     InvalidDictionary,
     /// A frame needs a dictionary and the run stores none.
     MissingDictionary,
-    /// A frame names a dictionary other than the run's.
-    DictionaryMismatch,
     /// A frame's stored bytes do not decompress to its declared length.
     CorruptPayload,
     /// A frame holds a block with no records.
@@ -267,7 +201,6 @@ impl fmt::Display for CorruptRun {
             RunCorruption::ChecksumMismatch => f.write_str("checksum mismatch"),
             RunCorruption::InvalidDictionary => f.write_str("invalid dictionary"),
             RunCorruption::MissingDictionary => f.write_str("frame needs a missing dictionary"),
-            RunCorruption::DictionaryMismatch => f.write_str("frame names another dictionary"),
             RunCorruption::CorruptPayload => f.write_str("corrupt compressed payload"),
             RunCorruption::EmptyBlock => f.write_str("block has no records"),
             RunCorruption::RecordCountMismatch => f.write_str("record count mismatch"),

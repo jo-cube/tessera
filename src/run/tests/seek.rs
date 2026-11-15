@@ -11,8 +11,8 @@ use crate::run::{
 
 type Owned = (Vec<u8>, u64, Option<Vec<u8>>);
 
-const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
-const COMPRESSED: [Codec; 2] = [Codec::Lz4, Codec::Zstd];
+const CODECS: [Codec; 2] = [Codec::None, Codec::Zstd];
+const COMPRESSED: [Codec; 1] = [Codec::Zstd];
 const RECORD_BOUND: usize = 200_000;
 /// Bounds retained bytes too, since keys can be 64 KiB long.
 const RETAINED_BOUND: usize = 64 << 20;
@@ -32,7 +32,7 @@ fn owned(record: Record<'_>) -> Owned {
 }
 
 fn build(codec: Codec, records: &[Owned], target: usize) -> Run<Vec<u8>> {
-    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(codec, target);
     for (key, seq, value) in records {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();
@@ -272,7 +272,7 @@ fn cursors_reposition_in_any_direction_and_after_ending() {
 #[test]
 fn a_new_cursor_forgets_a_previous_prefix() {
     let records = numbered(40);
-    let run = build(Codec::Lz4, &records, SMALL_BLOCK);
+    let run = build(Codec::Zstd, &records, SMALL_BLOCK);
     let mut workspace = ReadWorkspace::new();
     let mut first = run.cursor(&mut workspace);
     first.seek_prefix(b"key:001").unwrap();
@@ -379,7 +379,7 @@ fn prefix_scans_stop_without_loading_later_blocks() {
 }
 
 fn frame_starts(bytes: &[u8]) -> Vec<usize> {
-    let footer = bytes.len() - 32;
+    let footer = bytes.len() - 48;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let count = u32::from_le_bytes(bytes[footer + 16..footer + 20].try_into().unwrap()) as usize;
     (0..count)
@@ -748,7 +748,7 @@ fn a_finished_prefix_reads_nothing_further_however_often_it_is_polled() {
 #[test]
 fn an_oversized_prefix_discards_a_peeked_record() {
     let records = numbered(10);
-    let run = build(Codec::Lz4, &records, SMALL_BLOCK);
+    let run = build(Codec::Zstd, &records, SMALL_BLOCK);
     let mut workspace = ReadWorkspace::new();
     let mut cursor = run.cursor(&mut workspace);
     assert_eq!(owned(cursor.peek().unwrap().unwrap()), records[0]);

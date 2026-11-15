@@ -2,10 +2,8 @@
 //! ranged reads.
 
 mod compact;
-mod costs;
 mod dictionary;
 mod format;
-mod layouts;
 mod logical;
 mod merge;
 mod ranges;

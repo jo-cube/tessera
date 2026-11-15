@@ -12,7 +12,7 @@ use crate::run::{
 
 type Owned = (Vec<u8>, u64, Option<Vec<u8>>);
 
-const CODECS: [Codec; 3] = [Codec::None, Codec::Lz4, Codec::Zstd];
+const CODECS: [Codec; 2] = [Codec::None, Codec::Zstd];
 const RECORD_BOUND: usize = 200_000;
 const RETAINED_BOUND: usize = 64 << 20;
 const SMALL_BLOCK: usize = 1024;
@@ -30,7 +30,7 @@ fn owned(record: Record<'_>) -> Owned {
 }
 
 fn build(codec: Codec, records: &[Owned], target: usize) -> Run<Vec<u8>> {
-    let mut builder = RunBuilder::with_target_block_len(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(codec, target);
     for (key, seq, value) in records {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();
@@ -119,7 +119,7 @@ fn interleave(records: &[Owned], count: usize) -> Vec<Vec<Owned>> {
 }
 
 fn frame_start(bytes: &[u8], frame: usize) -> usize {
-    let footer = bytes.len() - 32;
+    let footer = bytes.len() - 48;
     let table = u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()) as usize;
     let at = table + frame * 12;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
@@ -254,7 +254,7 @@ fn runs_with_different_codecs_and_block_sizes_merge() {
     let runs: Vec<_> = inputs
         .iter()
         .enumerate()
-        .map(|(i, input)| build(CODECS[i % 3], input, [256, 1024, 8192][i % 3]))
+        .map(|(i, input)| build(CODECS[i % CODECS.len()], input, [256, 1024, 8192][i % 3]))
         .collect();
     assert_eq!(scan(&runs), records);
     assert_eq!(scan_prefix(&runs, b"key:0"), records);
@@ -443,7 +443,7 @@ fn corrupt_run(codec: Codec, records: &[Owned], frame: usize) -> Vec<u8> {
 fn a_damaged_input_fails_the_seek_until_a_good_seek() {
     let records = numbered(0..600);
     let inputs = interleave(&records, 2);
-    let good = build(Codec::Lz4, &inputs[0], SMALL_BLOCK);
+    let good = build(Codec::Zstd, &inputs[0], SMALL_BLOCK);
     let bytes = corrupt_run(Codec::Zstd, &inputs[1], 1);
     let damaged = RunView::open(&bytes).unwrap();
     let in_second_block = inputs[1]
@@ -474,7 +474,7 @@ fn a_damaged_input_fails_the_seek_until_a_good_seek() {
 fn iteration_stops_at_a_damaged_input_without_misordering() {
     let records = numbered(0..600);
     let inputs = interleave(&records, 2);
-    let good = build(Codec::Lz4, &inputs[0], SMALL_BLOCK);
+    let good = build(Codec::Zstd, &inputs[0], SMALL_BLOCK);
     let bytes = corrupt_run(Codec::Zstd, &inputs[1], 2);
     let damaged = RunView::open(&bytes).unwrap();
     let expected = CorruptRun {
@@ -503,7 +503,7 @@ fn a_first_read_of_a_damaged_input_fails_and_keeps_failing() {
     let records = numbered(0..200);
     let inputs = interleave(&records, 2);
     // The damaged input holds the first key, so the first read must reach it.
-    let good = build(Codec::Lz4, &inputs[1], SMALL_BLOCK);
+    let good = build(Codec::Zstd, &inputs[1], SMALL_BLOCK);
     let bytes = corrupt_run(Codec::Zstd, &inputs[0], 0);
     let damaged = RunView::open(&bytes).unwrap();
     let expected = CorruptRun {
@@ -601,7 +601,13 @@ fn merges_match_a_reference_model() {
         let expected = model(&inputs);
         let runs: Vec<_> = inputs
             .iter()
-            .map(|input| build(CODECS[rng.below(3)], input, [64, 256, 4096][rng.below(3)]))
+            .map(|input| {
+                build(
+                    CODECS[rng.below(CODECS.len())],
+                    input,
+                    [64, 256, 4096][rng.below(3)],
+                )
+            })
             .collect();
 
         assert_eq!(scan(&runs), expected, "seed {seed}");

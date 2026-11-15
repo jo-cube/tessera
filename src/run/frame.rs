@@ -12,9 +12,10 @@ pub(super) const HEADER_LEN: usize = 12;
 const CHECKSUMMED_LEN: usize = 8;
 
 /// Writes the header of `frame`, whose stored bytes follow a zeroed header.
-pub(super) fn seal(frame: &mut [u8], codec: Codec, decoded_len: usize) {
+pub(super) fn seal(frame: &mut [u8], codec: Codec, decoded_len: usize, dictionary_ref: u32) {
     let (header, stored) = frame.split_at_mut(HEADER_LEN);
     header[0] = codec.to_byte();
+    header[1..4].copy_from_slice(&dictionary_ref.to_le_bytes()[..3]);
     // Blocks are at most MAX_BLOCK_LEN, which fits in u32.
     header[4..CHECKSUMMED_LEN].copy_from_slice(&(decoded_len as u32).to_le_bytes());
     let checksum = checksum(&header[..CHECKSUMMED_LEN], stored);
@@ -35,6 +36,8 @@ pub(super) struct Frame<'a> {
     header: &'a [u8; HEADER_LEN],
     pub(super) codec: Codec,
     pub(super) decoded_len: usize,
+    pub(super) dictionary_ref: u32,
+    pub(super) dictionary: &'a [u8],
     pub(super) stored: &'a [u8],
 }
 
@@ -51,7 +54,11 @@ impl<'a> Frame<'a> {
             Codec::from_byte(header[0]).ok_or_else(|| error(RunCorruption::UnsupportedCodec))?;
         let decoded_len = read_u32(header, 4) as usize;
         let raw_len_differs = codec == Codec::None && decoded_len != stored.len();
-        if header[1..4] != [0; 3] || decoded_len > MAX_BLOCK_LEN || raw_len_differs {
+        let dictionary_ref = u32::from_le_bytes([header[1], header[2], header[3], 0]);
+        if decoded_len > MAX_BLOCK_LEN
+            || raw_len_differs
+            || (codec == Codec::None && dictionary_ref != 0)
+        {
             return Err(error(RunCorruption::InvalidFrame));
         }
         Ok(Self {
@@ -60,6 +67,8 @@ impl<'a> Frame<'a> {
             codec,
             decoded_len,
             stored,
+            dictionary_ref,
+            dictionary: &[],
         })
     }
 

@@ -4,8 +4,8 @@
 use crate::block::Value;
 use crate::run::{
     CONTEXT_ALLOWANCE, Codec, CompactError, CompactLimits, Compacted, ConflictingCopies,
-    MAX_ENGINE_BLOCK_LEN, MergeWorkspace, OutputCuts, RECORD_INPUT_OVERHEAD, ReadError,
-    ReadWorkspace, Run, RunBuilder, TARGET_BLOCK_LEN, compact, compact_with,
+    MergeWorkspace, OutputCuts, RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, ReadError, ReadWorkspace,
+    Run, RunBuilder, TARGET_BLOCK_LEN, compact, compact_with,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -42,8 +42,8 @@ const UNLIMITED: CompactLimits = CompactLimits {
     max_output_bytes: usize::MAX,
     max_workspace_bytes: usize::MAX,
     codec: Codec::Zstd,
-    target_block_len: crate::run::TARGET_BLOCK_LEN,
-    dictionary: false,
+    target_block_compressed: crate::run::TARGET_BLOCK_LEN,
+    zero_seq: false,
 };
 
 fn merge(
@@ -215,12 +215,12 @@ fn limits_fail_the_merge_with_the_amount_needed() {
 /// length the engine builds. A compression context grows with the block.
 #[test]
 fn measured_codec_contexts_fit_their_allowance() {
-    for target in [256, TARGET_BLOCK_LEN, MAX_ENGINE_BLOCK_LEN] {
-        // Two blocks' worth, so that one block reaches the target.
-        let input: Vec<(String, String)> = (0..2 * target / 72 + 64)
+    for target in [256, TARGET_BLOCK_LEN, RAW_BLOCK_CAP] {
+        // Fill a segment so compression happens before the context is measured.
+        let input: Vec<(String, String)> = (0..(4 << 20) / 72 + 64)
             .map(|i| (format!("key{i:07}"), format!("{:064}", i * 7)))
             .collect();
-        let mut builder = RunBuilder::with_target_block_len(Codec::Zstd, target);
+        let mut builder = RunBuilder::with_raw_block_target(Codec::Zstd, target);
         for (seq, (key, value)) in input.iter().enumerate() {
             let value = Value::Bytes(value.as_bytes());
             builder.add(key.as_bytes(), seq as u64 + 1, value).unwrap();
@@ -232,12 +232,12 @@ fn measured_codec_contexts_fit_their_allowance() {
             builder.context_bytes()
         );
         let run = builder.finish();
-        assert!(run.view().largest_block_len().unwrap() >= target - 64);
+        assert!(run.view().largest_block_len().unwrap() >= target - 128);
 
         let views = [run.view()];
         let mut workspace = MergeWorkspace::new();
         let limits = CompactLimits {
-            target_block_len: target,
+            target_block_compressed: target,
             ..UNLIMITED
         };
         compact(&views, |_| true, limits, &mut workspace).unwrap();

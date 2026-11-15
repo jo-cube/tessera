@@ -64,6 +64,31 @@ impl BlockBuilder {
         Ok(())
     }
 
+    /// Exact encoded length after an already checked record, including restarts.
+    /// Run builders use this to cut at raw byte limits without over-counting
+    /// the shared part of a prefix-compressed key.
+    pub(crate) fn encoded_len_after(&self, key: &[u8], seq: u64, value: Value<'_>) -> usize {
+        let restart = self.record_count.is_multiple_of(RESTART_INTERVAL);
+        let shared = if restart {
+            0
+        } else {
+            common_prefix_len(&self.last_key, key)
+        };
+        let (tag, len) = match value {
+            Value::Bytes(v) => (v.len() as u64 + 1, v.len()),
+            Value::Tombstone => (0, 0),
+        };
+        let suffix = key.len() - shared;
+        self.encoded_len()
+            + varint::encoded_len(shared as u64)
+            + varint::encoded_len(suffix as u64)
+            + varint::encoded_len(tag)
+            + varint::encoded_len(seq)
+            + suffix
+            + len
+            + if restart { U32_LEN } else { 0 }
+    }
+
     /// Encodes a record that has passed [`check`](Self::check).
     pub(crate) fn append(
         &mut self,
@@ -116,10 +141,6 @@ impl BlockBuilder {
     }
 
     /// Returns the number of records added so far.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
     pub fn len(&self) -> usize {
         self.record_count
     }
