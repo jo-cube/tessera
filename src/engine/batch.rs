@@ -98,8 +98,8 @@ impl Core {
             }
             charge = charge.saturating_add(record);
         }
+        let mut state = self.write_state();
         loop {
-            let mut state = self.write_state();
             let end = state
                 .last_seq
                 .checked_add(batch.len() as u64)
@@ -123,16 +123,7 @@ impl Core {
                 }
                 return Ok(end);
             }
-            drop(state);
-            let serial = self.serialize_flush();
-            let mut state = self.wait_for_level0(self.write_state());
-            let job = self
-                .begin_making_room(serial, &mut state)
-                .map_err(UpdateError::FlushRefused)?;
-            drop(state);
-            if let Some(job) = job {
-                job.build().publish().map_err(UpdateError::FlushRefused)?;
-            }
+            state = self.make_room(state)?;
         }
     }
 }

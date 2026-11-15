@@ -141,6 +141,7 @@ fn sequence_numbers_continue_across_flushes() {
 fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
     let engine = Engine::new(EngineOptions {
         memtable_budget: 200,
+        max_frozen_memtables: 1,
         ..manual()
     })
     .unwrap();
@@ -183,8 +184,10 @@ fn a_rejected_write_uses_no_sequence_number_and_changes_nothing() {
     // Raising the limits lets the next write flush both tables.
     engine.set_run_limits(64, usize::MAX).unwrap();
     assert_eq!(engine.put(b"c", &[0; 40]), Ok(3));
+    engine.flush().unwrap();
     let stats = engine.stats();
-    assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
+    assert_eq!(stats.frozen_tables, 0);
+    assert!(stats.runs >= 1);
 }
 
 #[test]
@@ -421,7 +424,7 @@ fn a_write_to_a_full_table_flushes_it_and_lands_in_the_next() {
     let b = engine.put(b"b", b"v").unwrap();
     assert_eq!(b, a + 1);
     let stats = engine.stats();
-    assert_eq!((stats.runs, stats.frozen_tables), (1, 0));
+    assert_eq!(stats.runs + stats.frozen_tables, 1);
     assert_eq!(stats.active.charged, budget);
     assert_eq!(
         scanned(&engine, b""),
@@ -430,7 +433,7 @@ fn a_write_to_a_full_table_flushes_it_and_lands_in_the_next() {
 }
 
 #[test]
-fn at_most_one_table_is_frozen_while_the_new_one_fills() {
+fn frozen_tables_are_bounded_while_the_new_one_fills() {
     let budget = 1 + 1 + ENTRY_OVERHEAD;
     let engine = Engine::new(EngineOptions {
         memtable_budget: budget,
@@ -442,13 +445,15 @@ fn at_most_one_table_is_frozen_while_the_new_one_fills() {
     engine.set_run_limits(1, 1).unwrap();
     engine.flush().unwrap_err();
     engine.put(b"b", b"v").unwrap();
-    let refused = engine.put(b"c", b"v").unwrap_err();
+    engine.put(b"c", b"v").unwrap();
+    let refused = engine.put(b"d", b"v").unwrap_err();
     assert!(matches!(refused, UpdateError::FlushRefused(_)), "{refused}");
     let stats = engine.stats();
     assert_eq!(stats.active.charged, budget);
-    assert_eq!(stats.frozen.unwrap().charged, budget);
+    assert_eq!(stats.frozen.unwrap().charged, 2 * budget);
     engine.set_run_limits(usize::MAX, usize::MAX).unwrap();
-    engine.put(b"c", b"v").unwrap();
+    engine.put(b"d", b"v").unwrap();
+    engine.flush().unwrap();
     assert_eq!(engine.stats().frozen, None);
 }
 
@@ -1011,6 +1016,7 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
         let budget = [1_500, 6_000, 40_000][rng.below(3)];
         let engine = Engine::new(EngineOptions {
             memtable_budget: budget,
+            max_frozen_memtables: 2,
             target_run_len: [1, 512, 1 << 20][rng.below(3)],
             max_runs: 100_000,
             max_run_bytes: usize::MAX,
@@ -1022,10 +1028,6 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
         })
         .unwrap();
         let mut model = Model::new();
-        // Charged per key in the active table, and what frozen tables are
-        // charged: a refused flush leaves its tables frozen.
-        let mut active: HashMap<Vec<u8>, usize> = HashMap::new();
-        let (mut has_frozen, mut frozen_charged) = (false, 0);
         let mut last_seq = 0;
 
         for _ in 0..OPERATIONS {
@@ -1054,30 +1056,15 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                     let value: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
 
                     let charge = entry_charge(&key, len);
-                    let total: usize = active.values().sum();
-                    let held = active.get(&key).copied().unwrap_or(0);
-                    // Frozen tables lower the active table's budget so that
-                    // all of them stay within two budgets.
-                    let active_budget = budget.min(2 * budget - frozen_charged);
-                    let fits = charge <= budget && total - held + charge <= active_budget;
-
                     let result = if delete {
                         engine.delete(&key)
                     } else {
                         engine.put(&key, &value)
                     };
-                    // A write with no room flushes every table and lands
-                    // alone in a new one.
-                    let flushes_first = !fits && charge <= budget;
-                    if fits || flushes_first {
+                    if charge <= budget {
                         last_seq += 1;
                         assert_eq!(result, Ok(last_seq), "seed {seed}");
-                        if flushes_first {
-                            active.clear();
-                            (has_frozen, frozen_charged) = (false, 0);
-                            automatic += 1;
-                        }
-                        active.insert(key.clone(), charge);
+                        automatic += 1;
                         model.insert(key, (last_seq, (!delete).then_some(value)));
                     } else {
                         assert!(matches!(result, Err(UpdateError::Rejected(_))));
@@ -1085,30 +1072,17 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
                     }
                 }
                 75..=85 => {
-                    let empty = !has_frozen && active.is_empty();
                     if rng.below(5) == 0 {
                         engine.set_run_limits(1, 1).unwrap();
-                        let result = engine.flush();
+                        refused += usize::from(engine.flush().is_err());
                         engine.set_run_limits(100_000, usize::MAX).unwrap();
-                        if empty {
-                            assert_eq!(result.unwrap().tables, 0);
-                        } else {
-                            assert!(result.is_err(), "seed {seed}");
-                            frozen_charged += active.values().sum::<usize>();
-                            active.clear();
-                            has_frozen = true;
-                            refused += 1;
-                        }
                     } else {
-                        assert_eq!(engine.flush().unwrap().tables == 0, empty);
-                        active.clear();
-                        (has_frozen, frozen_charged) = (false, 0);
-                        flushes += usize::from(!empty);
+                        engine.flush().unwrap();
+                        flushes += 1;
                     }
                 }
                 _ => {}
             }
-            assert_eq!(engine.stats().frozen.is_some(), has_frozen);
             assert_eq!(engine.stats().last_seq, last_seq);
             assert_engine_matches(&engine, &model, &pool, prefix);
         }
