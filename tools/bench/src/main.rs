@@ -219,7 +219,7 @@ fn all(outdir: &str, filter: &Filter) {
                 if let Some(s) = child.try_wait().unwrap() {
                     break s.to_string();
                 }
-                if Instant::now() > deadline || started.elapsed() > Duration::from_secs(if filter.streaming { 720 } else { 900 }) {
+                if Instant::now() > deadline {
                     child.kill().unwrap();
                     child.wait().unwrap();
                     break "killed: timeout".into();

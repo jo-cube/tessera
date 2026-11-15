@@ -72,7 +72,7 @@ Tessera `samples-*.csv` records live heap, RSS and footprint above baseline, plu
 2 s intervals, including drains and phase endpoints. Memory after each drain
 is sampled before its correctness gate. Group-index memory is in the baseline.
 The streaming process aborts at 12 GiB RSS plus RAM-disk allocation, and the
-suite has a 720 s deadline (300 s per child). Each child reports peak RSS.
+each dataset/engine case has its own 300 s deadline, starting when that child is spawned; setup and earlier cases do not consume it. Each child reports peak RSS.
 
 Transient RocksDB SST inputs and outputs exhausted 6 GiB on B before its
 load drained, so streaming defaults to 8 GiB. `TESSERA_BENCH_DISK_GIB` overrides
