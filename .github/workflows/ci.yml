@@ -1,7 +1,7 @@
 # The checks of `scripts/validate.sh check` on hosted runners, without its
 # container: one job per platform on the pinned toolchain, and one on the
-# minimum supported Rust version. Benchmarks, the large-allocation tests and
-# the RocksDB comparison stay local and opt-in.
+# minimum supported Rust version. The large-allocation tests stay local
+# and opt-in.
 name: ci
 
 # Pushes to the long-lived branches and release tags, and pull requests, so
@@ -45,7 +45,7 @@ jobs:
       - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo build --locked --release --lib --examples
+      - run: cargo build --locked --release --lib
 
   msrv:
     name: minimum Rust version

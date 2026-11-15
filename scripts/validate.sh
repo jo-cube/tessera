@@ -9,12 +9,6 @@
 #   scripts/validate.sh full               check, then limits
 #   scripts/validate.sh msrv-image         add the minimum Rust toolchain (online)
 #   scripts/validate.sh msrv               check and Clippy on that toolchain
-#   scripts/validate.sh bench [MODE…]      the benchmark suite, or some of its modes:
-#                                          memtable lookups scans readers density
-#                                          maintenance snapshots ingest mixed
-#                                          durable recovery, and on request
-#                                          workloads-zstd workloads-lz4
-#                                          workloads-none
 #   scripts/validate.sh verify             prove the limits are enforced
 #   scripts/validate.sh exec SECONDS CMD…  any command under the same limits
 #
@@ -58,10 +52,8 @@ offline=true
 extra_mounts=()
 
 memory=3g
-# The /tmp tmpfs, charged to the container's memory. TESSERA_TMPFS_SIZE
-# raises it for the RocksDB comparison in tools/compare, whose largest
-# dataset needs about 1.2 GiB of files during a full compaction.
-tmpfs_size="${TESSERA_TMPFS_SIZE:-512m}"
+# The /tmp tmpfs, charged to the container's memory.
+tmpfs_size=512m
 cpus=2
 pids=256
 run_label="tessera.validate=$$"
@@ -159,10 +151,8 @@ check() {
   bounded build-tests 300 cargo test --locked --no-run
   bounded test 300 cargo test --locked
   bounded doc 120 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-  # The library and examples as an application builds them. The benchmark
-  # suite's release build is the same cache entry, so this relinks nothing
-  # it has built.
-  bounded release 300 cargo build --locked --release --lib --examples
+
+  bounded release 300 cargo build --locked --release --lib
 }
 
 # The minimum Rust version is a compile contract: every target type-checks and
@@ -185,17 +175,6 @@ limits() {
 # cache volume (measured: 20–40 MiB for an incremental test build, a few
 # hundred MiB when every test binary relinks); prefer one final `full` to
 # repeated ones.
-#
-# The benchmarks write their fixtures to the /tmp tmpfs only, never to the
-# VM disk (and so the host's SSD): `durable` and `recovery` measure the
-# engine's own costs, with fsync free. Release builds share one cache entry
-# with no features, so every mode reuses the same binary.
-bench() {
-  local modes=("$@")
-  [ ${#modes[@]} -gt 0 ] || modes=(memtable lookups scans readers density maintenance snapshots ingest mixed durable recovery)
-  bounded bench 1800 sh -c 'cargo build --locked --release --example bench && for mode; do /cache/target/release/examples/bench "$mode" /tmp || exit; done' sh "${modes[@]}"
-}
-
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output
@@ -254,7 +233,6 @@ case "$command" in
   check) check ;;
   limits) limits ;;
   full) check; limits ;;
-  bench) bench "$@" ;;
   verify) verify ;;
   exec) seconds="$1"; shift; bounded exec "$seconds" "$@" ;;
   *) sed -n '2,15p' "$0"; exit 2 ;;
