@@ -27,6 +27,7 @@ unsafe extern "C" {
     fn tb_stats(p: *mut c_void, a: *mut u64);
     pub fn tb_rss() -> u64;
     pub fn tb_footprint() -> u64;
+    pub fn tb_live_heap() -> u64;
 }
 
 pub fn rocksdb_version() -> String {
@@ -187,6 +188,16 @@ impl Store {
                 assert!(s.failures == 0 && s.panic.is_none(), "compaction failed: {s:?}");
             }
             Self::R(p) => unsafe { tb_drain(*p) },
+        }
+    }
+    /// Stored runs plus held filters/segment metadata, after a drain.
+    pub fn accounted_run_bytes(&self) -> Option<u64> {
+        match self {
+            Self::T(e) => {
+                let s = e.stats();
+                Some((s.run_bytes + s.held_bytes) as u64)
+            }
+            Self::R(_) => None,
         }
     }
     /// Flush bytes written, compaction bytes written, stored run/SST bytes.

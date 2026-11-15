@@ -171,15 +171,17 @@ impl Permutation {
 
 /// Sample through drains too. The condition variable stops the sampler without
 /// waiting for a sampling interval; all buffers are bounded by the run timeout.
-fn measured<T>(store: &Store, trace: &mut fs::File, base: u64, origin: Instant, phase: &str, f: impl FnOnce() -> T) -> T {
+fn measured<T>(store: &Store, trace: &mut fs::File, base: MemoryBaseline, origin: Instant, phase: &str, f: impl FnOnce() -> T) -> T {
     let done = (Mutex::new(false), Condvar::new());
     thread::scope(|scope| {
         let done_ref = &done;
         let sampler = scope.spawn(move || {
             let sample = |trace: &mut fs::File| {
-                let physical = footprint().saturating_sub(base);
+                let heap = live_heap().saturating_sub(base.heap);
+                let ram = rss().saturating_sub(base.rss);
+                let physical = footprint().saturating_sub(base.footprint);
                 let stored = store.counters()[2];
-                writeln!(trace, "{:.2},{phase},{physical},{stored},{}", origin.elapsed().as_secs_f64(), physical as i64 - stored as i64)
+                writeln!(trace, "{:.2},{phase},{heap},{ram},{physical},{stored},{}", origin.elapsed().as_secs_f64(), heap as i64 - stored as i64)
                     .unwrap();
             };
             sample(trace);
@@ -208,13 +210,12 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
     let out = Out { prefix: format!("{ds},{engine}") };
     let setup = Instant::now();
     let data = StreamData::new(ds, target);
-    let (base_rss, base_fp, base_disk) = (rss(), footprint(), disk_used());
+    let memory = MemoryBaseline::capture();
     out.emit("setup", "records", data.n);
     out.emit("setup", "raw_mib", format!("{:.2}", data.raw as f64 / MIB as f64));
     out.emit("setup", "generate_s", format!("{:.2}", setup.elapsed().as_secs_f64()));
     out.emit("setup", "group_index_bytes", data.groups.capacity() * std::mem::size_of::<Group>());
-    out.emit("setup", "baseline_rss_mib", base_rss >> 20);
-    out.emit("setup", "baseline_footprint_mib", base_fp >> 20);
+    memory.emit(&out);
     let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sampled_peak = peak.clone();
     thread::spawn(move || {
@@ -240,7 +241,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         copy_options(&format!("{dir}/db"), &format!("{outdir}/OPTIONS-{ds}-{engine}"));
     }
     let mut trace = fs::File::create(format!("{outdir}/samples-{ds}-{engine}.csv")).unwrap();
-    writeln!(trace, "time_s,phase,footprint_bytes,stored_bytes,overhead_bytes").unwrap();
+    writeln!(trace, "time_s,phase,live_heap_bytes,rss_bytes,footprint_bytes,stored_bytes,heap_overhead_bytes").unwrap();
     let origin = Instant::now();
     let mut live = data.raw;
     let mut b = store.batch();
@@ -300,19 +301,12 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
             span.finish(&out, phase, ops, bytes);
         };
         if engine == "tessera" {
-            measured(&store, &mut trace, base_fp, origin, phase, write);
+            measured(&store, &mut trace, memory, origin, phase, write);
         } else {
             write();
         }
         amplification(&out, phase, before, store.counters());
-        let disk = if engine == "tessera" { 0 } else { disk_used().saturating_sub(base_disk) };
-        let ram = rss().saturating_sub(base_rss) + disk;
-        let physical = footprint().saturating_sub(base_fp) + disk;
-        out.emit(phase, "engine_ram_mib", format!("{:.2}", ram as f64 / MIB as f64));
-        out.emit(phase, "engine_footprint_mib", format!("{:.2}", physical as f64 / MIB as f64));
-        out.emit(phase, "ram_disk_mib", format!("{:.2}", disk as f64 / MIB as f64));
-        out.emit(phase, "live_mib", format!("{:.2}", live as f64 / MIB as f64));
-        out.emit(phase, "live_per_footprint", format!("{:.2}", live as f64 / physical as f64));
+        memory.report(&store, &out, phase, live);
         let mut rng = Rng(0x67617465 ^ ds as u64);
         let mut reader = Reader::new();
         let mut bad = 0;

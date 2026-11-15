@@ -12,6 +12,7 @@
 #include <rocksdb/version.h>
 #include <rocksdb/write_batch.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <libproc.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -64,6 +65,12 @@ uint64_t tb_rss() {
   mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
   task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&m, &n);
   return m.resident_size;
+}
+uint64_t tb_live_heap() {
+  malloc_statistics_t stats{};
+  // A null zone aggregates every allocator zone in the process.
+  malloc_zone_statistics(nullptr, &stats);
+  return stats.size_in_use;
 }
 uint64_t tb_footprint() {
   rusage_info_v2 info{};

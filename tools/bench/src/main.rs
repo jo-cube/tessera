@@ -46,6 +46,47 @@ fn footprint() -> u64 {
     unsafe { store::tb_footprint() }
 }
 
+fn live_heap() -> u64 {
+    unsafe { store::tb_live_heap() }
+}
+
+#[derive(Clone, Copy)]
+struct MemoryBaseline {
+    rss: u64,
+    heap: u64,
+    footprint: u64,
+    disk: u64,
+}
+impl MemoryBaseline {
+    /// Capture with input/oracle allocated, before opening the engine.
+    fn capture() -> Self {
+        Self { rss: rss(), heap: live_heap(), footprint: footprint(), disk: disk_used() }
+    }
+    fn emit(&self, out: &Out) {
+        out.emit("setup", "baseline_rss_mib", format!("{:.2}", self.rss as f64 / MIB as f64));
+        out.emit("setup", "baseline_heap_mib", format!("{:.2}", self.heap as f64 / MIB as f64));
+        out.emit("setup", "baseline_footprint_mib", format!("{:.2}", self.footprint as f64 / MIB as f64));
+    }
+    fn report(&self, store: &Store, out: &Out, case: &str, live: usize) {
+        let disk = if matches!(store, Store::R(_)) { disk_used().saturating_sub(self.disk) } else { 0 };
+        let heap = live_heap().saturating_sub(self.heap) + disk;
+        let ram = rss().saturating_sub(self.rss) + disk;
+        let physical = footprint().saturating_sub(self.footprint) + disk;
+        out.emit(case, "engine_heap_bytes", heap);
+        out.emit(case, "engine_heap_mib", format!("{:.2}", heap as f64 / MIB as f64));
+        out.emit(case, "engine_ram_mib", format!("{:.2}", ram as f64 / MIB as f64));
+        out.emit(case, "engine_footprint_mib", format!("{:.2}", physical as f64 / MIB as f64));
+        out.emit(case, "ram_disk_mib", format!("{:.2}", disk as f64 / MIB as f64));
+        out.emit(case, "live_mib", format!("{:.2}", live as f64 / MIB as f64));
+        out.emit(case, "live_per_heap", format!("{:.2}", live as f64 / heap as f64));
+        out.emit(case, "live_per_rss", format!("{:.2}", live as f64 / ram as f64));
+        if let Some(accounted) = store.accounted_run_bytes() {
+            out.emit(case, "accounted_run_bytes", accounted);
+            assert!(heap >= accounted, "live heap {heap} below run_bytes + held_bytes {accounted} after {case}");
+        }
+    }
+}
+
 fn disk_used() -> u64 {
     if std::env::var_os("TESSERA_BENCH_NO_DISK").is_some() {
         return 0;
@@ -215,7 +256,7 @@ fn summary(rows: &[[String; 5]], total: f64, engines: &[&str; 3]) -> String {
     for ds in ["A", "B"] {
         let mut order = Vec::new();
         let mut cells = HashMap::new();
-        for r in rows.iter().filter(|r| r[0] == ds) {
+        for r in rows.iter().filter(|r| r[0] == ds && !r[3].contains("footprint")) {
             let key = (r[2].clone(), r[3].clone());
             if !order.contains(&key) {
                 order.push(key.clone());
@@ -250,9 +291,8 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     out.emit("setup", "records", n);
     out.emit("setup", "raw_mib", format!("{:.0}", data.raw as f64 / MIB as f64));
     out.emit("setup", "generate_s", format!("{:.1}", t.elapsed().as_secs_f64()));
-    let (base_rss, base_footprint, base_disk) = (rss(), footprint(), disk_used());
-    out.emit("setup", "baseline_rss_mib", base_rss >> 20);
-    out.emit("setup", "baseline_footprint_mib", base_footprint >> 20);
+    let memory = MemoryBaseline::capture();
+    memory.emit(&out);
     thread::spawn(|| {
         loop {
             let used = rss() + disk_used();
@@ -273,19 +313,6 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             _ => Store::rocks(&path, data.raw as u64 * 5 / 4),
         }
     };
-    let mem = |out: &Out, case: &str, data: &Data| {
-        let disk = disk_used().saturating_sub(base_disk);
-        let engine_disk = if engine == "tessera" { 0 } else { disk };
-        let ram = rss().saturating_sub(base_rss) + engine_disk;
-        let physical = footprint().saturating_sub(base_footprint) + engine_disk;
-        let live = data.live_bytes();
-        out.emit(case, "engine_ram_mib", ram >> 20);
-        out.emit(case, "engine_footprint_mib", physical >> 20);
-        out.emit(case, "ram_disk_mib", disk >> 20);
-        out.emit(case, "live_mib", live >> 20);
-        out.emit(case, "live_per_ram", format!("{:.2}", live as f64 / ram as f64));
-        out.emit(case, "live_per_footprint", format!("{:.2}", live as f64 / physical as f64));
-    };
 
     // 1. Shuffled load in 256-record batches, drained.
     if load {
@@ -305,7 +332,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         span.finish(&out, "load", n, data.raw);
         let c = store.counters();
         amplification(&out, "load", [0; 3], c);
-        mem(&out, "load", &data);
+        memory.report(&store, &out, "load", data.live_bytes());
         gate(&store, &data, &mut rng, &out, "load");
 
         if update {
@@ -337,7 +364,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             for &i in &data.deletes {
                 data.state[i as usize] = DELETED;
             }
-            mem(&out, "update", &data);
+            memory.report(&store, &out, "update", data.live_bytes());
             gate(&store, &data, &mut rng, &out, "update");
 
             // 4–6. Reads, scans and the mixed workload on the updated DB.
@@ -606,4 +633,30 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
     out.emit("mixed", "writer_max_lag_ms", format!("{:.1}", lag.as_secs_f64() * 1e3));
     out.emit("mixed", "reader_ops_s", format!("{:.0}", readers.iter().map(|r| r.1).sum::<u64>() as f64 / wall));
     out.lat("mixed", &h);
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn live_heap_counts_and_releases_large_allocations() {
+        // Well above the other harness tests' bounded scratch/noise.
+        let before = live_heap();
+        let allocation = vec![7u8; 32 * MIB];
+        black_box(&allocation);
+        let allocated = live_heap();
+        assert!(allocated >= before + 24 * MIB as u64);
+        drop(allocation);
+        assert!(live_heap() + 16 * (MIB as u64) < allocated);
+    }
+
+    #[test]
+    fn summaries_use_heap_and_rss_and_leave_footprint_in_csv_only() {
+        let rows = ["engine_heap_mib", "engine_ram_mib", "engine_footprint_mib", "baseline_footprint_mib", "live_per_heap", "live_per_rss"]
+            .map(|metric| ["A".into(), "tessera".into(), "update".into(), metric.into(), "1".into()]);
+        let text = summary(&rows, 0.0, &SCALE_ENGINES);
+        assert!(text.contains("engine_heap_mib") && text.contains("live_per_heap") && text.contains("live_per_rss"));
+        assert!(!text.contains("footprint"));
+    }
 }

@@ -36,12 +36,16 @@ RAM-disk use exceeds 8 GiB, and the parent kills any child after 300 s.
   sorted keys; 20k prefix scans of about 100 records; 20 s of four readers
   against a writer that offers 70% of Tessera's update rate in 1 s bursts.
   `r-large` skips the bulk and mixed cases. Write cases include the drain.
-- Memory reports both RSS (`engine_ram_mib`) and physical footprint
-  (`engine_footprint_mib`) after a drain, minus their respective baselines
-  measured with the dataset generated and no engine open. Footprint comes
-  from macOS `proc_pid_rusage(RUSAGE_INFO_V2).ri_phys_footprint` and excludes
-  allocator pages marked reusable. Both columns add RAM-disk bytes for
-  RocksDB. Write amplification is (flush + compaction bytes written) ÷ flush bytes.
+- Primary engine memory is live heap: macOS
+  `malloc_zone_statistics(NULL, &stats).size_in_use` summed across all zones,
+  minus the harness baseline taken after generating input and before opening
+  the engine. RSS (`engine_ram_mib`) is also reported, including allocator
+  retention; both figures add RAM-disk used bytes for RocksDB. Summaries show
+  `engine_heap_mib`, `live_per_heap` and `live_per_rss`. Physical footprint is
+  retained only in CSV diagnostics because reusable pages and OS compression
+  distort it. After each Tessera drain, live heap must cover `run_bytes + held_bytes`;
+  exact heap and accounted bytes are included in the CSV. Write amplification
+  is (flush + compaction bytes written) ÷ flush bytes.
 - After every load and update, 20k sampled keys and 200 group scans are
   checked against an in-harness oracle.
 
@@ -64,7 +68,7 @@ and permutation, so it is not directly comparable with the in-memory suite.
 The 20k-key gates regenerate and compare complete expected values; timed
 queries keep only a fixed 200k-key sample with expected lengths.
 
-Tessera `samples-*.csv` records footprint above baseline and stored bytes at
+Tessera `samples-*.csv` records live heap, RSS and footprint above baseline, plus stored bytes at
 2 s intervals, including drains and phase endpoints. Memory after each drain
 is sampled before its correctness gate. Group-index memory is in the baseline.
 The streaming process aborts at 12 GiB RSS plus RAM-disk allocation, and the
@@ -78,4 +82,5 @@ recorded in `environment.txt`; memory charges allocated bytes, not capacity.
 Tessera-only selections (`run.sh --engine tessera`, including streaming) skip
 RAM-disk setup and run entirely in memory. `TESSERA_BENCH_LEVEL_RATIO=10`
 overrides Tessera's level ratio without rebuilding; the selected ratio and
-builder count are logged.
+builder count are logged. `TESSERA_BENCH_BACKGROUND_THREADS=1` overrides the
+builder limit for controlled serial/parallel comparisons.
