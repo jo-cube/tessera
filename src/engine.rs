@@ -415,6 +415,7 @@
 //! directory at a time, through an advisory lock on its `LOCK` file, which
 //! the kernel releases if the process dies.
 
+mod batch;
 mod checkpoint;
 mod directory;
 mod levels;
@@ -429,6 +430,7 @@ mod leveling_tests;
 #[cfg(test)]
 mod staged_tests;
 
+pub use batch::WriteBatch;
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};
 pub use worker::{BackgroundError, BackgroundStatus};
 
@@ -1283,6 +1285,13 @@ impl Engine {
     /// Deletes `key` and returns the update's sequence number.
     pub fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
         self.core.delete(key)
+    }
+
+    /// Applies every operation atomically and returns the last sequence number.
+    /// Later operations on the same key win. An empty batch returns the current
+    /// sequence number without changing state.
+    pub fn write(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
+        self.core.write_batch(batch)
     }
 
     /// Returns the latest value of `key`, or `None` if it is absent or

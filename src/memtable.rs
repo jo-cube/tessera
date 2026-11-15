@@ -765,6 +765,19 @@ impl Memtable {
         self.0.memory()
     }
 
+    /// A conservative upper bound on the charge of one additional update,
+    /// including nodes and records a live snapshot could pin.
+    pub(crate) fn write_charge(&self, key: &[u8], value: Value<'_>) -> usize {
+        let bytes = match value {
+            Value::Bytes(bytes) => bytes.len(),
+            Value::Tombstone => 0,
+        };
+        key.len()
+            .saturating_add(bytes)
+            .saturating_add(ENTRY_OVERHEAD)
+            .saturating_add(self.0.plan(key).2)
+    }
+
     /// Raises the budget to `budget` if that is larger.
     pub(crate) fn raise_budget(&mut self, budget: usize) {
         self.0.budget = self.0.budget.max(budget);
