@@ -274,4 +274,31 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn adjacent_keys_and_duplicates_decode_each_group_block_once() {
+        let mut runs = Vec::new();
+        let keys: Vec<_> = (0..120u64).map(u64::to_be_bytes).collect();
+        for part in keys.chunks(40) {
+            let mut builder = RunBuilder::with_raw_block_target(Codec::Zstd, 180);
+            for (index, key) in part.iter().enumerate() {
+                builder
+                    .add(
+                        key,
+                        index as u64 + 1,
+                        Value::Bytes(b"a moderately sized value"),
+                    )
+                    .unwrap();
+            }
+            runs.extend(published(vec![builder.finish()]));
+        }
+        let blocks: usize = runs.iter().map(|run| run.run.block_count()).sum();
+        let directory = RunDirectory::build(&runs);
+        assert_eq!(directory.group_count(), 1);
+        let probes: Vec<_> = keys.iter().rev().chain(keys.iter()).collect();
+        let mut workspace = Workspace::default();
+        workspace.prepare(&probes);
+        workspace.runs(&probes, &directory).unwrap();
+        assert_eq!(workspace.blocks_loaded(), blocks as u64);
+        workspace.deliver(|_, value| assert_eq!(value, Some(&b"a moderately sized value"[..])));
+    }
 }

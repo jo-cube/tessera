@@ -412,3 +412,36 @@ fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
         engine.wait_for_compaction().unwrap();
     }
 }
+
+#[test]
+fn rejected_batches_and_refused_ingestion_leave_no_partial_data_or_sequences() {
+    use tessera::engine::MAX_KEY_LEN;
+    let engine = Engine::new(EngineOptions {
+        max_run_bytes: 1,
+        background_compaction: None,
+        ..EngineOptions::default()
+    })
+    .unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"a", b"value");
+    batch.put(b"b", b"value");
+    assert!(matches!(
+        engine.ingest_sorted(&batch),
+        Err(UpdateError::FlushRefused(_))
+    ));
+    assert_eq!(engine.stats().last_seq, 0);
+    let mut ws = EngineWorkspace::new();
+    assert!(engine.get(b"a", &mut ws).unwrap().is_none());
+    batch.put(&vec![b'x'; MAX_KEY_LEN + 1], b"bad");
+    assert!(matches!(
+        engine.write(&batch),
+        Err(UpdateError::Rejected(_))
+    ));
+    assert_eq!(engine.stats().last_seq, 0);
+    assert!(engine.get(b"a", &mut ws).unwrap().is_none());
+    engine.set_run_limits(100, usize::MAX).unwrap();
+    batch.clear();
+    batch.put(b"a", b"value");
+    batch.put(b"b", b"value");
+    assert_eq!(engine.ingest_sorted(&batch), Ok(2));
+}

@@ -778,11 +778,6 @@ impl Memtable {
             .saturating_add(self.0.plan(key).2)
     }
 
-    /// Raises the budget to `budget` if that is larger.
-    pub(crate) fn raise_budget(&mut self, budget: usize) {
-        self.0.budget = self.0.budget.max(budget);
-    }
-
     /// Returns the table as it is now, in constant time and without copying,
     /// leaving it writable. Later updates do not change the snapshot; what
     /// they copy or replace for it is charged to this table as

@@ -1141,10 +1141,6 @@ impl State {
                 },
             )
     }
-
-    fn frozen_charged(&self) -> usize {
-        self.frozen.iter().map(|table| table.memory().charged).sum()
-    }
 }
 
 /// Everything an engine shares with its background worker.
@@ -1584,15 +1580,15 @@ impl Core {
 
     /// The level-0 backpressure, before a flush is built: while level 0 is
     /// at its stop and a running worker can drain it, waits for the worker
-    /// without the state lock, holding only the caller's flush guard, until
+    /// without the state lock until
     /// a step it publishes leaves room or a pass begun after this call ends.
     /// One pass is all it waits for: a pass ends only once nothing is due or
     /// a step is refused, and level 0 at its stop is always due, so a pass
     /// that leaves no room ended on a refusal (snapshots retaining too much,
     /// a job over the limits) that waiting longer would not lift. That
     /// failure, or the worker's panic, is kept in `State::blocked` for the
-    /// refusal at publication to carry. Flushes are serialized, so nothing
-    /// fills level 0 while this waits.
+    /// refusal at publication to carry. Callers recheck their predicates
+    /// after this wait because ingestion can publish concurrently.
     ///
     /// A refusal at the level-0 stop is forgotten once level 0 has room
     /// again, so the next write needing room tries a flush; any other
@@ -1661,39 +1657,28 @@ impl Core {
         Ok(seq)
     }
 
-    /// Sorts a memtable's refusal into a lack of room, which a flush makes,
-    /// and a rejection for the caller. While frozen tables hold memory, the
-    /// active table's budget is lowered so that all of them stay within two
-    /// budgets, so a record refused only by the lowered budget fits once a
-    /// flush frees it.
+    /// Distinguishes invalid records from an active table needing rotation.
     fn refusal(&self, error: TableError) -> Refusal {
         let rejected = |error| Refusal::Error(UpdateError::Rejected(error));
         match error {
             TableError::KeyTooLong { len } => rejected(WriteError::KeyTooLong { len }),
             TableError::ValueTooLong { len } => rejected(WriteError::ValueTooLong { len }),
-            TableError::RecordExceedsBudget { charge, .. } if charge > self.memtable_budget => {
+            TableError::RecordExceedsBudget { charge, .. } => {
                 rejected(WriteError::RecordExceedsBudget {
                     charge,
                     budget: self.memtable_budget,
                 })
             }
-            TableError::RecordExceedsBudget { .. } | TableError::BudgetExceeded { .. } => {
-                Refusal::Full
-            }
+            TableError::BudgetExceeded { .. } => Refusal::Full,
             TableError::SequenceNotIncreasing { .. } => {
                 unreachable!("the engine assigns, and the log checks, increasing numbers")
             }
         }
     }
 
-    fn active_budget(&self, _frozen: usize) -> usize {
-        self.memtable_budget
-    }
-
     /// Freezes the active table and replaces it, in constant time.
     fn freeze_active(&self, state: &mut State) {
-        let frozen = state.frozen_charged() + state.active.memory().charged;
-        let successor = Memtable::new(self.active_budget(frozen), Some(state.last_seq));
+        let successor = Memtable::new(self.memtable_budget, Some(state.last_seq));
         let table = std::mem::replace(&mut state.active, successor).freeze();
         state.frozen.push(Arc::new(table));
     }
@@ -2375,8 +2360,6 @@ impl BuiltFlush<'_> {
             };
             state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
         }
-        let budget = job.engine.active_budget(state.frozen_charged());
-        state.active.raise_budget(budget);
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
