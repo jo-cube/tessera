@@ -17,12 +17,12 @@ impl Rng {
     pub fn n(&mut self, n: usize) -> usize {
         (self.next() % (n as u64)) as usize
     }
-    fn text(&mut self, n: usize) -> String {
+    pub(super) fn text(&mut self, n: usize) -> String {
         (0..n)
             .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[self.n(36)] as char)
             .collect()
     }
-    fn hex(&mut self, n: usize) -> String {
+    pub(super) fn hex(&mut self, n: usize) -> String {
         (0..n)
             .map(|_| b"0123456789abcdef"[self.n(16)] as char)
             .collect()
@@ -99,6 +99,10 @@ pub fn generate(name: char) -> Data {
     // TESSERA_BENCH_SCALE=n divides the dataset sizes, for smoke runs only.
     let scale: usize = std::env::var("TESSERA_BENCH_SCALE").map_or(1, |s| s.parse().unwrap());
     let target = if name == 'A' { 1024 * MIB } else { 512 * MIB } / scale;
+    generate_target(name, target)
+}
+
+pub fn generate_target(name: char, target: usize) -> Data {
     let mut rng = Rng(0x4c53504b ^ name as u64);
     let mut urng = Rng(0x55504454 ^ name as u64);
     let mut arena = Vec::with_capacity(target * 3 / 2 + 64 * MIB);

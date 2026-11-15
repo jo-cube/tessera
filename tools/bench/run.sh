@@ -13,7 +13,9 @@ sha=$(git -C "$root" rev-parse --short HEAD)
 out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
 mkdir -p "$out"
 [ ! -e /Volumes/tessbench ] || { echo "/Volumes/tessbench already exists" >&2; exit 1; }
-dev=$(hdiutil attach -nomount ram://8388608 | awk '{print $1}')
+sectors=8388608
+if [[ " $* " == *" --mode streaming "* ]]; then sectors=12582912; fi
+dev=$(hdiutil attach -nomount ram://$sectors | awk '{print $1}')
 trap 'hdiutil detach "$dev" >/dev/null || hdiutil detach -force "$dev" >/dev/null' EXIT
 diskutil erasevolume APFS tessbench "$dev" >/dev/null
 

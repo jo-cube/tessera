@@ -44,3 +44,28 @@ RAM-disk use exceeds 8 GiB, and the parent kills any child after 300 s.
   RocksDB. Write amplification is (flush + compaction bytes written) ÷ flush bytes.
 - After every load and update, 20k sampled keys and 200 group scans are
   checked against an in-harness oracle.
+
+## Streaming scale suite
+
+`run.sh --mode streaming` uses A at 8 GiB raw and B at 4 GiB raw on a
+6 GiB RAM disk. It runs Tessera defaults, `r-small` (128 MiB cache) and
+`r-mid` (1 GiB cache), each once: shuffled load, 50% updates plus 2% deletes,
+then exactly 200k random gets (10% deliberately absent keys) on 1 and 4 threads.
+Scans, multi-get, bulk and mixed workloads are excluded. Filters and
+`TESSERA_BENCH_SCALE` still work; the regular in-memory suite is unchanged.
+
+Regeneration preserves the regular generator's exact keys and both value
+versions. A small per-group RNG checkpoint index replaces the input arena;
+there is no per-record state or shuffled order array. A six-round Feistel
+bijection with cycle walking supplies write order for arbitrary record counts.
+Only 256 owned records are buffered per write; RocksDB pointers remain valid
+until the synchronous write returns. Write timing/CPU includes regeneration
+and permutation, so it is not directly comparable with the in-memory suite.
+The 20k-key gates regenerate and compare complete expected values; timed
+queries keep only a fixed 200k-key sample with expected lengths.
+
+Tessera `samples-*.csv` records footprint above baseline and stored bytes at
+2 s intervals, including drains and phase endpoints. Memory after each drain
+is sampled before its correctness gate. Group-index memory is in the baseline.
+The streaming process aborts at 12 GiB RSS plus RAM-disk allocation, and the
+suite has a 720 s deadline (300 s per child). Each child reports peak RSS.

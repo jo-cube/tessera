@@ -3,6 +3,7 @@
 //! summary.md. See README.md.
 mod data;
 mod store;
+mod streaming;
 use data::*;
 use hdrhistogram::Histogram;
 use std::{
@@ -22,12 +23,14 @@ const MOUNT: &str = "/Volumes/tessbench";
 /// Process RSS plus RAM-disk bytes beyond which a child aborts.
 const LIMIT: u64 = 8 << 30;
 const ENGINES: [&str; 3] = ["tessera", "r-small", "r-large"];
+const SCALE_ENGINES: [&str; 3] = ["tessera", "r-small", "r-mid"];
 const MISS: u32 = u32::MAX;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("all") => all(&args[2], &Filter::parse(&args[3..])),
+        Some("case") if args.get(7).is_some_and(|s| s == "streaming") => streaming::run(args[2].chars().next().unwrap(), &args[3], &args[4], &args[6]),
         Some("case") => case(args[2].chars().next().unwrap(), &args[3], &args[4], args[5].parse().unwrap(), &args[6]),
         _ => panic!("usage: bench all OUTDIR [--dataset A,B] [--engine E,..] [--case C,..]"),
     }
@@ -114,19 +117,29 @@ struct Filter {
     datasets: String,
     engines: String,
     cases: String,
+    streaming: bool,
 }
 impl Filter {
     fn parse(args: &[String]) -> Self {
-        let mut f = Self { datasets: "A,B".into(), engines: ENGINES.join(","), cases: CASES.into() };
+        let mut f = Self { datasets: "A,B".into(), engines: ENGINES.join(","), cases: CASES.into(), streaming: false };
         for pair in args.chunks(2) {
             let value = pair.get(1).cloned().expect("a filter needs a value");
             match pair[0].as_str() {
+                "--mode" => { assert!(value == "memory" || value == "streaming"); f.streaming = value == "streaming"; },
                 "--dataset" => f.datasets = value,
                 "--engine" => f.engines = value,
                 "--case" => f.cases = value,
                 other => panic!("unknown option {other}"),
             }
         }
+        if f.streaming {
+            if !args.iter().any(|a| a == "--engine") { f.engines = SCALE_ENGINES.join(","); }
+            if !args.iter().any(|a| a == "--case") { f.cases = "load,update,reads".into(); }
+            assert!(f.engines.split(',').all(|e| SCALE_ENGINES.contains(&e)), "streaming engines: tessera,r-small,r-mid");
+            assert!(f.cases.split(',').all(|c| ["load", "update", "reads"].contains(&c)), "streaming cases: load,update,reads");
+        }
+        assert!(f.datasets.split(',').all(|d| ["A", "B"].contains(&d)), "unknown dataset");
+        assert!(f.engines.split(',').all(|e| if f.streaming { SCALE_ENGINES.contains(&e) } else { ENGINES.contains(&e) }), "unknown engine");
         for c in f.cases.split(',') {
             assert!(wants(CASES, c), "unknown case {c}; cases are {CASES}");
         }
@@ -144,12 +157,14 @@ fn all(outdir: &str, filter: &Filter) {
     let mut csv = fs::File::create(format!("{outdir}/results.csv")).unwrap();
     writeln!(csv, "dataset,engine,case,metric,value").unwrap();
     let mut rows: Vec<[String; 5]> = Vec::new();
+    let mut failed = false;
+    let engines = if filter.streaming { &SCALE_ENGINES } else { &ENGINES };
     for ds in ["A", "B"].into_iter().filter(|d| wants(&filter.datasets, d)) {
         let mut rate = 0.0;
-        for engine in ENGINES.into_iter().filter(|e| wants(&filter.engines, e)) {
+        for engine in engines.iter().copied().filter(|e| wants(&filter.engines, e)) {
             eprintln!("[{:>5.0}s] {ds} {engine}", started.elapsed().as_secs_f64());
             let mut child = Command::new(&exe)
-                .args(["case", ds, engine, outdir, &rate.to_string(), &filter.cases])
+                .args(["case", ds, engine, outdir, &rate.to_string(), &filter.cases, if filter.streaming { "streaming" } else { "memory" }])
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -160,7 +175,7 @@ fn all(outdir: &str, filter: &Filter) {
                 if let Some(s) = child.try_wait().unwrap() {
                     break s.to_string();
                 }
-                if Instant::now() > deadline || started.elapsed() > Duration::from_secs(900) {
+                if Instant::now() > deadline || started.elapsed() > Duration::from_secs(if filter.streaming { 720 } else { 900 }) {
                     child.kill().unwrap();
                     child.wait().unwrap();
                     break "killed: timeout".into();
@@ -169,6 +184,7 @@ fn all(outdir: &str, filter: &Filter) {
             };
             let mut lines = lines.join().unwrap();
             if status != "exit status: 0" {
+                failed = true;
                 lines.push(format!("{ds},{engine},process,status,{}", status.replace(',', ";")));
             }
             for l in lines {
@@ -186,11 +202,12 @@ fn all(outdir: &str, filter: &Filter) {
     }
     let total = started.elapsed().as_secs_f64();
     writeln!(csv, "all,all,run,wall_s,{total:.1}").unwrap();
-    fs::write(format!("{outdir}/summary.md"), summary(&rows, total)).unwrap();
+    fs::write(format!("{outdir}/summary.md"), summary(&rows, total, engines)).unwrap();
     eprintln!("total {total:.1} s; results in {outdir}");
+    assert!(!failed, "benchmark child failed; see {outdir}/results.csv");
 }
 
-fn summary(rows: &[[String; 5]], total: f64) -> String {
+fn summary(rows: &[[String; 5]], total: f64, engines: &[&str; 3]) -> String {
     let mut s = format!("# Tessera vs RocksDB {}\n\nTotal runtime {total:.0} s.\n", store::rocksdb_version());
     for ds in ["A", "B"] {
         let mut order = Vec::new();
@@ -202,9 +219,9 @@ fn summary(rows: &[[String; 5]], total: f64) -> String {
             }
             cells.insert((key, r[1].clone()), r[4].clone());
         }
-        let _ = write!(s, "\n## Dataset {ds}\n\n| case | metric | {} |\n|---|---|{}\n", ENGINES.join(" | "), "---|".repeat(3));
+        let _ = write!(s, "\n## Dataset {ds}\n\n| case | metric | {} |\n|---|---|{}\n", engines.join(" | "), "---|".repeat(3));
         for key in order {
-            let v: Vec<&str> = ENGINES.iter().map(|e| cells.get(&(key.clone(), e.to_string())).map_or("–", String::as_str)).collect();
+            let v: Vec<&str> = engines.iter().map(|e| cells.get(&(key.clone(), e.to_string())).map_or("–", String::as_str)).collect();
             let _ = writeln!(s, "| {} | {} | {} |", key.0, key.1, v.join(" | "));
         }
     }

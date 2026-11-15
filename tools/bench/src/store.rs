@@ -66,7 +66,8 @@ impl Drop for Reader {
 }
 
 /// Reusable write buffers: a Tessera batch or RocksDB record pointers.
-/// RocksDB records point into the dataset, which outlives every batch.
+/// RocksDB records borrow the input; its keys and values must remain at stable
+/// addresses until the synchronous write/ingest returns.
 pub struct Batch {
     rocks: bool,
     t: WriteBatch,
