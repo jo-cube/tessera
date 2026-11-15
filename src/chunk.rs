@@ -1,6 +1,7 @@
 //! Engine-owned bulk allocations. Only the bounded free reserve is pooled;
 //! checked-out chunks belong to their run or memtable, including snapshots.
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) const CHUNK_BYTES: usize = 1 << 20;
@@ -15,22 +16,103 @@ struct State {
 }
 
 #[derive(Debug)]
-struct Pool(Mutex<State>);
+struct Pool {
+    state: Mutex<State>,
+    counters: Counters,
+}
+
+/// Cumulative work performed by this engine, including abandoned builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildCounters {
+    /// Compressed frames shared into compaction outputs.
+    pub blocks_reused: u64,
+    /// Frame bytes shared into compaction outputs, including their headers.
+    pub bytes_reused: u64,
+    /// Newly encoded output blocks (including uncompressed output).
+    pub blocks_compressed: u64,
+    /// Newly encoded frame bytes, including headers.
+    pub bytes_compressed: u64,
+    /// Encoded raw block bytes passed to Zstandard, excluding ratio probes.
+    pub raw_bytes_compressed: u64,
+    /// Admitted key and value bytes; deletes count their keys.
+    pub raw_bytes_ingested: u64,
+    /// New blocks ended below their target to append a shared block.
+    pub forced_undersized_blocks: u64,
+    /// Raw block bytes decoded to rebuild filters for reused blocks.
+    pub filter_decoded_bytes: u64,
+}
+#[derive(Default, Debug)]
+struct Counters {
+    blocks_reused: AtomicU64,
+    bytes_reused: AtomicU64,
+    blocks_compressed: AtomicU64,
+    bytes_compressed: AtomicU64,
+    raw_bytes_compressed: AtomicU64,
+    raw_bytes_ingested: AtomicU64,
+    forced_undersized_blocks: AtomicU64,
+    filter_decoded_bytes: AtomicU64,
+}
+impl Counters {
+    fn snapshot(&self) -> BuildCounters {
+        BuildCounters {
+            blocks_reused: self.blocks_reused.load(Ordering::Relaxed),
+            bytes_reused: self.bytes_reused.load(Ordering::Relaxed),
+            blocks_compressed: self.blocks_compressed.load(Ordering::Relaxed),
+            bytes_compressed: self.bytes_compressed.load(Ordering::Relaxed),
+            raw_bytes_compressed: self.raw_bytes_compressed.load(Ordering::Relaxed),
+            raw_bytes_ingested: self.raw_bytes_ingested.load(Ordering::Relaxed),
+            forced_undersized_blocks: self.forced_undersized_blocks.load(Ordering::Relaxed),
+            filter_decoded_bytes: self.filter_decoded_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkPool(Arc<Pool>);
 
 impl ChunkPool {
     pub(crate) fn new(reserve_bytes: usize) -> Self {
-        Self(Arc::new(Pool(Mutex::new(State {
-            limit: reserve_bytes / CHUNK_BYTES,
-            ..State::default()
-        }))))
+        Self(Arc::new(Pool {
+            state: Mutex::new(State {
+                limit: reserve_bytes / CHUNK_BYTES,
+                ..State::default()
+            }),
+            counters: Counters::default(),
+        }))
     }
 
+    pub(crate) fn counters(&self) -> BuildCounters {
+        self.0.counters.snapshot()
+    }
+    pub(crate) fn ingested(&self, bytes: usize) {
+        self.0
+            .counters
+            .raw_bytes_ingested
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn compressed(&self, raw: usize, stored: usize, compressed: bool) {
+        self.0
+            .counters
+            .blocks_compressed
+            .fetch_add(1, Ordering::Relaxed);
+        self.0
+            .counters
+            .bytes_compressed
+            .fetch_add(stored as u64, Ordering::Relaxed);
+        if compressed {
+            self.0
+                .counters
+                .raw_bytes_compressed
+                .fetch_add(raw as u64, Ordering::Relaxed);
+        }
+    }
     pub(crate) fn take(&self) -> Chunk {
         let bytes = {
-            let mut state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             state.in_use += 1;
             state.free.pop()
         }
@@ -50,7 +132,11 @@ impl ChunkPool {
     }
     /// A coherent snapshot, including capacity beyond logically charged bytes.
     pub(crate) fn accounting(&self) -> (usize, usize, usize, usize) {
-        let state = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         (
             state.free.len() * CHUNK_BYTES,
             state.in_use * CHUNK_BYTES,
@@ -60,7 +146,7 @@ impl ChunkPool {
     }
     pub(crate) fn trim(&self) {
         self.0
-            .0
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .free
@@ -96,7 +182,7 @@ impl Chunk {
 
     pub(crate) fn set_used(&mut self, used: usize) {
         if let Some(pool) = self.pool.upgrade() {
-            let mut state = pool.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
             state.used = state.used - self.used + used;
         }
         self.used = used;
@@ -126,7 +212,7 @@ impl Clone for Chunk {
 impl Drop for Chunk {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
-            let mut state = pool.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
             state.in_use -= 1;
             state.used -= self.used;
             if state.free.len() < state.limit {

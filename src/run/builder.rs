@@ -289,6 +289,8 @@ impl RunBuilder {
             self.compressor.compress(raw, None, &mut self.frames);
         }
         frame::seal(&mut self.frames, codec, len, reference);
+        self.storage
+            .compressed(len, self.frames.len(), codec == Codec::Zstd);
         self.storage.frame(&self.frames);
         retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
         self.keys.extend_from_slice(block.last_key());

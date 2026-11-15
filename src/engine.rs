@@ -158,6 +158,7 @@ pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damag
 pub use worker::{BackgroundError, BackgroundStatus};
 
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
+pub use crate::chunk::BuildCounters;
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub use crate::run::{
     CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue, MergeWorkspace, ReadError,
@@ -497,6 +498,12 @@ pub struct FlushReport {
 /// A summary of an engine's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineStats {
+    /// Cumulative encoding and block-reuse work.
+    pub build: BuildCounters,
+    /// Physical chunk capacity held by published compressed runs.
+    pub chunk_bytes_held: usize,
+    /// Frame bytes referenced by published compressed runs.
+    pub block_bytes_live: usize,
     /// The last sequence number used.
     pub last_seq: u64,
     /// Total memory charged to writer admission (sum of the components below).
@@ -1152,6 +1159,13 @@ impl Core {
         written.map_err(|error| self.refusal(error))?;
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
+        self.chunks.ingested(
+            key.len()
+                + match value {
+                    Value::Bytes(bytes) => bytes.len(),
+                    Value::Tombstone => 0,
+                },
+        );
         Ok(seq)
     }
 
@@ -1530,6 +1544,9 @@ impl Core {
         let usage = self.usage(&state);
 
         EngineStats {
+            build: self.chunks.counters(),
+            chunk_bytes_held: state.runs.iter().map(|run| run.run.chunk_capacity()).sum(),
+            block_bytes_live: state.runs.iter().map(|run| run.run.frame_bytes()).sum(),
             used: usage.used,
             memory_limit: self.memory_limit,
             memtable_bytes: usage.memtables,

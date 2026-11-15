@@ -81,6 +81,9 @@ impl Packing {
         *len += bytes.len();
     }
 
+    pub fn compressed(&self, raw: usize, stored: usize, compressed: bool) {
+        self.pool.compressed(raw, stored, compressed);
+    }
     pub fn frame(&mut self, bytes: &[u8]) {
         self.append(bytes, false);
     }
@@ -148,6 +151,16 @@ impl<B: AsRef<[u8]>> RunData<B> {
         match self {
             Self::Contiguous(data) => data.as_ref().len(),
             Self::Segmented(data) => data.frames_len + data.dictionaries_len + data.tail.len(),
+        }
+    }
+    pub fn chunk_capacity(&self) -> usize {
+        match self {
+            Self::Contiguous(bytes) => bytes.as_ref().len(),
+            Self::Segmented(data) => data
+                .allocations
+                .iter()
+                .map(|chunk| chunk.bytes().len())
+                .sum(),
         }
     }
     /// Metadata beside serialized bytes. Pool capacity, including padding and

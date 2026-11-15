@@ -302,6 +302,12 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
     }
 
+    pub(crate) fn chunk_capacity(&self) -> usize {
+        self.data.chunk_capacity()
+    }
+    pub(crate) fn frame_bytes(&self) -> usize {
+        self.view().frame_bytes()
+    }
     /// Serialized byte count, excluding filters and physical segment metadata.
     pub fn stored_len(&self) -> usize {
         self.data.stored_len()

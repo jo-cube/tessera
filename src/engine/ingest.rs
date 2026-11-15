@@ -182,6 +182,18 @@ impl Core {
         state.held_bytes += held;
         state.order_runs();
         state.last_seq = seq;
+        self.chunks.ingested(
+            batch
+                .records()
+                .map(|(key, value)| {
+                    key.len()
+                        + match value {
+                            Value::Bytes(bytes) => bytes.len(),
+                            Value::Tombstone => 0,
+                        }
+                })
+                .sum(),
+        );
         drop(charge);
         drop(state);
         self.resources.changed();
