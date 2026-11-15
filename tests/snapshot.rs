@@ -368,7 +368,8 @@ fn frequent_snapshots_freeze_and_flush_nothing() {
 /// makes it.
 #[test]
 fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
-    const BUDGET: usize = 64 << 10;
+    // Leave room for the snapshot's copied partial arena chunk before rotation.
+    const BUDGET: usize = 80 << 10;
     let engine = Engine::new(EngineOptions {
         memtable_budget: BUDGET,
         ..manual()
@@ -390,7 +391,10 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
         (written, full) = (written + 1, stats);
     }
     assert!(full.active.charged <= BUDGET);
-    assert_eq!(full.active.charged, live + full.active.pinned);
+    assert_eq!(
+        full.active.charged,
+        live + written * 104 + full.active.pinned
+    );
     assert!(full.active.pinned > 0);
     // Every key was overwritten at most once: the leaves and values the
     // snapshot shares are pinned once each.

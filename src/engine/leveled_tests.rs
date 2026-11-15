@@ -891,7 +891,11 @@ fn a_merge_at_the_byte_limits_is_not_admitted_to_overflow() {
     };
     // The first merge, compacting after every flush, whose output exceeds
     // its inputs and whose inputs a valid limit can equal.
-    let reference = Engine::new(options()).unwrap();
+    let reference = Engine::new(EngineOptions {
+        memtable_budget: 128 << 10,
+        ..options()
+    })
+    .unwrap();
     let mut found = None;
     'search: for flush in 0..400 {
         history(&reference, flush);
@@ -911,7 +915,11 @@ fn a_merge_at_the_byte_limits_is_not_admitted_to_overflow() {
         }
     }
     let (flush, step, input) = found.expect("some merge writes more than it reads");
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: 128 << 10,
+        ..options()
+    })
+    .unwrap();
     for earlier in 0..flush {
         history(&engine, earlier);
         drain(&engine);

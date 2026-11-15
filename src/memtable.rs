@@ -6,11 +6,10 @@
 //!
 //! # Versions
 //!
-//! A table is a copy-on-write B+ tree: its nodes, keys and values are shared
-//! through reference counts. [`Memtable::snapshot`] returns the current tree
-//! as a [`FrozenMemtable`] in constant time, sharing every node. Later writes
-//! copy the nodes on their path that a snapshot still shares, so a snapshot
-//! never changes, and a node or value is freed with the last tree holding it.
+//! A table is a copy-on-write B+ tree. Snapshots share every node and the
+//! arena's chunk handles; copying the handles costs O(number of chunks).
+//! Later writes copy shared nodes on their path and, when appending to a
+//! shared partial chunk, copy that chunk first. No record straddles chunks.
 //! Each tree holds only the latest update of each key it saw: the versions are
 //! the trees, not chains inside one.
 //!
@@ -36,26 +35,19 @@
 //! # Memory
 //!
 //! A table admits an update only if its charged bytes stay within the budget.
-//! An entry is charged the length of its key, the length of its value and
-//! [`ENTRY_OVERHEAD`]. Replacing a value charges the difference in value
-//! length.
+//! The charge is arena bytes used (including overwritten garbage), plus
+//! [`ENTRY_OVERHEAD`] per live key and any history pinned by snapshots.
+//! Overwrites and deletes append key/value bytes and never free old payloads.
+//! A full table must be rotated even when an overwrite would shrink its value.
 //!
-//! A table is also charged what it has stopped using but its snapshots still
-//! share: the nodes an update copied and the values it replaced, from the
-//! oldest snapshot still alive onwards. This is [`MemoryUsage::pinned`]. It
-//! counts each copied node and replaced value once, at its allocated size, as
-//! it leaves the table while shared, and nothing else leaves a table while
-//! shared, so nothing a live snapshot holds apart from the table is missed.
-//! It is an upper estimate, since a node copied after one snapshot may be
-//! shared only by snapshots already dropped, and it falls to zero once every
-//! snapshot of the table is dropped. An update is admitted only with the bytes it pins, so
-//! a replacement that does not grow its entry is always admitted while no
-//! snapshot shares its path, and the budget bounds the table together with the
-//! history its snapshots hold.
+//! Copied nodes and the used part of a copied arena chunk are charged as
+//! [`MemoryUsage::pinned`] until the oldest snapshot needing them is gone.
+//! This is an upper estimate when snapshots are dropped out of order; it
+//! falls to zero when all snapshots are dropped. Arena garbage remains charged.
 //!
-//! The charge is an estimate of what the table allocates, not a limit on
-//! resident memory: allocator rounding and headers are not charged, and
-//! replacing a value briefly holds both values.
+//! The charge estimates used bytes, not resident memory. Chunk padding and
+//! the bounded free reserve are reported by the engine's pool counters.
+//! Records larger than a chunk have exact allocations outside the pool.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -63,7 +55,10 @@ use std::sync::{Arc, Weak};
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::chunk::ChunkPool;
+
 use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder, TARGET_BLOCK_COMPRESSED};
+mod arena;
+use arena::{Arena, Location};
 
 #[cfg(test)]
 mod tests;
@@ -72,8 +67,7 @@ mod tests;
 ///
 /// This covers, on 64-bit targets, the entry's slot in a leaf at the half
 /// occupancy every leaf off the tree's right edge keeps (about 66 bytes), the
-/// header of the allocation holding its key and value (16), and its share of
-/// branch nodes, with room to spare. Allocator rounding is not included, so
+/// arena metadata and its share of branch nodes, with room to spare. Allocator rounding is not included, so
 /// this is an estimate.
 pub const ENTRY_OVERHEAD: usize = 128;
 
@@ -101,56 +95,41 @@ const BRANCH_BYTES: usize = ARC_HEADER
     + size_of::<Node>()
     + (NODE_CAPACITY + 1) * (size_of::<Arc<[u8]>>() + size_of::<Arc<Node>>());
 
-/// The latest update of one key in one tree.
+/// The latest update of one key in one tree. The arena also keeps overwritten
+/// payloads until its last table or snapshot is dropped.
 #[derive(Clone)]
 struct Slot {
     seq: u64,
-    /// The key followed by the value, in one allocation shared with the trees
-    /// that still hold this update.
-    data: Arc<[u8]>,
-    /// At most [`MAX_KEY_LEN`], which fits.
+    data: Location,
     key_len: u32,
     tombstone: bool,
 }
 
 impl Slot {
-    fn new(key: &[u8], seq: u64, value: Option<&[u8]>) -> Self {
-        let tombstone = value.is_none();
-        let value = value.unwrap_or_default();
-        // One allocation, filled at memory speed: zeroing compiles to a fill,
-        // where copying through a chained iterator goes byte by byte.
-        let mut data: Arc<[u8]> = std::iter::repeat_n(0, key.len() + value.len()).collect();
-        let buffer = Arc::get_mut(&mut data).expect("a new allocation is unshared");
-        buffer[..key.len()].copy_from_slice(key);
-        buffer[key.len()..].copy_from_slice(value);
-        Self {
-            seq,
-            data,
-            key_len: u32::try_from(key.len()).expect("keys are within MAX_KEY_LEN"),
-            tombstone,
-        }
+    fn new(key: &[u8], seq: u64, value: Option<&[u8]>, arena: &mut Arena) -> (Self, usize) {
+        let (data, copied) = arena.append(key, value.unwrap_or_default());
+        (
+            Self {
+                seq,
+                data,
+                key_len: key.len() as u32,
+                tombstone: value.is_none(),
+            },
+            copied,
+        )
     }
-
-    fn key(&self) -> &[u8] {
-        &self.data[..self.key_len as usize]
+    fn key<'a>(&self, arena: &'a Arena) -> &'a [u8] {
+        &arena.get(self.data)[..self.key_len as usize]
     }
-
-    fn value(&self) -> Value<'_> {
+    fn value<'a>(&self, arena: &'a Arena) -> Value<'a> {
         if self.tombstone {
             Value::Tombstone
         } else {
-            Value::Bytes(&self.data[self.key_len as usize..])
+            Value::Bytes(&arena.get(self.data)[self.key_len as usize..])
         }
     }
-
-    fn value_len(&self) -> usize {
-        self.data.len() - self.key_len as usize
-    }
-
-    /// What this update's allocation holds: its counts and data, padded to
-    /// the alignment of the counts.
-    fn bytes(&self) -> usize {
-        (ARC_HEADER + self.data.len()).next_multiple_of(align_of::<usize>())
+    fn value_len(&self, arena: &Arena) -> usize {
+        arena.get(self.data).len() - self.key_len as usize
     }
 }
 
@@ -204,13 +183,13 @@ impl Node {
 }
 
 impl Leaf {
-    fn search(&self, key: &[u8]) -> Result<usize, usize> {
-        self.slots.binary_search_by(|slot| slot.key().cmp(key))
+    fn search(&self, key: &[u8], arena: &Arena) -> Result<usize, usize> {
+        self.slots.binary_search_by(|slot| slot.key(arena).cmp(key))
     }
 
     /// Splits an overfull leaf. Appending at the right edge leaves the left
     /// leaf full, so ascending inserts fill their leaves.
-    fn split(&mut self, append: bool) -> (Arc<[u8]>, Arc<Node>) {
+    fn split(&mut self, append: bool, arena: &Arena) -> (Arc<[u8]>, Arc<Node>) {
         let at = if append {
             NODE_CAPACITY
         } else {
@@ -220,7 +199,10 @@ impl Leaf {
             slots: node_buffer(&self.slots[at..]),
         };
         self.slots.truncate(at);
-        (Arc::from(right.slots[0].key()), Arc::new(Node::Leaf(right)))
+        (
+            Arc::from(right.slots[0].key(arena)),
+            Arc::new(Node::Leaf(right)),
+        )
     }
 }
 
@@ -279,15 +261,12 @@ fn insert(
     slot: Slot,
     edge: bool,
     detached: &mut usize,
+    arena: &Arena,
 ) -> Option<(Arc<[u8]>, Arc<Node>)> {
     match unshare(node, detached) {
         Node::Leaf(leaf) => match path.leaf {
             Ok(at) => {
-                let old = std::mem::replace(&mut leaf.slots[at], slot);
-                // Another leaf holds it, so replacing it frees nothing.
-                if Arc::strong_count(&old.data) > 1 {
-                    *detached += old.bytes();
-                }
+                leaf.slots[at] = slot;
                 None
             }
             Err(at) => {
@@ -296,7 +275,8 @@ fn insert(
                         .reserve_exact(NODE_CAPACITY + 1 - leaf.slots.len());
                 }
                 leaf.slots.insert(at, slot);
-                (leaf.slots.len() > NODE_CAPACITY).then(|| leaf.split(edge && at == NODE_CAPACITY))
+                (leaf.slots.len() > NODE_CAPACITY)
+                    .then(|| leaf.split(edge && at == NODE_CAPACITY, arena))
             }
         },
         Node::Branch(branch) => {
@@ -309,6 +289,7 @@ fn insert(
                 slot,
                 edge && last,
                 detached,
+                arena,
             )?;
             branch.separators.insert(at, separator);
             branch.children.insert(at + 1, right);
@@ -336,6 +317,7 @@ impl View {
 
 /// The charge and pins of the trees of one table.
 struct Table {
+    arena: Arena,
     root: Arc<Node>,
     depth: usize,
     len: usize,
@@ -364,8 +346,9 @@ struct Admitted<'v> {
 }
 
 impl Table {
-    fn new(budget: usize, last_seq: Option<u64>) -> Self {
+    fn new(budget: usize, last_seq: Option<u64>, pool: &ChunkPool) -> Self {
         Self {
+            arena: Arena::new(pool),
             root: Arc::new(Node::Leaf(Leaf { slots: Vec::new() })),
             depth: 1,
             len: 0,
@@ -398,8 +381,7 @@ impl Table {
     }
 
     /// Finds where `key` goes, its slot if it has one, and what writing it
-    /// would detach: every node from the first shared one down, and the old
-    /// update if another tree holds it or will once its leaf is copied.
+    /// would detach: every node from the first shared one down.
     /// Others can only drop references, so the write itself detaches no more
     /// than this.
     fn plan(&self, key: &[u8]) -> (Path, Option<&Slot>, usize) {
@@ -417,13 +399,8 @@ impl Table {
                     level += 1;
                 }
                 Node::Leaf(leaf) => {
-                    let found = leaf.search(key);
+                    let found = leaf.search(key, &self.arena);
                     let slot = found.ok().map(|at| &leaf.slots[at]);
-                    if let Some(slot) = slot
-                        && (shared || Arc::strong_count(&slot.data) > 1)
-                    {
-                        detach += slot.bytes();
-                    }
                     let path = Path {
                         routes,
                         leaf: found,
@@ -448,7 +425,8 @@ impl Table {
             released,
             bytes,
         } = admitted;
-        let replacement = Slot::new(key, seq, bytes);
+        let (replacement, copied) = Slot::new(key, seq, bytes, &mut self.arena);
+        self.detached += copied;
         if let Some((separator, right)) = insert(
             &mut self.root,
             &path,
@@ -456,6 +434,7 @@ impl Table {
             replacement,
             true,
             &mut self.detached,
+            &self.arena,
         ) {
             let left = Arc::clone(&self.root);
             self.root = Arc::new(Node::Branch(Branch {
@@ -506,14 +485,15 @@ impl Table {
         }
         let (path, slot, detach) = self.plan(key);
         let (grows, released) = match slot {
-            Some(slot) => (value_len, slot.value_len()),
+            Some(slot) => (value_len, slot.value_len(&self.arena)),
             None => (charge, 0),
         };
-        let needed = grows + detach;
-        let available = self
-            .budget
-            .saturating_add(released)
-            .saturating_sub(self.live + self.pinned());
+        let appended = key.len() + value_len;
+        let needed = appended
+            + usize::from(slot.is_none()) * ENTRY_OVERHEAD
+            + detach
+            + self.arena.copy_charge(appended);
+        let available = self.budget.saturating_sub(self.memory().charged);
         if needed > available {
             return Err(TableError::BudgetExceeded { needed, available });
         }
@@ -532,10 +512,10 @@ impl Table {
             match node {
                 Node::Branch(branch) => node = &branch.children[branch.route(key)],
                 Node::Leaf(leaf) => {
-                    let slot = &leaf.slots[leaf.search(key).ok()?];
+                    let slot = &leaf.slots[leaf.search(key, &self.arena).ok()?];
                     return Some(Version {
                         seq: slot.seq,
-                        value: slot.value(),
+                        value: slot.value(&self.arena),
                     });
                 }
             }
@@ -555,8 +535,11 @@ impl Table {
                     node = &branch.children[at];
                 }
                 Node::Leaf(leaf) => {
-                    let at = leaf.slots.partition_point(|slot| slot.key() < start);
+                    let at = leaf
+                        .slots
+                        .partition_point(|slot| slot.key(&self.arena) < start);
                     return Records {
+                        arena: &self.arena,
                         path,
                         depth,
                         leaf,
@@ -571,6 +554,7 @@ impl Table {
     /// writes do not change.
     fn share(&self) -> Self {
         Self {
+            arena: self.arena.clone(),
             root: Arc::clone(&self.root),
             depth: self.depth,
             len: self.len,
@@ -587,7 +571,8 @@ impl Table {
         let pinned = self.pinned();
         MemoryUsage {
             payload: self.live - self.len * ENTRY_OVERHEAD,
-            charged: self.live + pinned,
+            arena_bytes: self.arena.used(),
+            charged: self.arena.used() + self.len * ENTRY_OVERHEAD + pinned,
             pinned,
             budget: self.budget,
         }
@@ -609,10 +594,13 @@ impl fmt::Debug for Table {
 pub struct MemoryUsage {
     /// Key and value bytes of the table's entries.
     pub payload: usize,
+    /// Arena bytes used, including overwritten keys/values and deletes.
+    /// Unused chunk capacity is reported in the engine pool counters.
+    pub arena_bytes: usize,
     /// Bytes charged against the budget, pinned bytes included.
     pub charged: usize,
     /// The part of `charged` that only snapshots of the table still need:
-    /// nodes and values its writes copied or replaced since the oldest live
+    /// nodes and used arena bytes its writes copied since the oldest live
     /// snapshot. See [Memory](crate::engine#memory).
     pub pinned: usize,
     /// The table's budget.
@@ -648,11 +636,11 @@ pub enum TableError {
         budget: usize,
     },
     /// The update does not fit now. A new table may admit it, and so may this
-    /// one once its snapshots are dropped.
+    /// one once its snapshots are dropped; arena garbage is never reclaimed here.
     BudgetExceeded {
-        /// Additional bytes the update needs, including those it would pin.
+        /// Appended bytes and node overhead the update needs, including bytes it would pin.
         needed: usize,
-        /// Bytes available to it, including any it would release.
+        /// Bytes remaining in the budget.
         available: usize,
     },
 }
@@ -699,8 +687,16 @@ impl Memtable {
     ///
     /// Updates must have sequence numbers above `after`. A table that follows
     /// a frozen one should pass [`FrozenMemtable::last_seq`] here.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "component constructor used by tests")
+    )]
     pub fn new(budget: usize, after: Option<u64>) -> Self {
-        Self(Table::new(budget, after))
+        Self::in_pool(budget, after, &ChunkPool::new(0))
+    }
+
+    pub(crate) fn in_pool(budget: usize, after: Option<u64>, pool: &ChunkPool) -> Self {
+        Self(Table::new(budget, after, pool))
     }
 
     /// Sets `key` to `value` at sequence number `seq`.
@@ -773,10 +769,11 @@ impl Memtable {
             .saturating_add(bytes)
             .saturating_add(ENTRY_OVERHEAD)
             .saturating_add(self.0.plan(key).2)
+            .saturating_add(self.0.arena.copy_charge(key.len().saturating_add(bytes)))
     }
 
-    /// Returns the table as it is now, in constant time and without copying,
-    /// leaving it writable. Later updates do not change the snapshot; what
+    /// Shares every tree node and copies the arena chunk handles, leaving the
+    /// table writable. Later updates do not change the snapshot; what
     /// they copy or replace for it is charged to this table as
     /// [`pinned`](MemoryUsage::pinned) until the snapshot is dropped.
     pub fn snapshot(&mut self) -> FrozenMemtable {
@@ -785,7 +782,7 @@ impl Memtable {
         self.0.views.push_back(View {
             pin: Arc::downgrade(&pin),
             mark: self.0.detached,
-            live: self.0.live,
+            live: self.0.arena.used() + self.0.len * ENTRY_OVERHEAD,
         });
         FrozenMemtable {
             table: self.0.share(),
@@ -1010,6 +1007,7 @@ pub(crate) fn flush_merged(
 /// Iterates a table's latest updates in ascending key order. Holds the path
 /// from the root inline, so creating one allocates nothing.
 pub struct Records<'a> {
+    arena: &'a Arena,
     /// Each branch above the leaf, root first, and the child taken.
     path: [Option<(&'a Branch, usize)>; MAX_DEPTH],
     depth: usize,
@@ -1047,9 +1045,9 @@ impl<'a> Iterator for Records<'a> {
         let slot = &self.leaf.slots[self.at];
         self.at += 1;
         Some(Record {
-            key: slot.key(),
+            key: slot.key(self.arena),
             seq: slot.seq,
-            value: slot.value(),
+            value: slot.value(self.arena),
         })
     }
 }

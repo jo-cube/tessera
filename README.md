@@ -150,7 +150,8 @@ manifest version 2 replace earlier formats without backward compatibility.
 - `memtable_budget` defaults to 64 MiB for each active or frozen table. A larger
   budget reduces flush frequency and can improve writes while using more
   transient memory. A smaller budget lowers that memory cost but flushes more
-  often; the budget charges entries and does not reserve memory in advance.
+  often; the budget charges arena bytes used, including overwritten garbage,
+  plus node overhead and snapshot history. It does not reserve memory in advance.
 
 A `ReadGuard` provides a stable view while holding a shared lock and blocks
 writers for its lifetime. Use snapshots for longer reads. See the

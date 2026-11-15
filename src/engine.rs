@@ -78,8 +78,8 @@
 //! the number of runs. The memtable is a
 //! copy-on-write tree, so its snapshot shares every node, and later writes
 //! copy only the nodes they change that a snapshot still shares. Nothing is
-//! frozen or flushed for a snapshot, and taking one costs the same whatever
-//! the size of the table.
+//! frozen or flushed for a snapshot. Taking one copies the memtable arena
+//! chunk handles; its first later append may copy a shared partial chunk.
 //!
 //! Every source a snapshot holds is immutable, so it reads without the lock,
 //! in the same newest-first order as the engine, and sees exactly the writes
@@ -278,14 +278,15 @@
 //! # Memory
 //!
 //! Each memtable has [`EngineOptions::memtable_budget`] charged bytes, including
-//! snapshot-pinned history. The active table and up to
+//! all appended arena bytes, overwritten garbage, node overhead and
+//! snapshot-pinned copies. The active table and up to
 //! [`EngineOptions::max_frozen_memtables`] frozen tables may coexist. An atomic
 //! batch exceeding one budget uses the ingestion path (unsorted input is
 //! staged in a private table sized for that batch).
 //! Long-lived snapshots make rotations come sooner.
 //!
 //! Published runs are limited by a byte total, [`EngineOptions::max_run_bytes`],
-//! the physical limit on what the engine holds, and by a count,
+//! their stored data plus filters and chunk metadata, and by a count,
 //! [`EngineOptions::max_runs`], a safety valve on their metadata. With a
 //! background worker, a flush is also refused while level 0 holds runs of
 //! 12 flushes (the level-0 stop), so that lookups stay bounded when the
@@ -1503,11 +1504,12 @@ impl Core {
     }
 
     fn with_pool(options: &EngineOptions, chunks: ChunkPool) -> Self {
+        let active = Memtable::in_pool(options.memtable_budget, Some(options.last_seq), &chunks);
         Self {
             chunks,
             state: RwLock::new(State {
                 last_seq: options.last_seq,
-                active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
+                active,
                 frozen: Vec::new(),
                 runs: Vec::new(),
                 directory: Arc::new(RunDirectory::empty()),
@@ -1739,7 +1741,7 @@ impl Core {
 
     /// Freezes the active table and replaces it, in constant time.
     fn freeze_active(&self, state: &mut State) {
-        let successor = Memtable::new(self.memtable_budget, Some(state.last_seq));
+        let successor = Memtable::in_pool(self.memtable_budget, Some(state.last_seq), &self.chunks);
         let table = std::mem::replace(&mut state.active, successor).freeze();
         state.frozen.push(Arc::new(table));
     }
@@ -2193,6 +2195,7 @@ impl Core {
                 .map(|table| table.memory())
                 .reduce(|sum, table| MemoryUsage {
                     payload: sum.payload + table.payload,
+                    arena_bytes: sum.arena_bytes + table.arena_bytes,
                     charged: sum.charged + table.charged,
                     pinned: sum.pinned + table.pinned,
                     budget: sum.budget + table.budget,

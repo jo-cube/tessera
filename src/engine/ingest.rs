@@ -72,7 +72,7 @@ impl Core {
             keys.sort_unstable();
             keys.dedup();
             let budget = batch.validate(self.memtable_budget)?;
-            let mut table = Memtable::new(budget, None);
+            let mut table = Memtable::in_pool(budget, None, &self.chunks);
             for (index, (key, value)) in batch.records().enumerate() {
                 let seq = index as u64 + 1;
                 match value {

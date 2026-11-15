@@ -145,8 +145,8 @@ fn memtable_checkpoints(seed: u64) -> usize {
 }
 
 /// The tight case: one snapshot of a whole table, then every entry replaced
-/// once, so everything detached is held only by the snapshot. Keys and values
-/// whose lengths leave the allocation unaligned make padding count.
+/// once. Dropping it frees the detached nodes and returns the copied partial
+/// chunk to the pool. Used arena bytes and chunk capacity are accounted separately.
 fn whole_table_replaced() {
     let engine = memtable_only();
     let keys: Vec<Vec<u8>> = (0..20_000u32)
@@ -155,18 +155,26 @@ fn whole_table_replaced() {
     for key in &keys {
         engine.put(key, b"12345678").unwrap();
     }
+    let arena_used = engine.stats().active.arena_bytes;
     let snapshot = engine.snapshot().unwrap();
     for key in &keys {
         engine.put(key, b"abcdefgh").unwrap();
     }
-    let pinned = engine.stats().active.pinned;
+    let before = engine.stats();
+    let pinned = before.active.pinned;
     let freed = freed_by(|| drop(snapshot));
+    let after = engine.stats();
+    assert_eq!(before.pool_in_use_bytes - after.pool_in_use_bytes, 1 << 20);
+    assert_eq!(
+        after.pool_reserve_bytes - before.pool_reserve_bytes,
+        1 << 20
+    );
     assert!(
         freed <= pinned + OWN + 8,
         "freed {freed} bytes, {pinned} were pinned"
     );
     assert!(
-        freed * 100 >= pinned * 95,
+        freed * 100 >= (pinned - arena_used) * 95,
         "freed {freed} bytes, {pinned} were pinned"
     );
 }

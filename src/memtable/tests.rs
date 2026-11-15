@@ -328,6 +328,7 @@ fn an_entry_is_charged_its_key_value_and_overhead() {
         table.memory(),
         MemoryUsage {
             payload: 3 + 5 + 4,
+            arena_bytes: 3 + 5 + 4,
             charged: 3 + 5 + 4 + 2 * ENTRY_OVERHEAD,
             pinned: 0,
             budget: ROOMY
@@ -377,32 +378,50 @@ fn a_new_entry_may_use_exactly_the_remaining_budget() {
 }
 
 #[test]
-fn a_replacement_is_charged_only_the_change_in_value_length() {
+fn replacements_charge_all_appended_bytes_including_overwritten_garbage() {
     let mut table = table();
     table.put(b"k", 1, b"abc").unwrap();
     let before = table.memory().charged;
     table.put(b"k", 2, b"abcdefg").unwrap();
-    assert_eq!(table.memory().charged, before + 4);
+    assert_eq!(table.memory().charged, before + 8);
     table.put(b"k", 3, b"a").unwrap();
-    assert_eq!(table.memory().charged, before - 2);
-    assert_eq!(table.memory().payload, 1 + 1);
+    assert_eq!(table.memory().charged, before + 10);
+    assert_eq!(table.memory().arena_bytes, 14);
+    assert_eq!(table.memory().payload, 2);
 }
 
 #[test]
-fn a_replacement_of_equal_size_is_admitted_at_a_full_budget() {
+fn an_equal_sized_replacement_needs_arena_room_even_without_snapshots() {
     let mut table = Memtable::new(charge(b"k", b"abc"), None);
     table.put(b"k", 1, b"abc").unwrap();
-    table.put(b"k", 2, b"xyz").unwrap();
-    assert_eq!(table.get(b"k").unwrap().value, Value::Bytes(b"xyz"));
+    assert_rejected(
+        &mut table,
+        TableError::BudgetExceeded {
+            needed: 4,
+            available: 0,
+        },
+        b"k",
+        2,
+        b"xyz",
+    );
+    assert_eq!(table.get(b"k").unwrap().value, Value::Bytes(b"abc"));
 }
 
 #[test]
-fn a_replacement_may_use_the_budget_its_old_value_releases() {
+fn a_replacement_cannot_reuse_the_previous_values_arena_bytes() {
     let budget = charge(b"k", b"abc") + 1;
     let mut table = Memtable::new(budget, None);
     table.put(b"k", 1, b"abc").unwrap();
-    table.put(b"k", 2, b"abcd").unwrap();
-    assert_eq!(table.memory().charged, budget);
+    assert_rejected(
+        &mut table,
+        TableError::BudgetExceeded {
+            needed: 5,
+            available: 1,
+        },
+        b"k",
+        2,
+        b"abcd",
+    );
 }
 
 #[test]
@@ -412,37 +431,46 @@ fn a_replacement_that_grows_too_far_keeps_the_old_value() {
     table.put(b"k", 1, b"abc").unwrap();
     table.put(b"other", 2, b"").unwrap();
     let expected = TableError::BudgetExceeded {
-        needed: 4,
-        available: 3,
+        needed: 5,
+        available: 0,
     };
     assert_rejected(&mut table, expected, b"k", 3, b"abcd");
     assert_eq!(table.get(b"k").unwrap().value, Value::Bytes(b"abc"));
 }
 
 #[test]
-fn a_delete_releases_the_value_and_keeps_the_key_charged() {
+fn a_delete_keeps_the_old_payload_and_appends_its_key() {
     let mut table = table();
     table.put(b"k", 1, b"value").unwrap();
     table.delete(b"k", 2).unwrap();
-    assert_eq!(table.memory().charged, charge(b"k", b""));
+    assert_eq!(table.memory().charged, charge(b"k", b"value") + 1);
+    assert_eq!(table.memory().arena_bytes, 7);
     assert_eq!(table.memory().payload, 1);
 }
 
 #[test]
-fn a_delete_of_a_held_key_is_admitted_at_a_full_budget() {
+fn a_delete_needs_room_for_its_key_at_a_full_budget() {
     let mut table = Memtable::new(charge(b"k", b"v"), None);
     table.put(b"k", 1, b"v").unwrap();
-    table.delete(b"k", 2).unwrap();
-    assert_eq!(table.get(b"k").unwrap().value, Value::Tombstone);
+    let before = state(&table);
+    assert_eq!(
+        table.delete(b"k", 2),
+        Err(TableError::BudgetExceeded {
+            needed: 1,
+            available: 0
+        })
+    );
+    assert_eq!(state(&table), before);
 }
 
 #[test]
-fn a_tombstone_replacing_a_tombstone_costs_nothing() {
+fn another_tombstone_appends_its_key() {
     let mut table = table();
     table.delete(b"k", 1).unwrap();
     let before = table.memory();
     table.delete(b"k", 2).unwrap();
-    assert_eq!(table.memory(), before);
+    assert_eq!(table.memory().charged, before.charged + 1);
+    assert_eq!(table.memory().arena_bytes, before.arena_bytes + 1);
     assert_eq!(table.get(b"k").unwrap().seq, 2);
 }
 
@@ -463,13 +491,13 @@ fn a_delete_of_an_absent_key_is_subject_to_the_budget() {
 }
 
 #[test]
-fn a_reinsertion_is_charged_only_its_value() {
+fn a_reinsertion_appends_its_key_and_value() {
     let mut table = table();
     table.put(b"k", 1, b"").unwrap();
     table.delete(b"k", 2).unwrap();
     let before = table.memory().charged;
     table.put(b"k", 3, b"abc").unwrap();
-    assert_eq!(table.memory().charged, before + 3);
+    assert_eq!(table.memory().charged, before + 4);
 }
 
 #[test]
@@ -487,7 +515,7 @@ fn an_extreme_budget_does_not_overflow_the_accounting() {
     let mut table = Memtable::new(usize::MAX, None);
     table.put(b"k", 1, b"abc").unwrap();
     table.put(b"k", 2, b"abcdef").unwrap();
-    assert_eq!(table.memory().charged, charge(b"k", b"abcdef"));
+    assert_eq!(table.memory().charged, charge(b"k", b"abc") + 7);
 }
 
 // Freezing.
@@ -844,6 +872,7 @@ fn expected_outcome(
     value: Option<&[u8]>,
     last: Option<u64>,
     budget: usize,
+    arena_bytes: usize,
 ) -> Result<(), &'static str> {
     if key.len() > MAX_KEY_LEN {
         return Err("key");
@@ -858,10 +887,12 @@ fn expected_outcome(
     if entry > budget {
         return Err("record");
     }
-    let held = model
-        .get(key)
-        .map_or(0, |(_, old)| entry_charge(key, old.as_deref()));
-    if total_charge(model) - held + entry > budget {
+    let appended = key.len() + value.map_or(0, <[u8]>::len);
+    if arena_bytes
+        + appended
+        + (model.len() + usize::from(!model.contains_key(key))) * ENTRY_OVERHEAD
+        > budget
+    {
         return Err("budget");
     }
     Ok(())
@@ -886,7 +917,7 @@ fn sorted_entries(model: &Model) -> Vec<Entry> {
     entries
 }
 
-fn assert_table_matches(table: &Memtable, model: &Model, pool: &[Vec<u8>]) {
+fn assert_table_matches(table: &Memtable, model: &Model, pool: &[Vec<u8>], arena_bytes: usize) {
     assert_eq!(contents(table), sorted_entries(model));
     for key in pool {
         let found = table.get(key).map(|version| {
@@ -899,7 +930,8 @@ fn assert_table_matches(table: &Memtable, model: &Model, pool: &[Vec<u8>]) {
         assert_eq!(found.as_ref(), model.get(key));
     }
     let memory = table.memory();
-    assert_eq!(memory.charged, total_charge(model));
+    assert_eq!(memory.arena_bytes, arena_bytes);
+    assert_eq!(memory.charged, arena_bytes + model.len() * ENTRY_OVERHEAD);
     assert_eq!(
         memory.payload,
         total_charge(model) - model.len() * ENTRY_OVERHEAD
@@ -955,6 +987,7 @@ fn randomized_updates_match_an_independent_model_across_flushes() {
             let budget = [600, 2_000, 8_000, 40_000][rng.below(4)];
             let mut table = Memtable::new(budget, last);
             let mut model = Model::new();
+            let mut arena_bytes = 0;
 
             for _ in 0..OPERATIONS {
                 let roll = rng.below(100);
@@ -985,7 +1018,7 @@ fn randomized_updates_match_an_independent_model_across_flushes() {
                     }
                 };
 
-                let want = expected_outcome(&model, key, seq, value, last, budget);
+                let want = expected_outcome(&model, key, seq, value, last, budget, arena_bytes);
                 let got = match value {
                     Some(value) => table.put(key, seq, value),
                     None => table.delete(key, seq),
@@ -995,6 +1028,7 @@ fn randomized_updates_match_an_independent_model_across_flushes() {
                 match want {
                     Ok(()) => {
                         accepted += 1;
+                        arena_bytes += key.len() + value.map_or(0, <[u8]>::len);
                         let update = (seq, value.map(<[u8]>::to_vec));
                         model.insert(key.to_vec(), update.clone());
                         history.insert(key.to_vec(), update);
@@ -1003,7 +1037,7 @@ fn randomized_updates_match_an_independent_model_across_flushes() {
                     Err(reason) => *rejected.entry(reason).or_insert(0) += 1,
                 }
                 assert_eq!(table.last_seq(), last);
-                assert_table_matches(&table, &model, &pool);
+                assert_table_matches(&table, &model, &pool, arena_bytes);
             }
 
             let frozen = table.freeze();
@@ -1055,6 +1089,7 @@ fn snapshots_keep_their_state_through_random_writes() {
         let budget = [1 << 24, 400_000][seed as usize % 2];
         let mut table = Memtable::new(budget, None);
         let mut model = Model::new();
+        let mut arena_bytes = 0;
         let mut held: Vec<(FrozenMemtable, Vec<Entry>)> = Vec::new();
         let mut seq = 0;
 
@@ -1081,6 +1116,7 @@ fn snapshots_keep_their_state_through_random_writes() {
                     };
                     match result {
                         Ok(()) => {
+                            arena_bytes += key.len() + value.as_ref().map_or(0, Vec::len);
                             model.insert(key.clone(), (seq, value));
                         }
                         Err(TableError::BudgetExceeded { .. }) => {
@@ -1094,7 +1130,11 @@ fn snapshots_keep_their_state_through_random_writes() {
             }
             let memory = table.memory();
             assert!(memory.charged <= memory.budget, "seed {seed}");
-            assert_eq!(memory.charged, total_charge(&model) + memory.pinned);
+            assert_eq!(memory.arena_bytes, arena_bytes);
+            assert_eq!(
+                memory.charged,
+                arena_bytes + model.len() * ENTRY_OVERHEAD + memory.pinned
+            );
             if held.is_empty() {
                 assert_eq!(memory.pinned, 0, "seed {seed}");
             }
@@ -1118,7 +1158,10 @@ fn snapshots_keep_their_state_through_random_writes() {
         }
         drop(held);
         assert_eq!(table.memory().pinned, 0);
-        assert_eq!(table.memory().charged, total_charge(&model));
+        assert_eq!(
+            table.memory().charged,
+            arena_bytes + model.len() * ENTRY_OVERHEAD
+        );
         let frozen = table.freeze();
         assert_eq!(frozen_contents(&frozen), final_entries);
     }
@@ -1129,7 +1172,7 @@ fn snapshots_keep_their_state_through_random_writes() {
 /// A snapshot of an untouched table pins nothing, an overwrite pins its
 /// leaf and old value once, and a write the budget refuses pins nothing.
 #[test]
-fn a_snapshot_pins_only_what_later_writes_replace() {
+fn a_snapshot_pins_copied_nodes_and_the_partial_arena_chunk() {
     let mut table = Memtable::new(4_000, None);
     table.put(b"a", 1, &[1; 100]).unwrap();
     table.put(b"b", 2, &[1; 100]).unwrap();
@@ -1141,10 +1184,10 @@ fn a_snapshot_pins_only_what_later_writes_replace() {
     table.put(b"a", 3, &[2; 100]).unwrap();
     let once = table.memory().pinned;
     assert!(once > 100);
-    // The leaf is now the table's own, so only the old value is pinned.
+    // The leaf and partial chunk are now private; later appends pin no more.
     table.put(b"b", 4, &[2; 100]).unwrap();
     let twice = table.memory().pinned;
-    assert!(twice > once && twice - once < once);
+    assert_eq!(twice, once);
     // Overwriting a value no snapshot shares pins nothing more.
     table.put(b"b", 5, &[3; 100]).unwrap();
     assert_eq!(table.memory().pinned, twice);
@@ -1162,7 +1205,7 @@ fn a_snapshot_pins_only_what_later_writes_replace() {
     );
     drop(snapshot);
     assert_eq!(table.memory().pinned, 0);
-    assert_eq!(table.memory().charged, charged);
+    assert_eq!(table.memory().charged, charged + 3 * 101);
 }
 
 // Flush splitting.
@@ -1289,4 +1332,32 @@ fn split_flushes_of_several_tables_keep_each_newest_update_once() {
     assert_eq!(firsts, [&b"k00"[..], b"k05", b"k12", b"k30"]);
     let k12 = pieces[2].iter().find(|entry| entry.0 == b"k12").unwrap();
     assert_eq!(k12, &del(b"k12", 112));
+}
+
+#[test]
+fn arena_overwrites_deletes_and_large_records_survive_the_last_owning_snapshot() {
+    use crate::chunk::{CHUNK_BYTES, ChunkPool};
+    let pool = ChunkPool::new(3 * CHUNK_BYTES);
+    let mut table = Memtable::in_pool(8 * CHUNK_BYTES, None, &pool);
+    let large = vec![9; CHUNK_BYTES + 13];
+    table.put(b"large", 1, &large).unwrap();
+    table.put(b"small", 2, b"old").unwrap();
+    let snapshot = table.snapshot();
+    table.put(b"small", 3, b"new").unwrap();
+    table.delete(b"large", 4).unwrap();
+    let used = 5 + large.len() + 8 + 8 + 5;
+    let memory = table.memory();
+    assert_eq!(memory.arena_bytes, used);
+    assert_eq!(memory.charged, used + 2 * ENTRY_OVERHEAD + memory.pinned);
+    assert_eq!(memory.payload, 5 + 8);
+    assert_eq!(pool.stats().1, 2 * CHUNK_BYTES);
+    assert_eq!(table.get(b"large").unwrap().value, Value::Tombstone);
+    let frozen = table.freeze();
+    drop(frozen);
+    assert_eq!(pool.stats().1, CHUNK_BYTES);
+    assert_eq!(snapshot.get(b"large").unwrap().value, Value::Bytes(&large));
+    assert_eq!(snapshot.get(b"small").unwrap().value, Value::Bytes(b"old"));
+    drop(snapshot);
+    assert_eq!(pool.stats().1, 0);
+    assert_eq!(pool.stats().0, 2 * CHUNK_BYTES);
 }
