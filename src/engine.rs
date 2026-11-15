@@ -146,8 +146,8 @@
 //! disjoint. Levels are compaction's bookkeeping only: they are kept in
 //! memory, never persisted, and never consulted by reads, which go by
 //! sequence number through the [run directory](self#reading-runs), so a run
-//! returns the same answers whatever its level. Recovery puts a checkpoint's
-//! runs, which are disjoint, in the last level. Each level below 0 is sized
+//! returns the same answers whatever its level. Recovery restores the levels
+//! and level-0 flush groups recorded by the checkpoint. Each level below 0 is sized
 //! using [`EngineOptions::level_ratio`] (10 by default), from the last level's
 //! size, and empty levels are
 //! added under level 0 as the data grows. One step is the first that applies:
@@ -273,7 +273,7 @@
 //! else. Every run records its own codec, block lengths and dictionary, so
 //! runs and checkpoints written under other settings are read and recovered
 //! as they are, and are rebuilt with the current settings only when a
-//! compaction or checkpoint rewrites their records.
+//! compaction rewrites their records. Checkpoints preserve existing bytes.
 //!
 //! # Memory
 //!
@@ -392,9 +392,16 @@
 //! checkpoint when it is closed or dropped or its process ends. No
 //! checkpoint is ever taken automatically.
 //!
+//! Checkpoints use the normal flush builder, then stream immutable run chunks
+//! and persisted Bloom filters once per stable run ID. Later checkpoints reuse
+//! those files and report written/reused bytes and runs, plus deleted run files.
+//! Levels and sequence overrides are restored without compaction. Use
+//! [`Engine::checkpoint_with_metadata`] and [`Engine::recover_with_metadata`]
+//! to store and recover opaque application metadata (up to 16 MiB).
+//!
 //! A checkpoint is committed when the directory's `CURRENT` file is renamed
-//! to name it, after its runs and manifest are synced; the previous one
-//! stays committed until then and is removed afterwards. A failed or
+//! to name it, after its runs and manifest are synced. The previous generation
+//! stays readable; GC keeps files referenced by either generation. A failed or
 //! interrupted checkpoint leaves the previous one intact. Recovery checks
 //! every file of exactly the committed checkpoint, with no fallback to an
 //! older one, before it returns an engine. One engine or process uses a
@@ -455,6 +462,8 @@ type SharedRun = Arc<Published>;
 /// A published run.
 #[derive(Debug)]
 struct Published {
+    id: u128,
+    checkpoint_crc: std::sync::OnceLock<u32>,
     run: Run<Vec<u8>>,
     /// The decoded length of its largest block, for sizing a compaction's
     /// workspace before reading anything.
@@ -467,7 +476,12 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
         // A run that cannot report its blocks is damaged, which the merge
         // that reads it reports; until then it is sized as one empty block.
         let largest_block = run.view().largest_block_len().unwrap_or(0);
-        Arc::new(Published { run, largest_block })
+        Arc::new(Published {
+            id: checkpoint::new_run_id(),
+            checkpoint_crc: std::sync::OnceLock::new(),
+            run,
+            largest_block,
+        })
     })
 }
 
@@ -2368,6 +2382,11 @@ impl BuiltFlush<'_> {
     /// On a [`RunLimitError`] the built runs are dropped and the tables stay
     /// frozen and readable.
     fn publish(self) -> Result<FlushReport, RunLimitError> {
+        self.publish_kept().map(|(report, _)| report)
+    }
+
+    /// The checkpoint keeps the exact outputs even if compaction replaces them.
+    fn publish_kept(self) -> Result<(FlushReport, Vec<SharedRun>), RunLimitError> {
         let Self { job, runs } = self;
         let report = FlushReport {
             tables: job.tables.len(),
@@ -2413,7 +2432,7 @@ impl BuiltFlush<'_> {
             .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
             .sum();
         state.levels.push_flush(&runs, logical);
-        state.runs.extend(runs);
+        state.runs.extend(runs.iter().cloned());
         state.order_runs();
         state.run_bytes += report.run_bytes;
         state.held_bytes += report.held_bytes;
@@ -2438,7 +2457,7 @@ impl BuiltFlush<'_> {
         drop(state);
         job.engine.notify_worker();
         job.engine.flush_signal.changed();
-        Ok(report)
+        Ok((report, runs))
     }
 }
 

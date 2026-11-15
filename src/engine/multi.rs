@@ -250,6 +250,8 @@ mod tests {
         let c = run(&[(b"a", 11, Value::Tombstone)]);
         let damaged_source = run(&[(b"z", 1, Value::Bytes(b"old"))]);
         let damaged = Arc::new(Published {
+            id: crate::engine::checkpoint::new_run_id(),
+            checkpoint_crc: std::sync::OnceLock::new(),
             run: damaged_source.run.damaged_at(16),
             largest_block: 0,
         });

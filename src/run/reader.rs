@@ -5,7 +5,9 @@ use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Va
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::dictionary::DICTIONARY_LEN;
-use super::filter::{self as key_filter, KeyFilter, KeyHashes};
+#[cfg(test)]
+use super::filter::KeyHashes;
+use super::filter::{self as key_filter, KeyFilter};
 use super::frame::{self, Frame};
 use super::storage::{Packing, Region, RunData, Segmented};
 use super::{
@@ -288,6 +290,14 @@ impl<B: AsRef<[u8]>> Run<B> {
         self.data.chunks()
     }
 
+    pub(crate) fn seq_override(&self) -> Option<u64> {
+        self.seq_override
+    }
+
+    pub(crate) fn filter_words(&self) -> impl Iterator<Item = [u8; 8]> + '_ {
+        self.filter.iter().flat_map(|filter| filter.encoded())
+    }
+
     /// Contiguous serialization only for tests of the on-disk format.
     #[cfg(test)]
     pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
@@ -310,6 +320,7 @@ impl Run<Vec<u8>> {
         Self::recover_in(data, &ChunkPool::new(0))
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
         let max_seq = validate(&data)?;
         let mut hashes = KeyHashes::new();
@@ -321,6 +332,32 @@ impl Run<Vec<u8>> {
                 hashes.add(record.key);
             }
         }
+        Self::pack_recovered(data, pool, hashes.finish(), max_seq)
+    }
+
+    pub(crate) fn recover_checkpoint_in(
+        data: Vec<u8>,
+        filter: &[u8],
+        pool: &ChunkPool,
+    ) -> Result<(Self, u64), CorruptRun> {
+        let max_seq = validate(&data)?;
+        let filter = if filter.is_empty() {
+            None
+        } else {
+            Some(
+                KeyFilter::decode(filter)
+                    .ok_or(corrupt(data.len(), RunCorruption::InvalidFilter))?,
+            )
+        };
+        Self::pack_recovered(data, pool, filter, max_seq)
+    }
+
+    fn pack_recovered(
+        data: Vec<u8>,
+        pool: &ChunkPool,
+        filter: Option<KeyFilter>,
+        max_seq: u64,
+    ) -> Result<(Self, u64), CorruptRun> {
         let view = RunView::open(&data)?;
         let mut packing = Packing::new(pool);
         for block in 0..view.block_count() {
@@ -336,7 +373,7 @@ impl Run<Vec<u8>> {
         }
         let tail_start = view.frames.len() + view.dictionaries.len();
         let parts = packing.finish(data[tail_start..].into());
-        let run = Self::from_builder(RunData::Segmented(parts), hashes.finish(), max_seq);
+        let run = Self::from_builder(RunData::Segmented(parts), filter, max_seq);
         Ok((run, max_seq))
     }
 }
@@ -701,6 +738,7 @@ impl<'a> RunCursor<'a> {
 
     /// Advances to the next record, or returns `None` at the end of the run or
     /// of the prefix. After `None`, it keeps returning `None` until a seek.
+    #[cfg_attr(not(test), expect(dead_code, reason = "tested component API"))]
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
         self.fill_head()?;
         let head = self.head.take();

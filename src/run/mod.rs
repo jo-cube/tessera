@@ -182,6 +182,8 @@ pub enum RunCorruption {
     MissingDictionary,
     /// A frame's stored bytes do not decompress to its declared length.
     CorruptPayload,
+    /// A persisted Bloom filter has an invalid length.
+    InvalidFilter,
     /// A frame holds a block with no records.
     EmptyBlock,
     /// The footer's record count differs from the records stored.
@@ -206,6 +208,7 @@ impl fmt::Display for CorruptRun {
             RunCorruption::InvalidDictionary => f.write_str("invalid dictionary"),
             RunCorruption::MissingDictionary => f.write_str("frame needs a missing dictionary"),
             RunCorruption::CorruptPayload => f.write_str("corrupt compressed payload"),
+            RunCorruption::InvalidFilter => f.write_str("invalid persisted filter"),
             RunCorruption::EmptyBlock => f.write_str("block has no records"),
             RunCorruption::RecordCountMismatch => f.write_str("record count mismatch"),
             RunCorruption::Block(kind) => write!(f, "invalid block: {kind}"),

@@ -1,6 +1,6 @@
 //! Direct run ingestion builds once with placeholder sequences. Publication
 //! assigns one effective sequence to the whole batch, after draining only tables
-//! that share an actual batch key. Compaction and checkpoints materialize it.
+//! that share an actual batch key. Compaction materializes it; checkpoints preserve the override.
 use super::*;
 use crate::run::RunBuilder;
 

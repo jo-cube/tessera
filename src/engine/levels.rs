@@ -7,8 +7,8 @@
 //! go through the [`RunDirectory`](super::directory::RunDirectory), which is
 //! built from the run set alone and orders by sequence number, so a level
 //! tag can only change what compaction does next, never what a read returns.
-//! Nothing here is persisted: recovery puts a checkpoint's runs, which are
-//! disjoint, into the last level.
+//! Checkpoints preserve level membership and level-0 flush tags. Scheduling
+//! cursors, size estimates and remembered refusals restart on recovery.
 
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -224,11 +224,42 @@ impl Levels {
         }
     }
 
-    /// Recovered runs, sorted and disjoint, as the last level.
-    pub(super) fn recovered(runs: &[SharedRun], ratio: usize) -> Self {
+    /// Structural checkpoint order: level 0 in publication order, then each
+    /// disjoint level in key order. Flush tags preserve level-0 backpressure.
+    pub(super) fn checkpoint_runs(&self) -> Vec<(usize, u64, SharedRun)> {
+        self.levels
+            .iter()
+            .enumerate()
+            .flat_map(|(level, runs)| {
+                runs.iter().enumerate().map(move |(at, run)| {
+                    (
+                        level,
+                        if level == 0 { self.flushes[at] } else { 0 },
+                        Arc::clone(run),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn next_flush(&self) -> u64 {
+        self.next_flush
+    }
+
+    /// Restore the recorded shape without compacting or changing sequences.
+    pub(super) fn recovered(runs: &[(usize, u64, SharedRun)], depth: usize, ratio: usize) -> Self {
         let mut levels = Self::new(ratio);
-        levels.bytes[1] = runs.iter().map(bytes_of).sum();
-        levels.levels[1] = runs.to_vec();
+        levels.levels.resize_with(depth.max(1) + 1, Vec::new);
+        levels.bytes.resize(depth.max(1) + 1, 0);
+        levels.cursors.resize_with(depth.max(1) + 1, Vec::new);
+        for &(level, flush, ref run) in runs {
+            levels.levels[level].push(Arc::clone(run));
+            levels.bytes[level] += bytes_of(run);
+            if level == 0 {
+                levels.flushes.push(flush);
+                levels.next_flush = levels.next_flush.max(flush + 1);
+            }
+        }
         levels
     }
 
@@ -1038,7 +1069,7 @@ mod ratio_tests {
             assert_eq!(levels.depth(), 2);
             assert_eq!(levels.target(1, base), base * ratio);
             assert_eq!(levels.insert_levels(&fit), 0);
-            let recovered = Levels::recovered(&[], ratio);
+            let recovered = Levels::recovered(&[], 1, ratio);
             assert_eq!(recovered.ratio, ratio);
         }
     }

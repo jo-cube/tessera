@@ -263,14 +263,14 @@ fn a_move_lifts_a_refusal_at_the_level_0_stop() {
     assert_eq!(get(&engine, &key(59)), Some(value(59)));
 }
 
-/// Recovery puts a checkpoint's runs in one level with level 0 empty;
-/// compaction then only adds levels above them, writing nothing, and
-/// later writes keep the levels valid.
+/// Recovery preserves every ID and level, including overlapping level-0
+/// runs, without compacting at open; later writes and compaction stay valid.
 #[test]
-fn recovery_puts_runs_in_one_level() {
+fn recovery_preserves_run_ids_and_levels() {
     let dir = std::env::temp_dir().join(format!("tessera-leveled-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut model = BTreeMap::new();
+    let expected;
     {
         let engine = Engine::new(options()).unwrap();
         for index in 0..8_000u64 {
@@ -283,24 +283,38 @@ fn recovery_puts_runs_in_one_level() {
         engine
             .checkpoint(&dir, CheckpointOptions::default())
             .unwrap();
+        expected = engine
+            .core
+            .read_state()
+            .levels
+            .runs()
+            .iter()
+            .map(|level| level.iter().map(|run| run.id).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         engine.close().unwrap();
     }
     let engine = Engine::recover(&dir, options()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    let levels = level_ids(&engine);
+    level_ids(&engine);
     let stats = engine.stats();
-    assert_eq!((levels.len(), stats.level0_runs, stats.levels), (2, 0, 1));
-    assert_eq!(levels[1].len(), stats.runs);
+    let actual: Vec<Vec<_>> = engine
+        .core
+        .read_state()
+        .levels
+        .runs()
+        .iter()
+        .map(|level| level.iter().map(|run| run.id).collect())
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(stats.levels, expected.len() - 1);
+    assert_eq!(stats.level0_runs, expected[0].len());
     assert!(stats.runs > 64, "{} runs", stats.runs);
 
     let mut steps = Steps::default();
     settle(&engine, &mut steps);
-    assert_eq!(steps.written, 0, "{steps:?}");
     assert!(steps.refusal.is_none(), "{steps:?}");
-    let stats = engine.stats();
-    assert!(stats.levels > 1, "levels are inserted above recovered runs");
-    let last = level_ids(&engine).pop().unwrap();
-    assert_eq!(last, levels[1], "recovered runs stay where they are");
+    level_ids(&engine);
+    assert_eq!(scan(&engine.snapshot().unwrap()), model);
 
     let mut rng = Rng(3);
     for write in 0..4_000 {
@@ -321,6 +335,12 @@ fn recovery_puts_runs_in_one_level() {
 /// recovers the same contents.
 #[test]
 fn flushes_after_recovery_split_at_the_recovered_runs() {
+    // Keep the fixture in level 1 so its recovered boundaries split flushes.
+    let original_options = options();
+    let options = || EngineOptions {
+        level_ratio: 1000,
+        ..original_options
+    };
     let dir = std::env::temp_dir().join(format!("tessera-split-recovery-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut model = BTreeMap::new();
@@ -359,6 +379,7 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
     drop(whole);
     let engine = Engine::recover(&dir, options()).unwrap();
     let recovered = engine.stats().runs;
+    let existing_level0 = engine.stats().level0_runs;
     let before = engine.snapshot().unwrap();
     let level0 = writes(&engine, &mut model);
     assert!(
@@ -367,7 +388,7 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
     );
     assert_eq!(engine.stats().levels, 1, "nothing has compacted yet");
     assert_eq!(scan(&engine.snapshot().unwrap()), model);
-    assert_eq!(engine.stats().runs, recovered + level0);
+    assert_eq!(engine.stats().runs, recovered + level0 - existing_level0);
     settle(&engine, &mut Steps::default());
     level_ids(&engine);
     assert_eq!(scan(&engine.snapshot().unwrap()), model);

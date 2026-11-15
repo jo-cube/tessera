@@ -1,138 +1,59 @@
-//! Explicit, opt-in checkpoints: one snapshot of the engine written to a
-//! directory as runs, and recovery of the latest committed one.
+//! Incremental checkpoints of immutable runs, with no re-encoding or recompression.
 //!
-//! # Contract
+//! At flush rotation a checkpoint pins the existing runs and the tables being
+//! flushed. The normal flush builder publishes those tables, completing the
+//! structural snapshot at that rotation's sequence ceiling. Later writes and
+//! compactions proceed while files are written, outside the state lock.
 //!
-//! [`Engine::checkpoint`] takes a [`Snapshot`](super::Snapshot) and streams
-//! its live keys, in key order, into runs of the ordinary run format, one run
-//! in memory at a time. A checkpoint therefore holds exactly the state at the
-//! snapshot's sequence number, its **ceiling**: every key live then, with the
-//! value and sequence number of its newest version. A key deleted by then is
-//! absent, which is its deletion state, since nothing lies beneath a full
-//! checkpoint. Writes after the ceiling are not in it and are lost unless
-//! included in a later checkpoint.
+//! Layout: `runs/<32-hex-digit RunId>` holds the exact v5 run chunks, followed
+//! by little-endian Bloom words and their CRC-32. The manifest records both
+//! lengths and a CRC-32 of the entire file. Filters use the fixed hash defined
+//! in `run/filter.rs`; recovery validates runs fully without rebuilding filters.
+//! `ckpt-<20-digit generation>/MANIFEST` records levels, level-0 flush groups,
+//! effective sequence overrides, ceiling, next ID counter and application data.
 //!
-//! A checkpoint is **committed** once the file `CURRENT` durably names its
-//! generation. Recovery reads exactly that checkpoint and nothing else: there
-//! is no fallback to an older one. Generations increase by one for each
-//! attempt and are never reused.
+//! Publication preserves the LOCK/CURRENT protocol: sync every new run file,
+//! its directory, the manifest, its directory and the parent; write and sync
+//! CURRENT.tmp, rename over CURRENT (the commit point), then sync the parent.
+//! Only after that sync does GC remove files outside the union of the new and
+//! previous manifests. Before rename an error leaves the old commit intact;
+//! after rename a sync error retains both generations. Atomic temporary run
+//! files prevent an interrupted write from becoming a reusable final file.
 //!
-//! # Layout
+//! LOCK is an advisory exclusive file lock, released on close or process exit.
+//! Recovery reads exactly CURRENT, with no fallback, and changes no files.
+//! Durability assumes local POSIX rename and working file/directory fsync
+//! (Linux ext4/XFS); network filesystems and external writers are unsupported.
+//! Checksums detect damage rather than repairing it. CURRENT visibility after
+//! process death is tested; power-loss durability depends on the filesystem.
 //!
-//! The directory belongs to Tessera, and only these names in it are read,
-//! written or removed:
-//!
-//! - `LOCK`: held with an exclusive advisory lock while a checkpoint or
-//!   recovery runs, so that two processes do not interleave.
-//! - `CURRENT`: the committed generation (20 bytes, checksummed).
-//! - `CURRENT.tmp`: its replacement while one is being published.
-//! - `ckpt-<generation>/`: one checkpoint, 20 decimal digits, holding
-//!   `run-<index>` files (six digits) and `MANIFEST`.
-//!
-//! `MANIFEST` (all integers little-endian): the magic `TSRCKPT\x01`, format
-//! version (u32, now 1), flags (u32, now 0; a reader rejects unknown ones),
-//! generation (u64), ceiling (u64), live records (u64), run count (u32), then
-//! per run its length (u64) and CRC-32 (u32), and last a CRC-32 of everything
-//! before it. Runs are in ascending, disjoint key order. `CURRENT`: the magic
-//! `TSRCUR\0\x01`, the generation (u64) and a CRC-32 of both.
-//!
-//! # Publication
-//!
-//! 1. Under `LOCK`, directories `ckpt-*` other than the committed one are
-//!    removed: they are leftovers of interrupted attempts.
-//! 2. A snapshot is taken, and runs are built and written to the new
-//!    `ckpt-<generation>/`, each file synced (`fsync`) after writing. The
-//!    manifest is written and synced, then the checkpoint directory and the
-//!    parent are synced, so that every entry is durable. The snapshot is
-//!    released.
-//! 3. `CURRENT.tmp` is written and synced, renamed over `CURRENT`, and the
-//!    parent is synced. **The rename is the commit point**; the sync makes it
-//!    durable.
-//! 4. The previous checkpoint is removed. Failing to remove it leaves it for
-//!    the next checkpoint and is reported, not an error.
-//!
-//! An error before the rename removes the new directory and leaves the
-//! previous checkpoint committed. An error after it (only the final sync) is
-//! returned and removes nothing, because `CURRENT` may name either
-//! checkpoint and both stay intact. A crash at any point leaves `CURRENT`
-//! naming a complete checkpoint, if the assumptions below hold.
-//!
-//! Two guarantees differ here. **Atomic visibility**: `rename` switches
-//! `CURRENT` from one complete checkpoint to the next with no state in
-//! between, for any other process and after this process dies, since the
-//! kernel's cache survives it. That needs only POSIX rename semantics.
-//! **Durability after power loss** additionally needs every `fsync` above to
-//! reach stable storage; without them a power loss could leave `CURRENT`
-//! naming a directory whose files never reached the disk. The second is an
-//! assumption about the filesystem and device, not something the tests can
-//! show.
-//!
-//! The previous checkpoint is removed only after the rename and the parent's
-//! sync succeed, and leftovers are removed before a new attempt only when
-//! `CURRENT` names a generation that is kept. While `CURRENT` cannot be read
-//! nothing is removed until a new checkpoint is committed in its place, so
-//! no step deletes the only checkpoint that might be recoverable.
-//!
-//! `LOCK` is an advisory `flock` on an open file. The kernel releases it when
-//! the file is closed, including when the process is killed, so a crash never
-//! leaves the directory locked; the file itself is left and is harmless.
-//! The lock belongs to the open file description, so a process that forks
-//! while it holds `LOCK` shares the lock with the child until the child
-//! executes another program or exits (the descriptor is close-on-exec);
-//! meanwhile a second open of the same directory, even in this process,
-//! finds it locked.
-//!
-//! # Filesystem assumptions
-//!
-//! Supported: a local Linux filesystem such as ext4 or XFS, where `fsync` of
-//! a file makes its contents durable, `fsync` of a directory makes its
-//! entries (creations and renames) durable, and `rename` replaces an entry
-//! atomically. On macOS, `File::sync_all` issues `F_FULLFSYNC`; directory
-//! syncs are attempted the same way, but that platform is not part of the
-//! tested contract. Network filesystems, filesystems or devices that
-//! acknowledge `fsync` without persisting, and concurrent writers outside
-//! `LOCK` are unsupported. Checksums detect corruption; they do not repair it.
-//!
-//! # Resources
-//!
-//! A checkpoint holds one snapshot until its runs are written, so sources a
-//! flush or compaction replaces meanwhile stay allocated and count toward
-//! [`SnapshotLimits`](super::SnapshotLimits) as retained bytes, like any
-//! snapshot's. Beside them it holds one run being built (input up to the
-//! engine's `target_run_len`), one decoded block per run it reads, and no
-//! copy of the database. The builder buffers one roughly 4 MiB segment for
-//! its raw dictionary and adaptive block estimate. No limit is applied to
-//! that, as none is to the rest of a checkpoint's
-//! memory. On disk it needs the new checkpoint beside the
-//! previous one until the previous is removed, and
-//! [`CheckpointOptions::max_bytes`] bounds the new one.
-//!
-//! Recovery reads one run file at a time into memory, which is the engine's
-//! storage afterwards, checks it fully and rebuilds its key filter. Nothing
-//! is exposed until every file has passed. A file is read only if it is no
-//! longer than it may be: `CURRENT` its fixed size, the manifest a list of
-//! the allowed runs, a run the length its manifest entry gives (and those
-//! lengths within the run limits), so a damaged file cannot make recovery
-//! allocate more than the checkpoint it should hold.
+//! Run IDs combine a random process namespace and a monotonic counter. The
+//! counter is persisted and advanced on recovery; a fresh namespace after a
+//! restart also prevents collisions with abandoned or forked recovery branches.
+//! File names remain unchanged for recovered runs. A checkpoint retains one
+//! structural snapshot, but builds no additional copy of an existing run.
+//! Recovery temporarily holds one contiguous file while packing its frames into
+//! pool chunks. Application metadata is bounded at 16 MiB.
 
 use crate::chunk::{ChunkPool, RESERVE_BYTES};
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
 
-use crate::block::Value;
-use crate::run::{
-    CorruptRun, MAX_TARGET_RUN_LEN, RECORD_INPUT_OVERHEAD, ReadError, Run, RunBuilder,
-};
+use crate::run::{CorruptRun, Run};
+use std::collections::HashSet;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::levels::{LEVEL0_STOP, Levels};
 use super::{
-    Core, Engine, EngineOptions, EngineWorkspace, RunLimitError, SnapshotError, published,
+    Core, Engine, EngineOptions, FlushJob, Published, RunLimitError, SharedRun, SnapshotError,
 };
 
 pub(super) const LOCK: &str = "LOCK";
@@ -144,19 +65,30 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-const MANIFEST_VERSION: u32 = 2;
-/// Magic, version, flags, generation, ceiling, records and run count.
-const MANIFEST_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4;
-const MANIFEST_ENTRY_LEN: usize = 12;
+const MANIFEST_VERSION: u32 = 3;
+// Magic/version/flags, generation/ceiling/records/next-id/previous,
+// depth, metadata length, run count. Entries include both file and v5 lengths.
+const MANIFEST_HEADER_LEN: usize = 72;
+const MANIFEST_ENTRY_LEN: usize = 60;
+const MAX_METADATA_BYTES: usize = 16 << 20;
+const RUNS: &str = "runs";
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn new_run_id() -> u128 {
+    static NAMESPACE: OnceLock<u64> = OnceLock::new();
+    let namespace = *NAMESPACE.get_or_init(|| RandomState::new().hash_one(std::process::id()));
+    let number = NEXT_RUN_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .expect("run IDs exhausted");
+    (u128::from(namespace) << 64) | u128::from(number)
+}
 
 /// Bounds on one checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointOptions {
-    /// The most bytes the new checkpoint may write: the exact lengths of its
-    /// run files and manifest, checked before each file is written, so the
-    /// limit is never exceeded on disk. It excludes `CURRENT`, filesystem
-    /// allocation overhead and the previous checkpoint, which stays on disk
-    /// beside the new one until the new one is committed.
+    /// Maximum new run-file and manifest bytes written in this attempt.
+    /// Reused files, CURRENT and filesystem overhead are excluded. Older
+    /// generations remain until the new commit is durable.
     pub max_bytes: u64,
 }
 
@@ -169,38 +101,49 @@ impl Default for CheckpointOptions {
     }
 }
 
-/// What a committed checkpoint holds.
+/// What a committed checkpoint holds and the I/O performed for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointReport {
-    /// Its generation, named by `CURRENT`.
+    /// Its generation, named by CURRENT.
     pub generation: u64,
-    /// The sequence number it covers: every write up to it, none after.
+    /// Every update through this ceiling is included; later updates are excluded.
     pub last_seq: u64,
-    /// Live keys written.
+    /// Physical records, including retained versions and tombstones.
     pub records: u64,
-    /// Run files written.
+    /// Total referenced run files.
     pub runs: usize,
-    /// Bytes written: run files and manifest.
+    /// New run-file and manifest bytes, excluding CURRENT.
+    pub bytes_written: u64,
+    /// Existing run-file bytes skipped, including filters.
+    pub bytes_reused: u64,
+    /// New run files written.
+    pub runs_written: usize,
+    /// Existing run files skipped.
+    pub runs_reused: usize,
+    /// Obsolete run files (including interrupted temporary files) deleted.
+    pub files_deleted: usize,
+    /// Alias of bytes_written.
     pub bytes: u64,
-    /// The largest run, the most run bytes held in memory at once.
+    /// Largest referenced run file, including its filter.
     pub largest_run_bytes: usize,
-    /// Older checkpoint directories removed: the previous one and leftovers
-    /// of interrupted attempts.
+    /// Obsolete generation directories removed.
     pub reclaimed: usize,
-    /// Older checkpoint directories that could not be removed; the next
-    /// checkpoint tries again.
+    /// File or directory removals that failed; retried after the next commit.
     pub unreclaimed: usize,
 }
 
 /// Why a checkpoint was not committed, or (for [`Self::Io`] after the commit
 /// point) was committed without the final directory sync. The engine is
-/// unchanged either way, and the previously committed checkpoint is intact.
+/// still readable either way; its memtables may have flushed. The previously
+/// committed generation is retained.
 #[derive(Debug)]
 pub enum CheckpointError {
     /// The snapshot the checkpoint needs was refused.
     Snapshot(SnapshotError),
-    /// Reading the snapshot failed.
-    Read(ReadError),
+    /// The normal flush path refused publication.
+    Flush(RunLimitError),
+    /// Application metadata exceeds the 16 MiB format bound.
+    MetadataLimit,
     /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
     /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
@@ -227,7 +170,8 @@ impl fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Snapshot(error) => write!(f, "checkpoint snapshot refused: {error}"),
-            Self::Read(error) => write!(f, "checkpoint read failed: {error}"),
+            Self::Flush(error) => write!(f, "checkpoint flush refused: {error}"),
+            Self::MetadataLimit => f.write_str("checkpoint metadata exceeds 16 MiB"),
             Self::Locked(path) => write!(
                 f,
                 "{} is locked by another engine or process",
@@ -280,6 +224,8 @@ pub enum Damage {
     },
     /// A checksum does not match the bytes.
     Checksum,
+    /// A persisted Bloom filter failed its independent checksum.
+    FilterChecksum,
     /// The manifest is for another generation than `CURRENT` names.
     Generation {
         /// Named by `CURRENT`.
@@ -289,7 +235,7 @@ pub enum Damage {
     },
     /// A run is not a valid run.
     Run(CorruptRun),
-    /// A run is empty, or its keys do not follow the previous run's.
+    /// The run IDs, levels, flush groups or disjoint level ordering are invalid.
     Order,
     /// A record has a sequence number above the checkpoint's ceiling.
     Sequence {
@@ -374,8 +320,8 @@ fn checkpoint_dir(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("{PREFIX}{generation:020}"))
 }
 
-fn run_name(index: usize) -> String {
-    format!("run-{index:06}")
+fn run_name(id: u128) -> String {
+    format!("{id:032x}")
 }
 
 fn crc(parts: &[&[u8]]) -> u32 {
@@ -429,32 +375,60 @@ fn decode_current(bytes: &[u8]) -> Result<u64, Damage> {
     Ok(u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
 }
 
-/// What a manifest records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunEntry {
+    id: u128,
+    level: usize,
+    flush: u64,
+    seq_override: Option<u64>,
+    len: u64,
+    run_len: u64,
+    sum: u32,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Manifest {
     generation: u64,
     last_seq: u64,
     records: u64,
-    /// Length and CRC-32 of each run file.
-    runs: Vec<(u64, u32)>,
+    next_run_id: u64,
+    previous: u64,
+    depth: usize,
+    metadata: Vec<u8>,
+    runs: Vec<RunEntry>,
 }
 
 impl Manifest {
     fn encode(&self) -> Vec<u8> {
-        let mut bytes =
-            Vec::with_capacity(MANIFEST_HEADER_LEN + self.runs.len() * MANIFEST_ENTRY_LEN + 4);
+        let mut bytes = Vec::with_capacity(
+            MANIFEST_HEADER_LEN + self.runs.len() * MANIFEST_ENTRY_LEN + self.metadata.len() + 4,
+        );
         bytes.extend_from_slice(&MANIFEST_MAGIC);
         bytes.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
-        bytes.extend_from_slice(&self.last_seq.to_le_bytes());
-        bytes.extend_from_slice(&self.records.to_le_bytes());
-        // Runs are bounded by the engine's run limits, far below u32.
-        bytes.extend_from_slice(&(self.runs.len() as u32).to_le_bytes());
-        for &(len, sum) in &self.runs {
-            bytes.extend_from_slice(&len.to_le_bytes());
-            bytes.extend_from_slice(&sum.to_le_bytes());
+        for n in [
+            self.generation,
+            self.last_seq,
+            self.records,
+            self.next_run_id,
+            self.previous,
+        ] {
+            bytes.extend_from_slice(&n.to_le_bytes());
         }
+        bytes.extend_from_slice(&(self.depth as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.metadata.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.runs.len() as u32).to_le_bytes());
+        for run in &self.runs {
+            bytes.extend_from_slice(&run.id.to_le_bytes());
+            bytes.extend_from_slice(&(run.level as u32).to_le_bytes());
+            bytes.extend_from_slice(&u32::from(run.seq_override.is_some()).to_le_bytes());
+            bytes.extend_from_slice(&run.seq_override.unwrap_or(0).to_le_bytes());
+            bytes.extend_from_slice(&run.flush.to_le_bytes());
+            bytes.extend_from_slice(&run.len.to_le_bytes());
+            bytes.extend_from_slice(&run.run_len.to_le_bytes());
+            bytes.extend_from_slice(&run.sum.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.metadata);
         let sum = crc(&[&bytes]);
         bytes.extend_from_slice(&sum.to_le_bytes());
         bytes
@@ -463,41 +437,93 @@ impl Manifest {
     fn decode(bytes: &[u8]) -> Result<Self, Damage> {
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let length = |expected| Damage::Length {
+            expected,
+            found: bytes.len() as u64,
+        };
         if bytes.len() < MANIFEST_HEADER_LEN + 4 {
-            return Err(Damage::Length {
-                expected: (MANIFEST_HEADER_LEN + 4) as u64,
-                found: bytes.len() as u64,
-            });
+            return Err(length((MANIFEST_HEADER_LEN + 4) as u64));
         }
         if bytes[..8] != MANIFEST_MAGIC {
             return Err(Damage::BadMagic);
-        }
-        let count = u32_at(MANIFEST_HEADER_LEN - 4) as usize;
-        let expected = MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN + 4;
-        if bytes.len() != expected {
-            return Err(Damage::Length {
-                expected: expected as u64,
-                found: bytes.len() as u64,
-            });
-        }
-        let body = expected - 4;
-        if crc(&[&bytes[..body]]).to_le_bytes() != bytes[body..] {
-            return Err(Damage::Checksum);
         }
         let (version, flags) = (u32_at(8), u32_at(12));
         if version != MANIFEST_VERSION || flags != 0 {
             return Err(Damage::Unsupported { version, flags });
         }
-        let runs = (0..count)
-            .map(|index| {
-                let at = MANIFEST_HEADER_LEN + index * MANIFEST_ENTRY_LEN;
-                (u64_at(at), u32_at(at + 8))
-            })
-            .collect();
+        let count = u32_at(68) as usize;
+        let metadata_len = u64_at(60);
+        if metadata_len > MAX_METADATA_BYTES as u64 {
+            return Err(length(
+                (MANIFEST_HEADER_LEN + MAX_METADATA_BYTES + 4) as u64,
+            ));
+        }
+        let expected = MANIFEST_HEADER_LEN as u64
+            + count as u64 * MANIFEST_ENTRY_LEN as u64
+            + metadata_len
+            + 4;
+        if bytes.len() as u64 != expected {
+            return Err(length(expected));
+        }
+        let body = bytes.len() - 4;
+        if crc(&[&bytes[..body]]).to_le_bytes() != bytes[body..] {
+            return Err(Damage::Checksum);
+        }
+        let depth = u32_at(56) as usize;
+        let next_run_id = u64_at(40);
+        if depth == 0
+            || depth > count.saturating_add(64)
+            || next_run_id == 0
+            || u64_at(48) >= u64_at(16)
+        {
+            return Err(Damage::Order);
+        }
+        let mut runs = Vec::with_capacity(count);
+        let mut ids = HashSet::with_capacity(count);
+        let mut previous = (0, 0);
+        for index in 0..count {
+            let at = MANIFEST_HEADER_LEN + index * MANIFEST_ENTRY_LEN;
+            let id = u128::from_le_bytes(bytes[at..at + 16].try_into().unwrap());
+            let level = u32_at(at + 16) as usize;
+            let flags = u32_at(at + 20);
+            let seq = u64_at(at + 24);
+            let flush = u64_at(at + 32);
+            let len = u64_at(at + 40);
+            let run_len = u64_at(at + 48);
+            if !ids.insert(id)
+                || id as u64 == 0
+                || id as u64 >= next_run_id
+                || level > depth
+                || flags > 1
+                || (flags == 0 && seq != 0)
+                || (level > 0 && flush != 0)
+                || (level, flush) < previous
+                || flush == u64::MAX
+                || run_len > len.saturating_sub(4)
+                || len < 4
+            {
+                return Err(Damage::Order);
+            }
+            previous = (level, flush);
+            runs.push(RunEntry {
+                id,
+                level,
+                flush,
+                seq_override: (flags == 1).then_some(seq),
+                len,
+                run_len,
+                sum: u32_at(at + 56),
+            });
+        }
+        let metadata_at = MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN;
         Ok(Self {
             generation: u64_at(16),
             last_seq: u64_at(24),
             records: u64_at(32),
+            next_run_id,
+            previous: u64_at(48),
+            depth,
+            metadata: bytes[metadata_at..body].to_vec(),
             runs,
         })
     }
@@ -508,6 +534,7 @@ impl Manifest {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Crash {
+    PartialRun,
     AfterFirstRun,
     BeforeManifestSync,
     BeforeRename,
@@ -604,100 +631,249 @@ fn generations(dir: &Path) -> Result<Vec<u64>, CheckpointError> {
     Ok(found)
 }
 
-/// Removes every checkpoint directory but `keep`, returning how many were
-/// removed and how many could not be.
-fn reclaim(dir: &Path, found: &[u64], keep: u64) -> (usize, usize) {
-    let (mut removed, mut failed) = (0, 0);
-    for &generation in found.iter().filter(|&&generation| generation != keep) {
-        match fs::remove_dir_all(checkpoint_dir(dir, generation)) {
-            Ok(()) => removed += 1,
-            Err(_) => failed += 1,
+/// GC runs only after the new CURRENT and its parent are durable. The previous
+/// committed manifest is retained even if abandoned attempts lie between it
+/// and the new generation.
+fn reclaim(
+    dir: &Path,
+    found: &[u64],
+    manifest: &Manifest,
+    previous: Option<&Manifest>,
+) -> (usize, usize, usize) {
+    let keep: HashSet<_> = manifest
+        .runs
+        .iter()
+        .chain(previous.into_iter().flat_map(|m| &m.runs))
+        .map(|r| run_name(r.id))
+        .collect();
+    let (mut files, mut directories, mut failed) = (0, 0, 0);
+    if let Ok(entries) = fs::read_dir(dir.join(RUNS)) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                failed += 1;
+                continue;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let digits = name.strip_suffix(".tmp").unwrap_or(name);
+            if digits.len() == 32
+                && digits.bytes().all(|b| b.is_ascii_hexdigit())
+                && !keep.contains(name)
+            {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => files += 1,
+                    Err(_) => failed += 1,
+                }
+            }
         }
     }
-    (removed, failed)
+    for &generation in found {
+        if generation != manifest.generation && generation != manifest.previous {
+            match fs::remove_dir_all(checkpoint_dir(dir, generation)) {
+                Ok(()) => directories += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    (files, directories, failed)
+}
+
+struct Image {
+    runs: Vec<(usize, u64, SharedRun)>,
+    ceiling: u64,
+    depth: usize,
+    _live: Arc<()>,
+}
+
+impl Core {
+    /// Use the normal flush job, keeping precisely the run image at rotation.
+    /// Taking a later snapshot of the state would include runs published by
+    /// concurrent ingestion, or miss pre-ceiling runs replaced by compaction.
+    fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
+        let serial = self.serialize_flush();
+        let mut state = self.wait_for_level0(self.write_state());
+        let live = Arc::strong_count(&self.snapshots) - 1;
+        if live >= self.snapshot_limits.max_live {
+            return Err(CheckpointError::Snapshot(SnapshotError::Readers {
+                live,
+                max: self.snapshot_limits.max_live,
+            }));
+        }
+        let bytes = state.retained().bytes;
+        if bytes > self.snapshot_limits.max_retained_bytes {
+            return Err(CheckpointError::Snapshot(SnapshotError::Retained {
+                bytes,
+                max: self.snapshot_limits.max_retained_bytes,
+            }));
+        }
+        let mut image = Image {
+            runs: state.levels.checkpoint_runs(),
+            ceiling: state.last_seq,
+            depth: state.levels.depth(),
+            _live: Arc::clone(&self.snapshots),
+        };
+        let flush = state.levels.next_flush();
+        if !state.active.is_empty() {
+            self.freeze_active(&mut state);
+        }
+        if state.frozen.is_empty() {
+            return Ok(image);
+        }
+        let job = FlushJob {
+            engine: self,
+            _serial: serial,
+            tables: state.frozen.clone(),
+            cuts: state.flush_cuts(self.target_run_len),
+        };
+        drop(state);
+        #[cfg(test)]
+        AFTER_ROTATION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let (_, runs) = job.build().publish_kept().map_err(CheckpointError::Flush)?;
+        image
+            .runs
+            .extend(runs.into_iter().map(|run| (0, flush, run)));
+        image.runs.sort_by_key(|(level, _, _)| *level);
+        Ok(image)
+    }
+}
+
+/// Visit the exact file bytes without allocating a contiguous serialization.
+fn run_parts(run: &Run<Vec<u8>>, mut part: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    for bytes in run.chunks() {
+        part(bytes)?;
+    }
+    let mut filter_sum = Hasher::new();
+    for word in run.filter_words() {
+        filter_sum.update(&word);
+        part(&word)?;
+    }
+    part(&filter_sum.finalize().to_le_bytes())
 }
 
 struct Written {
     manifest: Manifest,
     bytes: u64,
+    bytes_reused: u64,
+    runs_written: usize,
+    runs_reused: usize,
+    files_deleted: usize,
     largest_run_bytes: usize,
 }
 
-/// Streams the snapshot's live keys into run files in `path`, then writes
-/// the manifest, syncing each file and the directory.
-///
-/// Run builders sample raw dictionaries from the records being written.
 fn write_runs(
-    core: &Core,
-    snapshot: &super::Snapshot,
-    path: &Path,
+    image: &Image,
+    dir: &Path,
     generation: u64,
+    previous: u64,
     options: CheckpointOptions,
+    metadata: &[u8],
 ) -> Result<Written, Failure> {
-    let target = core.target_run_len.min(MAX_TARGET_RUN_LEN);
+    let runs_dir = dir.join(RUNS);
+    fs::create_dir_all(&runs_dir).map_err(io_error(&runs_dir))?;
     let mut written = Written {
         manifest: Manifest {
             generation,
-            last_seq: snapshot.last_seq(),
-            records: 0,
-            runs: Vec::new(),
+            last_seq: image.ceiling,
+            records: image.runs.iter().map(|(_, _, r)| r.run.len() as u64).sum(),
+            next_run_id: NEXT_RUN_ID.load(Ordering::Relaxed),
+            previous,
+            depth: image.depth,
+            metadata: metadata.to_vec(),
+            runs: Vec::with_capacity(image.runs.len()),
         },
         bytes: 0,
+        bytes_reused: 0,
+        runs_written: 0,
+        runs_reused: 0,
+        files_deleted: 0,
         largest_run_bytes: 0,
     };
-    let emit = |run: Run<Vec<u8>>, written: &mut Written| -> Result<(), Failure> {
-        let len = run.stored_len();
-        let total = written.bytes + len as u64;
-        if total > options.max_bytes {
+    for &(level, flush, ref published) in &image.runs {
+        let run = &published.run;
+        let len = (run.stored_len() + run.filter_bytes() + 4) as u64;
+        let file = runs_dir.join(run_name(published.id));
+        let exists = match fs::metadata(&file) {
+            Ok(found) if found.len() == len => true,
+            Ok(_) => {
+                return Err(io_error(&file)(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "existing run file has the wrong length",
+                ))
+                .into());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(io_error(&file)(e).into()),
+        };
+        if !exists && written.bytes.saturating_add(len) > options.max_bytes {
             return Err(CheckpointError::DiskLimit {
-                bytes: total,
+                bytes: written.bytes.saturating_add(len),
                 max_bytes: options.max_bytes,
             }
             .into());
         }
-        let file = path.join(run_name(written.manifest.runs.len()));
-        let mut output = File::create_new(&file).map_err(io_error(&file))?;
-        let mut checksum = crc32fast::Hasher::new();
-        for bytes in run.chunks() {
-            output.write_all(bytes).map_err(io_error(&file))?;
-            checksum.update(bytes);
-        }
-        output.sync_all().map_err(io_error(&file))?;
-        written.bytes = total;
-        written.largest_run_bytes = written.largest_run_bytes.max(len);
-        written
-            .manifest
-            .runs
-            .push((len as u64, checksum.finalize()));
-        crash_point!(Crash::AfterFirstRun, &file);
-        Ok(())
-    };
-
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = snapshot.scan(&mut workspace);
-    let mut builder: Option<RunBuilder> = None;
-    let mut input = 0;
-    while let Some(record) = scan.next_record().map_err(CheckpointError::Read)? {
-        let open = builder.get_or_insert_with(|| {
-            RunBuilder::in_pool(core.codec, core.target_block_compressed, &core.chunks)
+        let sum = if exists {
+            written.bytes_reused += len;
+            written.runs_reused += 1;
+            *published.checkpoint_crc.get_or_init(|| {
+                let mut sum = Hasher::new();
+                run_parts(run, |bytes| {
+                    sum.update(bytes);
+                    Ok(())
+                })
+                .expect("hashing cannot fail");
+                sum.finalize()
+            })
+        } else {
+            let tmp = runs_dir.join(format!("{}.tmp", run_name(published.id)));
+            // An interrupted temporary file is never a reusable final file.
+            match fs::remove_file(&tmp) {
+                Ok(()) => written.files_deleted += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_error(&tmp)(e).into()),
+            }
+            let mut output = BufWriter::new(File::create_new(&tmp).map_err(io_error(&tmp))?);
+            #[cfg(test)]
+            if crash(Crash::PartialRun) {
+                output
+                    .write_all(&run.chunks().next().unwrap()[..1])
+                    .map_err(io_error(&tmp))?;
+                return Err(Failure::Crashed(crashed(&tmp)));
+            }
+            let mut sum = Hasher::new();
+            run_parts(run, |bytes| {
+                output.write_all(bytes)?;
+                sum.update(bytes);
+                Ok(())
+            })
+            .map_err(io_error(&tmp))?;
+            output.flush().map_err(io_error(&tmp))?;
+            output.get_ref().sync_all().map_err(io_error(&tmp))?;
+            fs::rename(&tmp, &file).map_err(io_error(&file))?;
+            written.bytes += len;
+            written.runs_written += 1;
+            let sum = sum.finalize();
+            let _ = published.checkpoint_crc.set(sum);
+            crash_point!(Crash::AfterFirstRun, &file);
+            sum
+        };
+        written.largest_run_bytes = written.largest_run_bytes.max(len as usize);
+        written.manifest.runs.push(RunEntry {
+            id: published.id,
+            level,
+            flush,
+            seq_override: run.seq_override(),
+            len,
+            run_len: run.stored_len() as u64,
+            sum,
         });
-        // Keys and values came from runs and memtables that held them.
-        open.add(record.key, record.seq, Value::Bytes(record.value))
-            .expect("live records fit a run");
-        written.manifest.records += 1;
-        input += record.key.len() + record.value.len() + RECORD_INPUT_OVERHEAD;
-        if input >= target {
-            emit(builder.take().unwrap().finish(), &mut written)?;
-            input = 0;
-        }
     }
-    drop(scan);
-    if let Some(open) = builder.take() {
-        emit(open.finish(), &mut written)?;
-    }
-
+    sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
     let manifest = written.manifest.encode();
-    let total = written.bytes + manifest.len() as u64;
+    let total = written.bytes.saturating_add(manifest.len() as u64);
     if total > options.max_bytes {
         return Err(CheckpointError::DiskLimit {
             bytes: total,
@@ -705,34 +881,36 @@ fn write_runs(
         }
         .into());
     }
+    let path = checkpoint_dir(dir, generation);
     let file = path.join(MANIFEST);
     write_synced(&file, &manifest)?;
     written.bytes = total;
     crash_point!(Crash::BeforeManifestSync, &file);
-    sync_dir(path).map_err(io_error(path))?;
-    let parent = path.parent().expect("a checkpoint directory has a parent");
-    sync_dir(parent).map_err(io_error(parent))?;
+    sync_dir(&path).map_err(io_error(&path))?;
+    sync_dir(dir).map_err(io_error(dir))?;
     Ok(written)
 }
 
 impl Engine {
-    /// Writes the current state to `dir` as a new checkpoint and commits it,
-    /// then removes older ones. See [Checkpoints](crate::engine#checkpoints)
-    /// for the guarantees; the layout and protocol are specified in the
-    /// source of `src/engine/checkpoint.rs`.
-    ///
-    /// Writes continue throughout: the checkpoint holds the state at the
-    /// snapshot it takes, and holds the state lock only to take it. Flushes
-    /// and compactions also continue; sources they replace stay allocated
-    /// until the runs are written. Checkpoints of one engine run one at a
-    /// time. On any error before the commit point the new files are removed
-    /// and the previous checkpoint stays committed.
+    /// Flushes and commits the state at one sequence ceiling. Existing run
+    /// files are reused; file I/O holds no state lock. Keeps one previous
+    /// generation. See [Checkpoints](crate::engine#checkpoints).
     pub fn checkpoint(
         &self,
         dir: &Path,
         options: CheckpointOptions,
     ) -> Result<CheckpointReport, CheckpointError> {
-        // This mutex guards no data.
+        self.checkpoint_with_metadata(dir, options, &[])
+    }
+
+    /// Like checkpoint, with an opaque application blob (at most 16 MiB).
+    /// Recover it with [`Self::recover_with_metadata`].
+    pub fn checkpoint_with_metadata(
+        &self,
+        dir: &Path,
+        options: CheckpointOptions,
+        metadata: &[u8],
+    ) -> Result<CheckpointReport, CheckpointError> {
         let _serial = self
             .core
             .checkpointing
@@ -743,48 +921,59 @@ impl Engine {
             Ok(file) => file,
             Err(()) => return Err(CheckpointError::Locked(dir.to_owned())),
         };
-        self.publish(dir, options)
+        self.publish_metadata(dir, options, metadata)
     }
 
-    /// The checkpoint itself, once the caller serializes checkpoints of this
-    /// engine and holds `dir`'s lock.
-    pub(super) fn publish(
+    fn publish_metadata(
         &self,
         dir: &Path,
         options: CheckpointOptions,
+        metadata: &[u8],
     ) -> Result<CheckpointReport, CheckpointError> {
-        // None if there is no CURRENT, Some(None) if it cannot be read.
-        let committed = match read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64) {
-            Ok(bytes) => Some(decode_current(&bytes).ok()),
+        if metadata.len() > MAX_METADATA_BYTES {
+            return Err(CheckpointError::MetadataLimit);
+        }
+        let max_runs = self.core.read_state().max_runs;
+        let previous = match committed_manifest(dir, max_runs) {
+            Ok((_, _, manifest)) => Some(manifest),
             Err(OpenError::Corrupt {
+                path,
                 damage: Damage::Missing,
-                ..
-            }) => None,
-            Err(_) => Some(None),
+            }) if path == dir.join(CURRENT) => None,
+            Err(error) => return Err(io_error(dir)(io::Error::other(error))),
         };
         let found = generations(dir)?;
-        // Leftovers of interrupted attempts, removed first so that disk holds
-        // at most the committed checkpoint and the new one. While CURRENT
-        // exists but cannot be read, nothing is removed before the commit.
-        let (mut reclaimed, mut unreclaimed) = match committed {
-            None => reclaim(dir, &found, u64::MAX),
-            Some(Some(generation)) => reclaim(dir, &found, generation),
-            Some(None) => (0, 0),
-        };
         let generation = found
             .iter()
             .copied()
-            .chain(committed.flatten())
+            .chain(previous.iter().map(|m| m.generation))
             .max()
-            .map_or(1, |latest| latest + 1);
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| io_error(dir)(io::Error::other("checkpoint generations exhausted")))?;
         let _ = fs::remove_file(dir.join(CURRENT_TMP));
-
         let path = checkpoint_dir(dir, generation);
         fs::create_dir(&path).map_err(io_error(&path))?;
-        let snapshot = self.core.snapshot().map_err(CheckpointError::Snapshot);
-        let built = snapshot
+        let built = self
+            .core
+            .checkpoint_image()
             .map_err(Failure::Error)
-            .and_then(|snapshot| write_runs(&self.core, &snapshot, &path, generation, options));
+            .and_then(|image| {
+                #[cfg(test)]
+                AFTER_IMAGE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                write_runs(
+                    &image,
+                    dir,
+                    generation,
+                    previous.as_ref().map_or(0, |m| m.generation),
+                    options,
+                    metadata,
+                )
+            });
         let written = match built {
             Ok(written) => written,
             Err(Failure::Error(error)) => {
@@ -794,8 +983,6 @@ impl Engine {
             #[cfg(test)]
             Err(Failure::Crashed(error)) => return Err(error),
         };
-
-        // Publication: CURRENT.tmp, then the rename that commits.
         let tmp = dir.join(CURRENT_TMP);
         let current = encode_current(generation);
         #[cfg(test)]
@@ -803,9 +990,9 @@ impl Engine {
             write_synced(&tmp, &current)?;
             return Err(crashed(&tmp));
         }
-        let published = write_synced(&tmp, &current)
+        let committed = write_synced(&tmp, &current)
             .and_then(|()| fs::rename(&tmp, dir.join(CURRENT)).map_err(io_error(dir)));
-        if let Err(error) = published {
+        if let Err(error) = committed {
             let _ = fs::remove_file(&tmp);
             let _ = fs::remove_dir_all(&path);
             return Err(error);
@@ -825,49 +1012,55 @@ impl Engine {
         if crash(Crash::BeforeReclaim) {
             return Err(crashed(dir));
         }
-        let (removed, failed) = reclaim(dir, &found, generation);
-        reclaimed += removed;
-        unreclaimed += failed;
-        // Removal need not be durable: a directory that reappears after a
-        // crash is a leftover the next checkpoint removes.
+        let (files_deleted, reclaimed, unreclaimed) =
+            reclaim(dir, &found, &written.manifest, previous.as_ref());
+        let _ = sync_dir(&dir.join(RUNS));
         let _ = sync_dir(dir);
-        let Written {
-            manifest,
-            bytes,
-            largest_run_bytes,
-        } = written;
         Ok(CheckpointReport {
             generation,
-            last_seq: manifest.last_seq,
-            records: manifest.records,
-            runs: manifest.runs.len(),
-            bytes,
-            largest_run_bytes,
+            last_seq: written.manifest.last_seq,
+            records: written.manifest.records,
+            runs: written.manifest.runs.len(),
+            bytes: written.bytes,
+            bytes_written: written.bytes,
+            bytes_reused: written.bytes_reused,
+            runs_written: written.runs_written,
+            runs_reused: written.runs_reused,
+            files_deleted: files_deleted + written.files_deleted,
+            largest_run_bytes: written.largest_run_bytes,
             reclaimed,
             unreclaimed,
         })
     }
 
-    /// Recovers the checkpoint that `dir`'s `CURRENT` names into a new engine
-    /// with `options`, whose sequence numbers continue after the larger of the
-    /// checkpoint's ceiling and [`EngineOptions::last_seq`].
-    ///
-    /// Every file is read and checked (lengths, checksums, the full run
-    /// check, key order across runs and sequence numbers against the
-    /// ceiling) and each run's key filter rebuilt before the engine exists.
-    /// Nothing on disk is changed. Any failure is an error: recovery never
-    /// returns an empty engine for a missing or damaged checkpoint, nor falls
-    /// back to an older one.
+    /// Recovers CURRENT without changing disk. Sequences continue after the
+    /// larger of the checkpoint ceiling and options.last_seq. No fallback.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
+        Self::recover_with_metadata(dir, options).map(|(engine, _)| engine)
+    }
+
+    /// Recovers the engine and its opaque application metadata.
+    pub fn recover_with_metadata(
+        dir: &Path,
+        options: EngineOptions,
+    ) -> Result<(Engine, Vec<u8>), OpenError> {
         options.validate().map_err(OpenError::Config)?;
         let _lock = lock_existing(dir)?;
-        let loaded = load(dir, &options)?;
+        let mut loaded = load(dir, &options)?;
+        let metadata = std::mem::take(&mut loaded.metadata);
         let options = EngineOptions {
             last_seq: options.last_seq.max(loaded.ceiling),
             ..options
         };
-        Engine::start(Arc::new(loaded.into_core(&options)), &options)
+        let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options)?;
+        Ok((engine, metadata))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_ROTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_IMAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn read_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
@@ -905,26 +1098,30 @@ pub(super) fn lock_existing(dir: &Path) -> Result<File, OpenError> {
     }
 }
 
-/// A committed checkpoint, read and checked in full.
+/// A committed checkpoint, checked in full before starting any worker.
 pub(super) struct Loaded {
     pub(super) ceiling: u64,
-    runs: Vec<Run<Vec<u8>>>,
+    metadata: Vec<u8>,
+    next_run_id: u64,
+    depth: usize,
+    runs: Vec<(usize, u64, SharedRun)>,
     pool: ChunkPool,
     run_bytes: usize,
     held_bytes: usize,
 }
 
 impl Loaded {
-    /// A core holding the checkpoint's runs, whose sequence continues after
-    /// `options.last_seq`.
     pub(super) fn into_core(self, options: &EngineOptions) -> Core {
+        NEXT_RUN_ID.fetch_max(self.next_run_id, Ordering::Relaxed);
         let core = Core::with_pool(options, self.pool);
         {
             let mut state = core.write_state();
-            state.runs.extend(published(self.runs));
-            // A checkpoint is one sorted scan, so its runs are disjoint: the
-            // last level. Compaction inserts levels above it as it needs.
-            state.levels = Levels::recovered(&state.runs, options.level_ratio);
+            state.runs = self
+                .runs
+                .iter()
+                .map(|(_, _, run)| Arc::clone(run))
+                .collect();
+            state.levels = Levels::recovered(&self.runs, self.depth, options.level_ratio);
             state.order_runs();
             state.run_bytes = self.run_bytes;
             state.held_bytes = self.held_bytes;
@@ -967,11 +1164,8 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, OpenError> {
     Ok(bytes)
 }
 
-/// The committed checkpoint's directory, manifest path and manifest, from
-/// `CURRENT` and the manifest alone. The manifest is read only if it is no
-/// longer than a list of `max_runs` runs, or of 2^20 if that is more
-/// (`48 + 12 × max(max_runs, 2^20)` bytes); a longer one is
-/// [`Damage::Length`], not [`OpenError::RunLimit`].
+/// CURRENT's generation and checked manifest. Bounds the allocation to a
+/// list of max(max_runs, 2^20) entries plus the metadata format allowance.
 fn committed_manifest(
     dir: &Path,
     max_runs: usize,
@@ -982,13 +1176,12 @@ fn committed_manifest(
     let path = checkpoint_dir(dir, generation);
     let manifest_path = path.join(MANIFEST);
     // Generous beside the run limit, which is checked once it is decoded and
-    // reported as such; capped by the format's u32 count. At most 12 bytes a
-    // run the options allow, and 12 MiB at least.
+    // reported as such; capped by the format's u32 count.
     let most = max_runs
         .max(1 << 20)
         .min(u32::MAX as usize)
         .saturating_mul(MANIFEST_ENTRY_LEN)
-        .saturating_add(MANIFEST_HEADER_LEN + 4);
+        .saturating_add(MANIFEST_HEADER_LEN + MAX_METADATA_BYTES + 4);
     let bytes = read_bounded(&manifest_path, most as u64)?;
     let manifest = Manifest::decode(&bytes).map_err(|damage| corrupt(&manifest_path, damage))?;
     if manifest.generation != generation {
@@ -1003,104 +1196,134 @@ fn committed_manifest(
     Ok((path, manifest_path, manifest))
 }
 
-/// Reads and checks the checkpoint `dir`'s `CURRENT` names, under its lock.
+/// Reads and checks exactly CURRENT's generation under LOCK.
 pub(super) fn load(dir: &Path, options: &EngineOptions) -> Result<Loaded, OpenError> {
-    {
-        let (path, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
-
-        // The manifest's lengths bound what reading the runs allocates; refuse
-        // before reading any. Filters are added to the bytes once rebuilt.
-        let listed: u64 = manifest.runs.iter().map(|&(len, _)| len).sum();
-        if manifest.runs.len() > options.max_runs || listed > options.max_run_bytes as u64 {
-            return Err(OpenError::RunLimit(RunLimitError {
-                runs: manifest.runs.len(),
-                max_runs: options.max_runs,
-                run_bytes: usize::try_from(listed).unwrap_or(usize::MAX),
-                max_run_bytes: options.max_run_bytes,
-                level0_flushes: 0,
-                max_level0_flushes: LEVEL0_STOP,
-                background: None,
-            }));
-        }
-        let pool = ChunkPool::new(RESERVE_BYTES);
-        let mut runs: Vec<Run<Vec<u8>>> = Vec::with_capacity(manifest.runs.len());
-        let mut records = 0u64;
-        for (index, &(len, sum)) in manifest.runs.iter().enumerate() {
-            let file = path.join(run_name(index));
-            let data = read_bounded(&file, len)?;
-            if data.len() as u64 != len {
-                return Err(corrupt(
-                    &file,
-                    Damage::Length {
-                        expected: len,
-                        found: data.len() as u64,
-                    },
-                ));
-            }
-            if crc(&[&data]) != sum {
-                return Err(corrupt(&file, Damage::Checksum));
-            }
-            let (run, max_seq) =
-                Run::recover_in(data, &pool).map_err(|error| corrupt(&file, Damage::Run(error)))?;
-            if max_seq > manifest.last_seq {
-                return Err(corrupt(
-                    &file,
-                    Damage::Sequence {
-                        seq: max_seq,
-                        ceiling: manifest.last_seq,
-                    },
-                ));
-            }
-            let range = run.key_range();
-            let follows = match (range, runs.last()) {
-                (None, _) => false,
-                (Some(_), None) => true,
-                (Some(range), Some(previous)) => previous
-                    .key_range()
-                    .is_some_and(|previous| previous.max < range.min),
-            };
-            if !follows {
-                return Err(corrupt(&file, Damage::Order));
-            }
-            records += run.len() as u64;
-            runs.push(run);
-        }
-        if records != manifest.records {
+    let (_, manifest_path, manifest) = committed_manifest(dir, options.max_runs)?;
+    let listed = manifest
+        .runs
+        .iter()
+        .try_fold(0u64, |total, run| total.checked_add(run.len))
+        .unwrap_or(u64::MAX);
+    let limit = |runs, bytes| {
+        OpenError::RunLimit(RunLimitError {
+            runs,
+            max_runs: options.max_runs,
+            run_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+            max_run_bytes: options.max_run_bytes,
+            level0_flushes: 0,
+            max_level0_flushes: LEVEL0_STOP,
+            background: None,
+        })
+    };
+    if manifest.runs.len() > options.max_runs || listed > options.max_run_bytes as u64 {
+        return Err(limit(manifest.runs.len(), listed));
+    }
+    let pool = ChunkPool::new(RESERVE_BYTES);
+    let mut runs: Vec<(usize, u64, SharedRun)> = Vec::with_capacity(manifest.runs.len());
+    let mut records = 0u64;
+    for entry in &manifest.runs {
+        let file = dir.join(RUNS).join(run_name(entry.id));
+        let mut data = read_bounded(&file, entry.len)?;
+        if data.len() as u64 != entry.len {
             return Err(corrupt(
-                &manifest_path,
-                Damage::Records {
-                    expected: manifest.records,
-                    found: records,
+                &file,
+                Damage::Length {
+                    expected: entry.len,
+                    found: data.len() as u64,
                 },
             ));
         }
-        let run_bytes: usize = runs.iter().map(|run| run.stored_len()).sum();
-        let held_bytes: usize = runs.iter().map(Run::held_bytes).sum();
-        if runs.len() > options.max_runs || run_bytes + held_bytes > options.max_run_bytes {
-            return Err(OpenError::RunLimit(RunLimitError {
-                runs: runs.len(),
-                max_runs: options.max_runs,
-                run_bytes: run_bytes + held_bytes,
-                max_run_bytes: options.max_run_bytes,
-                level0_flushes: 0,
-                max_level0_flushes: LEVEL0_STOP,
-                background: None,
-            }));
+        let filter_at = entry.run_len as usize;
+        let filter_end = data.len() - 4;
+        let filter = &data[filter_at..filter_end];
+        if crc(&[filter]).to_le_bytes() != data[filter_end..] {
+            return Err(corrupt(&file, Damage::FilterChecksum));
         }
-
-        Ok(Loaded {
-            ceiling: manifest.last_seq,
-            pool,
-            runs,
-            run_bytes,
-            held_bytes,
-        })
+        if crc(&[&data]) != entry.sum {
+            return Err(corrupt(&file, Damage::Checksum));
+        }
+        let filter = filter.to_vec();
+        data.truncate(filter_at);
+        let (mut run, max_seq) = Run::recover_checkpoint_in(data, &filter, &pool)
+            .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+        if max_seq > manifest.last_seq
+            || entry
+                .seq_override
+                .is_some_and(|seq| seq > manifest.last_seq)
+        {
+            return Err(corrupt(
+                &file,
+                Damage::Sequence {
+                    seq: max_seq.max(entry.seq_override.unwrap_or(0)),
+                    ceiling: manifest.last_seq,
+                },
+            ));
+        }
+        if let Some(seq) = entry.seq_override {
+            if max_seq != 0 {
+                return Err(corrupt(&file, Damage::Order));
+            }
+            run.set_seq_override(seq);
+        }
+        let Some(range) = run.key_range() else {
+            return Err(corrupt(&file, Damage::Order));
+        };
+        if entry.level > 0
+            && runs.last().is_some_and(|(level, _, previous)| {
+                *level == entry.level && previous.run.key_range().unwrap().max >= range.min
+            })
+        {
+            return Err(corrupt(&file, Damage::Order));
+        }
+        records += run.len() as u64;
+        let largest_block = run
+            .view()
+            .largest_block_len()
+            .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+        runs.push((
+            entry.level,
+            entry.flush,
+            Arc::new(Published {
+                id: entry.id,
+                checkpoint_crc: OnceLock::from(entry.sum),
+                run,
+                largest_block,
+            }),
+        ));
     }
+    if records != manifest.records {
+        return Err(corrupt(
+            &manifest_path,
+            Damage::Records {
+                expected: manifest.records,
+                found: records,
+            },
+        ));
+    }
+    let run_bytes: usize = runs.iter().map(|(_, _, r)| r.run.stored_len()).sum();
+    let held_bytes: usize = runs.iter().map(|(_, _, r)| r.run.held_bytes()).sum();
+    if run_bytes.saturating_add(held_bytes) > options.max_run_bytes {
+        return Err(limit(
+            runs.len(),
+            run_bytes.saturating_add(held_bytes) as u64,
+        ));
+    }
+    Ok(Loaded {
+        ceiling: manifest.last_seq,
+        metadata: manifest.metadata,
+        next_run_id: manifest.next_run_id,
+        depth: manifest.depth,
+        pool,
+        runs,
+        run_bytes,
+        held_bytes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineWorkspace;
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
@@ -1162,7 +1385,30 @@ mod tests {
             generation: 7,
             last_seq: 1 << 40,
             records: 12,
-            runs: vec![(100, 0xdead_beef), (5, 1)],
+            next_run_id: 3,
+            previous: 4,
+            depth: 2,
+            metadata: b"offsets\0\xff".to_vec(),
+            runs: vec![
+                RunEntry {
+                    id: 1,
+                    level: 0,
+                    flush: 0,
+                    seq_override: Some(7),
+                    len: 100,
+                    run_len: 88,
+                    sum: 0xdead_beef,
+                },
+                RunEntry {
+                    id: 2,
+                    level: 2,
+                    flush: 0,
+                    seq_override: None,
+                    len: 100,
+                    run_len: 88,
+                    sum: 1,
+                },
+            ],
         };
         let bytes = manifest.encode();
         assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
@@ -1216,6 +1462,7 @@ mod tests {
     #[test]
     fn a_crash_at_each_boundary_leaves_one_recoverable_checkpoint() {
         for (crash, committed) in [
+            (Crash::PartialRun, false),
             (Crash::AfterFirstRun, false),
             (Crash::BeforeManifestSync, false),
             (Crash::BeforeRename, false),
@@ -1255,10 +1502,15 @@ mod tests {
                 .checkpoint(&dir, CheckpointOptions::default())
                 .unwrap();
             assert_eq!(report.generation, 3, "{crash:?}");
-            assert_eq!(report.reclaimed, 2, "{crash:?}");
+            assert_eq!(report.reclaimed, 1, "{crash:?}");
             assert_eq!(
                 entries(&dir),
-                [CURRENT.to_owned(), format!("{PREFIX}{:020}", 3)],
+                [
+                    CURRENT.to_owned(),
+                    format!("{PREFIX}{:020}", if committed { 2 } else { 1 }),
+                    format!("{PREFIX}{:020}", 3),
+                    RUNS.to_owned()
+                ],
                 "{crash:?}"
             );
             let recovered = Engine::recover(&dir, manual()).unwrap();
@@ -1290,5 +1542,335 @@ mod tests {
         drop(held);
         Engine::recover(&dir, manual()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+    fn manifest(dir: &Path) -> Manifest {
+        committed_manifest(dir, usize::MAX).unwrap().2
+    }
+
+    fn compact_all(engine: &Engine) {
+        let options = super::super::CompactionOptions {
+            max_overlap: 1,
+            ..super::super::CompactionOptions::default()
+        };
+        let mut workspace = super::super::MergeWorkspace::new();
+        while engine.compact(options, &mut workspace).unwrap().is_some() {}
+    }
+
+    #[test]
+    fn incremental_checkpoints_write_only_new_runs_and_gc_keeps_two_commits() {
+        let dir = scratch("incremental");
+        let options = EngineOptions {
+            compression: super::super::Compression::Uncompressed,
+            target_run_len: 1 << 20,
+            ..manual()
+        };
+        let engine = Engine::new(options).unwrap();
+        for i in 0..1_000u32 {
+            engine.put(&i.to_be_bytes(), b"original").unwrap();
+        }
+        engine.flush().unwrap();
+        let expected: Vec<_> = engine
+            .core
+            .read_state()
+            .runs
+            .iter()
+            .map(|r| {
+                let mut bytes = Vec::new();
+                run_parts(&r.run, |part| {
+                    bytes.extend_from_slice(part);
+                    Ok(())
+                })
+                .unwrap();
+                (r.id, bytes)
+            })
+            .collect();
+        let first = engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        assert_eq!((first.runs_written, first.runs_reused), (1, 0));
+        assert_eq!(first.bytes_reused, 0);
+        for (id, bytes) in &expected {
+            assert_eq!(
+                &fs::read(dir.join(RUNS).join(run_name(*id))).unwrap(),
+                bytes
+            );
+        }
+        let original = manifest(&dir);
+        for i in 0..10u32 {
+            engine.put(&i.to_be_bytes(), b"changed").unwrap();
+        }
+        engine.flush().unwrap();
+        let second = engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        let second_manifest = manifest(&dir);
+        assert_eq!(
+            (
+                second.runs_written,
+                second.runs_reused,
+                second.files_deleted
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(second.bytes_reused, original.runs[0].len);
+        assert_eq!(
+            second.bytes_written,
+            second_manifest.runs[1].len + second_manifest.encode().len() as u64
+        );
+        assert!(second.bytes_written < first.bytes_written / 10);
+        for (id, bytes) in &expected {
+            assert_eq!(
+                &fs::read(dir.join(RUNS).join(run_name(*id))).unwrap(),
+                bytes
+            );
+        }
+
+        compact_all(&engine);
+        let third = engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        let third_manifest = manifest(&dir);
+        assert_eq!(
+            (third.runs_written, third.runs_reused, third.files_deleted),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            third.bytes_written,
+            third_manifest.runs[0].len + third_manifest.encode().len() as u64
+        );
+        // The preceding committed generation still recovers after GC.
+        fs::write(dir.join(CURRENT), encode_current(second.generation)).unwrap();
+        let previous = Engine::recover(&dir, options).unwrap();
+        assert_eq!(state(&previous), state(&engine));
+        previous.close().unwrap();
+        fs::write(dir.join(CURRENT), encode_current(third.generation)).unwrap();
+
+        let fourth = engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        assert_eq!(
+            (
+                fourth.runs_written,
+                fourth.runs_reused,
+                fourth.files_deleted
+            ),
+            (0, 1, 2)
+        );
+        assert_eq!(fourth.bytes_written, manifest(&dir).encode().len() as u64);
+        assert_eq!(fourth.bytes_reused, third_manifest.runs[0].len);
+        for entry in &second_manifest.runs {
+            assert!(!dir.join(RUNS).join(run_name(entry.id)).exists());
+        }
+        // Recovery preserves IDs and the persisted filter exactly, allowing a
+        // metadata-only checkpoint without rehashing any keys or rewriting files.
+        let recovered = Engine::recover(&dir, options).unwrap();
+        assert!(
+            recovered
+                .core
+                .read_state()
+                .runs
+                .iter()
+                .all(|r| r.run.filter_build_bytes() == 0)
+        );
+        let fifth = recovered
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        assert_eq!(
+            (fifth.runs_written, fifth.runs_reused, fifth.files_deleted),
+            (0, 1, 0)
+        );
+        assert_eq!(fifth.bytes_reused, fourth.bytes_reused);
+        assert_eq!(manifest(&dir).runs, third_manifest.runs);
+        assert_eq!(state(&recovered), state(&engine));
+        for (name, report) in [
+            ("first", first),
+            ("second", second),
+            ("third", third),
+            ("fourth", fourth),
+            ("recovered", fifth),
+        ] {
+            eprintln!(
+                "{name}: written={} reused={} runs_written={} runs_reused={} deleted={}",
+                report.bytes_written,
+                report.bytes_reused,
+                report.runs_written,
+                report.runs_reused,
+                report.files_deleted
+            );
+        }
+        recovered.close().unwrap();
+        engine.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_commits_with_its_ceiling_and_empty_metadata_remains_supported() {
+        let dir = scratch("metadata");
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"offset", b"value").unwrap();
+        let metadata = b"kafka/partition-7=12345\0\xff";
+        let first = engine
+            .checkpoint_with_metadata(&dir, CheckpointOptions::default(), metadata)
+            .unwrap();
+        let (recovered, found) = Engine::recover_with_metadata(&dir, manual()).unwrap();
+        assert_eq!(found, metadata);
+        assert_eq!(recovered.stats().last_seq, first.last_seq);
+        assert_eq!(state(&recovered), state(&engine));
+        recovered.close().unwrap();
+        let second = engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        assert_eq!((second.runs_written, second.runs_reused), (0, 1));
+        let (recovered, found) = Engine::recover_with_metadata(&dir, manual()).unwrap();
+        assert!(found.is_empty());
+        recovered.close().unwrap();
+        assert!(matches!(
+            engine.checkpoint_with_metadata(
+                &dir,
+                CheckpointOptions::default(),
+                &vec![0; MAX_METADATA_BYTES + 1]
+            ),
+            Err(CheckpointError::MetadataLimit)
+        ));
+        assert_eq!(manifest(&dir).generation, second.generation);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_paused_checkpoint_retains_its_ceiling_while_writes_ingestion_and_compaction_continue() {
+        let dir = scratch("paused-image");
+        let engine = Arc::new(Engine::new(manual()).unwrap());
+        for i in 0..1_000u32 {
+            engine.put(&i.to_be_bytes(), b"original").unwrap();
+        }
+        engine.flush().unwrap();
+        for i in 0..10u32 {
+            engine.delete(&i.to_be_bytes()).unwrap();
+        }
+        let pin = engine.snapshot().unwrap();
+        let expected = state(&engine);
+        let ceiling = engine.stats().last_seq;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let checkpoint_engine = Arc::clone(&engine);
+        let checkpoint_dir = dir.clone();
+        let checkpoint = std::thread::spawn(move || {
+            AFTER_IMAGE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            checkpoint_engine.checkpoint_with_metadata(
+                &checkpoint_dir,
+                CheckpointOptions::default(),
+                b"offset=1010",
+            )
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        engine.put(b"after-ceiling", b"excluded").unwrap();
+        engine.flush().unwrap();
+        let mut batch = super::super::WriteBatch::new();
+        batch.put(b"ingested-later", b"excluded");
+        engine.ingest_sorted(&batch).unwrap();
+        let before = engine
+            .core
+            .read_state()
+            .runs
+            .iter()
+            .map(|r| r.id)
+            .collect::<HashSet<_>>();
+        compact_all(&engine);
+        let after = engine
+            .core
+            .read_state()
+            .runs
+            .iter()
+            .map(|r| r.id)
+            .collect::<HashSet<_>>();
+        assert_ne!(
+            before, after,
+            "compaction published while the checkpoint was paused"
+        );
+        assert!(engine.stats().retained_run_bytes > 0);
+        resume_tx.send(()).unwrap();
+        let report = checkpoint.join().unwrap().unwrap();
+        assert_eq!(report.last_seq, ceiling);
+        let (recovered, metadata) = Engine::recover_with_metadata(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        assert_eq!(metadata, b"offset=1010");
+        let mut ws = EngineWorkspace::new();
+        let mut scan = pin.scan(&mut ws);
+        let mut pinned = Vec::new();
+        while let Some(record) = scan.next_record().unwrap() {
+            pinned.push((record.key.to_vec(), record.value.to_vec()));
+        }
+        assert_eq!(pinned, expected);
+        recovered.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn independently_recovered_branches_never_reuse_ids_for_different_outputs() {
+        let dir = scratch("recovery-branches");
+        let seed = Engine::new(manual()).unwrap();
+        seed.put(b"shared", b"base").unwrap();
+        seed.checkpoint(&dir, CheckpointOptions::default()).unwrap();
+        let left = Engine::recover(&dir, manual()).unwrap();
+        let right = Engine::recover(&dir, manual()).unwrap();
+        left.put(b"branch", b"left").unwrap();
+        right.put(b"branch", b"right").unwrap();
+        left.checkpoint(&dir, CheckpointOptions::default()).unwrap();
+        let left_manifest = manifest(&dir);
+        right
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        let right_manifest = manifest(&dir);
+        assert_eq!(left_manifest.runs[0].id, right_manifest.runs[0].id);
+        assert_ne!(left_manifest.runs[1].id, right_manifest.runs[1].id);
+        let recovered = Engine::recover(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), state(&right));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn writes_during_the_checkpoint_flush_are_excluded_even_if_they_publish_first() {
+        let dir = scratch("flush-ceiling");
+        let engine = Arc::new(Engine::new(manual()).unwrap());
+        engine.put(b"a", b"base").unwrap();
+        engine.flush().unwrap();
+        engine.put(b"b", b"checkpointed").unwrap();
+        let expected = state(&engine);
+        let ceiling = engine.stats().last_seq;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let checkpoint_engine = Arc::clone(&engine);
+        let checkpoint_dir = dir.clone();
+        let checkpoint = std::thread::spawn(move || {
+            AFTER_ROTATION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            checkpoint_engine.checkpoint(&checkpoint_dir, CheckpointOptions::default())
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // Both operations finish while checkpoint compression is paused. The
+        // ingestion publishes first, yet its sequence is above the ceiling.
+        assert!(engine.put(b"z", b"later").unwrap() > ceiling);
+        let mut batch = super::super::WriteBatch::new();
+        batch.put(b"zz", b"published-before-checkpoint-flush");
+        assert!(engine.ingest_sorted(&batch).unwrap() > ceiling);
+        resume_tx.send(()).unwrap();
+        let report = checkpoint.join().unwrap().unwrap();
+        assert_eq!(report.last_seq, ceiling);
+        let recovered = Engine::recover(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        recovered.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -36,6 +36,8 @@ fn run(records: &[Record]) -> SharedRun {
         builder.add(key, *seq, value).unwrap();
     }
     Arc::new(Published {
+        id: crate::engine::checkpoint::new_run_id(),
+        checkpoint_crc: std::sync::OnceLock::new(),
         run: builder.finish(),
         largest_block: 0,
     })
@@ -429,6 +431,8 @@ fn damage_is_reported_only_where_a_read_must_open_the_run() {
     let left = run(&[put(b"b", 1, b"-"), put(b"c", 2, b"-")]);
     let damaged_source = run(&[put(b"m", 3, b"old"), put(b"n", 4, b"old")]);
     let damaged = Arc::new(Published {
+        id: crate::engine::checkpoint::new_run_id(),
+        checkpoint_crc: std::sync::OnceLock::new(),
         run: damaged_source.run.damaged_at(DAMAGE_AT),
         largest_block: 0,
     });

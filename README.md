@@ -19,7 +19,7 @@ bundled Zstandard library.
   maintenance is also available.
 - Zstandard level 1 with raw segment dictionaries and adaptive blocks, or
   uncompressed blocks.
-- Explicit full checkpoints and recovery of the latest committed checkpoint,
+- Explicit incremental checkpoints and recovery of the latest committed checkpoint,
   including format, checksum and corruption checks.
 - Configurable admission limits for memtables, runs, snapshots and compaction.
   These account for estimated bytes; they do not cap process resident memory.
@@ -96,7 +96,8 @@ publication into level 0; range overlap alone causes no wait. Builds release the
 state lock, so concurrent writes proceed. Each ingestion builds once with stored
 placeholders, then assigns one shared sequence at publication, after all
 previous writes. A run-level override supplies this effective sequence to readers
-and merges; compaction and checkpoints write it into ordinary run records.
+and merges; compaction writes it into ordinary run records, while checkpoints
+preserve the override.
 An oversized unsorted batch stages its records in a private memtable and uses
 the same single-sequence run path, preserving the last duplicate operation.
 Snapshots and checkpoints taken during a build exclude its unpublished runs;
@@ -134,7 +135,14 @@ snapshot or overlapping unselected run needs them. Snapshot views keep their
 records and visibility, and checkpoint recovery preserves the write ceiling.
 Readers reuse one context and borrow dictionary bytes from the run; there is
 no prepared dictionary or decoded-block cache. Run format 5 and checkpoint
-manifest version 2 replace earlier formats without backward compatibility.
+manifest version 3 replace earlier formats without backward compatibility.
+
+Checkpoints flush memtables, then write each immutable compressed run and its
+checksummed Bloom filter once to `runs/<id>`, with no recompression. Manifests
+preserve levels, sequence overrides and the ceiling. Reports count written/reused
+bytes and runs, and deleted run files; GC retains the latest two generations.
+`checkpoint_with_metadata(dir, options, blob)` and `recover_with_metadata` round-trip
+opaque application data (up to 16 MiB) with the same commit.
 
 ## Tuning
 

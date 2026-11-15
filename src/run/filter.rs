@@ -1,19 +1,10 @@
 //! Run-local Bloom filters over user keys.
 //!
-//! A filter is built beside each run its builder finishes and lives only in
-//! memory: it is not part of the run format, and a run made from bytes with
-//! [`Run::new`](super::Run::new) has none. It answers whether a user key may
-//! be in the run; "no" is exact, "maybe" is wrong for about 1% of absent
-//! keys. Every version and tombstone of a key counts as the key.
-//!
-//! Keys are hashed with SipHash-1-3 under fixed keys (the standard library's
-//! [`DefaultHasher`]), and the probes are `h + i * step` for one 64-bit hash
-//! `h` and an odd `step` derived from it (Kirsch and Mitzenmacher), each
-//! reduced to a bit by multiplying and shifting. The hash may differ between
-//! builds of the standard library, which is why filters are never stored.
+//! Filters accompany checkpoint run bytes with their own checksum. Hashing
+//! is fixed by checkpoint format 3: FNV-1a followed by the MurmurHash3 finalizer.
+//! Every version and tombstone contributes its key; a negative is exact.
 
 use std::fmt;
-use std::hash::{DefaultHasher, Hasher};
 
 /// Ten bits per distinct key with seven probes: about a 0.8% false positive
 /// rate, near the optimum for that size.
@@ -29,9 +20,15 @@ pub(crate) const MAX_FILTER_KEYS: usize = 1 << 24;
 const FIRST_RESERVE: usize = 1024;
 
 pub(crate) fn hash(key: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(key);
-    hasher.finish()
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in key {
+        h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
 }
 
 /// Which bits a hash sets, in a filter of `bits` bits.
@@ -62,6 +59,28 @@ impl KeyFilter {
 
     pub(crate) fn bytes(&self) -> usize {
         self.words.len() * size_of::<u64>()
+    }
+
+    pub(crate) fn encoded(&self) -> impl Iterator<Item = [u8; 8]> + '_ {
+        self.words.iter().map(|word| word.to_le_bytes())
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty()
+            || !bytes.len().is_multiple_of(8)
+            || bytes.len() > (MAX_FILTER_KEYS * BITS_PER_KEY).div_ceil(64) * 8
+        {
+            return None;
+        }
+        Some(Self {
+            words: bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|word| u64::from_le_bytes(*word))
+                .collect(),
+            build_bytes: 0,
+        })
     }
 
     pub(crate) fn build_bytes(&self) -> usize {
@@ -176,6 +195,27 @@ mod tests {
             hashes.add(key);
         }
         hashes.finish().unwrap()
+    }
+
+    #[test]
+    fn persisted_filters_keep_their_hash_and_bits() {
+        // Golden hashes are part of checkpoint format 3, independent of std's
+        // DefaultHasher implementation and the machine's byte order.
+        assert_eq!(hash(b""), 0xefd0_1f60_ba99_2926);
+        assert_eq!(hash(b"a"), 0x82a2_a958_a9be_ce5b);
+        assert_eq!(hash(b"abc"), 0x33eb_af99_27cb_c5bd);
+        let original = filter(&[b"a", b"b", b"c"]);
+        let bytes: Vec<_> = original.encoded().flatten().collect();
+        let restored = KeyFilter::decode(&bytes).unwrap();
+        assert_eq!(restored.words, original.words);
+        assert_eq!(restored.build_bytes(), 0);
+        assert!(
+            [b"a", b"b", b"c"]
+                .iter()
+                .all(|key| restored.may_contain(hash(*key)))
+        );
+        assert!(KeyFilter::decode(&[]).is_none());
+        assert!(KeyFilter::decode(&[0; 7]).is_none());
     }
 
     #[test]

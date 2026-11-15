@@ -124,11 +124,11 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
     assert_eq!(report.last_seq, engine.stats().last_seq);
-    assert_eq!(report.records as usize, model.len());
+    assert!(report.records as usize >= model.len());
     assert!(report.runs > 1, "split at the target run length");
     assert_eq!(
         checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000001"]
+        ["CURRENT", "ckpt-00000000000000000001", "runs"]
     );
 
     let recovered = Engine::recover(&scratch.0, manual()).unwrap();
@@ -146,9 +146,22 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
     ] {
         assert_eq!(get(&recovered, key), model.get(key).cloned(), "{key:?}");
     }
+    let keys: Vec<_> = (0..2_100u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    let mut actual = Vec::new();
+    recovered
+        .multi_get(&keys, &mut EngineWorkspace::new(), |_, value| {
+            actual.push(value.map(<[u8]>::to_vec));
+        })
+        .unwrap();
+    assert_eq!(
+        actual,
+        keys.iter()
+            .map(|key| model.get(key).cloned())
+            .collect::<Vec<_>>()
+    );
     let stats = recovered.stats();
     assert_eq!(stats.last_seq, report.last_seq);
-    assert!(stats.held_bytes > 0, "filters are rebuilt");
+    assert!(stats.held_bytes > 0, "filters are restored");
     assert_eq!(recovered.put(b"next", b"1").unwrap(), report.last_seq + 1);
 
     // A larger configured sequence number wins; a smaller one never does.
@@ -169,10 +182,15 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
     let second = recovered
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
-    assert_eq!((second.generation, second.reclaimed), (2, 1));
+    assert_eq!((second.generation, second.reclaimed), (2, 0));
     assert_eq!(
         checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000002"]
+        [
+            "CURRENT",
+            "ckpt-00000000000000000001",
+            "ckpt-00000000000000000002",
+            "runs"
+        ]
     );
     let again = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&again, b""), contents(&recovered, b""));
@@ -262,8 +280,8 @@ fn checkpoints_recover_under_any_compression() {
 
 /// Like the codec, the block length decides only what new runs use: each
 /// block records its length, so runs of every length are read side by side
-/// and recover under any setting, and compactions and checkpoints rewrite
-/// what they write in the current one.
+/// and recover under any setting, and compactions rewrite
+/// records in the current setting. Checkpoints preserve existing bytes.
 #[test]
 fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     const LENGTHS: [usize; 3] = [16 << 10, 2 << 10, 256];
@@ -327,8 +345,8 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
             assert_eq!(get(&recovered, &12u32.to_be_bytes()), None);
             assert_eq!(block_of(&recovered, 4), block, "{written} as {read}");
 
-            // A checkpoint of the mixed runs writes every run in the current
-            // length, whatever the engine it is recovered into is set to.
+            // A checkpoint preserves all existing block lengths, including the
+            // older run under the newer runs.
             let again = Scratch::new(&format!("block-length-{written}-{read}"));
             recovered
                 .checkpoint(&again.0, CheckpointOptions::default())
@@ -423,26 +441,30 @@ fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
     reports
 }
 
-/// The format version of every run file in a checkpoint directory tree.
+/// The manifest's exact v5 payload boundaries, excluding persisted filters.
+fn run_payloads(dir: &Path) -> Vec<(PathBuf, usize)> {
+    let current = fs::read(dir.join("CURRENT")).unwrap();
+    let generation = u64::from_le_bytes(current[8..16].try_into().unwrap());
+    let manifest = fs::read(dir.join(format!("ckpt-{generation:020}/MANIFEST"))).unwrap();
+    let count = u32::from_le_bytes(manifest[68..72].try_into().unwrap()) as usize;
+    (0..count)
+        .map(|i| {
+            let at = 72 + i * 60;
+            let id = u128::from_le_bytes(manifest[at..at + 16].try_into().unwrap());
+            let len = u64::from_le_bytes(manifest[at + 48..at + 56].try_into().unwrap()) as usize;
+            (dir.join("runs").join(format!("{id:032x}")), len)
+        })
+        .collect()
+}
+
 fn run_versions(dir: &Path) -> Vec<u32> {
-    let mut versions = Vec::new();
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            versions.extend(run_versions(&path));
-        } else if path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("run-")
-        {
-            let bytes = fs::read(&path).unwrap();
-            let at = bytes.len() - 8;
-            versions.push(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
-        }
-    }
-    versions
+    run_payloads(dir)
+        .into_iter()
+        .map(|(path, len)| {
+            let bytes = fs::read(path).unwrap();
+            u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap())
+        })
+        .collect()
 }
 
 /// Dictionary runs through the engine: compaction builds them on
@@ -551,7 +573,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     drop(snapshot);
     assert_eq!(contents(&engine, b""), model);
 
-    // A checkpoint samples its output segments and writes version 5.
+    // A checkpoint writes the existing version-5 runs unchanged.
     let scratch = Scratch::new("dictionary-runs");
     engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
@@ -823,7 +845,7 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
             .windows(2)
             .all(|pair| pair[0].last_seq <= pair[1].last_seq)
     );
-    assert_eq!(checkpoint_dirs(&scratch.0).len(), 2);
+    assert_eq!(checkpoint_dirs(&scratch.0).len(), 4);
 }
 
 #[test]
@@ -841,6 +863,10 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
             let bytes = fs::read(&path).unwrap();
             (path, bytes)
         })
+        .chain(run_payloads(&scratch.0).into_iter().map(|(path, _)| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        }))
         .chain([(
             scratch.0.join("CURRENT"),
             fs::read(scratch.0.join("CURRENT")).unwrap(),
@@ -858,7 +884,7 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
         }
         other => panic!("{:?}", other.map(|_| ())),
     };
-    let run = ckpt.join("run-000001");
+    let run = run_payloads(&scratch.0)[1].0.clone();
     let manifest = ckpt.join("MANIFEST");
     let current = scratch.0.join("CURRENT");
 
@@ -867,6 +893,14 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
     bytes[middle] ^= 0x10;
     fs::write(&run, &bytes).unwrap();
     assert_eq!(damage(&run), Damage::Checksum);
+    restore();
+
+    // A filter has its own checksum, checked before it is trusted.
+    let filter_at = run_payloads(&scratch.0)[1].1;
+    let mut filter_damage = fs::read(&run).unwrap();
+    filter_damage[filter_at] ^= 1;
+    fs::write(&run, &filter_damage).unwrap();
+    assert_eq!(damage(&run), Damage::FilterChecksum);
     restore();
 
     fs::write(&run, &bytes[..middle]).unwrap();
@@ -911,15 +945,14 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
     let before = engine.stats();
 
     let error = engine
-        .checkpoint(&scratch.0, CheckpointOptions { max_bytes: 10_000 })
+        .checkpoint(&scratch.0, CheckpointOptions { max_bytes: 1 })
         .unwrap_err();
-    assert!(
-        matches!(error, CheckpointError::DiskLimit { bytes, max_bytes: 10_000 } if bytes > 10_000)
-    );
-    assert_eq!(engine.stats(), before);
+    assert!(matches!(error, CheckpointError::DiskLimit { bytes, max_bytes: 1 } if bytes > 1));
+    assert_eq!(engine.stats().last_seq, before.last_seq);
+    assert_eq!(get(&engine, b"later"), Some(b"x".to_vec()));
     assert_eq!(
         checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000001"]
+        ["CURRENT", "ckpt-00000000000000000001", "runs"]
     );
     let recovered = Engine::recover(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
@@ -940,7 +973,7 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
     ));
     assert_eq!(
         checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000001"]
+        ["CURRENT", "ckpt-00000000000000000001", "runs"]
     );
 
     // The next checkpoint takes a new generation and succeeds.
@@ -994,7 +1027,7 @@ fn oversized_files_are_refused_before_they_are_read() {
     for path in [
         scratch.0.join("CURRENT"),
         generation.join("MANIFEST"),
-        generation.join("run-000000"),
+        run_payloads(&scratch.0)[0].0.clone(),
     ] {
         let original = fs::read(&path).unwrap();
         fs::OpenOptions::new()
@@ -1068,9 +1101,11 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
         let recovered = Engine::recover(&scratch.0, options).unwrap();
         let stats = recovered.stats();
         assert_eq!(stats.runs, 1);
-        assert!(stats.pool_in_use_bytes >= 1 << 20);
-        assert_eq!(stats.pool_reserve_bytes, 0);
-        assert_eq!(stats.pool_reserve_limit, 64 << 20);
+        if compression == Compression::Uncompressed {
+            assert!(stats.pool_in_use_bytes >= 1 << 20);
+        }
+        assert!(stats.pool_reserve_bytes <= stats.pool_reserve_limit);
+        assert_eq!(stats.pool_reserve_limit, 32 << 20);
         let mut workspace = EngineWorkspace::new();
         let guard = recovered.read();
         let mut scan = guard.scan(&mut workspace);

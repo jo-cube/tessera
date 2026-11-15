@@ -47,6 +47,21 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
             engine.put(&key, &value).unwrap();
             model.insert(key, value);
         }
+        engine.flush().unwrap();
+        // Consolidate all versions once to seed the independent schedule
+        // with disjoint runs, which checkpoints now preserve as-is.
+        let count = engine.stats().runs;
+        engine
+            .compact_picked(
+                CompactionOptions {
+                    max_inputs: count.max(2),
+                    max_workspace_bytes: 256 << 20,
+                    ..CompactionOptions::default()
+                },
+                (0..count).collect(),
+                &mut MergeWorkspace::new(),
+            )
+            .unwrap();
         engine
             .checkpoint(&dir, CheckpointOptions::default())
             .unwrap();
@@ -64,13 +79,13 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
             .windows(2)
             .all(|pair| range(&pair[0]).1 < range(&pair[1]).0)
     };
-    // Recovery: every run in one sorted, disjoint level; one group.
+    // The fixture is settled before checkpointing: all runs are disjoint.
     let mut recovered = engine.core.read_state().runs.clone();
     recovered.sort_by_key(|run| range(run).0);
     assert!(recovered.len() > 4 && disjoint(&recovered));
     assert_eq!(engine.core.read_state().directory.group_count(), 1);
-    // Level 0, then levels 1 and 2: recovery's runs are the last level, and
-    // a level is inserted above it when it holds more than four runs.
+    // Start the independent schedule model with all settled runs in level 2.
+    // The production engine has restored its recorded levels.
     let mut levels: Vec<Vec<SharedRun>> = vec![Vec::new(), Vec::new(), recovered];
 
     let check_reads = |engine: &Engine, model: &BTreeMap<Vec<u8>, Vec<u8>>| {
