@@ -144,7 +144,7 @@
 //! holds the runs of recent flushes in publication order, and they may
 //! overlap; each deeper level is sorted by key and its runs are strictly
 //! disjoint. Levels are compaction's bookkeeping only: they are kept in
-//! memory, never persisted, and never consulted by reads, which go by
+//! memory and recorded in checkpoints, and never consulted by reads, which go by
 //! sequence number through the [run directory](self#reading-runs), so a run
 //! returns the same answers whatever its level. Recovery restores the levels
 //! and level-0 flush groups recorded by the checkpoint. Each level below 0 is sized

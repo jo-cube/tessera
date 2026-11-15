@@ -666,6 +666,8 @@ fn reclaim(
                 }
             }
         }
+    } else {
+        failed += 1;
     }
     for &generation in found {
         if generation != manifest.generation && generation != manifest.previous {
@@ -690,54 +692,69 @@ impl Core {
     /// Taking a later snapshot of the state would include runs published by
     /// concurrent ingestion, or miss pre-ceiling runs replaced by compaction.
     fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
-        let serial = self.serialize_flush();
-        let mut state = self.wait_for_level0(self.write_state());
-        let live = Arc::strong_count(&self.snapshots) - 1;
-        if live >= self.snapshot_limits.max_live {
-            return Err(CheckpointError::Snapshot(SnapshotError::Readers {
-                live,
-                max: self.snapshot_limits.max_live,
-            }));
-        }
-        let bytes = state.retained().bytes;
-        if bytes > self.snapshot_limits.max_retained_bytes {
-            return Err(CheckpointError::Snapshot(SnapshotError::Retained {
-                bytes,
-                max: self.snapshot_limits.max_retained_bytes,
-            }));
-        }
-        let mut image = Image {
-            runs: state.levels.checkpoint_runs(),
-            ceiling: state.last_seq,
-            depth: state.levels.depth(),
-            _live: Arc::clone(&self.snapshots),
-        };
-        let flush = state.levels.next_flush();
-        if !state.active.is_empty() {
-            self.freeze_active(&mut state);
-        }
-        if state.frozen.is_empty() {
+        loop {
+            let serial = self.serialize_flush();
+            let mut state = self.wait_for_level0(self.write_state());
+            // Respect the ordinary frozen-table bound before rotating active.
+            // This can occur after an abandoned or refused background flush.
+            if !state.active.is_empty() && state.frozen.len() >= self.max_frozen_memtables {
+                let job = FlushJob {
+                    engine: self,
+                    _serial: serial,
+                    tables: state.frozen.clone(),
+                    cuts: state.flush_cuts(self.target_run_len),
+                };
+                drop(state);
+                job.build().publish().map_err(CheckpointError::Flush)?;
+                continue;
+            }
+            let live = Arc::strong_count(&self.snapshots) - 1;
+            if live >= self.snapshot_limits.max_live {
+                return Err(CheckpointError::Snapshot(SnapshotError::Readers {
+                    live,
+                    max: self.snapshot_limits.max_live,
+                }));
+            }
+            let bytes = state.retained().bytes;
+            if bytes > self.snapshot_limits.max_retained_bytes {
+                return Err(CheckpointError::Snapshot(SnapshotError::Retained {
+                    bytes,
+                    max: self.snapshot_limits.max_retained_bytes,
+                }));
+            }
+            let mut image = Image {
+                runs: state.levels.checkpoint_runs(),
+                ceiling: state.last_seq,
+                depth: state.levels.depth(),
+                _live: Arc::clone(&self.snapshots),
+            };
+            let flush = state.levels.next_flush();
+            if !state.active.is_empty() {
+                self.freeze_active(&mut state);
+            }
+            if state.frozen.is_empty() {
+                return Ok(image);
+            }
+            let job = FlushJob {
+                engine: self,
+                _serial: serial,
+                tables: state.frozen.clone(),
+                cuts: state.flush_cuts(self.target_run_len),
+            };
+            drop(state);
+            #[cfg(test)]
+            AFTER_ROTATION.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            let (_, runs) = job.build().publish_kept().map_err(CheckpointError::Flush)?;
+            image
+                .runs
+                .extend(runs.into_iter().map(|run| (0, flush, run)));
+            image.runs.sort_by_key(|(level, _, _)| *level);
             return Ok(image);
         }
-        let job = FlushJob {
-            engine: self,
-            _serial: serial,
-            tables: state.frozen.clone(),
-            cuts: state.flush_cuts(self.target_run_len),
-        };
-        drop(state);
-        #[cfg(test)]
-        AFTER_ROTATION.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
-            }
-        });
-        let (_, runs) = job.build().publish_kept().map_err(CheckpointError::Flush)?;
-        image
-            .runs
-            .extend(runs.into_iter().map(|run| (0, flush, run)));
-        image.runs.sort_by_key(|(level, _, _)| *level);
-        Ok(image)
     }
 }
 
@@ -1428,6 +1445,67 @@ mod tests {
         assert_eq!(decode_current(&damaged), Err(Damage::Checksum));
     }
 
+    #[test]
+    fn malformed_manifest_fields_are_rejected_without_panicking() {
+        let manifest = Manifest {
+            generation: 2,
+            last_seq: 42,
+            records: 2,
+            next_run_id: 3,
+            previous: 1,
+            depth: 1,
+            metadata: Vec::new(),
+            runs: vec![
+                RunEntry {
+                    id: 1,
+                    level: 0,
+                    flush: 0,
+                    seq_override: None,
+                    len: 100,
+                    run_len: 88,
+                    sum: 0,
+                },
+                RunEntry {
+                    id: 2,
+                    level: 0,
+                    flush: 1,
+                    seq_override: None,
+                    len: 100,
+                    run_len: 88,
+                    sum: 0,
+                },
+            ],
+        };
+        let bytes = manifest.encode();
+        for end in 0..bytes.len() {
+            assert!(Manifest::decode(&bytes[..end]).is_err());
+        }
+        let seal = |bytes: &mut [u8]| {
+            let end = bytes.len() - 4;
+            let sum = crc(&[&bytes[..end]]);
+            bytes[end..].copy_from_slice(&sum.to_le_bytes());
+        };
+        for (at, replacement) in [
+            (40, 0u64),                           // exhausted/invalid next counter
+            (48, 2),                              // previous is not older
+            (60, u64::MAX),                       // unbounded metadata length
+            (MANIFEST_HEADER_LEN + 40, 3),        // file cannot hold its checksum
+            (MANIFEST_HEADER_LEN + 48, u64::MAX), // v5 payload exceeds file
+            (MANIFEST_HEADER_LEN + 32, u64::MAX), // flush counter cannot advance
+        ] {
+            let mut damaged = bytes.clone();
+            damaged[at..at + 8].copy_from_slice(&replacement.to_le_bytes());
+            seal(&mut damaged);
+            assert!(Manifest::decode(&damaged).is_err(), "offset {at}");
+        }
+        let mut duplicate = bytes.clone();
+        duplicate[MANIFEST_HEADER_LEN + MANIFEST_ENTRY_LEN
+            ..MANIFEST_HEADER_LEN + MANIFEST_ENTRY_LEN + 16]
+            .copy_from_slice(&1u128.to_le_bytes());
+        seal(&mut duplicate);
+        assert_eq!(Manifest::decode(&duplicate), Err(Damage::Order));
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let path =
             std::env::temp_dir().join(format!("tessera-crash-{name}-{}", std::process::id()));
@@ -1837,9 +1915,17 @@ mod tests {
     #[test]
     fn writes_during_the_checkpoint_flush_are_excluded_even_if_they_publish_first() {
         let dir = scratch("flush-ceiling");
-        let engine = Arc::new(Engine::new(manual()).unwrap());
+        let engine = Arc::new(
+            Engine::new(EngineOptions {
+                max_frozen_memtables: 1,
+                ..manual()
+            })
+            .unwrap(),
+        );
         engine.put(b"a", b"base").unwrap();
-        engine.flush().unwrap();
+        // Leave a full frozen queue and a nonempty successor, as after an
+        // abandoned flush. Checkpoint must drain the queue before rotation.
+        drop(engine.core.begin_flush().unwrap());
         engine.put(b"b", b"checkpointed").unwrap();
         let expected = state(&engine);
         let ceiling = engine.stats().last_seq;
@@ -1859,6 +1945,11 @@ mod tests {
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
+        assert_eq!(
+            engine.stats().frozen_tables,
+            1,
+            "checkpoint respects the frozen-table limit"
+        );
         // Both operations finish while checkpoint compression is paused. The
         // ingestion publishes first, yet its sequence is above the ceiling.
         assert!(engine.put(b"z", b"later").unwrap() > ceiling);
