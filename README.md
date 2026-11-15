@@ -121,13 +121,29 @@ Compaction builds disjoint key ranges of one selected job in parallel, using up
 to `background_threads` builders (default half the available CPUs, capped at 4,
 at least 1). Segment buffers shrink to share the existing workspace limit;
 small jobs and tight limits use fewer builders. Flush builds remain serial.
-`level_ratio` controls level sizing and overlap bounds and defaults to 4.
 Bottom-level compaction can erase settled sequence numbers to zero when no
 snapshot or overlapping unselected run needs them. Snapshot views keep their
 records and visibility, and checkpoint recovery preserves the write ceiling.
 Readers reuse one context and borrow dictionary bytes from the run; there is
 no prepared dictionary or decoded-block cache. Run format 5 and checkpoint
 manifest version 2 replace earlier formats without backward compatibility.
+
+## Tuning
+
+- `level_ratio` defaults to 10. Higher ratios generally use less live heap and
+  give faster reads; lower ratios favor faster writes and lower write
+  amplification. Choose 4 when write cost matters more than memory and reads.
+- `target_block_compressed` defaults to 1024 bytes. Larger blocks reduce index
+  and frame overhead, using less memory, but point reads decode more data and
+  become slower. Smaller blocks trade memory for faster point reads.
+- `background_threads` limits builders within a selected compaction job. The
+  default is half the available CPUs, capped at 4 and at least 1. More builders
+  can accelerate large jobs at greater CPU cost; small jobs and tight workspace
+  limits use fewer, and 1 builds serially.
+- `memtable_budget` defaults to 64 MiB for each active or frozen table. A larger
+  budget reduces flush frequency and can improve writes while using more
+  transient memory. A smaller budget lowers that memory cost but flushes more
+  often; the budget charges entries and does not reserve memory in advance.
 
 A `ReadGuard` provides a stable view while holding a shared lock and blocks
 writers for its lifetime. Use snapshots for longer reads. See the

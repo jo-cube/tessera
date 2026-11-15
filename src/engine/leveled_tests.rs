@@ -391,7 +391,13 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
 /// compaction settles, no piece is split again, and nothing is lost.
 #[test]
 fn a_split_lets_a_wide_run_proceed() {
-    let engine = Engine::new(options()).unwrap();
+    // The once-per-level split-count bound below uses ratio-4 geometry.
+    // Higher ratios can require several cuts to fit this six-input budget.
+    let engine = Engine::new(EngineOptions {
+        level_ratio: 4,
+        ..options()
+    })
+    .unwrap();
     let mut model = BTreeMap::new();
     for index in 0..6_000u64 {
         engine.put(&key(index), &value(index)).unwrap();

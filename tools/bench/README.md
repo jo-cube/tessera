@@ -80,7 +80,7 @@ capacity; the 12 GiB RSS-plus-used-disk guard still applies. The capacity is
 recorded in `environment.txt`; memory charges allocated bytes, not capacity.
 
 Tessera-only selections (`run.sh --engine tessera`, including streaming) skip
-RAM-disk setup and run entirely in memory. `TESSERA_BENCH_LEVEL_RATIO=10`
+RAM-disk setup and run entirely in memory. `TESSERA_BENCH_LEVEL_RATIO=4`
 overrides Tessera's level ratio without rebuilding; the selected ratio and
 builder count are logged. `TESSERA_BENCH_BACKGROUND_THREADS=1` overrides the
 builder limit for controlled serial/parallel comparisons.

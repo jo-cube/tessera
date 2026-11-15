@@ -148,7 +148,7 @@
 //! sequence number through the [run directory](self#reading-runs), so a run
 //! returns the same answers whatever its level. Recovery puts a checkpoint's
 //! runs, which are disjoint, in the last level. Each level below 0 is sized
-//! using [`EngineOptions::level_ratio`] (4 by default), from the last level's
+//! using [`EngineOptions::level_ratio`] (10 by default), from the last level's
 //! size, and empty levels are
 //! added under level 0 as the data grows. One step is the first that applies:
 //!
@@ -515,7 +515,7 @@ pub struct EngineOptions {
     /// Defaults to half the available CPUs, capped at 4 and at least 1.
     /// Small jobs and tight workspace budgets use fewer builders.
     pub background_threads: usize,
-    /// Size multiplier between adjacent levels, at least 2 (default 4).
+    /// Size multiplier between adjacent levels, at least 2 (default 10).
     /// Dynamic level targets and the bounds on overlap use this ratio.
     pub level_ratio: usize,
     /// Limits on [`Engine::snapshot`]. Zero is valid for both and refuses
@@ -547,7 +547,7 @@ impl Default for EngineOptions {
             max_run_bytes: DEFAULT_MAX_RUN_BYTES,
             last_seq: 0,
             background_compaction: Some(CompactionOptions::default()),
-            level_ratio: 4,
+            level_ratio: 10,
             background_threads: std::thread::available_parallelism()
                 .map_or(1, |cpus| (cpus.get() / 2).clamp(1, 4)),
             snapshots: SnapshotLimits::default(),
