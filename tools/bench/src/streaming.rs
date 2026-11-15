@@ -29,7 +29,7 @@ fn updated(i: usize) -> bool {
 }
 
 fn deleted(i: usize) -> bool {
-    (mix(0x75706464 ^ i as u64) >> 8) % 50 == 0
+    (mix(0x75706464 ^ i as u64) >> 8).is_multiple_of(50)
 }
 
 fn digits(n: usize) -> usize {

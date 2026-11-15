@@ -127,7 +127,7 @@ impl Store {
     }
     pub fn get<R>(&self, k: &[u8], r: &mut Reader, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
         match self {
-            Self::T(e) => f(e.get(k, &mut r.ws).unwrap().as_ref().map(|v| &v.value[..])),
+            Self::T(e) => f(e.get(k, &mut r.ws).unwrap().as_ref().map(|v| v.value)),
             Self::R(p) => {
                 let (mut v, mut n) = (std::ptr::null(), 0);
                 let found = unsafe { tb_get(*p, r.r, k.as_ptr(), k.len(), &mut v, &mut n) };

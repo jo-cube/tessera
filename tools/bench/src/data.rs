@@ -166,7 +166,7 @@ pub fn generate_target(name: char, target: usize) -> Data {
                 }
                 None => (0, 0),
             };
-            if (h >> 8) % 50 == 0 {
+            if (h >> 8).is_multiple_of(50) {
                 deletes.push(i);
             }
             recs.push(Rec { key, off, len, upd_off, upd_len });

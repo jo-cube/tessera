@@ -13,13 +13,17 @@ sha=$(git -C "$root" rev-parse --short HEAD)
 out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
 mkdir -p "$out"
 [ ! -e /Volumes/tessbench ] || { echo "/Volumes/tessbench already exists" >&2; exit 1; }
-sectors=8388608
-if [[ " $* " == *" --mode streaming "* ]]; then sectors=12582912; fi
+disk_gib=4
+if [[ " $* " == *" --mode streaming "* ]]; then disk_gib=8; fi
+disk_gib=${TESSERA_BENCH_DISK_GIB:-$disk_gib}
+[[ "$disk_gib" =~ ^[1-9][0-9]*$ ]] || { echo "invalid RAM-disk GiB: $disk_gib" >&2; exit 1; }
+sectors=$((disk_gib * 2097152))
 dev=$(hdiutil attach -nomount ram://$sectors | awk '{print $1}')
 trap 'hdiutil detach "$dev" >/dev/null || hdiutil detach -force "$dev" >/dev/null' EXIT
 diskutil erasevolume APFS tessbench "$dev" >/dev/null
 
 {
+  echo "RAM disk: $disk_gib GiB APFS"
   echo "date: $(date '+%Y-%m-%d %H:%M:%S %z')"
   echo "sha: $(git -C "$root" rev-parse HEAD) (branch $(git -C "$root" branch --show-current), $(git -C "$root" status --porcelain | wc -l | tr -d ' ') uncommitted paths)"
   echo "machine: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.physicalcpu) cores ($(sysctl -n hw.perflevel0.physicalcpu)P+$(sysctl -n hw.perflevel1.physicalcpu)E), $(( $(sysctl -n hw.memsize) >> 30 )) GiB"

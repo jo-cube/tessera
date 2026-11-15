@@ -48,7 +48,7 @@ RAM-disk use exceeds 8 GiB, and the parent kills any child after 300 s.
 ## Streaming scale suite
 
 `run.sh --mode streaming` uses A at 8 GiB raw and B at 4 GiB raw on a
-6 GiB RAM disk. It runs Tessera defaults, `r-small` (128 MiB cache) and
+8 GiB RAM disk (6 GiB exhausted transient RocksDB SST space). It runs Tessera defaults, `r-small` (128 MiB cache) and
 `r-mid` (1 GiB cache), each once: shuffled load, 50% updates plus 2% deletes,
 then exactly 200k random gets (10% deliberately absent keys) on 1 and 4 threads.
 Scans, multi-get, bulk and mixed workloads are excluded. Filters and
@@ -69,3 +69,8 @@ Tessera `samples-*.csv` records footprint above baseline and stored bytes at
 is sampled before its correctness gate. Group-index memory is in the baseline.
 The streaming process aborts at 12 GiB RSS plus RAM-disk allocation, and the
 suite has a 720 s deadline (300 s per child). Each child reports peak RSS.
+
+Transient RocksDB SST inputs and outputs exhausted 6 GiB on B before its
+load drained, so streaming defaults to 8 GiB. `TESSERA_BENCH_DISK_GIB` overrides
+capacity; the 12 GiB RSS-plus-used-disk guard still applies. The capacity is
+recorded in `environment.txt`; memory charges allocated bytes, not capacity.
