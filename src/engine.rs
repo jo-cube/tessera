@@ -930,8 +930,9 @@ pub struct FlushReport {
     /// Bytes the published runs hold beside their stored bytes: their key
     /// filters. Segment dictionaries are included in `run_bytes`.
     pub held_bytes: usize,
-    /// The most bytes one run's filter construction held for key hashes,
-    /// freed when that run was finished.
+    /// High-water bytes one flush run's filter construction held for key hashes,
+    /// freed when that run finished. Aggregated flush reports retain the
+    /// engine's high-water mark; an empty report returns zero.
     pub filter_build_bytes: usize,
 }
 
@@ -989,7 +990,6 @@ pub struct EngineStats {
 
 struct State {
     last_seq: u64,
-    pending_ingests: usize,
     active: Memtable,
     /// Oldest first. Each table's sequence numbers are above the runs' and
     /// those of the tables before it, and below `active`'s. Only flushes
@@ -1316,9 +1316,9 @@ impl Engine {
     /// Builds a strictly key-sorted, duplicate-free batch directly into runs
     /// outside the state lock and publishes it atomically. Returns its last
     /// sequence number; rejects unsorted or repeated keys without changes.
-    /// Overlapping memtables are flushed before publication. Concurrent writes
-    /// are ordered after the sequence reservation and remain newer.
-    /// A failed build/publication can leave a gap in sequence numbers.
+    /// Overlapping memtables are flushed before publication. Sequences are
+    /// assigned at publication, after every existing write. A concurrent write
+    /// during the build causes a rebuild outside the lock.
     pub fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         if !batch.is_sorted() {
             return Err(UpdateError::Rejected(WriteError::BatchNotSorted));
@@ -1452,7 +1452,6 @@ impl Core {
         Self {
             state: RwLock::new(State {
                 last_seq: options.last_seq,
-                pending_ingests: 0,
                 active: Memtable::new(options.memtable_budget, Some(options.last_seq)),
                 frozen: Vec::new(),
                 runs: Vec::new(),
@@ -2012,10 +2011,8 @@ impl Core {
         // Logical reads resolve overlapping runs by sequence. Preserve it if
         // any unselected run could compete, even above the bottom level.
         // A snapshot taken after selection retains the original input runs.
-        let keep_all_tombstones = state.pending_ingests > 0;
         let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth())
             && others.is_empty()
-            && state.pending_ingests == 0
             && Arc::strong_count(&self.snapshots) == 1;
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
@@ -2029,7 +2026,6 @@ impl Core {
             level,
             dest,
             zero_seq,
-            keep_all_tombstones,
             cuts,
             cursor,
             refusal: split,
@@ -2096,7 +2092,6 @@ impl Core {
             .max()
             .unwrap_or(0);
         let others = Self::others(&state, &inputs);
-        let state_pending = state.pending_ingests > 0;
         drop(state);
         Ok(CompactionJob {
             engine: self,
@@ -2109,7 +2104,6 @@ impl Core {
             level: deepest,
             dest: Dest::Anywhere(deepest),
             zero_seq: false,
-            keep_all_tombstones: state_pending,
             cuts: OutputCuts::default(),
             cursor: None,
             refusal: None,
@@ -2747,7 +2741,6 @@ struct CompactionJob<'e> {
     dest: Dest,
     /// Settled output with no competing unselected run or pre-existing snapshot.
     zero_seq: bool,
-    keep_all_tombstones: bool,
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.
     cursor: Option<Cursor>,
@@ -2794,10 +2787,9 @@ impl<'e> CompactionJob<'e> {
             .map(|run| run.run.key_range().expect(NOT_EMPTY))
             .collect();
         let keep_tombstone = |key: &[u8]| {
-            self.keep_all_tombstones
-                || ranges
-                    .iter()
-                    .any(|range| range.min <= key && key <= range.max)
+            ranges
+                .iter()
+                .any(|range| range.min <= key && key <= range.max)
         };
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,

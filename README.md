@@ -92,9 +92,9 @@ input reaches `bulk_ingest_min: Option<usize>` (`None` means half the memtable
 budget). `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
 duplicate keys. Overlapping memtables are flushed before atomic publication
 into level 0. Builds release the state lock, so concurrent writes proceed and
-receive newer sequences. Pending ingests preserve compaction sequences and
-tombstones. A failed ingest can consume its reserved sequence range. An
-oversized unsorted batch stages its records in a private memtable and publishes
+commit normally. Ingestion assigns sequences and publishes under one lock,
+after every existing write. It rebuilds outside the lock if concurrent writes
+change the sequence ceiling while it builds or waits. An oversized unsorted batch stages its records in a private memtable and publishes
 through the same run path, preserving the last duplicate operation.
 
 `multi_get(keys, workspace, |index, value| ...) -> Result<(), ReadError>` is

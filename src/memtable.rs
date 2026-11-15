@@ -852,10 +852,6 @@ impl FrozenMemtable {
     }
 
     /// Returns the sequence number a successor's updates must exceed, if any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
     pub fn last_seq(&self) -> Option<u64> {
         self.table.last_seq
     }
