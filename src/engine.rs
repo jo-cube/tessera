@@ -2196,6 +2196,8 @@ pub struct EngineWorkspace {
     value: Vec<u8>,
     prefix: Vec<u8>,
     multi: multi::Workspace,
+    /// Always empty between scans; keeps only the cursor allocation.
+    scan_tables: Vec<TableCursor<'static>>,
 }
 
 impl EngineWorkspace {
@@ -2420,6 +2422,8 @@ fn next_within<'a>(records: &mut Records<'a>, prefix: &[u8]) -> Option<Record<'a
         .filter(|record| record.key.starts_with(prefix))
 }
 
+type TableCursor<'a> = (Records<'a>, Option<Record<'a>>);
+
 /// Iterates live keys in ascending order, each once with its latest value.
 ///
 /// This merges the memtables and the live keys of the runs. A table's update
@@ -2427,7 +2431,8 @@ fn next_within<'a>(records: &mut Records<'a>, prefix: &[u8]) -> Option<Record<'a
 /// the key whatever they hold, and values are not copied.
 pub struct Scan<'r> {
     /// Each table's records and the next of them, newest table first.
-    tables: Vec<(Records<'r>, Option<Record<'r>>)>,
+    tables: Vec<TableCursor<'r>>,
+    spare_tables: &'r mut Vec<TableCursor<'static>>,
     runs: LogicalCursor<'r>,
     /// Whether the record the runs stand on has been used.
     runs_stale: bool,
@@ -2446,6 +2451,7 @@ impl<'r> Scan<'r> {
         let EngineWorkspace {
             logical,
             prefix: bound,
+            scan_tables,
             ..
         } = workspace;
         bound.clear();
@@ -2455,18 +2461,30 @@ impl<'r> Scan<'r> {
         let mut cursor = LogicalCursor::grouped(runs, runs.groups(), logical);
         // A failed seek is repeated by the first read of the cursor.
         let _ = cursor.seek_prefix(prefix);
-        let tables = tables
-            .map(|mut records| {
-                let head = next_within(&mut records, prefix);
-                (records, head)
-            })
-            .collect();
+        let mut cursors: Vec<TableCursor<'r>> = std::mem::take(scan_tables);
+        cursors.extend(tables.map(|mut records| {
+            let head = next_within(&mut records, prefix);
+            (records, head)
+        }));
         Self {
-            tables,
+            tables: cursors,
+            spare_tables: scan_tables,
             runs: cursor,
             runs_stale: true,
             prefix,
         }
+    }
+}
+
+impl Drop for Scan<'_> {
+    fn drop(&mut self) {
+        self.tables.clear();
+        // All borrowed cursors are gone. Vec's in-place collection reuses the
+        // empty allocation while changing its element lifetime, in safe code.
+        *self.spare_tables = std::mem::take(&mut self.tables)
+            .into_iter()
+            .map(|_| unreachable!("scan cursors were cleared"))
+            .collect();
     }
 }
 
@@ -2605,6 +2623,45 @@ mod tests {
         let state = engine.core.read_state();
         assert_eq!(state.frozen.len(), 1);
         Arc::clone(&state.frozen[0])
+    }
+
+    #[test]
+    fn scans_reuse_workspace_cursor_capacity_after_early_drop_and_source_release() {
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"a", b"old").unwrap();
+        engine.put(b"b", b"deleted").unwrap();
+        let job = engine.core.begin_flush().unwrap();
+        engine.put(b"a", b"new").unwrap();
+        engine.delete(b"b").unwrap();
+        engine.put(b"c", b"live").unwrap();
+        let snapshot = engine.snapshot();
+        let mut ws = EngineWorkspace::new();
+        let mut scan = snapshot.scan(&mut ws);
+        assert_eq!(scan.tables.len(), 2);
+        let allocation = scan.tables.as_ptr().addr();
+        let capacity = scan.tables.capacity();
+        assert_eq!(scan.next_record().unwrap().unwrap().value, b"new");
+        drop(scan); // Leave another live key unread.
+        assert!(ws.scan_tables.is_empty());
+        assert_eq!(ws.scan_tables.as_ptr().addr(), allocation);
+        for _ in 0..3 {
+            let mut scan = snapshot.scan_prefix(b"c", &mut ws);
+            assert_eq!(scan.tables.as_ptr().addr(), allocation);
+            assert_eq!(scan.next_record().unwrap().unwrap().value, b"live");
+            assert!(scan.next_record().unwrap().is_none());
+        }
+        drop(snapshot);
+        job.build().publish();
+        engine.flush().unwrap();
+        engine.close().unwrap();
+        // No cursor or borrowed source survives in the workspace.
+        let empty = Engine::new(manual()).unwrap();
+        let guard = empty.read();
+        let mut scan = guard.scan(&mut ws);
+        assert_eq!(scan.tables.as_ptr().addr(), allocation);
+        assert!(scan.next_record().unwrap().is_none());
+        drop(scan);
+        assert_eq!(ws.scan_tables.capacity(), capacity);
     }
 
     /// The writer-priority rule: from the moment a writer waits for the state
