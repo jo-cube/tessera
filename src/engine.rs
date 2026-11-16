@@ -153,6 +153,9 @@ mod leveling_tests;
 #[cfg(test)]
 mod staged_tests;
 
+#[cfg(test)]
+mod stress_tests;
+
 pub use batch::WriteBatch;
 pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};
 pub use worker::{BackgroundError, BackgroundStatus};
