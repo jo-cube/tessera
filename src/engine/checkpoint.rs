@@ -13,7 +13,7 @@
 //! `ckpt-<20-digit generation>/MANIFEST` records levels, level-0 flush groups,
 //! effective sequence overrides, ceiling, next ID counter and application data.
 //!
-//! Publication preserves the LOCK/CURRENT protocol: sync every new run file,
+//! Publication uses the LOCK/CURRENT protocol: sync every new run file,
 //! its directory, the manifest, its directory and the parent; write and sync
 //! CURRENT.tmp, rename over CURRENT (the commit point), then sync the parent.
 //! Only after that sync does GC remove files outside the union of the new and
@@ -64,8 +64,8 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-// The run-file envelope includes the Bloom layout. Version 3 used global probes;
-// version 4 uses aligned 512-bit blocks. The run's own format stays at version 6.
+// Manifest version 4 specifies aligned 512-bit Bloom blocks in run files.
+// Run payloads use format version 6.
 const MANIFEST_VERSION: u32 = 4;
 // Magic/version/flags, generation/ceiling/records/next-id/previous,
 // depth, metadata length, run count. Entries include both file and run lengths.
@@ -142,7 +142,7 @@ pub struct CheckpointReport {
 
 /// Why a checkpoint was not committed, or (for [`Self::Io`] after the commit
 /// point) was committed without the final directory sync. The engine is
-/// still readable either way; its memtables may have flushed. The previously
+/// still readable either way; its memtables may have flushed. The preceding
 /// committed generation is retained.
 #[derive(Debug)]
 pub enum CheckpointError {
@@ -257,8 +257,8 @@ pub enum Damage {
 
 /// Why [`Engine::new`] or [`Engine::recover`] returned no engine. Nothing is
 /// exposed, no worker is left running and any directory lock is released.
-/// Recovery changes nothing on disk and never substitutes an empty database
-/// or an older checkpoint. [`Engine::new`] fails only with [`Self::Config`]
+/// Recovery leaves checkpoint data unchanged and may create `LOCK`. It never
+/// substitutes an empty database or a different checkpoint. [`Engine::new`] fails only with [`Self::Config`]
 /// or [`Self::Worker`].
 #[derive(Debug)]
 pub enum OpenError {
@@ -918,6 +918,13 @@ impl Engine {
     /// Flushes and commits the state at one sequence ceiling. Existing run
     /// files are reused; file I/O holds no state lock. Keeps one previous
     /// generation. See [Checkpoints](crate::engine#checkpoints).
+    ///
+    /// # Errors
+    /// Returns [`CheckpointError`] for locking, disk-budget or I/O failures.
+    /// Its I/O variant identifies errors after the commit point.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or a synchronous flush build panics.
     pub fn checkpoint(
         &self,
         dir: &Path,
@@ -928,6 +935,13 @@ impl Engine {
 
     /// Like checkpoint, with an opaque application blob (at most 16 MiB).
     /// Recover it with [`Self::recover_with_metadata`].
+    ///
+    /// # Errors
+    /// Returns [`CheckpointError::MetadataLimit`] for oversized metadata and
+    /// the same locking, disk-budget and I/O errors as [`Self::checkpoint`].
+    ///
+    /// # Panics
+    /// Panics under the same conditions as [`Self::checkpoint`].
     pub fn checkpoint_with_metadata(
         &self,
         dir: &Path,
@@ -1057,11 +1071,19 @@ impl Engine {
 
     /// Recovers CURRENT without rewriting checkpoint data. Sequences continue after the
     /// checkpoint ceiling. No fallback.
+    ///
+    /// # Errors
+    /// Returns [`OpenError`] for invalid options, missing or locked checkpoints,
+    /// I/O, validation failures or worker thread creation failures. A failed
+    /// recovery releases its directory lock and leaves no worker running.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
         Self::recover_with_metadata(dir, options).map(|(engine, _)| engine)
     }
 
     /// Recovers the engine and its opaque application metadata.
+    ///
+    /// # Errors
+    /// Returns the same [`OpenError`] variants as [`Self::recover`].
     pub fn recover_with_metadata(
         dir: &Path,
         options: EngineOptions,

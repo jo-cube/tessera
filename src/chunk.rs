@@ -1,5 +1,7 @@
 //! Engine-owned bulk allocations. Only the bounded free reserve is pooled;
 //! checked-out chunks belong to their run or memtable, including snapshots.
+//! Shared ownership returns an allocation only after its last user releases it,
+//! bounding idle capacity without constraining live data.
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};

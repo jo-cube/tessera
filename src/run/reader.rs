@@ -1,3 +1,7 @@
+//! Immutable run ownership, validation and sparse-index reads. Recovery
+//! establishes format invariants once; checked reads decode only touched
+//! frames and lend values through caller-owned reusable workspaces.
+
 use std::fmt;
 use std::ops::Range;
 

@@ -1,3 +1,7 @@
+//! Deterministic block encoding with prefix sharing and restart keys.
+//! Records must arrive in internal-key order; preflight checks let callers
+//! finish a full block and retry without losing the rejected record.
+
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -212,7 +216,7 @@ pub enum BuildError {
         /// Length of the rejected value.
         len: usize,
     },
-    /// The record sorts before the previously added record.
+    /// The record sorts before the preceding record.
     OutOfOrder,
     /// The record has the same user key and sequence number as the previous
     /// record. An internal key may appear at most once in a block.

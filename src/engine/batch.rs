@@ -1,4 +1,7 @@
-//! Owned, reusable atomic write batches.
+//! Owned, reusable atomic write batches. Operations retain insertion order
+//! and share a byte arena; complete preflight precedes any publication so
+//! rejected batches consume no sequences and expose no partial writes.
+
 use super::*;
 use std::ops::Range;
 

@@ -1,4 +1,7 @@
-//! Dedicated flush worker and condition-variable notifications.
+//! Dedicated flush worker and condition-variable notifications. Requests
+//! wake a serial builder; publication replaces frozen tables atomically,
+//! and waiters observe progress or a captured worker failure.
+
 use super::*;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Condvar;

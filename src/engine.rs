@@ -77,9 +77,18 @@
 //! again. Closing joins both workers and reports a panic; it writes nothing.
 //! Snapshots remain usable after closure.
 //!
+//! # Thread safety
+//!
+//! [`Engine`] and [`Snapshot`] are `Send + Sync`: share them across threads and
+//! use a separate [`EngineWorkspace`] for each concurrent read. A workspace is
+//! mutably borrowed for an operation and its returned values. A [`ReadGuard`]
+//! is not `Send`; it holds its shared lock until dropped. Scans borrow their
+//! view and workspace, and return records valid until the next cursor step.
+//!
 //! # Panics
 //!
-//! A panic under the exclusive state lock poisons the engine. Build panics
+//! A panic under the exclusive state lock poisons the engine; subsequent
+//! operations acquiring that lock panic. Build panics
 //! leave published sources readable. A stopped flush worker is replaced by
 //! synchronous flushing when needed; a stopped compaction worker can likewise
 //! be serviced synchronously. Corrupt runs are reported by reads and maintenance.
@@ -230,7 +239,7 @@ pub struct EngineOptions {
     pub background_threads: usize,
     /// Compression used for new runs.
     pub compression: Compression,
-    /// Estimated compressed block bytes, from 1 to 64 KiB (default 1024).
+    /// Estimated compressed block bytes, from 1 byte to 64 KiB (default 1024).
     pub target_block_compressed: usize,
     // Deterministic scheduling and small run fixtures, absent from the public build.
     #[cfg(test)]
@@ -403,7 +412,7 @@ impl Compression {
 
 /// Why a write can never be applied with the engine's current options. A
 /// write that only needs room flushes instead; see
-/// [Automatic flushing](self#automatic-flushing).
+/// [Flushing](self#flushing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
     /// Sorted ingestion requires strictly ascending keys without duplicates.
@@ -455,8 +464,8 @@ impl std::error::Error for WriteError {}
 /// A write used no sequence number and changed no reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateError {
-    /// The write can never be applied: its key or value is too long, or its
-    /// record exceeds a whole memtable budget.
+    /// The write violates key, value or record-budget limits, or a batch
+    /// passed to sorted ingestion is not strictly ordered and unique.
     Rejected(WriteError),
     /// No further memory can currently be reclaimed. The write used no sequence.
     MemoryLimit {
@@ -771,6 +780,9 @@ struct Core {
 
 /// A key-value engine. See the [module documentation](self) for its
 /// consistency, flushing, compaction and persistence rules.
+/// It is `Send + Sync`; use one workspace per concurrent reader.
+/// Methods that acquire the state lock panic if it is poisoned; see
+/// [Panics](self#panics). Drop any [`ReadGuard`] before calling those methods.
 pub struct Engine {
     core: Arc<Core>,
     /// Joined when the engine is dropped.
@@ -811,9 +823,8 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Shuts the engine down: stops the background worker after the
-    /// compaction it is running, if any, which is published as usual, joins
-    /// its thread and releases the engine's memory.
+    /// Shuts the engine down, joins its flush and compaction workers and
+    /// releases its memory. In-flight builds may publish before workers stop.
     /// No new compaction starts once this begins.
     ///
     /// It consumes the engine, so no read, write, [`ReadGuard`] or other
@@ -826,7 +837,7 @@ impl Engine {
     /// goes with it unless checkpointed first.
     /// Dropping the engine does the same and discards the result.
     ///
-    /// Fails only with [`BackgroundError::Panicked`] if the worker had
+    /// Fails only with [`BackgroundError::Panicked`] if either worker
     /// stopped by panicking, at any time; the engine is shut down all the
     /// same. A compaction read failure is reported by [`Engine::background_status`].
     ///
@@ -871,11 +882,26 @@ impl Engine {
     }
 
     /// Sets `key` to `value` and returns the update's sequence number.
+    ///
+    /// # Errors
+    /// Returns [`UpdateError`] for an invalid record, memory admission failure
+    /// or exhausted sequence space, without publishing the write.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or a synchronous flush build panics.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
         self.core.put(key, value)
     }
 
     /// Deletes `key` and returns the update's sequence number.
+    /// A missing key still receives a tombstone and a sequence.
+    ///
+    /// # Errors
+    /// Returns [`UpdateError`] for an invalid key or record charge, memory
+    /// admission failure or exhausted sequences. Rejection publishes nothing.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or a synchronous flush build panics.
     pub fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
         self.core.delete(key)
     }
@@ -884,6 +910,13 @@ impl Engine {
     /// Later operations on the same key win. An empty batch returns the current
     /// sequence number without changing state. Batches built directly into runs
     /// take one publication sequence; memtable batches take one per operation.
+    ///
+    /// # Errors
+    /// Returns [`UpdateError`] if any record is invalid, admission fails or
+    /// sequences are exhausted. Rejection publishes none of the batch.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned or a synchronous build panics.
     pub fn write(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         self.core.write_batch(batch)
     }
@@ -895,6 +928,15 @@ impl Engine {
     /// Tables sharing an actual batch key are flushed before publication.
     /// Runs are built once; concurrent writes to other keys cause no retries.
     /// Writes completed before publication are older than the ingested data.
+    ///
+    /// # Errors
+    /// Returns [`UpdateError::Rejected`] for unsorted, duplicate or invalid
+    /// records, or another [`UpdateError`] for admission or sequence exhaustion.
+    /// Rejection publishes nothing.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or the private run build panics;
+    /// a build panic leaves the published sources readable.
     pub fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         if !batch.is_sorted() {
             return Err(UpdateError::Rejected(WriteError::BatchNotSorted));
@@ -909,6 +951,12 @@ impl Engine {
 
     /// Returns the latest value of `key`, or `None` if it is absent or
     /// deleted. The value is copied into `workspace`, once per call.
+    ///
+    /// # Errors
+    /// Returns [`ReadError`] for touched corrupt runs or conflicting copies.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned.
     pub fn get<'w>(
         &self,
         key: &[u8],
@@ -923,12 +971,18 @@ impl Engine {
     /// Writers and flush publication wait until it is dropped, so use a
     /// [`Snapshot`] for a long scan. See the [module documentation](self) for
     /// what must not be done while holding it.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned.
     pub fn read(&self) -> ReadGuard<'_> {
         self.core.read()
     }
 
     /// Takes a consistent copy-on-write view without retaining a lock.
     /// Snapshots keep their own immutable sources through maintenance and closure.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned.
     pub fn snapshot(&self) -> Snapshot {
         self.core.snapshot()
     }
@@ -936,11 +990,24 @@ impl Engine {
     /// Waits for everything written before this call to appear in runs.
     /// Publication is unconditional. A stopped flush worker reports its panic;
     /// its tables stay readable and writers can flush them synchronously.
+    ///
+    /// # Errors
+    /// Returns [`BackgroundError::Panicked`] if the flush worker has failed.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned.
     pub fn flush(&self) -> Result<FlushReport, BackgroundError> {
         self.core.flush()
     }
 
-    /// Takes one eager compaction step, for deterministic maintenance tests.
+    /// Performs one eager compaction step, or returns `None` if none is eligible.
+    /// Uses the caller's workspace and serializes with other compactions.
+    ///
+    /// # Errors
+    /// Returns [`CompactionError`] for a read failure or invalidated selection.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or a synchronous builder panics.
     #[doc(hidden)]
     pub fn compact(
         &self,
@@ -956,6 +1023,9 @@ impl Engine {
     }
 
     /// Returns a summary of the current state.
+    ///
+    /// # Panics
+    /// Panics if the engine state lock is poisoned.
     pub fn stats(&self) -> EngineStats {
         self.core.stats()
     }
@@ -1900,8 +1970,8 @@ pub enum CompactionError {
     /// runs are unchanged; this is corruption, not a limit, and retrying
     /// meets it again.
     Read(ReadError),
-    /// The runs the job chose were no longer where it found them when it
-    /// was to publish. Nothing was published; compactions are serialized,
+    /// The selected runs do not occupy their expected positions at
+    /// publication. Nothing was published; compactions are serialized,
     /// so this is a defect, reported rather than published.
     Stale,
 }
@@ -2190,6 +2260,8 @@ impl fmt::Debug for BuiltCompaction<'_> {
 }
 
 /// Reusable buffers for reading an engine, created once per reader.
+/// Each concurrent operation needs an exclusive mutable borrow; returned
+/// values borrow this storage. Workspace allocations are outside admission accounting.
 #[derive(Debug, Default)]
 pub struct EngineWorkspace {
     logical: LogicalWorkspace,
@@ -2249,7 +2321,7 @@ impl EngineWorkspace {
 ///
 /// Do not call [`Engine`] methods on a thread that holds a guard: a write
 /// would deadlock. The guard borrows the engine, so the engine cannot be
-/// closed while it is held.
+/// closed while it is held. A guard is not `Send`; keep it on its acquiring thread.
 ///
 /// ```
 /// use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
@@ -2272,7 +2344,8 @@ pub struct ReadGuard<'e>(RwLockReadGuard<'e, State>);
 
 impl ReadGuard<'_> {
     /// Returns the latest value of `key`, or `None` if it is absent or
-    /// deleted, without copying it.
+    /// deleted, without copying it. Returns [`ReadError`] for touched corruption
+    /// or conflicting copies.
     pub fn get<'r>(
         &'r self,
         key: &[u8],
@@ -2281,12 +2354,15 @@ impl ReadGuard<'_> {
         lookup_state(&self.0, key, &mut workspace.logical)
     }
 
-    /// Returns a scan of every live key.
+    /// Returns a scan of every live key in bytewise ascending order.
+    /// Decoding failures are returned by [`Scan::next_record`].
     pub fn scan<'r>(&'r self, workspace: &'r mut EngineWorkspace) -> Scan<'r> {
         self.scan_prefix(&[], workspace)
     }
 
-    /// Returns a scan of every live key starting with `prefix`.
+    /// Returns a scan of every live key starting with the raw bytes `prefix`.
+    /// An empty prefix selects all keys. Decoding failures are returned by
+    /// [`Scan::next_record`].
     pub fn scan_prefix<'r>(
         &'r self,
         prefix: &[u8],
@@ -2348,7 +2424,8 @@ impl Snapshot {
     }
 
     /// Returns the value `key` had, or `None` if it was absent or deleted,
-    /// without copying it.
+    /// without copying it. Returns [`ReadError`] for touched corruption or
+    /// conflicting copies.
     pub fn get<'r>(
         &'r self,
         key: &[u8],
@@ -2358,12 +2435,15 @@ impl Snapshot {
         resolve(in_memory, &self.runs, key, &mut workspace.logical)
     }
 
-    /// Returns a scan of every live key.
+    /// Returns a scan of every live key in bytewise ascending order.
+    /// Decoding failures are returned by [`Scan::next_record`].
     pub fn scan<'r>(&'r self, workspace: &'r mut EngineWorkspace) -> Scan<'r> {
         self.scan_prefix(&[], workspace)
     }
 
-    /// Returns a scan of every live key starting with `prefix`.
+    /// Returns a scan of every live key starting with the raw bytes `prefix`.
+    /// An empty prefix selects all keys. Decoding failures are returned by
+    /// [`Scan::next_record`].
     pub fn scan_prefix<'r>(
         &'r self,
         prefix: &[u8],
@@ -2429,6 +2509,8 @@ type TableCursor<'a> = (Records<'a>, Option<Record<'a>>);
 /// This merges the memtables and the live keys of the runs. A table's update
 /// beats anything in older tables or the runs, so a tombstone in a table hides
 /// the key whatever they hold, and values are not copied.
+/// Records borrow the scan, so consume or copy a record before advancing.
+/// The scan holds its view and workspace borrowed for its lifetime.
 pub struct Scan<'r> {
     /// Each table's records and the next of them, newest table first.
     tables: Vec<TableCursor<'r>>,
@@ -2490,6 +2572,11 @@ impl Drop for Scan<'_> {
 
 impl Scan<'_> {
     /// Advances to the next live key, or returns `None` when none is left.
+    /// After the end, further calls return `None`.
+    ///
+    /// # Errors
+    /// Returns [`ReadError`] for touched corrupt data or conflicting copies.
+    /// Discard the scan after an error.
     pub fn next_record(&mut self) -> Result<Option<LiveRecord<'_>>, ReadError> {
         loop {
             if self.runs_stale {
@@ -2541,7 +2628,7 @@ impl fmt::Debug for Scan<'_> {
 /// published runs, valid while nothing else changes them.
 #[cfg(test)]
 impl Engine {
-    /// Compacts `picks` through the production job: the same tombstone
+    /// Compacts `picks` through the engine job: the same tombstone
     /// rule, build and publication, with the output placed as
     /// [`Core::begin_picked`] says.
     pub(crate) fn compact_picked(

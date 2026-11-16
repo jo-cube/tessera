@@ -1,4 +1,6 @@
-//! Merging runs into fewer runs that hold only what can still be read.
+//! Latest-state compaction over immutable inputs. Conflicting copies fail
+//! before publication, and tombstones survive while unselected runs may hold
+//! older values. Disjoint output ranges share a bounded workspace allowance.
 
 use crate::block::{Record, Value};
 use crate::chunk::ChunkPool;
@@ -36,7 +38,7 @@ pub const CONTEXT_ALLOWANCE: usize = 2 << 20;
 /// Upper estimate beside the output: a block and context per input, plus
 /// segment and block buffers, a compression context and one prepared segment
 /// dictionary for the builder.
-/// Checks frame metadata and dictionaries without decoding. Previously retained
+/// Checks frame metadata and dictionaries without decoding. Existing retained
 /// workspace capacity is excluded.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     let blocks = inputs
@@ -134,7 +136,7 @@ pub struct Compacted {
 /// only the newest version of each user key.
 ///
 /// - Older versions are dropped. This assumes no reader needs anything but the
-///   latest state, which holds while there are no snapshots.
+///   latest state of these inputs; snapshots retain their own immutable sources.
 /// - Identical copies of an internal key count once. Copies that differ fail
 ///   the compaction at any version, newest or not, because nothing can choose
 ///   between them.

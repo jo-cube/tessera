@@ -14,8 +14,7 @@
 //! groups possible, the largest number of runs whose inclusive key ranges share
 //! one key. Nothing about it depends on sequence numbers, so how much a group's
 //! bound prunes depends on the history. When runs overlap heavily the groups
-//! are single runs and the directory reads them as the flat newest-first order
-//! did.
+//! are single runs, read in descending sequence-bound order.
 //!
 //! The directory holds a reference to each run and no keys: bounds are the
 //! run's own, found when it was built or validated. It is rebuilt whole, under

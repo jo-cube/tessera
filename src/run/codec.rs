@@ -1,3 +1,7 @@
+//! Zstandard contexts and raw block encoding. Stored Zstandard frames omit
+//! fields supplied by the run header; size checks bound decode allocations.
+//! Contexts are reused, and raw dictionaries are borrowed for each decode.
+
 use zstd_safe::{CCtx, CDict, CParameter, DCtx, DParameter, FrameFormat};
 
 /// Block compression used by a run.

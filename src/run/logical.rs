@@ -1,3 +1,7 @@
+//! Latest-value resolution over immutable runs. Sequence bounds and filters
+//! prune only inputs that cannot decide a key; equal deciding sequences are
+//! checked for conflicting copies so input order cannot choose a value.
+
 use std::fmt;
 use std::ops::Range;
 

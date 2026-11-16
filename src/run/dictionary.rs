@@ -1,4 +1,7 @@
-//! Raw-content dictionaries sampled from a buffered segment; no training.
+//! Raw-content dictionaries sampled from a bounded segment without training.
+//! Samples stay within the dictionary limit so every segment can be decoded
+//! independently using dictionary bytes stored beside its frames.
+
 use crate::block::{BlockPosition, BlockView, Value};
 
 pub(super) const SEGMENT_RAW_LEN: usize = 4 << 20;

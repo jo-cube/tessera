@@ -1,38 +1,35 @@
-# Releasing a private alpha
+# Release checklist
 
-Tessera is consumed by path or Git revision and is not published to crates.io
-(`publish = false`). The API and checkpoint format may change without migration.
+Tessera is consumed by path or Git revision (`publish = false`). Releases
+identify a validated commit and its supported API and checkpoint formats.
 
-## Checklist
-
-- Record the release commit and verify that the tracked working tree is clean.
-- Verify package version, license, repository, description and Rust version in
-  `Cargo.toml`; keep the package version in `Cargo.lock` consistent.
-- Keep dependencies locked. After validation, `git diff --exit-code Cargo.lock`
-  must pass. Update dependencies deliberately in a separate commit.
+- Verify that the tracked working tree is clean and record the release commit.
+- Check version, license, repository, description, keywords, categories and MSRV
+  in `Cargo.toml`; keep both Cargo lockfiles consistent with the package version.
+- Keep dependencies locked; update dependencies deliberately in a separate commit.
 - Run `scripts/validate.sh verify`, `scripts/validate.sh full` and
-  `scripts/validate.sh msrv` using the validation images described by the script.
-  These check formatting, Clippy, unit/integration/documentation tests, rustdoc,
-  the release library build and large-allocation boundaries.
-- Record CI results for each configured platform and list untested platforms.
-- Check that the README and generated engine documentation describe this release.
-- Record test counts, toolchain versions and known limitations in release notes.
+  `scripts/validate.sh msrv` using the script's documented validation images.
+  These cover formatting, Clippy, tests, rustdoc, a release library build,
+  large-allocation boundaries and the MSRV.
+- Run `cargo test --locked --lib long_ -- --ignored` for the long correctness
+  campaigns. CI runs these on x86-64 Linux as well as ordinary checks on
+  x86-64 Linux, arm64 Linux and macOS.
+- On macOS, build `tools/bench` in release mode as described in its README;
+  running measurements is optional and is not a release gate.
+- Verify that generated documentation and the README describe the current API.
+- Record test counts, toolchain versions, platform results and limitations.
 
-After the release decision, create an annotated version tag on that validated
-commit. Do not move an existing release tag; fixes get a new alpha version.
+After the release decision, create an annotated version tag on the validated
+commit. Keep existing release tags immutable; fixes receive a new version.
 
-## Limitations to carry into release notes
+## Limitations for release notes
 
-- The dataset must fit in RAM; admission limits do not cap resident memory.
-- Recovery loads only the latest committed explicit full checkpoint. There is
-  no per-write persistence or automatic checkpointing. Closing writes nothing.
-- Checkpoints rely on filesystem sync, advisory locks and atomic rename; tests
-  do not prove behavior under real power loss. Network filesystems are unsupported.
-- Transactions, multi-key atomic writes, replication and disk tiering are absent.
-- A `ReadGuard` blocks writers for its lifetime; snapshots remain readable
-  independently of the engine.
-- A worker panic stops background compaction for that engine's lifetime.
-- API and format compatibility are not promised before a stable release.
-
-Compression layout and dictionary measurements are optional research evidence,
-not release gates.
+- The dataset must fit in RAM; admission budgets do not cap resident memory.
+- Persistence requires explicit checkpoints. Closing writes nothing.
+- Checkpoints depend on filesystem sync, advisory locks and atomic rename;
+  tests cannot establish real power-loss behavior. Network filesystems are unsupported.
+- Multi-key atomic batches are supported. Read/write transactions, replication
+  and disk tiering are outside the API.
+- A `ReadGuard` blocks writers for its lifetime; snapshots retain their sources.
+- A worker panic stops that worker; callers can inspect its failure.
+- Document the supported run and manifest versions; recovery rejects others.

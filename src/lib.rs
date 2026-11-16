@@ -40,14 +40,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Writes rotate full memtables for the flush worker and wait for room when
-//! necessary. See the [`engine`] module for the consistency,
-//! snapshot, maintenance, memory and checkpoint contracts.
-//!
-//! Internally, writes go to a bounded mutable memtable, which the engine
-//! flushes into immutable sorted runs of compressed blocks when it fills;
-//! compaction merges runs. Those components are private: their contracts are
-//! the engine's to keep.
+//! The [`engine`] module defines consistency, snapshot, maintenance, memory
+//! and checkpoint contracts. Internal storage modules are private so callers
+//! depend on one engine-level API.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

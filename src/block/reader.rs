@@ -1,3 +1,7 @@
+//! Checked block access, restart-key seeking and complete record validation.
+//! Views check the bytes they touch; full validation establishes ordering and
+//! restart invariants. Separate positions reuse key storage across blocks.
+
 use std::cmp::Ordering;
 use std::fmt;
 

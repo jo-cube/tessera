@@ -173,6 +173,12 @@ impl Engine {
     /// order, including duplicates and misses. The entire call sees one state.
     /// Values borrow reusable workspace storage for the callback's duration.
     /// No callbacks run if reading fails. Run decoding holds no state lock.
+    ///
+    /// # Errors
+    /// Returns [`ReadError`] for touched corrupt data or conflicting copies.
+    ///
+    /// # Panics
+    /// Propagates a panic from `found`. Panics if the engine state lock is poisoned.
     pub fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: &[K],
@@ -196,7 +202,9 @@ impl Engine {
 
 impl ReadGuard<'_> {
     /// Looks up keys in input order from this guard's stable state. See
-    /// [`Engine::multi_get`] for the callback and workspace contract.
+    /// [`Engine::multi_get`] for callback ordering, read errors and workspace
+    /// lifetimes. A callback panic propagates; while this guard is held a
+    /// callback must not call engine methods that acquire the state lock.
     pub fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: &[K],
@@ -217,7 +225,8 @@ impl ReadGuard<'_> {
 
 impl Snapshot {
     /// Looks up keys in input order from this snapshot's state. See
-    /// [`Engine::multi_get`] for the callback and workspace contract.
+    /// [`Engine::multi_get`] for callback ordering, read errors and workspace
+    /// lifetimes. A callback panic propagates; no engine lock is held.
     pub fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: &[K],

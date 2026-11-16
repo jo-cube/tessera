@@ -1,3 +1,7 @@
+//! Frame headers, checksums and bounded structural checks. Headers bind the
+//! codec, dictionary reference and decoded length to the stored payload;
+//! checksums are verified before compressed data reaches the decoder.
+
 use crc32fast::Hasher;
 
 use crate::block::{CorruptBlock, MAX_BLOCK_LEN};

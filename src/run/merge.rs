@@ -1,3 +1,7 @@
+//! Internal-key merging with one decoded block per disjoint run group.
+//! A heap orders active heads and range bounds delay unopened inputs; equal
+//! internal keys retain input order for the logical reader to reconcile.
+
 use std::ops::Range;
 
 use crate::block::{Record, cmp_internal};

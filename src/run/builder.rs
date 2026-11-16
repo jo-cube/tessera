@@ -1,3 +1,7 @@
+//! Sorted-run encoding with bounded segment buffers and adaptive block cuts.
+//! Records arrive in internal-key order; frames and dictionaries are packed
+//! atomically so reads can borrow contiguous bytes from shared chunks.
+
 use super::codec::{Codec, Compressor};
 use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;

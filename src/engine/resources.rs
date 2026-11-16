@@ -1,4 +1,7 @@
 //! Writer admission and accounting of temporary maintenance allocations.
+//! Shared sources are charged once; build estimates reserve transient room.
+//! Maintenance can finish above the budget so it can reclaim writer space.
+
 use super::*;
 use std::sync::Condvar;
 use std::sync::atomic::Ordering;

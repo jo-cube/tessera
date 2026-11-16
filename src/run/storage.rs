@@ -1,4 +1,7 @@
-//! Physical storage behind the unchanged logical run format.
+//! Chunk-backed storage with one contiguous region per frame or dictionary.
+//! Logical offsets map to shared allocations; exact tails avoid retaining
+//! unused chunk capacity, while checkpoint writes stream the same run bytes.
+
 use std::ops::Range;
 
 use super::CorruptRun;

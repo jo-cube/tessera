@@ -1,4 +1,7 @@
-//! Allocation-free reconstruction of a prefix-compressed index key.
+//! Allocation-free reconstruction of prefix-compressed index keys. Restart
+//! entries hold whole keys and bound each search walk; checked offsets keep
+//! malformed key areas from escaping their byte slice.
+
 use crate::block::{MAX_KEY_LEN, RESTART_INTERVAL};
 
 /// Order-preserving head; equal heads still require a full bytewise comparison
