@@ -65,6 +65,9 @@ mod run;
 #[cfg(test)]
 mod limits_tests;
 
+#[cfg(test)]
+mod test_support;
+
 /// The README's Rust examples, compiled and run as documentation tests so
 /// that they keep matching the API.
 #[cfg(doctest)]

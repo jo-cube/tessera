@@ -1313,6 +1313,10 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
 }
 
 #[cfg(test)]
+#[path = "checkpoint_robustness.rs"]
+mod robustness;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
