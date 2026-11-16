@@ -148,10 +148,14 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
     // Without them, the snapshot holds the older inputs; the update's run
     // was flushed after it, from a memtable it holds instead.
     drop((before, after));
+    crate::test_support::wait_until(|| {
+        engine.stats().retained_run_bytes == report.input_bytes - update_bytes
+    });
     assert_eq!(
         engine.stats().retained_run_bytes,
         report.input_bytes - update_bytes
     );
     drop(snapshot);
+    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
     assert_eq!(engine.stats().retained_run_bytes, 0);
 }

@@ -339,6 +339,7 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     assert!(scanned(&snapshot, b"k").iter().all(|(_, v)| v == &[0; 100]));
 
     drop(snapshot);
+    wait_until(|| engine.stats().retained_bytes == 0);
     assert_eq!(engine.stats().retained_bytes, 0);
 }
 

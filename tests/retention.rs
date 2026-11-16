@@ -9,6 +9,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot};
 
 fn options() -> EngineOptions {
@@ -232,6 +236,10 @@ fn engine_checkpoints(seed: u64) -> usize {
                  {} were reported retained",
                 stats.retained_bytes
             );
+            test_support::wait_until(|| {
+                let stats = engine.stats();
+                (stats.retained_bytes, stats.retained_sources) == (0, 0)
+            });
             let after = engine.stats();
             assert_eq!((after.retained_bytes, after.retained_sources), (0, 0));
             checked += 1;

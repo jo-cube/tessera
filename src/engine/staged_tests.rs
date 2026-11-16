@@ -643,10 +643,14 @@ mod compaction {
                 check_snapshot(snapshot, then, &pool);
             }
             outlived += held.len();
+            crate::test_support::wait_until(|| {
+                !held.is_empty() || engine.stats().retained_bytes == 0
+            });
             let stats = engine.stats();
             assert_eq!(stats.snapshots, held.len());
             assert!(held.is_empty() <= (stats.retained_bytes == 0));
             drop(held);
+            crate::test_support::wait_until(|| engine.stats().retained_bytes == 0);
             let stats = engine.stats();
             assert_eq!((stats.snapshots, stats.retained_bytes), (0, 0));
         }

@@ -149,6 +149,7 @@ fn reads_match_a_model_through_leveled_compaction() {
     }
     assert!(stats.level0_flushes <= 4, "{stats:?}");
     drop((now, snapshots));
+    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
     assert_eq!(engine.stats().retained_run_bytes, 0);
 }
 

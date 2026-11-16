@@ -241,6 +241,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         }
     }
     drop(snapshot);
+    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
     assert_eq!(engine.stats().retained_run_bytes, 0);
     for level in &levels[1..] {
         assert!(disjoint(level));
