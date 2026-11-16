@@ -41,7 +41,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crc32fast::Hasher;
 
@@ -49,7 +49,6 @@ use crate::run::{CorruptRun, Run};
 use std::collections::HashSet;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::levels::Levels;
 use super::{Core, Engine, EngineOptions, FlushJob, Published, SharedRun};
@@ -70,14 +69,21 @@ const MANIFEST_HEADER_LEN: usize = 72;
 const MANIFEST_ENTRY_LEN: usize = 60;
 const MAX_METADATA_BYTES: usize = 16 << 20;
 const RUNS: &str = "runs";
-static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+// Keep namespace and counter together, including when recovery advances the
+// counter to the end of its range. Rollover starts a fresh namespace.
+static RUN_IDS: Mutex<(Option<u64>, u64)> = Mutex::new((None, 1));
 
 pub(super) fn new_run_id() -> u128 {
-    static NAMESPACE: OnceLock<u64> = OnceLock::new();
-    let namespace = *NAMESPACE.get_or_init(|| RandomState::new().hash_one(std::process::id()));
-    let number = NEXT_RUN_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .expect("run IDs exhausted");
+    let mut ids = RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if ids.1 == u64::MAX {
+        ids.0 = None;
+        ids.1 = 1;
+    }
+    let namespace = *ids
+        .0
+        .get_or_insert_with(|| RandomState::new().hash_one(std::process::id()));
+    let number = ids.1;
+    ids.1 += 1;
     (u128::from(namespace) << 64) | u128::from(number)
 }
 
@@ -771,7 +777,15 @@ fn write_runs(
             generation,
             last_seq: image.ceiling,
             records: image.runs.iter().map(|(_, _, r)| r.run.len() as u64).sum(),
-            next_run_id: NEXT_RUN_ID.load(Ordering::Relaxed),
+            next_run_id: image
+                .runs
+                .iter()
+                .map(|(_, _, run)| (run.id as u64) + 1)
+                .chain(std::iter::once(
+                    RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner).1,
+                ))
+                .max()
+                .unwrap(),
             previous,
             depth: image.depth,
             metadata: metadata.to_vec(),
@@ -1099,7 +1113,10 @@ pub(super) struct Loaded {
 
 impl Loaded {
     pub(super) fn into_core(self, options: &EngineOptions) -> Core {
-        NEXT_RUN_ID.fetch_max(self.next_run_id, Ordering::Relaxed);
+        {
+            let mut ids = RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+            ids.1 = ids.1.max(self.next_run_id);
+        }
         let core = Core::with_pool(options, self.pool);
         {
             let mut state = core.write_state();
@@ -1341,6 +1358,34 @@ mod robustness;
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn recovery_with_an_exhausted_run_counter_can_flush_and_checkpoint() {
+        let dir = scratch("exhausted-run-counter");
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"a", b"old").unwrap();
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
+        manifest.next_run_id = u64::MAX;
+        fs::write(path, manifest.encode()).unwrap();
+        let recovered = Engine::recover(&dir, manual()).unwrap();
+        for key in [b"b", b"c"] {
+            recovered.put(key, b"new").unwrap();
+            recovered.flush().unwrap();
+        }
+        let expected = state(&recovered);
+        recovered
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        recovered.close().unwrap();
+        let again = Engine::recover(&dir, manual()).unwrap();
+        assert_eq!(state(&again), expected);
+        again.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn recovery_rejects_conflicting_copies_across_valid_runs() {
