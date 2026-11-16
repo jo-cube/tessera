@@ -182,7 +182,18 @@ fn compress(codec: Codec, block: &[u8]) -> Vec<u8> {
         return block.to_vec();
     }
     let mut out = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
-    zstd_safe::compress(&mut out, block, 3).unwrap();
+    let mut ctx = zstd_safe::CCtx::create();
+    ctx.set_parameter(zstd_safe::CParameter::CompressionLevel(3))
+        .unwrap();
+    for parameter in [
+        zstd_safe::CParameter::Format(zstd_safe::FrameFormat::Magicless),
+        zstd_safe::CParameter::ContentSizeFlag(false),
+        zstd_safe::CParameter::ChecksumFlag(false),
+        zstd_safe::CParameter::DictIdFlag(false),
+    ] {
+        ctx.set_parameter(parameter).unwrap();
+    }
+    ctx.compress2(&mut out, block).unwrap();
     out
 }
 fn decode_frame(frame: &[u8], dictionary: &[u8]) -> Vec<u8> {
@@ -191,8 +202,12 @@ fn decode_frame(frame: &[u8], dictionary: &[u8]) -> Vec<u8> {
     match frame[0] {
         0 => out.copy_from_slice(stored),
         1 => {
-            zstd_safe::DCtx::create()
-                .decompress_using_dict(&mut out[..], stored, dictionary)
+            let mut ctx = zstd_safe::DCtx::create();
+            ctx.set_parameter(zstd_safe::DParameter::Format(
+                zstd_safe::FrameFormat::Magicless,
+            ))
+            .unwrap();
+            ctx.decompress_using_dict(&mut out[..], stored, dictionary)
                 .unwrap();
         }
         other => panic!("codec {other}"),
@@ -489,6 +504,14 @@ fn compressed_frames_match_independent_codec_output() {
         let decoded = decode_frame(frame, dictionary);
         let mut expected = Vec::with_capacity(zstd_safe::compress_bound(decoded.len()));
         let mut context = zstd_safe::CCtx::create();
+        for parameter in [
+            zstd_safe::CParameter::Format(zstd_safe::FrameFormat::Magicless),
+            zstd_safe::CParameter::ContentSizeFlag(false),
+            zstd_safe::CParameter::ChecksumFlag(false),
+            zstd_safe::CParameter::DictIdFlag(false),
+        ] {
+            context.set_parameter(parameter).unwrap();
+        }
         context
             .set_parameter(zstd_safe::CParameter::CompressionLevel(1))
             .unwrap();
@@ -1524,19 +1547,26 @@ fn output_larger_than_declared_is_rejected_within_the_declared_size() {
 }
 
 #[test]
-fn zstd_frames_must_declare_their_content_size() {
+fn magicless_zstd_frames_omit_redundant_fields_and_round_trip() {
     let block = raw_block(&[rec(b"a", 1, None)]);
-    let mut context = zstd_safe::CCtx::create();
-    context
-        .set_parameter(zstd_safe::CParameter::ContentSizeFlag(false))
-        .unwrap();
-    let mut stored = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
-    context.compress2(&mut stored, &block).unwrap();
-
+    let stored = compress(Codec::Zstd, &block);
+    assert_eq!(
+        stored[0], 0,
+        "descriptor has no content size, checksum or dictionary ID"
+    );
+    assert!(!stored.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
     let frames = [(1, block.len() as u32, stored)];
     let bytes = assemble_frames(&frames, &[b"a"], 1);
+    assert_eq!(all(&Run::new(bytes).unwrap()), [rec(b"a", 1, None)]);
+    // The previous standard envelope is no longer accepted, even without size.
+    let mut ctx = zstd_safe::CCtx::create();
+    ctx.set_parameter(zstd_safe::CParameter::ContentSizeFlag(false))
+        .unwrap();
+    let mut stored = Vec::with_capacity(zstd_safe::compress_bound(block.len()));
+    ctx.compress2(&mut stored, &block).unwrap();
+    let bytes = assemble_frames(&[(1, block.len() as u32, stored)], &[b"a"], 1);
     assert_eq!(
-        Run::new(bytes.as_slice()).unwrap_err().kind,
+        Run::new(bytes).unwrap_err().kind,
         RunCorruption::InvalidFrame
     );
 }

@@ -55,6 +55,7 @@
 //! ```
 //!
 //! Codec 0 is uncompressed and has reference 0. Codec 1 is Zstandard and
+//! uses magicless frames without a content size, checksum or dictionary ID, and
 //! references segment `dictionary_ref - 1`. The segment table immediately
 //! precedes the block index; dictionary regions tile the bytes between the
 //! frames and that table. Dictionaries contain at most 16 KiB of raw content.

@@ -1,4 +1,4 @@
-use zstd_safe::{CCtx, CDict, CParameter, DCtx};
+use zstd_safe::{CCtx, CDict, CParameter, DCtx, DParameter, FrameFormat};
 
 /// Block compression used by a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,7 +40,19 @@ impl Compressor {
     pub(super) fn new(codec: Codec) -> Self {
         Self {
             codec,
-            zstd: (codec == Codec::Zstd).then(CCtx::create),
+            zstd: (codec == Codec::Zstd).then(|| {
+                let mut ctx = CCtx::create();
+                for parameter in [
+                    CParameter::Format(FrameFormat::Magicless),
+                    CParameter::ContentSizeFlag(false),
+                    CParameter::ChecksumFlag(false),
+                    CParameter::DictIdFlag(false),
+                ] {
+                    ctx.set_parameter(parameter)
+                        .expect("supported frame parameter");
+                }
+                ctx
+            }),
         }
     }
     pub(super) fn codec(&self) -> Codec {
@@ -100,8 +112,41 @@ impl Compressor {
 pub(super) fn plausible_decoded_len(codec: Codec, stored: &[u8], decoded_len: usize) -> bool {
     match codec {
         Codec::None => stored.len() == decoded_len,
-        Codec::Zstd => {
-            matches!(zstd_safe::get_frame_content_size(stored), Ok(Some(size)) if size == decoded_len as u64)
+        Codec::Zstd => magicless_decoded_bounds(stored)
+            .is_some_and(|(min, max)| (min..=max).contains(&decoded_len)),
+    }
+}
+
+/// Without a content-size field, bound allocation from the block headers.
+/// Raw/RLE blocks declare their exact decoded size; compressed blocks decode
+/// to at most 128 KiB. This inspects no compressed data. The Zstd decoder still
+/// validates it and must produce exactly the outer frame's decoded length.
+fn magicless_decoded_bounds(stored: &[u8]) -> Option<(usize, usize)> {
+    // No content size, single-segment flag, checksum, dictionary ID or reserved
+    // bits. The second byte is the window descriptor, checked by Zstd itself.
+    if stored.first() != Some(&0) {
+        return None;
+    }
+    let mut rest = stored.get(2..)?;
+    let (mut min, mut max) = (0usize, 0usize);
+    loop {
+        let (header, tail) = rest.split_first_chunk::<3>()?;
+        let header = u32::from_le_bytes([header[0], header[1], header[2], 0]);
+        let size = (header >> 3) as usize;
+        if size > 128 << 10 {
+            return None;
+        }
+        let (stored_len, lower, upper) = match (header >> 1) & 3 {
+            0 => (size, size, size),
+            1 => (1, size, size),
+            2 => (size, 0, 128 << 10),
+            _ => return None,
+        };
+        rest = tail.get(stored_len..)?;
+        min = min.checked_add(lower)?;
+        max = max.checked_add(upper)?;
+        if header & 1 != 0 {
+            return rest.is_empty().then_some((min, max));
         }
     }
 }
@@ -127,7 +172,12 @@ impl Decompressor {
             // for this call; it neither copies them nor constructs a DDict.
             Codec::Zstd => self
                 .zstd
-                .get_or_insert_with(DCtx::create)
+                .get_or_insert_with(|| {
+                    let mut ctx = DCtx::create();
+                    ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
+                        .expect("supported magicless format");
+                    ctx
+                })
                 .decompress_using_dict(output, stored, dictionary)
                 .ok(),
             Codec::None => None,
@@ -158,9 +208,16 @@ mod tests {
             // Reuse exactly the same prepared dictionary for multiple blocks.
             for input in [&block[..1024], block.as_slice()] {
                 let mut stored = Vec::new();
+                // Ratio probes intentionally retain their standard level-3
+                // envelope, preserving the estimated block cuts.
+                let mut probe = Vec::new();
+                compressor.compress(input, Some(&prepared), &mut probe);
+                assert_eq!(&probe[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
                 compressor.begin_segment(raw, input.len());
                 compressor.compress(input, None, &mut stored);
                 assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
+                assert_eq!(stored[0], 0, "no size, checksum or dictionary-ID fields");
+                assert!(plausible_decoded_len(Codec::Zstd, &stored, input.len()));
                 let mut decoded = vec![0; input.len()];
                 assert_eq!(
                     decompressor.decompress(Codec::Zstd, &stored, &mut decoded, raw),
