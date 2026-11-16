@@ -4,6 +4,57 @@ use crate::run::RunBuilder;
 use crate::run::dictionary::SEGMENT_RAW_LEN;
 
 #[test]
+fn restart_heads_search_equal_heads_and_short_zero_padded_keys() {
+    let mut keys: Vec<Vec<u8>> = (0..=12).map(|len| vec![0; len]).collect();
+    keys.extend((0..=255u8).map(|byte| vec![byte]));
+    keys.extend((0..512u16).map(|i| [b"samehead".as_slice(), &i.to_be_bytes()].concat()));
+    keys.sort();
+    keys.dedup();
+    for codec in [Codec::None, Codec::Zstd] {
+        let mut builder = RunBuilder::with_raw_block_target(codec, 1);
+        for key in &keys {
+            builder.add(key, 1, Value::Bytes(b"v")).unwrap();
+        }
+        let built = builder.finish();
+        assert_eq!(built.block_count(), keys.len());
+        let bytes = built.as_bytes().into_owned();
+        let (recovered, _) = Run::recover(bytes.clone()).unwrap();
+        let wrapped = Run::new(bytes.as_slice()).unwrap();
+        assert_eq!(built.restart_heads, recovered.restart_heads);
+        assert_eq!(built.restart_heads, wrapped.restart_heads);
+        assert_eq!(recovered.as_bytes(), bytes);
+        assert_eq!(
+            built.restart_heads.len(),
+            keys.len().div_ceil(RESTART_INTERVAL)
+        );
+        assert_eq!(
+            built.index_bytes(),
+            built.view().index_len() + built.restart_heads.len() * 8
+        );
+        let raw = RunView::open(&bytes).unwrap();
+        for target in keys.iter().cloned().chain(keys.iter().map(|key| {
+            let mut absent = key.clone();
+            absent.push(0);
+            absent
+        })) {
+            let at = keys.partition_point(|key| key < &target);
+            let expected = (at < keys.len()).then_some(at);
+            assert_eq!(raw.locate(&target).unwrap(), expected);
+            for run in [&built, &recovered] {
+                assert_eq!(run.view().locate(&target).unwrap(), expected);
+                assert_eq!(
+                    run.get(&target, &mut ReadWorkspace::new())
+                        .unwrap()
+                        .is_some(),
+                    keys.binary_search(&target).is_ok()
+                );
+            }
+            assert_eq!(wrapped.view().locate(&target).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn persisted_filters_cannot_hide_present_keys() {
     for codec in [Codec::None, Codec::Zstd] {
         let mut builder = RunBuilder::new(codec);

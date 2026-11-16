@@ -11,7 +11,7 @@ use super::dictionary::DICTIONARY_LEN;
 use super::filter::KeyHashes;
 use super::filter::{self as key_filter, KeyFilter};
 use super::frame::{self, Frame};
-use super::index::IndexKey;
+use super::index::{IndexKey, head};
 use super::storage::{Packing, Region, RunData, Segmented};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, SEGMENT_ENTRY_LEN,
@@ -41,6 +41,8 @@ use crate::chunk::ChunkPool;
 #[derive(Clone, Debug)]
 pub struct Run<B> {
     data: RunData<B>,
+    /// One contiguous search head per index restart, rebuilt from stored keys.
+    restart_heads: Box<[u64]>,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
     /// The largest stored sequence number, 0 if there are none. The builder
@@ -101,8 +103,10 @@ impl<B: AsRef<[u8]>> Run<B> {
         let (max_seq, reclaimable, build_estimate) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
         let bounds = KeyBounds::of(&data);
+        let restart_heads = Self::restart_heads(&data);
         Ok(Self {
             data,
+            restart_heads,
             filter: None,
             max_seq,
             seq_override: None,
@@ -120,8 +124,10 @@ impl<B: AsRef<[u8]>> Run<B> {
         build_estimate: usize,
     ) -> Self {
         let bounds = KeyBounds::of(&data);
+        let restart_heads = Self::restart_heads(&data);
         Self {
             data,
+            restart_heads,
             filter: filter.map(Box::new),
             max_seq,
             seq_override: None,
@@ -129,6 +135,14 @@ impl<B: AsRef<[u8]>> Run<B> {
             reclaimable,
             build_estimate,
         }
+    }
+
+    fn restart_heads(data: &RunData<B>) -> Box<[u64]> {
+        let view = data.view().expect(VALIDATED);
+        (0..view.block_count())
+            .step_by(RESTART_INTERVAL)
+            .map(|block| head(view.unshared_key(block).expect(VALIDATED)))
+            .collect()
     }
 
     pub(crate) fn build_estimate(&self) -> usize {
@@ -198,6 +212,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
         Run {
             data,
+            restart_heads: self.restart_heads.clone(),
             filter: self.filter.clone(),
             max_seq: self.max_seq,
             seq_override: self.seq_override,
@@ -207,9 +222,9 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
     }
 
-    /// Key filter and physical segment metadata, charged beside stored bytes.
+    /// Key filter, restart heads and physical segment metadata, charged beside stored bytes.
     pub fn held_bytes(&self) -> usize {
-        self.filter_bytes() + self.data.held_bytes()
+        self.filter_bytes() + size_of_val(&*self.restart_heads) + self.data.held_bytes()
     }
 
     /// Returns the number of stored records, counting every version.
@@ -286,6 +301,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn view(&self) -> RunView<'_> {
         RunView {
             seq_override: self.seq_override,
+            restart_heads: Some(&self.restart_heads),
             ..self.data.view().expect(VALIDATED)
         }
     }
@@ -298,7 +314,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
     pub(crate) fn index_bytes(&self) -> usize {
         let view = self.view();
-        view.index_len()
+        view.index_len() + size_of_val(&*self.restart_heads)
     }
     /// Serialized byte count, excluding filters and physical segment metadata.
     pub fn stored_len(&self) -> usize {
@@ -937,6 +953,9 @@ pub struct RunView<'a> {
     min_key: &'a [u8],
     record_count: usize,
     seq_override: Option<u64>,
+    // Raw borrowed views used during validation allocate nothing. Owned runs
+    // attach their once-built heads to every view used for reads.
+    restart_heads: Option<&'a [u64]>,
 }
 
 impl<'a> RunView<'a> {
@@ -1014,6 +1033,7 @@ impl<'a> RunView<'a> {
             min_key,
             record_count,
             seq_override: None,
+            restart_heads: None,
         };
         match (view.table.first(), view.table.last()) {
             (Some(&first), Some(&last)) => {
@@ -1135,10 +1155,15 @@ impl<'a> RunView<'a> {
         // Find the first restart key >= target. Its preceding interval may
         // already hold the key, including versions spanning restart points.
         let restarts = self.table.len().div_ceil(RESTART_INTERVAL);
+        let target_head = head(target);
         let (mut low, mut high) = (0, restarts);
         while low < high {
             let middle = low + (high - low) / 2;
-            if self.unshared_key(middle * RESTART_INTERVAL)? < target {
+            let before = match self.restart_heads {
+                Some(heads) if heads[middle] != target_head => heads[middle] < target_head,
+                _ => self.unshared_key(middle * RESTART_INTERVAL)? < target,
+            };
+            if before {
                 low = middle + 1;
             } else {
                 high = middle;

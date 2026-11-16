@@ -514,7 +514,7 @@ pub struct EngineStats {
     pub block_bytes_live: usize,
     /// Bloom filter payload bytes of published runs.
     pub filter_bytes: usize,
-    /// Block index bytes (entries and keys) of published runs.
+    /// Block index bytes (entries, keys and rebuilt restart heads) of published runs.
     pub index_bytes: usize,
     /// The last sequence number used.
     pub last_seq: u64,
@@ -542,7 +542,7 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
-    /// Key filters and physical segment metadata beside `run_bytes`. Dictionaries are
+    /// Key filters, restart heads and physical segment metadata beside `run_bytes`. Dictionaries are
     /// stored inside the runs.
     pub held_bytes: usize,
     /// Unused 1 MiB chunks available for reuse by this engine.

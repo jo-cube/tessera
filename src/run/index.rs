@@ -1,6 +1,15 @@
 //! Allocation-free reconstruction of a prefix-compressed index key.
 use crate::block::{MAX_KEY_LEN, RESTART_INTERVAL};
 
+/// Order-preserving head; equal heads still require a full bytewise comparison
+/// (including short keys that differ only by trailing zero bytes).
+pub(super) fn head(key: &[u8]) -> u64 {
+    let mut bytes = [0; 8];
+    let len = key.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&key[..len]);
+    u64::from_be_bytes(bytes)
+}
+
 /// At most one borrowed suffix per entry since the last restart. Keeping the
 /// pieces avoids a maximum-key-sized buffer or an allocation on point reads.
 #[derive(Clone, Copy, Debug)]
