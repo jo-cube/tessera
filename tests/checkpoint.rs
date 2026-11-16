@@ -291,8 +291,8 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
         assert_eq!(workspace.blocks_loaded(), 1);
         workspace.capacity()
     };
-    // Records here are under 64 bytes, so a block passes its target by less.
-    let within = |block: usize, _target: usize| block <= 256 << 10;
+    // Adaptive compressed targets may reach the raw cap on repetitive records.
+    let within = |block: usize, _target: usize| block <= 64 << 10;
     let mut blocks = Vec::new();
     for written in LENGTHS {
         let scratch = Scratch::new(&format!("block-length-{written}"));
@@ -368,16 +368,15 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     assert!(blocks[0] > blocks[1] && blocks[1] > blocks[2], "{blocks:?}");
 
     // Lengths above the largest the engine builds are refused, not
-    // adjusted; at the largest, these records of about 100 KB are cut into
-    // blocks capped at 256 KiB raw.
-    let Err(OpenError::Config(refused)) = Engine::new(with((256 << 10) + 1)).map(drop) else {
+    // adjusted; the largest target still caps ordinary raw blocks at 64 KiB.
+    let Err(OpenError::Config(refused)) = Engine::new(with((64 << 10) + 1)).map(drop) else {
         panic!("an oversized block length was accepted");
     };
     assert_eq!(
         (refused.setting, refused.max),
-        ("EngineOptions::target_block_compressed", 256 << 10)
+        ("EngineOptions::target_block_compressed", 64 << 10)
     );
-    let engine = Engine::new(with(256 << 10)).unwrap();
+    let engine = Engine::new(with(64 << 10)).unwrap();
     for i in 0..3_000u32 {
         let value = format!("value {} of {i}", i % 10);
         engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();

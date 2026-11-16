@@ -89,7 +89,7 @@ value and 128-byte entry charge must also fit the memtable budget.
 | `level_ratio` | 10 | Level size multiplier, at least 2 |
 | `background_threads` | Half the CPUs, clamped to 1–4 | Builders per compaction |
 | `compression` | `Compression::Zstd` | Zstandard or `Uncompressed` |
-| `target_block_compressed` | 2048 (2 KiB) | Estimated compressed block bytes, 1–256 KiB |
+| `target_block_compressed` | 2048 (2 KiB) | Estimated compressed block bytes, 1–64 KiB |
 
 At 90% of the memory budget writers wait briefly for publication. At 100% they
 request maintenance while reclamation can progress, then return `MemoryLimit`
@@ -109,7 +109,7 @@ finished runs trim their partial final chunk. The free reserve is capped at
 32 MiB. Readers borrow dictionaries and reuse one decode context per workspace;
 there is no decoded-block cache. Zstandard level 1 uses raw dictionaries up to
 16 KiB per 4 MiB segment, with a level-3 ratio probe for adaptive block cuts.
-Ordinary raw blocks are capped at 256 KiB; a larger record gets its own block.
+Ordinary raw blocks are capped at 64 KiB; a larger record gets its own block.
 Uncompressed runs target 16 KiB raw blocks. Bottom-level compactions omit Bloom
 filters; other builders may omit them to bound temporary memory.
 

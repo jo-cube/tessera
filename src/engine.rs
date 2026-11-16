@@ -230,7 +230,7 @@ pub struct EngineOptions {
     pub background_threads: usize,
     /// Compression used for new runs.
     pub compression: Compression,
-    /// Estimated compressed block bytes, from 1 to 256 KiB (default 2048).
+    /// Estimated compressed block bytes, from 1 to 64 KiB (default 2048).
     pub target_block_compressed: usize,
     // Deterministic scheduling and small run fixtures, absent from the public build.
     #[cfg(test)]
@@ -310,7 +310,7 @@ impl EngineOptions {
             self.target_block_compressed as u64,
             1,
             RAW_BLOCK_CAP as u64,
-            "compressed targets are from 1 byte to the 256 KiB raw cap",
+            "compressed targets are from 1 byte to the 64 KiB raw cap",
         )?;
         Ok(())
     }

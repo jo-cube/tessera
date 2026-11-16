@@ -199,7 +199,8 @@ fn raw_cuts_count_encoded_prefixes_and_restart_keys() {
             .unwrap();
     }
     let run = b.finish();
-    assert!(run.block_count() <= 4);
+    // A 60 KB restart key leaves room for at least four records per block.
+    assert!(run.block_count() <= 32);
     for i in 0..run.block_count() {
         assert!(run.view().frame(i).unwrap().decoded_len <= RAW_BLOCK_CAP);
     }

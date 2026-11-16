@@ -126,7 +126,7 @@ pub const TARGET_BLOCK_COMPRESSED: usize = 2048;
 /// Fixed raw target for uncompressed runs.
 pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 /// Raw block cap, except for a single oversized record.
-pub const RAW_BLOCK_CAP: usize = 256 << 10;
+pub const RAW_BLOCK_CAP: usize = 64 << 10;
 
 /// The largest input per output run accepted when flushing or compacting. It
 /// keeps every run far enough inside the format's 32-bit index limits that
