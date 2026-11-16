@@ -241,7 +241,7 @@ impl fmt::Display for BuildError {
             Self::OutOfOrder => f.write_str("record sorts before the previous record"),
             Self::DuplicateKey => f.write_str("duplicate user key and sequence number"),
             Self::BlockFull => write!(f, "record would exceed block limit of {MAX_BLOCK_LEN}"),
-            Self::RunFull => f.write_str("run index would exceed its limits"),
+            Self::RunFull => f.write_str("run would exceed its 32-bit size or index limits"),
         }
     }
 }

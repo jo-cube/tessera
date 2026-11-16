@@ -259,20 +259,25 @@ pub(crate) fn compact_parallel_in<'a>(
     if threads == 1 || cuts.single {
         return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
-    // Borrow sparse-index keys, weighted by compressed input bytes. Equal user
+    // Reconstruct sparse-index keys, weighted by compressed input bytes. Equal user
     // keys stay together even when their versions span several input blocks.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
-    let metadata = count.saturating_mul(size_of::<(&[u8], usize)>());
+    let mut metadata = count.saturating_mul(size_of::<(Vec<u8>, usize)>());
+    for input in inputs {
+        for block in 0..input.block_count() {
+            metadata = metadata.saturating_add(input.last_key(block)?.len());
+        }
+    }
     if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
         return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
     }
     let mut boundaries = Vec::with_capacity(count);
     for input in inputs {
         for block in 0..input.block_count() {
-            boundaries.push((input.last_key(block)?, input.block_bytes(block)));
+            boundaries.push((input.last_key(block)?.to_vec(), input.block_bytes(block)));
         }
     }
-    boundaries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    boundaries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let largest = inputs
         .iter()
         .map(|input| input.largest_block_len())
@@ -357,25 +362,25 @@ pub(crate) fn compact_parallel_in<'a>(
 /// Approximate serial run boundaries with the same size estimate as planning.
 /// Balance whole runs, not arbitrary byte fractions: the final partial run
 /// belongs to the last builder. Repeated index keys always stay together.
-pub(super) fn partition_starts<'a>(
-    boundaries: &[(&'a [u8], usize)],
+pub(super) fn partition_starts<K: AsRef<[u8]>>(
+    boundaries: &[(K, usize)],
     target: usize,
     threads: usize,
-) -> Vec<&'a [u8]> {
+) -> Vec<&[u8]> {
     let full_runs = boundaries.iter().map(|(_, bytes)| bytes).sum::<usize>() / target;
     let mut starts = Vec::with_capacity(threads - 1);
     let mut seen = 0;
     let mut at = 0;
     while at < boundaries.len() && starts.len() < threads - 1 {
-        let key = boundaries[at].0;
-        while at < boundaries.len() && boundaries[at].0 == key {
+        let key = boundaries[at].0.as_ref();
+        while at < boundaries.len() && boundaries[at].0.as_ref() == key {
             seen += boundaries[at].1;
             at += 1;
         }
         let split_run = (full_runs as u128 * (starts.len() + 1) as u128 / threads as u128) as usize;
         if seen >= split_run * target && at < boundaries.len() {
             // Splitting before the first key would create an empty builder.
-            if key != boundaries[0].0 {
+            if key != boundaries[0].0.as_ref() {
                 starts.push(key);
             }
         }

@@ -3,11 +3,12 @@ use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
 use super::storage::{Packing, RunData};
 use super::{
-    FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
+    FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
     TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
 };
 use crate::block::{
-    BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, Value, cmp_internal,
+    BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, RESTART_INTERVAL, Value,
+    cmp_internal,
 };
 use crate::chunk::ChunkPool;
 use std::fmt;
@@ -32,6 +33,7 @@ pub struct RunBuilder {
     segments: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
+    index_last_key: Vec<u8>,
     min_key_len: usize,
     record_count: usize,
     reclaimable: bool,
@@ -66,6 +68,7 @@ impl RunBuilder {
             segments: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
+            index_last_key: Vec::new(),
             min_key_len: 0,
             record_count: 0,
             reclaimable: false,
@@ -99,6 +102,23 @@ impl RunBuilder {
         if !index_has_room(
             self.table.len() / TABLE_ENTRY_LEN + self.segment.len(),
             self.keys.len().saturating_add(self.pending_key_bytes),
+        ) {
+            return Err(BuildError::RunFull);
+        }
+        // Bound the complete serialized run, including the buffered segment,
+        // before accepting a record. No truncating offset casts can follow.
+        let stored = self
+            .storage
+            .frames_len
+            .saturating_add(self.storage.dictionaries_len)
+            .saturating_add(self.segments.len())
+            .saturating_add(self.table.len())
+            .saturating_add(self.keys.len());
+        if !run_has_room(
+            stored,
+            self.segment.encoded_len_after(key, seq, value),
+            self.segment.len().saturating_add(1),
+            self.pending_key_bytes.saturating_add(key.len()),
         ) {
             return Err(BuildError::RunFull);
         }
@@ -152,6 +172,26 @@ impl RunBuilder {
     }
     pub fn finish(mut self) -> Run<Vec<u8>> {
         self.cut_segment();
+        // Store the upper bound whole as well, so range pruning can borrow it.
+        // All other restart keys occur exactly every sixteen entries.
+        if !self.table.is_empty() {
+            let last = self.table.len() / TABLE_ENTRY_LEN - 1;
+            let start = if last == 0 {
+                self.min_key_len
+            } else {
+                u32::from_le_bytes(
+                    self.table[(last - 1) * TABLE_ENTRY_LEN + 4..last * TABLE_ENTRY_LEN]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            };
+            self.keys.truncate(start);
+            self.keys.extend_from_slice(&0u16.to_le_bytes());
+            self.keys.extend_from_slice(&self.index_last_key);
+            let end = u32::try_from(self.keys.len()).expect("bounded key area");
+            let at = self.table.len() - 4;
+            self.table[at..].copy_from_slice(&end.to_le_bytes());
+        }
         let dictionaries_offset = self.storage.frames_len;
         let index_offset =
             dictionaries_offset + self.storage.dictionaries_len + self.segments.len();
@@ -162,6 +202,12 @@ impl RunBuilder {
             entry[..8].copy_from_slice(&offset.to_le_bytes());
         }
         let segment_count = self.segments.len() / SEGMENT_ENTRY_LEN;
+        let total = index_offset + self.table.len() + self.keys.len() + FOOTER_LEN;
+        assert!(u32::try_from(total).is_ok(), "bounded run size");
+        let mut checksum = crc32fast::Hasher::new();
+        checksum.update(&self.table);
+        checksum.update(&self.keys);
+        let index_crc = checksum.finalize();
         let mut data = self.segments;
         data.extend_from_slice(&self.table);
         data.extend_from_slice(&self.keys);
@@ -171,7 +217,7 @@ impl RunBuilder {
         data.extend_from_slice(&(self.min_key_len as u32).to_le_bytes());
         data.extend_from_slice(&(dictionaries_offset as u64).to_le_bytes());
         data.extend_from_slice(&(segment_count as u32).to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&index_crc.to_le_bytes());
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
         Run::from_builder(
@@ -293,10 +339,31 @@ impl RunBuilder {
             .compressed(len, self.frames.len(), codec == Codec::Zstd);
         self.storage.frame(&self.frames);
         retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
-        self.keys.extend_from_slice(block.last_key());
-        self.table.extend_from_slice(&(offset as u64).to_le_bytes());
-        self.table
-            .extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
+        let last = block.last_key();
+        let shared = if (self.table.len() / TABLE_ENTRY_LEN).is_multiple_of(RESTART_INTERVAL) {
+            0
+        } else {
+            self.index_last_key
+                .iter()
+                .zip(last)
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(u16::MAX as usize)
+        };
+        self.keys.extend_from_slice(&(shared as u16).to_le_bytes());
+        self.keys.extend_from_slice(&last[shared..]);
+        self.index_last_key.clear();
+        self.index_last_key.extend_from_slice(last);
+        self.table.extend_from_slice(
+            &u32::try_from(offset)
+                .expect("bounded run offset")
+                .to_le_bytes(),
+        );
+        self.table.extend_from_slice(
+            &u32::try_from(self.keys.len())
+                .expect("bounded key area")
+                .to_le_bytes(),
+        );
     }
 }
 
@@ -315,7 +382,20 @@ fn retain_scratch(bytes: &mut Vec<u8>, limit: usize) {
 /// blocks later cannot fail.
 fn index_has_room(blocks: usize, key_bytes: usize) -> bool {
     let fits = |total: Option<usize>| total.is_some_and(|n| n <= u32::MAX as usize);
-    fits(blocks.checked_add(2)) && fits(key_bytes.checked_add(2 * MAX_KEY_LEN))
+    fits(blocks.checked_add(2)) && fits(key_bytes.checked_add(2 * (MAX_KEY_LEN + 2)))
+}
+
+/// Conservative upper bound for pending frames: even singleton Zstd frames
+/// fit in twice the raw bytes plus 128 bytes each. Reserve both a segment
+/// dictionary and a possible new oversized segment, and a whole final key.
+fn run_has_room(stored: usize, raw: usize, records: usize, keys: usize) -> bool {
+    let bound = stored
+        .saturating_add(raw.saturating_mul(2))
+        .saturating_add(records.saturating_mul(frame::HEADER_LEN + TABLE_ENTRY_LEN + 2 + 128))
+        .saturating_add(keys)
+        .saturating_add(2 * (dictionary::DICTIONARY_LEN + SEGMENT_ENTRY_LEN + MAX_KEY_LEN))
+        .saturating_add(FOOTER_LEN);
+    bound <= u32::MAX as usize
 }
 
 impl fmt::Debug for RunBuilder {
@@ -343,8 +423,25 @@ mod tests {
 
     #[test]
     fn key_area_stops_with_room_for_two_maximum_keys() {
-        assert!(index_has_room(0, LIMIT - 2 * MAX_KEY_LEN));
-        assert!(!index_has_room(0, LIMIT - 2 * MAX_KEY_LEN + 1));
+        assert!(index_has_room(0, LIMIT - 2 * (MAX_KEY_LEN + 2)));
+        assert!(!index_has_room(0, LIMIT - 2 * (MAX_KEY_LEN + 2) + 1));
+    }
+
+    #[test]
+    fn oversize_runs_are_rejected_before_a_record_or_offset_is_written() {
+        for codec in [Codec::None, Codec::Zstd] {
+            let mut builder = RunBuilder::new(codec);
+            builder.storage.frames_len = LIMIT - 1;
+            assert_eq!(
+                builder.add(b"key", 1, Value::Bytes(b"v")),
+                Err(BuildError::RunFull)
+            );
+            assert_eq!(builder.len(), 0);
+            assert!(builder.table.is_empty() && builder.segment.is_empty());
+        }
+        assert!(!run_has_room(usize::MAX, 0, 0, 0));
+        assert!(!run_has_room(0, usize::MAX, 1, 0));
+        assert!(run_has_room(0, 1 << 30, 1000, 16000));
     }
 
     #[test]

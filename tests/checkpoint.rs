@@ -436,7 +436,7 @@ fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
     reports
 }
 
-/// The manifest's exact v5 payload boundaries, excluding persisted filters.
+/// The manifest's exact v6 payload boundaries, excluding persisted filters.
 fn run_payloads(dir: &Path) -> Vec<(PathBuf, usize)> {
     let current = fs::read(dir.join("CURRENT")).unwrap();
     let generation = u64::from_le_bytes(current[8..16].try_into().unwrap());
@@ -464,7 +464,7 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 
 /// Dictionary runs through the engine: compaction builds them on
 /// structured values and reads equal the model; a checkpoint writes them
-/// (version 5) and they recover under every compression setting, beside
+/// (version 6) and they recover under every compression setting, beside
 /// newer plain runs; a snapshot keeps reading dictionary runs that a later
 /// compaction replaced.
 #[test]
@@ -538,14 +538,14 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     drop(snapshot);
     assert_eq!(contents(&engine, b""), model);
 
-    // A checkpoint writes the existing version-5 runs unchanged.
+    // A checkpoint writes the existing version-6 runs unchanged.
     let scratch = Scratch::new("dictionary-runs");
     engine
         .checkpoint(&scratch.0, CheckpointOptions::default())
         .unwrap();
     let versions = run_versions(&scratch.0);
     assert!(
-        !versions.is_empty() && versions.iter().all(|&v| v == 5),
+        !versions.is_empty() && versions.iter().all(|&v| v == 6),
         "{versions:?}"
     );
 
@@ -902,7 +902,7 @@ fn closing_a_recovered_engine_takes_no_checkpoint() {
 }
 
 #[test]
-fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
+fn multi_segment_checkpoint_streams_one_v6_run_and_recovers() {
     for compression in [Compression::Zstd, Compression::Uncompressed] {
         let options = EngineOptions {
             compression,
@@ -919,7 +919,7 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
             .checkpoint(&scratch.0, CheckpointOptions::default())
             .unwrap();
         assert_eq!((report.runs, report.records), (1, 9_000));
-        assert_eq!(run_versions(&scratch.0), vec![5]);
+        assert_eq!(run_versions(&scratch.0), vec![6]);
         let recovered = Engine::recover(&scratch.0, options).unwrap();
         let stats = recovered.stats();
         assert_eq!(stats.runs, 1);

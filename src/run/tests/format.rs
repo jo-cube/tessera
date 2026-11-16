@@ -25,7 +25,7 @@ const RECORD_BOUND: usize = 200_000;
 /// Bounds retained bytes too, since values can be megabytes long.
 const RETAINED_BOUND: usize = 512 << 20;
 const HEADER: usize = 12;
-const ENTRY: usize = 12;
+const ENTRY: usize = 8;
 const FOOTER: usize = 48;
 
 fn rec(key: &[u8], seq: u64, value: Option<&[u8]>) -> Owned {
@@ -135,9 +135,9 @@ fn frame_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     let l = layout(bytes);
     (0..l.block_count)
         .map(|i| {
-            let start = u64_at(bytes, l.table + i * ENTRY) as usize;
+            let start = u32_at(bytes, l.table + i * ENTRY) as usize;
             let end = if i + 1 < l.block_count {
-                u64_at(bytes, l.table + (i + 1) * ENTRY) as usize
+                u32_at(bytes, l.table + (i + 1) * ENTRY) as usize
             } else {
                 u64_at(bytes, l.footer + 24) as usize
             };
@@ -159,6 +159,15 @@ fn reseal(bytes: &mut [u8]) {
     for (start, end) in frame_ranges(bytes) {
         let sum = checksum(&bytes[start..start + HEADER], &bytes[start + HEADER..end]);
         put_u32(bytes, start + 8, sum);
+    }
+}
+
+fn reseal_index(bytes: &mut [u8]) {
+    let footer = bytes.len() - FOOTER;
+    let start = u64_at(bytes, footer) as usize;
+    if start <= footer {
+        let sum = crc32fast::hash(&bytes[start..footer]);
+        put_u32(bytes, footer + 36, sum);
     }
 }
 
@@ -301,15 +310,26 @@ fn assemble_frames_with_min(
     let mut run = Vec::new();
     let mut table = Vec::new();
     let mut keys = min_key.to_vec();
-    for ((codec, decoded_len, stored), key) in frames.iter().zip(last_keys) {
-        table.extend_from_slice(&(run.len() as u64).to_le_bytes());
+    for (at, ((codec, decoded_len, stored), key)) in frames.iter().zip(last_keys).enumerate() {
+        table.extend_from_slice(&(run.len() as u32).to_le_bytes());
         let mut header = vec![*codec, u8::from(*codec == 1), 0, 0];
         header.extend_from_slice(&decoded_len.to_le_bytes());
         let sum = checksum(&header, stored);
         run.extend_from_slice(&header);
         run.extend_from_slice(&sum.to_le_bytes());
         run.extend_from_slice(stored);
-        keys.extend_from_slice(key);
+        let shared = if at % 16 == 0 || at + 1 == frames.len() {
+            0
+        } else {
+            last_keys[at - 1]
+                .iter()
+                .zip(*key)
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(u16::MAX as usize)
+        };
+        keys.extend_from_slice(&(shared as u16).to_le_bytes());
+        keys.extend_from_slice(&key[shared..]);
         table.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     }
     let dictionaries_offset = run.len() as u64;
@@ -330,8 +350,9 @@ fn assemble_frames_with_min(
     run.extend_from_slice(&dictionaries_offset.to_le_bytes());
     run.extend_from_slice(&u32::from(has_dictionary).to_le_bytes());
     run.extend_from_slice(&0u32.to_le_bytes());
-    run.extend_from_slice(&5u32.to_le_bytes());
+    run.extend_from_slice(&6u32.to_le_bytes());
     run.extend_from_slice(b"TSRA");
+    reseal_index(&mut run);
     run
 }
 
@@ -438,18 +459,19 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
         &checksum(&header1, block1).to_le_bytes(),
         block1,
         // table: frame_offset, key_end
-        &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
-        &[26, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
+        &[0, 0, 0, 0, 4, 0, 0, 0],
+        &[26, 0, 0, 0, 7, 0, 0, 0],
         // key area: the minimum key, then each block's last key
-        b"aab",
+        b"a\0\0a\0\0b",
         // footer: index_offset, record_count, block_count, min_key_len, version, magic
         &[51, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0],
         &[1, 0, 0, 0],
         &[51, 0, 0, 0, 0, 0, 0, 0],
-        &[0; 8],
-        &[5, 0, 0, 0],
+        &[0; 4],
+        &crc32fast::hash(&[&[0,0,0,0,4,0,0,0][..], &[26,0,0,0,7,0,0,0], b"a\0\0a\0\0b"].concat()).to_le_bytes(),
+        &[6, 0, 0, 0],
         b"TSRA",
     ]
     .concat();
@@ -1166,26 +1188,26 @@ fn malformed_structures_are_rejected() {
     let cases: &[(&str, Mutation, RunCorruption)] = &[
         ("magic", |b, l| b[l.footer + 47] ^= 1, InvalidMagic),
         ("version 2", |b, l| put_u32(b, l.footer + 40, 2), UnsupportedVersion),
-        ("version 5", |b, l| put_u32(b, l.footer + 40, 6), UnsupportedVersion),
+        ("version 5", |b, l| put_u32(b, l.footer + 40, 5), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),
         ("block count too large", |b, l| put_u32(b, l.footer + 16, u32::MAX), InvalidFooter),
         ("no blocks but frames", |b, l| put_u32(b, l.footer + 16, 0), InvalidFooter),
-        ("first frame offset", |b, l| put_u64(b, l.table, 1), InvalidIndex),
-        ("offset past frames", |b, l| put_u64(b, l.table + ENTRY, 1 << 30), InvalidIndex),
-        ("offset overflow", |b, l| put_u64(b, l.table + ENTRY, u64::MAX), InvalidIndex),
-        ("frame too short for header", |b, l| put_u64(b, l.table + ENTRY, 5), InvalidIndex),
+        ("first frame offset", |b, l| put_u32(b, l.table, 1), InvalidIndex),
+        ("offset past frames", |b, l| put_u32(b, l.table + ENTRY, 1 << 30), InvalidIndex),
+        ("offset overflow", |b, l| put_u32(b, l.table + ENTRY, u32::MAX), InvalidIndex),
+        ("frame too short for header", |b, l| put_u32(b, l.table + ENTRY, 5), InvalidIndex),
         ("frame overlap", |b, l| {
-            let second = u64_at(b, l.table + ENTRY);
-            put_u64(b, l.table + 2 * ENTRY, second - 1);
+            let second = u32_at(b, l.table + ENTRY);
+            put_u32(b, l.table + 2 * ENTRY, second - 1);
         }, InvalidIndex),
-        ("key end past area", |b, l| put_u32(b, l.table + 2 * ENTRY + 8, 1 << 20), InvalidIndex),
-        ("key ends decrease", |b, l| put_u32(b, l.table + ENTRY + 8, 1), InvalidIndex),
+        ("key end past area", |b, l| put_u32(b, l.table + 2 * ENTRY + 4, 1 << 20), InvalidIndex),
+        ("key ends decrease", |b, l| put_u32(b, l.table + ENTRY + 4, 1), InvalidIndex),
         ("key area has trailing bytes", |b, l| b.insert(l.footer, 0), InvalidIndex),
         // The key area starts with the five bytes of the minimum key, "apple".
         ("minimum key differs", |b, l| b[l.keys] ^= 1, InvalidKeyRange),
         ("last key differs", |b, l| b[l.keys + 9] += 1, InvalidIndex),
-        ("last key below minimum", |b, l| b[l.keys + 5] ^= 1, InvalidKeyRange),
+        ("last key below minimum", |b, l| b[l.keys + 7] ^= 1, InvalidKeyRange),
         ("final key differs", |b, l| b[l.footer - 1] ^= 1, InvalidIndex),
         ("record count low", |b, l| put_u64(b, l.footer + 8, 4), RecordCountMismatch),
         ("record count high", |b, l| put_u64(b, l.footer + 8, 6), RecordCountMismatch),
@@ -1196,6 +1218,7 @@ fn malformed_structures_are_rejected() {
         for (name, mutate, kind) in cases {
             let mut bytes = base.clone();
             mutate(&mut bytes, layout(&base));
+            reseal_index(&mut bytes);
             let error = Run::new(bytes.as_slice()).expect_err(name);
             assert_eq!(error.kind, *kind, "{codec:?} {name}");
             assert_read_paths_are_safe(&bytes);
@@ -1270,8 +1293,9 @@ fn a_gap_between_frames_is_rejected() {
     ] {
         let mut bytes = three_block_bytes(codec);
         let l = layout(&bytes);
-        let second = u64_at(&bytes, l.table + ENTRY);
-        put_u64(&mut bytes, l.table + ENTRY, second + 1);
+        let second = u32_at(&bytes, l.table + ENTRY);
+        put_u32(&mut bytes, l.table + ENTRY, second + 1);
+        reseal_index(&mut bytes);
         assert_eq!(Run::new(bytes.as_slice()).unwrap_err().kind, kind);
     }
 }
@@ -1570,7 +1594,8 @@ fn view_trusts_the_index_and_full_validation_does_not() {
         let mut lying = base.clone();
         // "mango" becomes "aango", which is below its block's real last key.
         // It follows the minimum key and the first block's key, both "apple".
-        lying[l.keys + 10] = b'a';
+        lying[l.keys + 14] = b'a';
+        reseal_index(&mut lying);
 
         let view = RunView::open(&lying).unwrap();
         let mut workspace = ReadWorkspace::new();
@@ -1729,4 +1754,69 @@ fn a_built_runs_filter_never_hides_a_key_and_reloaded_bytes_fall_back() {
     }
     assert_eq!(blocks[1], 2_000);
     assert!(blocks[0] < 60, "{} of 2000 absent keys decoded", blocks[0]);
+}
+
+#[test]
+fn prefix_compressed_index_restarts_and_damage_are_checked() {
+    let records: Vec<_> = (0..65)
+        .map(|i| {
+            rec(
+                format!("a-long-shared-prefix/{i:04}").as_bytes(),
+                1,
+                Some(b"v"),
+            )
+        })
+        .collect();
+    let run = build(Codec::None, &records, 1);
+    let bytes = run.as_bytes();
+    let l = layout(&bytes);
+    assert_eq!(l.block_count, 65);
+    let entry_start = |at: usize| {
+        if at == 0 {
+            l.keys + records[0].0.len()
+        } else {
+            l.keys + u32_at(&bytes, l.table + (at - 1) * ENTRY + 4) as usize
+        }
+    };
+    for (at, record) in records.iter().enumerate() {
+        let start = entry_start(at);
+        let shared = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap());
+        assert_eq!(shared == 0, at % 16 == 0 || at == 64);
+        assert_eq!(run.view().locate(&record.0).unwrap(), Some(at));
+    }
+    assert!(run.view().index_len() < 65 * (ENTRY + records[0].0.len()));
+    for (at, prefix) in [(16, 1u16), (17, u16::MAX), (64, 1)] {
+        let mut damaged = bytes.to_vec();
+        let start = entry_start(at);
+        damaged[start..start + 2].copy_from_slice(&prefix.to_le_bytes());
+        assert_eq!(
+            Run::new(damaged.clone()).unwrap_err().kind,
+            RunCorruption::ChecksumMismatch
+        );
+        reseal_index(&mut damaged);
+        assert_eq!(
+            Run::new(damaged.clone()).unwrap_err().kind,
+            RunCorruption::InvalidIndex
+        );
+        assert_read_paths_are_safe(&damaged);
+    }
+}
+
+#[test]
+fn prefix_chains_and_maximum_keys_find_the_first_version_across_restarts() {
+    let mut records = Vec::new();
+    for len in 1..=48 {
+        for seq in (1..=3).rev() {
+            records.push(rec(&vec![b'a'; len], seq, Some(b"v")));
+        }
+    }
+    for len in [crate::block::MAX_KEY_LEN - 1, crate::block::MAX_KEY_LEN] {
+        records.push(rec(&vec![b'b'; len], 1, Some(b"long")));
+    }
+    let run = build(Codec::None, &records, 1);
+    for at in (0..144).step_by(3).chain(144..146) {
+        assert_eq!(run.view().locate(&records[at].0).unwrap(), Some(at));
+        assert_eq!(newest(&run, &records[at].0).unwrap().0, records[at].1);
+    }
+    assert_eq!(all(&Run::new(run.as_bytes()).unwrap()), records);
 }

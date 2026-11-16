@@ -68,12 +68,12 @@ struct Layout {
 
 fn layout(bytes: &[u8]) -> Layout {
     let footer = bytes.len() - FOOTER;
-    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    let u64_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let table = u64_at(footer);
     Layout {
         table,
-        keys: table + u32_at(footer + 16) * 12,
+        keys: table + u32_at(footer + 16) * 8,
         footer,
         min_len: u32_at(footer + 20),
         first_frame_payload: 12,
@@ -154,10 +154,10 @@ fn the_minimum_key_is_stored_once_ahead_of_the_block_keys() {
     assert_eq!(l.min_len, 9);
     assert_eq!(&bytes[l.keys..l.keys + 9], b"key:00000");
     // One minimum key, then one last key per block.
-    assert_eq!(l.footer - l.keys, 9 * (1 + run.block_count()));
+    assert_eq!(l.footer - l.keys, 9 + (2 + 9) * 2 + (2 + 1));
     assert_eq!(
         run.view().index_len(),
-        12 * run.block_count() + 9 * (1 + run.block_count())
+        8 * run.block_count() + 9 + (2 + 9) * 2 + (2 + 1)
     );
 }
 
@@ -192,6 +192,9 @@ fn a_minimum_key_differing_from_the_first_record_is_rejected() {
             .to_vec();
         let at = layout(&bytes).keys;
         damage(&mut bytes, at);
+        let l = layout(&bytes);
+        let sum = crc32fast::hash(&bytes[l.table..l.footer]);
+        put_u32(&mut bytes, l.footer + 36, sum);
         assert_eq!(
             kind_of(Run::new(bytes).unwrap_err()),
             RunCorruption::InvalidKeyRange,
@@ -244,7 +247,7 @@ fn malformed_minimum_key_lengths_are_rejected_on_open() {
 #[test]
 fn a_minimum_key_over_the_limit_is_rejected_even_inside_a_large_key_area() {
     // One block per record, so the key area outgrows the key length limit.
-    let mut bytes = build(Codec::None, &numbered(0..8000), 1)
+    let mut bytes = build(Codec::None, &numbered(0..24000), 1)
         .as_bytes()
         .to_vec();
     let l = layout(&bytes);
@@ -514,8 +517,8 @@ fn an_empty_prefix_and_the_empty_key_read_a_run_whose_minimum_is_empty() {
 
 fn damaged(run: &Run<Vec<u8>>, frame: usize) -> Vec<u8> {
     let mut bytes = run.as_bytes().to_vec();
-    let at = layout(&bytes).table + frame * 12;
-    let start = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    let at = layout(&bytes).table + frame * 8;
+    let start = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let _ = layout(&bytes).first_frame_payload;
     bytes[start + 12] ^= 0xFF;
     bytes

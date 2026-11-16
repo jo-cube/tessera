@@ -32,7 +32,8 @@
 //!   of a validated compressed run is a reportable event, so reads on [`Run`]
 //!   are fallible too.
 //!
-//! A point lookup binary searches the index and then decodes one frame.
+//! A point lookup binary searches restart keys, scans at most sixteen index
+//! entries and then decodes one frame.
 //!
 //! # Format
 //!
@@ -40,15 +41,16 @@
 //! block length and dictionary always encode to the same bytes. A run
 //! contains no process pointers.
 //!
-//! Version 5 stores independently decodable blocks followed by raw-content
+//! Version 6 stores independently decodable blocks followed by raw-content
 //! segment dictionaries, a segment table, the sparse block index, keys and footer.
 //!
 //! ```text
 //! frame := codec:u8 dictionary_ref:u24 decoded_len:u32 checksum:u32 stored
 //! segment := dictionary_offset:u64 dictionary_len:u32 dictionary_crc:u32
-//! entry := frame_offset:u64 key_end:u32
+//! entry := frame_offset:u32 key_end:u32
+//! index_key := shared_prefix:u16 suffix (length delimited by key_end)
 //! footer := index_offset:u64 record_count:u64 block_count:u32 min_key_len:u32
-//!           dictionaries_offset:u64 segment_count:u32 reserved:u32
+//!           dictionaries_offset:u64 segment_count:u32 index_crc:u32
 //!           version:u32 magic:u32
 //! ```
 //!
@@ -58,6 +60,12 @@
 //! frames and that table. Dictionaries contain at most 16 KiB of raw content.
 //! The frame CRC covers its first eight header bytes and stored payload.
 //! Dictionary CRCs are checked before decoding. No prepared dictionaries are held.
+//!
+//! The key area starts with the minimum key, then prefix-compressed last keys.
+//! Every sixteenth key and the final key have zero shared prefix. Shared lengths
+//! refer to the previous key and are capped at 65,535. The index CRC covers all
+//! table entries and key bytes. It is verified during full validation, while
+//! trusted reads check the entries they touch. Runs must fit in `u32::MAX` bytes.
 //!
 //! Validation checks all regions, checksums, record ordering, index keys,
 //! the minimum key and record count. Empty runs contain only the footer.
@@ -71,6 +79,7 @@ mod dictionary;
 mod filter;
 mod frame;
 mod group;
+mod index;
 mod logical;
 mod merge;
 mod reader;
@@ -127,8 +136,8 @@ pub const MAX_TARGET_RUN_LEN: usize = 1 << 30;
 pub(crate) const RECORD_INPUT_OVERHEAD: usize = 16;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
-const FORMAT_VERSION: u32 = 5;
-const TABLE_ENTRY_LEN: usize = 12;
+const FORMAT_VERSION: u32 = 6;
+const TABLE_ENTRY_LEN: usize = 8;
 const SEGMENT_ENTRY_LEN: usize = 16;
 const FOOTER_LEN: usize = 48;
 

@@ -1,7 +1,9 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::block::{BlockPosition, BlockView, MAX_KEY_LEN, Record, RecordWalk, Value, Version};
+use crate::block::{
+    BlockPosition, BlockView, MAX_KEY_LEN, RESTART_INTERVAL, Record, RecordWalk, Value, Version,
+};
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
 use super::dictionary::DICTIONARY_LEN;
@@ -9,6 +11,7 @@ use super::dictionary::DICTIONARY_LEN;
 use super::filter::KeyHashes;
 use super::filter::{self as key_filter, KeyFilter};
 use super::frame::{self, Frame};
+use super::index::IndexKey;
 use super::storage::{Packing, Region, RunData, Segmented};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, SEGMENT_ENTRY_LEN,
@@ -310,7 +313,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
     pub(crate) fn index_bytes(&self) -> usize {
         let view = self.view();
-        view.table.len() * TABLE_ENTRY_LEN + view.keys.len()
+        view.index_len()
     }
     /// Serialized byte count, excluding filters and physical segment metadata.
     pub fn stored_len(&self) -> usize {
@@ -983,7 +986,7 @@ impl<'a> RunView<'a> {
             return Err(corrupt(offset, RunCorruption::UnsupportedVersion));
         }
         let invalid = corrupt(offset, RunCorruption::InvalidFooter);
-        if read_u32(footer, 36) != 0 {
+        if offset.saturating_add(FOOTER_LEN) > u32::MAX as usize {
             return Err(invalid);
         }
         let record_count = usize::try_from(read_u64(footer, 8)).map_err(|_| invalid)?;
@@ -1045,7 +1048,7 @@ impl<'a> RunView<'a> {
                 if key_end(last) != keys.len() {
                     return Err(view.invalid_index(view.table.len() - 1));
                 }
-                if view.last_key(0)? < min_key {
+                if view.last_key(0)?.cmp(min_key).is_lt() {
                     return Err(view.invalid_key_range());
                 }
             }
@@ -1122,10 +1125,6 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns the bytes used by the table and key area.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
     pub fn index_len(self) -> usize {
         size_of_val(self.table) + self.keys.len()
     }
@@ -1138,7 +1137,7 @@ impl<'a> RunView<'a> {
         };
         Ok(Some(KeyRange {
             min: self.min_key,
-            max: self.last_key(last)?,
+            max: self.unshared_key(last)?,
         }))
     }
 
@@ -1158,16 +1157,28 @@ impl<'a> RunView<'a> {
     /// An earlier block ends below `target`, so it cannot hold the key, and
     /// any later block holds only older versions.
     pub fn locate(self, target: &[u8]) -> Result<Option<usize>, CorruptRun> {
-        let (mut low, mut high) = (0, self.table.len());
+        // Find the first restart key >= target. Its preceding interval may
+        // already hold the key, including versions spanning restart points.
+        let restarts = self.table.len().div_ceil(RESTART_INTERVAL);
+        let (mut low, mut high) = (0, restarts);
         while low < high {
             let middle = low + (high - low) / 2;
-            if self.last_key(middle)? < target {
+            if self.unshared_key(middle * RESTART_INTERVAL)? < target {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        Ok((low < self.table.len()).then_some(low))
+        let start = low.saturating_sub(1) * RESTART_INTERVAL;
+        let end = (low * RESTART_INTERVAL).min(self.table.len());
+        let mut key = IndexKey::new();
+        for block in start..end {
+            self.append_index_key(block, &mut key)?;
+            if !key.cmp(target).is_lt() {
+                return Ok(Some(block));
+            }
+        }
+        Ok((low < restarts).then_some(low * RESTART_INTERVAL))
     }
 
     /// Returns the newest version of `target`, which may be a tombstone, or
@@ -1218,7 +1229,7 @@ impl<'a> RunView<'a> {
             };
             let last = self.last_key(block)?;
             let start = next;
-            while next < indices.len() && keys[indices[next]].as_ref() <= last {
+            while next < indices.len() && !last.cmp(keys[indices[next]].as_ref()).is_lt() {
                 next += 1;
             }
             let frame = self.frame(block)?;
@@ -1288,14 +1299,45 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns a block's index key. `block` must be below the block count.
-    pub(super) fn last_key(self, block: usize) -> Result<&'a [u8], CorruptRun> {
-        let start = match block.checked_sub(1) {
-            Some(previous) => key_end(self.table[previous]),
-            None => self.min_key.len(),
-        };
-        self.keys
-            .get(start..key_end(self.table[block]))
-            .ok_or(self.invalid_index(block))
+    pub(super) fn last_key(self, block: usize) -> Result<IndexKey<'a>, CorruptRun> {
+        let mut key = IndexKey::new();
+        for at in block / RESTART_INTERVAL * RESTART_INTERVAL..=block {
+            self.append_index_key(at, &mut key)?;
+        }
+        Ok(key)
+    }
+
+    fn index_entry(self, block: usize) -> Result<(usize, &'a [u8]), CorruptRun> {
+        let entry = self.table.get(block).ok_or(self.invalid_index(block))?;
+        let start = block
+            .checked_sub(1)
+            .map_or(self.min_key.len(), |previous| key_end(self.table[previous]));
+        let bytes = self
+            .keys
+            .get(start..key_end(*entry))
+            .ok_or(self.invalid_index(block))?;
+        let (shared, suffix) = bytes
+            .split_first_chunk::<2>()
+            .ok_or(self.invalid_index(block))?;
+        let shared = u16::from_le_bytes(*shared) as usize;
+        if ((block.is_multiple_of(RESTART_INTERVAL) || block + 1 == self.table.len())
+            && shared != 0)
+            || suffix.len() > MAX_KEY_LEN
+        {
+            return Err(self.invalid_index(block));
+        }
+        Ok((shared, suffix))
+    }
+    fn unshared_key(self, block: usize) -> Result<&'a [u8], CorruptRun> {
+        let (shared, suffix) = self.index_entry(block)?;
+        if shared != 0 {
+            return Err(self.invalid_index(block));
+        }
+        Ok(suffix)
+    }
+    fn append_index_key(self, block: usize, key: &mut IndexKey<'a>) -> Result<(), CorruptRun> {
+        let (shared, suffix) = self.index_entry(block)?;
+        key.append(shared, suffix).ok_or(self.invalid_index(block))
     }
 
     /// Finds a frame and checks its header. `block` must be below the block
@@ -1343,11 +1385,11 @@ fn corrupt(offset: usize, kind: RunCorruption) -> CorruptRun {
 
 /// An offset too large for `usize` becomes one that no slice can satisfy.
 fn frame_offset(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
-    usize::try_from(read_u64(&entry, 0)).unwrap_or(usize::MAX)
+    read_u32(&entry, 0) as usize
 }
 
 fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
-    read_u32(&entry, 8) as usize
+    read_u32(&entry, 4) as usize
 }
 
 /// Checks every invariant in the module documentation.
@@ -1360,6 +1402,14 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// Checks all raw dictionaries before decoding any frame. No prepared state.
 fn validate(bytes: &[u8]) -> Result<(u64, bool, usize), CorruptRun> {
     let view = RunView::open(bytes)?;
+    let footer_at = bytes.len() - FOOTER_LEN;
+    let expected = u32::from_le_bytes(bytes[footer_at + 36..footer_at + 40].try_into().unwrap());
+    if crc32fast::hash(&bytes[view.table_offset()..footer_at]) != expected {
+        return Err(corrupt(
+            view.table_offset(),
+            RunCorruption::ChecksumMismatch,
+        ));
+    }
     let mut next = view.frames.len();
     for (i, entry) in view.segments.iter().enumerate() {
         if read_u64(entry, 0) != next as u64 {
@@ -1396,7 +1446,7 @@ fn validate(bytes: &[u8]) -> Result<(u64, bool, usize), CorruptRun> {
                 return Err(view.invalid_key_range());
             }
         }
-        if view.last_key(block)? != walk.key {
+        if !view.last_key(block)?.cmp(&walk.key).is_eq() {
             return Err(view.invalid_index(block));
         }
     }

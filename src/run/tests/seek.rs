@@ -384,8 +384,8 @@ fn frame_starts(bytes: &[u8]) -> Vec<usize> {
     let count = u32::from_le_bytes(bytes[footer + 16..footer + 20].try_into().unwrap()) as usize;
     (0..count)
         .map(|i| {
-            let at = table + i * 12;
-            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+            let at = table + i * 8;
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
         })
         .collect()
 }
