@@ -122,7 +122,7 @@ pub(crate) use reader::ReadWorkspace;
 pub use reader::{KeyRange, RunCursor};
 
 /// Default estimated compressed block target.
-pub const TARGET_BLOCK_COMPRESSED: usize = 1024;
+pub const TARGET_BLOCK_COMPRESSED: usize = 2048;
 /// Fixed raw target for uncompressed runs.
 pub const TARGET_BLOCK_LEN: usize = 16 << 10;
 /// Raw block cap, except for a single oversized record.
