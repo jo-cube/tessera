@@ -3,6 +3,27 @@ use crate::block::BlockBuilder;
 use crate::run::RunBuilder;
 use crate::run::dictionary::SEGMENT_RAW_LEN;
 
+#[test]
+fn persisted_filters_cannot_hide_present_keys() {
+    for codec in [Codec::None, Codec::Zstd] {
+        let mut builder = RunBuilder::new(codec);
+        builder.add(b"key", 1, Value::Bytes(b"value")).unwrap();
+        let bytes = builder.finish().as_bytes().into_owned();
+        let result = Run::recover_checkpoint_in(bytes.clone(), &[0; 8], &ChunkPool::new(0));
+        assert_eq!(result.unwrap_err().kind, RunCorruption::InvalidFilter);
+        // Extra Bloom bits and absent filters are safe.
+        for filter in [&[][..], &[255; 8][..]] {
+            let (run, _) =
+                Run::recover_checkpoint_in(bytes.clone(), filter, &ChunkPool::new(0)).unwrap();
+            assert!(
+                run.get(b"key", &mut ReadWorkspace::new())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+}
+
 fn build(codec: Codec) -> Run<Vec<u8>> {
     let mut builder = RunBuilder::new(codec);
     for i in 0..9_000u32 {
