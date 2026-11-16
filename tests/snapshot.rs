@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Snapshots: views that hold no lock, what they keep alive, and the limits on
 //! taking them.
 //!
@@ -7,6 +6,7 @@
 //! and the memtable tests check the copy-on-write tree on its own.
 //! Concurrency tests use barriers and joins and never sleep.
 
+use crate::test_support::wait_until;
 use std::sync::Barrier;
 use std::thread;
 
@@ -86,6 +86,7 @@ fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
     engine.delete(b"b").unwrap();
     let first = engine.snapshot();
     // Nothing was frozen, flushed or copied.
+    wait_until(|| engine.stats().retained_sources == 0);
     let stats = engine.stats();
     assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
     assert_eq!((stats.retained_sources, stats.retained_bytes), (0, 0));
@@ -193,6 +194,7 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     let first = engine.snapshot();
     // Nothing written since: the second shares the first's view.
     let second = engine.snapshot();
+    wait_until(|| engine.stats().retained_sources == 0);
     let stats = engine.stats();
     assert_eq!((stats.snapshots, stats.frozen_tables), (2, 0));
     assert_eq!((stats.retained_sources, stats.retained_bytes), (0, 0));
@@ -206,6 +208,7 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     let report = engine.flush().unwrap();
     assert_eq!(report.tables, 1);
     assert!(compact_all(&engine) > 0);
+    wait_until(|| engine.stats().retained_sources == 2);
     let held = engine.stats();
     // The flushed table, charged as the snapshots' view with what it
     // pinned, and the run it shadowed, since merged away. The run flushed after the snapshots
@@ -225,6 +228,7 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     assert_eq!(value(&second, b"a").unwrap(), b"2");
 
     drop(second);
+    wait_until(|| engine.stats().retained_sources == 0);
     let stats = engine.stats();
     assert_eq!((stats.snapshots, stats.retained_sources), (0, 0));
     assert_eq!((stats.retained_bytes, stats.retained_run_bytes), (0, 0));
@@ -251,6 +255,7 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     engine.flush().unwrap();
     // Only the small view and the leaves the inserts copied away from it
     // remain once the table is freed; the table's own charge is not kept.
+    wait_until(|| engine.stats().retained_bytes == seen + pinned);
     let retained = engine.stats().retained_bytes;
     assert_eq!(retained, seen + pinned);
     assert!(retained * 20 < full, "{retained} of {full}");
@@ -266,6 +271,7 @@ fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
     assert_eq!(value(&small, b"seen").unwrap(), b"1");
     assert_eq!(value(&whole, b"seen").unwrap(), b"2");
     drop((small, whole));
+    wait_until(|| engine.stats().retained_bytes == 0);
     assert_eq!(engine.stats().retained_bytes, 0);
 }
 
@@ -446,6 +452,7 @@ fn a_point_read_keeps_no_replaced_run_alive_after_it_returns() {
     );
     assert!(engine.get(b"c", &mut workspace).unwrap().is_none());
     assert!(compact_all(&engine) > 0);
+    wait_until(|| engine.stats().retained_sources == 0);
     let stats = engine.stats();
     assert_eq!(
         (stats.runs, stats.retained_sources, stats.retained_bytes),

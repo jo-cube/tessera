@@ -2852,6 +2852,7 @@ mod tests {
             .is_some()
         {}
         assert_eq!(engine.stats().runs, 1);
+        crate::test_support::wait_until(|| inputs.iter().all(|run| Arc::strong_count(run) == 1));
         assert!(inputs.iter().all(|run| Arc::strong_count(run) == 1));
     }
 

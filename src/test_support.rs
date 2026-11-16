@@ -55,6 +55,19 @@ pub(crate) fn mutate(
 
 pub(crate) struct Scratch(pub(crate) std::path::PathBuf);
 
+/// Publication makes records visible before the worker drops its temporary
+/// source references. Retention assertions wait for that asynchronous cleanup.
+pub(crate) fn wait_until(mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "publication cleanup timed out"
+        );
+        std::thread::yield_now();
+    }
+}
+
 impl Scratch {
     pub(crate) fn new(name: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
