@@ -227,7 +227,7 @@ pub enum Damage {
     },
     /// A run is not a valid run.
     Run(CorruptRun),
-    /// The run IDs, levels, flush groups or disjoint level ordering are invalid.
+    /// Run IDs, levels, flush groups, level ordering or copies of one update disagree.
     Order,
     /// A record has a sequence number above the checkpoint's ceiling.
     Sequence {
@@ -1298,6 +1298,27 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
             },
         ));
     }
+    // Per-run checks cannot detect disagreeing copies in different runs. Check
+    // the same grouped logical view used by readers before exposing an engine.
+    // This holds one decoded block per overlapping group, with no value copies.
+    {
+        let published: Vec<_> = runs.iter().map(|(_, _, run)| Arc::clone(run)).collect();
+        let directory = super::directory::RunDirectory::build(&published);
+        let mut workspace = crate::run::LogicalWorkspace::default();
+        let mut cursor =
+            crate::run::LogicalCursor::grouped(&directory, directory.groups(), &mut workspace);
+        while cursor
+            .next_record()
+            .map_err(|error| {
+                let damage = match error {
+                    crate::run::ReadError::Corrupt(error) => Damage::Run(error),
+                    crate::run::ReadError::ConflictingCopies(_) => Damage::Order,
+                };
+                corrupt(&manifest_path, damage)
+            })?
+            .is_some()
+        {}
+    }
     let run_bytes: usize = runs.iter().map(|(_, _, r)| r.run.stored_len()).sum();
     let held_bytes: usize = runs.iter().map(|(_, _, r)| r.run.held_bytes()).sum();
     Ok(Loaded {
@@ -1320,6 +1341,46 @@ mod robustness;
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn recovery_rejects_conflicting_copies_across_valid_runs() {
+        for identical in [false, true] {
+            let dir = scratch(if identical {
+                "identical-copies"
+            } else {
+                "conflicting-copies"
+            });
+            let engine = Engine::new(manual()).unwrap();
+            for value in [b"old".as_slice(), if identical { b"old" } else { b"new" }] {
+                let mut batch = crate::engine::WriteBatch::new();
+                batch.put(b"key", value);
+                engine.ingest_sorted(&batch).unwrap();
+            }
+            engine
+                .checkpoint(&dir, CheckpointOptions::default())
+                .unwrap();
+            engine.close().unwrap();
+            let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
+            assert_eq!(manifest.runs.len(), 2);
+            manifest.runs[1].seq_override = manifest.runs[0].seq_override;
+            fs::write(path, manifest.encode()).unwrap();
+            let result = Engine::recover(&dir, manual());
+            if identical {
+                let recovered = result.unwrap();
+                assert_eq!(state(&recovered), vec![(b"key".to_vec(), b"old".to_vec())]);
+                recovered.close().unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(OpenError::Corrupt {
+                        damage: Damage::Order,
+                        ..
+                    })
+                ));
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn an_unlimited_file_bound_does_not_overflow() {
