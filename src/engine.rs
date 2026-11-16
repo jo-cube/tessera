@@ -125,7 +125,7 @@
 //! [`Engine::checkpoint_with_metadata`] and [`Engine::recover_with_metadata`]
 //! to store and recover opaque application metadata (up to 16 MiB).
 //! Run format 6 stores magicless Zstandard frames and prefix-compressed index
-//! keys; checkpoint manifests use version 3. Recovery validates file lengths,
+//! keys; checkpoint manifests use version 4. Recovery validates file lengths,
 //! checksums, all records, filter membership and cross-run copies before
 //! starting workers. CRC-32 detects damage but does not authenticate files.
 //!

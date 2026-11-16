@@ -64,7 +64,9 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-const MANIFEST_VERSION: u32 = 3;
+// The run-file envelope includes the Bloom layout. Version 3 used global probes;
+// version 4 uses aligned 512-bit blocks. The run's own format stays at version 6.
+const MANIFEST_VERSION: u32 = 4;
 // Magic/version/flags, generation/ceiling/records/next-id/previous,
 // depth, metadata length, run count. Entries include both file and run lengths.
 const MANIFEST_HEADER_LEN: usize = 72;
@@ -1376,6 +1378,28 @@ mod robustness;
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn the_previous_filter_envelope_is_rejected_even_with_a_repaired_checksum() {
+        let dir = scratch("old-filter-envelope");
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let (_, _, manifest) = committed_manifest(&dir).unwrap();
+        let mut bytes = manifest.encode();
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let end = bytes.len() - 4;
+        let sum = crc(&[&bytes[..end]]);
+        bytes[end..].copy_from_slice(&sum.to_le_bytes());
+        assert!(matches!(
+            Manifest::decode(&bytes),
+            Err(Damage::Unsupported { version: 3, .. })
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn manifest_lengths_are_bounded_by_the_run_and_filter_formats() {

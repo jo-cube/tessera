@@ -146,7 +146,8 @@ of at most 16 MiB in the same commit.
 The layout is `CURRENT`, `LOCK`, `runs/<32-hex-digit ID>` and
 `ckpt-<20-digit generation>/MANIFEST`. Run format 6 uses magicless Zstandard
 frames and a prefix-compressed sparse index. Each run file appends Bloom words
-and their CRC-32. Manifest version 3 records file checksums and lengths, levels,
+and their CRC-32. Manifest/envelope version 4 selects cache-line-blocked Bloom
+filters and records file checksums and lengths, levels,
 flush groups, sequence overrides, the ceiling and application metadata.
 Unsupported versions are rejected.
 

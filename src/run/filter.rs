@@ -1,22 +1,25 @@
 //! Run-local Bloom filters over user keys.
 //!
 //! Filters accompany checkpoint run bytes with their own checksum. Hashing
-//! is fixed by checkpoint format 3: FNV-1a followed by the MurmurHash3 finalizer.
+//! is fixed: FNV-1a followed by the MurmurHash3 finalizer. Checkpoint envelope
+//! version 4 fixes the blocked layout and probe sequence below.
 //! Every version and tombstone contributes its key; a negative is exact.
 
 use std::fmt;
 
-/// Ten bits per distinct key with seven probes: about a 0.8% false positive
-/// rate, near the optimum for that size.
+/// Ten bits per distinct key in 512-bit blocks. With Poisson block occupancy,
+/// six probes give about 0.96% false positives, almost identical to seven.
 const BITS_PER_KEY: usize = 10;
-const PROBES: u64 = 7;
+const PROBES: usize = 6;
+const BLOCK_BITS: usize = 512;
 
 /// Distinct keys beyond which a run gets no filter, so that the hashes held
 /// while building (8 bytes each) and the filter stay bounded. A flush or
 /// compaction run of the default length holds far fewer.
 pub(crate) const MAX_FILTER_KEYS: usize = 1 << 24;
 
-pub(crate) const MAX_FILTER_BYTES: usize = (MAX_FILTER_KEYS * BITS_PER_KEY).div_ceil(64) * 8;
+pub(crate) const MAX_FILTER_BYTES: usize =
+    (MAX_FILTER_KEYS * BITS_PER_KEY).div_ceil(BLOCK_BITS) * 64;
 
 /// Hashes first reserved, after which the buffer doubles up to its limit.
 const FIRST_RESERVE: usize = 1024;
@@ -33,20 +36,29 @@ pub(crate) fn hash(key: &[u8]) -> u64 {
     h ^ (h >> 33)
 }
 
-/// Which bits a hash sets, in a filter of `bits` bits.
-fn probes(hash: u64, bits: u64) -> impl Iterator<Item = usize> {
-    let step = hash.rotate_left(32) | 1;
-    (0..PROBES).map(move |i| {
-        let mixed = hash.wrapping_add(i.wrapping_mul(step));
-        // Below `bits`, which came from a slice length.
-        ((u128::from(mixed) * u128::from(bits)) >> 64) as usize
+/// Block selection and local probes use separate halves of the mixed hash.
+fn block(hash: u64, count: usize) -> usize {
+    ((u64::from(hash as u32) * count as u64) >> 32) as usize
+}
+
+fn probes(hash: u64) -> impl Iterator<Item = usize> {
+    let mut local = (hash >> 32) as u32;
+    (0..PROBES).map(move |_| {
+        let bit = (local >> 23) as usize;
+        local = local.wrapping_mul(0x9e37_79b9);
+        bit
     })
 }
+
+/// Safe allocation alignment ensures that a block never straddles cache lines.
+#[repr(align(64))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterBlock([u64; 8]);
 
 /// A run's Bloom filter.
 #[derive(Clone)]
 pub(crate) struct KeyFilter {
-    words: Box<[u64]>,
+    blocks: Box<[FilterBlock]>,
     /// The bytes the builder held for hashes while building it.
     build_bytes: usize,
 }
@@ -55,28 +67,34 @@ impl KeyFilter {
     /// Whether a key with this hash may be in the run. Never false for a key
     /// that is.
     pub(crate) fn may_contain(&self, hash: u64) -> bool {
-        let bits = self.words.len() as u64 * 64;
-        probes(hash, bits).all(|bit| self.words[bit / 64] & (1 << (bit % 64)) != 0)
+        let words = &self.blocks[block(hash, self.blocks.len())].0;
+        probes(hash).all(|bit| words[bit / 64] & (1 << (bit % 64)) != 0)
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.words.len() * size_of::<u64>()
+        size_of_val(&*self.blocks)
     }
 
     pub(crate) fn encoded(&self) -> impl Iterator<Item = [u8; 8]> + '_ {
-        self.words.iter().map(|word| word.to_le_bytes())
+        self.blocks
+            .iter()
+            .flat_map(|block| block.0.iter().map(|word| word.to_le_bytes()))
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || !bytes.len().is_multiple_of(8) || bytes.len() > MAX_FILTER_BYTES {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(64) || bytes.len() > MAX_FILTER_BYTES {
             return None;
         }
         Some(Self {
-            words: bytes
-                .as_chunks::<8>()
+            blocks: bytes
+                .as_chunks::<64>()
                 .0
                 .iter()
-                .map(|word| u64::from_le_bytes(*word))
+                .map(|block| {
+                    FilterBlock(std::array::from_fn(|i| {
+                        u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap())
+                    }))
+                })
                 .collect(),
             build_bytes: 0,
         })
@@ -170,15 +188,15 @@ impl KeyHashes {
         }
         // The limit keeps this far from overflow; checked regardless.
         let bits = self.hashes.len().checked_mul(BITS_PER_KEY)?;
-        let mut words = vec![0u64; bits.div_ceil(64)].into_boxed_slice();
-        let total = words.len() as u64 * 64;
+        let mut blocks = vec![FilterBlock([0; 8]); bits.div_ceil(BLOCK_BITS)].into_boxed_slice();
         for &hash in &self.hashes {
-            for bit in probes(hash, total) {
+            let words = &mut blocks[block(hash, blocks.len())].0;
+            for bit in probes(hash) {
                 words[bit / 64] |= 1 << (bit % 64);
             }
         }
         Some(KeyFilter {
-            words,
+            blocks,
             build_bytes: self.held_bytes(),
         })
     }
@@ -198,7 +216,7 @@ mod tests {
 
     #[test]
     fn persisted_filters_keep_their_hash_and_bits() {
-        // Golden hashes are part of checkpoint format 3, independent of std's
+        // Golden hashes are independent of std's
         // DefaultHasher implementation and the machine's byte order.
         assert_eq!(hash(b""), 0xefd0_1f60_ba99_2926);
         assert_eq!(hash(b"a"), 0x82a2_a958_a9be_ce5b);
@@ -206,7 +224,8 @@ mod tests {
         let original = filter(&[b"a", b"b", b"c"]);
         let bytes: Vec<_> = original.encoded().flatten().collect();
         let restored = KeyFilter::decode(&bytes).unwrap();
-        assert_eq!(restored.words, original.words);
+        assert_eq!(restored.blocks, original.blocks);
+        assert_eq!(restored.blocks.as_ptr().addr() % 64, 0);
         assert_eq!(restored.build_bytes(), 0);
         assert!(
             [b"a", b"b", b"c"]
@@ -215,6 +234,8 @@ mod tests {
         );
         assert!(KeyFilter::decode(&[]).is_none());
         assert!(KeyFilter::decode(&[0; 7]).is_none());
+        assert!(KeyFilter::decode(&[0; 63]).is_none());
+        assert!(KeyFilter::decode(&[0; 65]).is_none());
     }
 
     #[test]
@@ -226,11 +247,15 @@ mod tests {
         let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
         let filter = filter(&refs);
         assert!(keys.iter().all(|key| filter.may_contain(hash(key))));
-        // About 1% of other keys pass; the hash is fixed, so this is exact.
-        let passed = (20_000..40_000u32)
+        assert_eq!(filter.blocks.as_ptr().addr() % 64, 0);
+        assert!(filter.bytes() >= keys.len() * BITS_PER_KEY / 8);
+        assert!(filter.bytes() < keys.len() * BITS_PER_KEY / 8 + 64);
+        // One million absent keys; fixed hashes make this reproducible.
+        let passed = (20_000..1_020_000u32)
             .filter(|i| filter.may_contain(hash(&i.to_be_bytes())))
             .count();
-        assert!(passed < 400, "{passed} of 20000 absent keys passed");
+        println!("blocked Bloom: {passed}/1000000 absent keys passed");
+        assert!((8_000..13_000).contains(&passed), "{passed}/1000000");
     }
 
     #[test]
@@ -240,8 +265,8 @@ mod tests {
             hashes.add(key);
         }
         assert_eq!(hashes.hashes.len(), 2);
-        // Ten bits per key, in whole words.
-        assert_eq!(hashes.finish().unwrap().bytes(), 8);
+        // Ten bits per key, rounded to a whole cache line.
+        assert_eq!(hashes.finish().unwrap().bytes(), 64);
     }
 
     #[test]

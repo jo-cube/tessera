@@ -1,5 +1,9 @@
 //! Deterministic, counter-only compaction scenarios; no clocks or timings.
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
+// Measure the same private filter implementation without expanding the engine API.
+#[allow(dead_code)]
+#[path = "../src/run/filter.rs"]
+mod filter;
 const ENTITIES: usize = 512;
 const MEMBERS: usize = 64;
 const RECORDS: usize = ENTITIES * MEMBERS;
@@ -56,7 +60,14 @@ fn flush(engine: &Engine) {
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
 }
-fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool) {
+fn scenario(
+    name: &str,
+    weak: bool,
+    clustered: bool,
+    records: usize,
+    small: bool,
+    budget: Option<usize>,
+) {
     let value = |i, version, weak| {
         let mut out = value(i, version, weak);
         if small {
@@ -64,15 +75,27 @@ fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool
         }
         out
     };
-    let engine = Engine::new(EngineOptions::default()).unwrap();
+    let engine = Engine::new(EngineOptions {
+        memtable_budget: budget.unwrap_or(EngineOptions::default().memtable_budget),
+        background_threads: 1,
+        ..EngineOptions::default()
+    })
+    .unwrap();
+    let mut peak = 0;
+    let mut ingested = 0u64;
     let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
     if !clustered {
         rng.shuffle(&mut order);
     }
     for (at, &i) in order.iter().enumerate() {
-        engine.put(&key(i), &value(i, 0, weak)).unwrap();
-        if (at + 1) % FLUSH == 0 {
+        let v = value(i, 0, weak);
+        engine.put(&key(i), &v).unwrap();
+        ingested += (16 + v.len()) as u64;
+        if budget.is_some() {
+            peak = peak.max(engine.stats().memtable_bytes);
+        }
+        if budget.is_none() && (at + 1) % FLUSH == 0 {
             flush(&engine);
         }
     }
@@ -87,9 +110,14 @@ fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool
         updates.truncate(records / 2);
     }
     for (at, &i) in updates.iter().enumerate() {
-        engine.put(&key(i), &value(i, 1, weak)).unwrap();
+        let v = value(i, 1, weak);
+        engine.put(&key(i), &v).unwrap();
+        ingested += (16 + v.len()) as u64;
+        if budget.is_some() {
+            peak = peak.max(engine.stats().memtable_bytes);
+        }
         updated[i] = true;
-        if (at + 1) % FLUSH == 0 {
+        if budget.is_none() && (at + 1) % FLUSH == 0 {
             flush(&engine);
         }
     }
@@ -97,6 +125,28 @@ fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool
     let mut merge = MergeWorkspace::new();
     while engine.compact(&mut merge).unwrap().is_some() {}
     engine.wait_for_compaction().unwrap();
+    let mut scans = EngineWorkspace::new();
+    for _ in 0..100 {
+        let guard = engine.read();
+        let mut scan = guard.scan(&mut scans);
+        for _ in 0..100 {
+            assert!(scan.next_record().unwrap().is_some());
+        }
+    }
+    // A standalone filter over the scenario's distinct keys, including when
+    // bottom-level runs omit filters. The million probes are all absent.
+    let mut hashes = filter::KeyHashes::new();
+    for i in 0..records {
+        hashes.add(&key(i));
+    }
+    let filter = hashes.finish().unwrap();
+    let positives = (0..1_000_000)
+        .filter(|&at| {
+            let mut absent = key(at % records).to_vec();
+            absent.extend_from_slice(&(at as u64).to_be_bytes());
+            filter.may_contain(filter::hash(&absent))
+        })
+        .count();
     // All reader paths are checked against the independent version oracle.
     let mut ws = EngineWorkspace::new();
     for (i, &changed) in updated.iter().enumerate() {
@@ -142,8 +192,9 @@ fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool
         assert!(engine.get(&missing, &mut misses).unwrap().is_none());
     }
     let s = engine.stats();
+    assert_eq!(s.build.raw_bytes_ingested, ingested);
     println!(
-        "{name},{},{},{},{},{:.3},{:.3},{},{}",
+        "{name},{},{},{},{},{:.3},{:.3},{},{},{:.3},{:.6},{peak},{},{},{},{},{:.6},{:.6},{ingested}",
         s.run_bytes,
         s.filter_bytes,
         s.index_bytes,
@@ -151,16 +202,40 @@ fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool
         ratio(hits.decoded_bytes(), 10_000),
         ratio(misses.decoded_bytes(), 1_000),
         hits.blocks_loaded(),
-        misses.blocks_loaded()
+        misses.blocks_loaded(),
+        ratio(scans.blocks_loaded(), 100),
+        ratio(positives as u64, 1_000_000),
+        s.flushes,
+        s.runs,
+        s.level0_flushes,
+        s.level0_runs,
+        ratio(s.build.bytes_compressed, s.flushed_bytes),
+        ratio(s.build.raw_bytes_compressed, ingested),
     );
     engine.close().unwrap();
 }
 fn main() {
+    let mut args = std::env::args().skip(1);
+    let budget = args.next().map(|mode| {
+        assert_eq!(mode, "buffers", "usage: counters [buffers BUDGET_MiB]");
+        args.next()
+            .expect("budget in MiB")
+            .parse::<usize>()
+            .unwrap()
+            << 20
+    });
     println!(
-        "scenario,stored_bytes,filter_bytes,index_bytes,frame_bytes,hit_decoded_bytes_per_get,miss_decoded_bytes_per_get,hit_blocks,miss_blocks"
+        "scenario,stored_bytes,filter_bytes,index_bytes,frame_bytes,hit_decoded_bytes_per_get,miss_decoded_bytes_per_get,hit_blocks,miss_blocks,blocks_per_100_record_scan,standalone_filter_fp,peak_sampled_memtable_charge,flushes,runs,l0_depth,l0_runs,write_amplification,raw_bytes_compressed_per_ingested_byte,ingested_bytes"
     );
-    scenario("B-random", true, false, RECORDS, false);
-    scenario("clustered", false, true, RECORDS, false);
-    scenario("A-random", false, false, RECORDS, false);
-    scenario("A-large", false, false, 200_704, true);
+    scenario("B-random", true, false, RECORDS, false, budget);
+    scenario("clustered", false, true, RECORDS, false, budget);
+    scenario("A-random", false, false, RECORDS, false, budget);
+    scenario(
+        "A-large",
+        false,
+        false,
+        if budget.is_some() { 4_194_304 } else { 200_704 },
+        true,
+        budget,
+    );
 }
