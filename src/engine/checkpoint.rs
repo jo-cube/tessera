@@ -1316,25 +1316,28 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         ));
     }
     // Per-run checks cannot detect disagreeing copies in different runs. Check
-    // the same grouped logical view used by readers before exposing an engine.
+    // the grouped merge before exposing an engine, including older versions
+    // that compaction will eventually visit.
     // This holds one decoded block per overlapping group, with no value copies.
     {
         let published: Vec<_> = runs.iter().map(|(_, _, run)| Arc::clone(run)).collect();
         let directory = super::directory::RunDirectory::build(&published);
-        let mut workspace = crate::run::LogicalWorkspace::default();
+        let mut workspace = crate::run::MergeWorkspace::new();
         let mut cursor =
-            crate::run::LogicalCursor::grouped(&directory, directory.groups(), &mut workspace);
+            crate::run::MergeCursor::grouped(&directory, directory.groups(), &mut workspace);
         while cursor
             .next_record()
-            .map_err(|error| {
+            .map_err(|error| corrupt(&manifest_path, Damage::Run(error)))?
+            .is_some()
+        {
+            cursor.collapse_copies().map_err(|error| {
                 let damage = match error {
                     crate::run::ReadError::Corrupt(error) => Damage::Run(error),
                     crate::run::ReadError::ConflictingCopies(_) => Damage::Order,
                 };
                 corrupt(&manifest_path, damage)
-            })?
-            .is_some()
-        {}
+            })?;
+        }
     }
     let run_bytes: usize = runs.iter().map(|(_, _, r)| r.run.stored_len()).sum();
     let held_bytes: usize = runs.iter().map(|(_, _, r)| r.run.held_bytes()).sum();
@@ -1358,6 +1361,33 @@ mod robustness;
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn recovery_rejects_conflicting_copies_hidden_by_a_newer_version() {
+        let dir = scratch("hidden-conflicting-copies");
+        let engine = Engine::new(manual()).unwrap();
+        for value in [b"old", b"bad", b"new"] {
+            let mut batch = crate::engine::WriteBatch::new();
+            batch.put(b"key", value);
+            engine.ingest_sorted(&batch).unwrap();
+        }
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
+        assert_eq!(manifest.runs.len(), 3);
+        manifest.runs[1].seq_override = manifest.runs[0].seq_override;
+        fs::write(path, manifest.encode()).unwrap();
+        assert!(matches!(
+            Engine::recover(&dir, manual()),
+            Err(OpenError::Corrupt {
+                damage: Damage::Order,
+                ..
+            })
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn recovery_with_an_exhausted_run_counter_can_flush_and_checkpoint() {
