@@ -1148,7 +1148,7 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, OpenError> {
         return Err(too_long(len));
     }
     let mut bytes = Vec::with_capacity(len as usize);
-    file.take(max + 1)
+    file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(read_error(path))?;
     if bytes.len() as u64 > max {
@@ -1316,6 +1316,35 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn an_unlimited_file_bound_does_not_overflow() {
+        let dir = scratch("unlimited-read-bound");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bytes");
+        fs::write(&path, b"small").unwrap();
+        assert_eq!(read_bounded(&path, u64::MAX).unwrap(), b"small");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_with_an_unlimited_run_length_is_typed_damage() {
+        let dir = scratch("unlimited-run-length");
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
+        manifest.runs[0].len = u64::MAX;
+        fs::write(&path, manifest.encode()).unwrap();
+        assert!(matches!(
+            Engine::recover(&dir, manual()),
+            Err(OpenError::Corrupt { .. })
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
