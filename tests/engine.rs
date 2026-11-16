@@ -901,7 +901,7 @@ fn the_defaults_compact_in_the_background() {
     assert_eq!(CompactionPolicy::default().max_overlap, 4);
     assert_eq!(
         (defaults.compression, defaults.target_block_compressed),
-        (Compression::Zstd, 2048)
+        (Compression::Zstd, 1024)
     );
     let engine = Engine::new(EngineOptions {
         memtable_budget: 16 << 10,

@@ -89,7 +89,7 @@ value and 128-byte entry charge must also fit the memtable budget.
 | `level_ratio` | 10 | Level size multiplier, at least 2 |
 | `background_threads` | Half the CPUs, clamped to 1–4 | Builders per compaction |
 | `compression` | `Compression::Zstd` | Zstandard or `Uncompressed` |
-| `target_block_compressed` | 2048 (2 KiB) | Estimated compressed block bytes, 1–64 KiB |
+| `target_block_compressed` | 1024 (1 KiB) | Estimated compressed block bytes, 1–64 KiB |
 
 At 90% of the memory budget writers wait briefly for publication. At 100% they
 request maintenance while reclamation can progress, then return `MemoryLimit`
