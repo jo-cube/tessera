@@ -5,10 +5,9 @@ use crate::chunk::ChunkPool;
 
 use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
-use super::logical::conflict;
 use super::{
-    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
-    ReadError, Run, RunBuilder, RunView,
+    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, ReadError, Run, RunBuilder,
+    RunView,
 };
 
 const BUILDABLE: &str = "merged records are ordered, within the limits, and fit in one run";
@@ -431,7 +430,9 @@ fn compact_range<'a>(
             key.extend_from_slice(record.key);
             has_key = true;
         }
-        collapse_copies(&mut merge, &mut stats)?;
+        let copies = merge.collapse_copies()?;
+        stats.records_read += copies;
+        stats.copies_collapsed += copies;
         if !newest {
             stats.versions_dropped += 1;
             continue;
@@ -457,21 +458,6 @@ fn compact_range<'a>(
         workspace_bytes: needed,
         stats,
     })
-}
-
-/// Removes identical copies of the current record and rejects any that differ.
-fn collapse_copies(merge: &mut MergeCursor<'_>, stats: &mut CompactStats) -> Result<(), ReadError> {
-    while let Some(at) = merge.next_copy() {
-        if let Some([(first, record), (other, copy)]) = merge.copies(at)
-            && record.value != copy.value
-        {
-            return Err(conflict(record.key, record.seq, first, other));
-        }
-        merge.drop_copy(at)?;
-        stats.records_read += 1;
-        stats.copies_collapsed += 1;
-    }
-    Ok(())
 }
 
 struct Output<'c> {
@@ -528,11 +514,7 @@ impl<'c> Output<'c> {
     /// that a record longer than the target is a run of its own and every
     /// run has a record.
     fn add(&mut self, record: Record<'_>) {
-        let value_len = match record.value {
-            Value::Bytes(bytes) => bytes.len(),
-            Value::Tombstone => 0,
-        };
-        let len = record.key.len() + value_len + RECORD_INPUT_OVERHEAD;
+        let len = super::input_len(record.key, record.value);
         let mut cut = false;
         while let Some(at) = self.cuts.at.get(self.next_cut)
             && at.as_slice() <= record.key

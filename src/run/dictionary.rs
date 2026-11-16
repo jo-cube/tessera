@@ -6,7 +6,7 @@ pub(super) const DICTIONARY_LEN: usize = 16 << 10;
 pub(super) const SAMPLE_LEN: usize = 64 << 10;
 
 /// Concatenate independently encoded records at evenly spaced positions,
-/// retaining the final 16 KiB, as in the compression spike.
+/// retaining the final 16 KiB.
 pub(super) fn sample(bytes: &[u8], records: usize) -> Vec<u8> {
     let block = BlockView::open(bytes).expect("builder's segment");
     let mut cursor = BlockPosition::new();

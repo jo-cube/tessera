@@ -18,23 +18,14 @@ use super::{
 /// Use this for bytes of unknown origin, and for long-lived blocks. To read
 /// bytes already known to be valid without another walk, see [`BlockView`].
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-    )
-)]
+#[cfg(test)]
 pub struct Block<B> {
     data: B,
     entries_len: usize,
     record_count: usize,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
-)]
+#[cfg(test)]
 impl<B: AsRef<[u8]>> Block<B> {
     /// Validates `data` in full and wraps it. This costs O(block length) and
     /// reports the first structural problem found.
@@ -85,13 +76,7 @@ impl<B: AsRef<[u8]>> Block<B> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-    )
-)]
+#[cfg(test)]
 const VALIDATED: &str = "block bytes were validated by Block::new";
 
 /// One stored version of a user key, yielded by [`Cursor::next_record`].
@@ -120,22 +105,13 @@ pub struct Version<'a> {
 /// borrows the key rebuilt in the cursor's single reusable buffer, so records
 /// need no individual allocation.
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-    )
-)]
+#[cfg(test)]
 pub struct Cursor<'a> {
     view: BlockView<'a>,
     position: BlockPosition,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
-)]
+#[cfg(test)]
 impl Cursor<'_> {
     /// Advances to the next record, or returns `None` at the end of the block.
     pub fn next_record(&mut self) -> Option<Record<'_>> {
@@ -177,10 +153,7 @@ impl BlockPosition {
     /// next block, then take its record. Loading the next block after a
     /// `next_record` call returns `None`, within a function returning that
     /// call's record, is rejected by the borrow checker.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn is_finished(&self, block: BlockView<'_>) -> bool {
         self.offset >= block.entries.len()
     }

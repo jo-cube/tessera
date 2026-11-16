@@ -1190,7 +1190,7 @@ impl Core {
             }
             TableError::BudgetExceeded { .. } => Refusal::Full,
             TableError::SequenceNotIncreasing { .. } => {
-                unreachable!("the engine assigns, and the log checks, increasing numbers")
+                unreachable!("the engine assigns increasing sequence numbers")
             }
         }
     }
@@ -2046,9 +2046,7 @@ impl<'e> CompactionJob<'e> {
         };
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
-            max_workspace_bytes: self.options.max_workspace_bytes.max(
-                crate::run::workspace_estimate(self.inputs.iter().map(|run| run.largest_block)),
-            ),
+            max_workspace_bytes: workspace_bytes,
             codec: self.engine.codec,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,

@@ -136,6 +136,16 @@ pub const MAX_TARGET_RUN_LEN: usize = 1 << 30;
 /// into runs, so that the number of records in a run is bounded as well.
 pub(crate) const RECORD_INPUT_OVERHEAD: usize = 16;
 
+/// Logical input charged when splitting flush, ingestion and compaction runs.
+pub(crate) fn input_len(key: &[u8], value: crate::block::Value<'_>) -> usize {
+    key.len()
+        + match value {
+            crate::block::Value::Bytes(bytes) => bytes.len(),
+            crate::block::Value::Tombstone => 0,
+        }
+        + RECORD_INPUT_OVERHEAD
+}
+
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
 const FORMAT_VERSION: u32 = 6;
 const TABLE_ENTRY_LEN: usize = 8;

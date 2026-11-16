@@ -126,9 +126,6 @@ impl Core {
                 .last_seq
                 .checked_add(batch.len() as u64)
                 .ok_or(UpdateError::SequencesExhausted)?;
-            if batch.is_empty() {
-                return Ok(end);
-            }
             let needed = batch.records().fold(0usize, |sum, (key, value)| {
                 sum.saturating_add(state.active.write_charge(key, value))
             });

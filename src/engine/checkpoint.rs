@@ -5,7 +5,7 @@
 //! structural snapshot at that rotation's sequence ceiling. Later writes and
 //! compactions proceed while files are written, outside the state lock.
 //!
-//! Layout: `runs/<32-hex-digit RunId>` holds the exact v5 run chunks, followed
+//! Layout: `runs/<32-hex-digit RunId>` holds the exact v6 run chunks, followed
 //! by little-endian Bloom words and their CRC-32. The manifest records both
 //! lengths and a CRC-32 of the entire file. Filters use the fixed hash defined
 //! in `run/filter.rs`; recovery validates runs fully without rebuilding filters.
@@ -64,7 +64,7 @@ const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
 const MANIFEST_VERSION: u32 = 3;
 // Magic/version/flags, generation/ceiling/records/next-id/previous,
-// depth, metadata length, run count. Entries include both file and v5 lengths.
+// depth, metadata length, run count. Entries include both file and run lengths.
 const MANIFEST_HEADER_LEN: usize = 72;
 const MANIFEST_ENTRY_LEN: usize = 60;
 const MAX_METADATA_BYTES: usize = 16 << 20;
@@ -1604,7 +1604,7 @@ mod tests {
             (48, 2),                              // previous is not older
             (60, u64::MAX),                       // unbounded metadata length
             (MANIFEST_HEADER_LEN + 40, 3),        // file cannot hold its checksum
-            (MANIFEST_HEADER_LEN + 48, u64::MAX), // v5 payload exceeds file
+            (MANIFEST_HEADER_LEN + 48, u64::MAX), // run payload exceeds file
             (MANIFEST_HEADER_LEN + 32, u64::MAX), // flush counter cannot advance
         ] {
             let mut damaged = bytes.clone();

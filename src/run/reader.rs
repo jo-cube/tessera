@@ -96,10 +96,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// This costs O(run length) and reports the first problem found. Temporary
     /// memory is one decoded block, at most
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         let (max_seq, reclaimable, build_estimate) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
@@ -221,19 +218,13 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 
     /// Returns whether the run stores no records.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns the number of blocks.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn block_count(&self) -> usize {
         self.view().block_count()
     }
@@ -271,10 +262,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Decodes at most one block, and none for a key outside the run's range
     /// or one its filter excludes. Once the workspace has grown to the largest
     /// block read, this performs no heap allocation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn get<'r>(
         &'r self,
         user_key: &[u8],
@@ -289,10 +277,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns a cursor positioned before the first record, which holds the
     /// workspace for as long as it lives. Use [`RunCursor::seek`] or
     /// [`RunCursor::seek_prefix`] to start elsewhere.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn cursor<'r>(&'r self, workspace: &'r mut ReadWorkspace) -> RunCursor<'r> {
         self.view().cursor(workspace)
     }
@@ -701,13 +686,6 @@ impl<'a> RunCursor<'a> {
     /// target is already in the block being walked or above every key. If this
     /// fails, [`next_record`](Self::next_record) reports the same error until a
     /// later seek succeeds.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-        )
-    )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.workspace.prefix.clear();
         self.reposition(target)
@@ -801,7 +779,7 @@ impl<'a> RunCursor<'a> {
 
     /// Advances to the next record, or returns `None` at the end of the run or
     /// of the prefix. After `None`, it keeps returning `None` until a seek.
-    #[cfg_attr(not(test), expect(dead_code, reason = "tested component API"))]
+    #[cfg(test)]
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
         self.fill_head()?;
         let head = self.head.take();
@@ -810,10 +788,7 @@ impl<'a> RunCursor<'a> {
 
     /// Returns the record [`next_record`](Self::next_record) would return,
     /// without advancing. Repeated peeks decode nothing further.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn peek(&mut self) -> Result<Option<Record<'_>>, CorruptRun> {
         self.fill_head()?;
         Ok(self.head.map(|head| self.record_of(head)))
@@ -1188,6 +1163,7 @@ impl<'a> RunView<'a> {
     /// outside the run's range, so damage in such a run is not noticed by this
     /// lookup. Once the workspace has grown to the largest block read, this
     /// performs no heap allocation.
+    #[cfg(test)]
     pub fn get<'r>(
         self,
         target: &[u8],

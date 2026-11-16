@@ -56,7 +56,9 @@ use std::sync::{Arc, Weak};
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::chunk::ChunkPool;
 
-use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder, TARGET_BLOCK_COMPRESSED};
+#[cfg(test)]
+use crate::run::TARGET_BLOCK_COMPRESSED;
+use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder};
 mod arena;
 use arena::{Arena, Location};
 
@@ -687,10 +689,7 @@ impl Memtable {
     ///
     /// Updates must have sequence numbers above `after`. A table that follows
     /// a frozen one should pass [`FrozenMemtable::last_seq`] here.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "component constructor used by tests")
-    )]
+    #[cfg(test)]
     pub fn new(budget: usize, after: Option<u64>) -> Self {
         Self::in_pool(budget, after, &ChunkPool::new(0))
     }
@@ -731,10 +730,7 @@ impl Memtable {
     }
 
     /// Returns the number of keys held, including tombstones.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len
     }
@@ -745,10 +741,7 @@ impl Memtable {
     }
 
     /// Returns the sequence number every update must exceed, if any.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn last_seq(&self) -> Option<u64> {
         self.0.last_seq
     }
@@ -832,10 +825,7 @@ impl FrozenMemtable {
     }
 
     /// Returns whether the table holds no keys.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.table.len == 0
     }
@@ -866,10 +856,7 @@ impl FrozenMemtable {
 
     /// Returns an iterator that builds this table's runs one at a time, with
     /// the default codec and block length, as [`Self::flush_with`] does.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn flush(&self, target_run_len: usize) -> Flush<'_> {
         self.flush_with(target_run_len, Codec::default(), TARGET_BLOCK_COMPRESSED)
     }
@@ -901,14 +888,6 @@ impl FrozenMemtable {
     }
 }
 
-fn input_len(record: &Record<'_>) -> usize {
-    let value_len = match record.value {
-        Value::Bytes(bytes) => bytes.len(),
-        Value::Tombstone => 0,
-    };
-    record.key.len() + value_len + RECORD_INPUT_OVERHEAD
-}
-
 /// Where a flush ends runs early, beside the target length: before the
 /// first record at or above each of `at`, as long as the run would hold at
 /// least `min_piece` bytes of input and the rest of the flush would too,
@@ -921,11 +900,6 @@ pub(crate) struct FlushCuts {
     pub(crate) at: Vec<Vec<u8>>,
     pub(crate) min_piece: usize,
     pub(crate) max_pieces: usize,
-}
-
-/// Finishes a flush's run: its last block, index and filter.
-fn finish(builder: RunBuilder) -> Run<Vec<u8>> {
-    builder.finish()
 }
 
 /// Builds runs from several frozen tables as if they were one, splitting
@@ -984,7 +958,7 @@ pub(crate) fn flush_merged(
             && rest >= cuts.min_piece
             && pieces < cuts.max_pieces
         {
-            runs.extend(builder.take().map(finish));
+            runs.extend(builder.take().map(RunBuilder::finish));
             piece = 0;
             pieces += 1;
         }
@@ -992,15 +966,15 @@ pub(crate) fn flush_merged(
             .get_or_insert_with(|| RunBuilder::in_pool(codec, target_block_compressed, pool))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
-        let len = input_len(&record);
+        let len = crate::run::input_len(record.key, record.value);
         (input, piece, rest) = (input + len, piece + len, rest.saturating_sub(len));
         if input >= target {
             // A full run starts the next target length with its own pieces.
-            runs.extend(builder.take().map(finish));
+            runs.extend(builder.take().map(RunBuilder::finish));
             (input, piece, pieces) = (0, 0, 1);
         }
     }
-    runs.extend(builder.map(finish));
+    runs.extend(builder.map(RunBuilder::finish));
     runs
 }
 
@@ -1078,7 +1052,7 @@ impl Iterator for Flush<'_> {
             builder
                 .add(record.key, record.seq, record.value)
                 .expect(FLUSHABLE);
-            input += input_len(&record);
+            input += crate::run::input_len(record.key, record.value);
             if input >= self.target {
                 break;
             }
@@ -1087,7 +1061,7 @@ impl Iterator for Flush<'_> {
             };
             record = next;
         }
-        Some(finish(builder))
+        Some(builder.finish())
     }
 }
 

@@ -23,13 +23,7 @@ use super::reader::{Found, LookupWorkspace, Run, RunView};
 /// tombstone and an empty value differ. Only the newest version of a key is
 /// checked, because no older copy can affect a result.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-    )
-)]
+#[cfg(test)]
 pub struct RunSet<'a> {
     runs: &'a [RunView<'a>],
 }
@@ -119,10 +113,7 @@ pub(super) fn conflict(key: &[u8], seq: u64, lower: usize, higher: usize) -> Rea
 
 impl LogicalWorkspace {
     /// Creates an empty workspace, which allocates nothing until first used.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -149,10 +140,7 @@ impl LogicalWorkspace {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "tested component API the engine does not use")
-)]
+#[cfg(test)]
 impl<'a> RunSet<'a> {
     /// Creates a set over `runs`. Their order does not affect any result.
     pub fn new(runs: &'a [RunView<'a>]) -> Self {
@@ -211,6 +199,7 @@ impl<'a> RunSet<'a> {
 /// into the other, so a copy with the same sequence number can be compared
 /// with it. Once the workspace is warm this performs no heap allocation, and
 /// the value returned borrows whichever buffer holds the winner.
+#[cfg(test)]
 pub(crate) fn latest_in<'a, 'r, I>(
     runs: I,
     key: &[u8],
@@ -292,8 +281,10 @@ pub(crate) trait LookupSource<'a> {
 }
 
 /// Every run, in the order given; positions count from 0.
+#[cfg(test)]
 struct InOrder<I>(I);
 
+#[cfg(test)]
 impl<'a, R, I> LookupSource<'a> for InOrder<I>
 where
     R: LookupInput<'a>,
@@ -321,6 +312,7 @@ pub(crate) trait LookupInput<'a>: Copy {
 
 /// A bare view has no filter and no sequence bound, so it is always read; a
 /// key outside its range still decodes nothing.
+#[cfg(test)]
 impl<'a> LookupInput<'a> for RunView<'a> {
     fn max_seq(self) -> u64 {
         u64::MAX
@@ -368,6 +360,7 @@ pub struct LogicalCursor<'a> {
 
 impl<'r> LogicalCursor<'r> {
     /// Creates a cursor over `runs`, as [`RunSet::cursor`] does.
+    #[cfg(test)]
     pub(crate) fn over<I>(runs: I, workspace: &'r mut LogicalWorkspace) -> Self
     where
         I: IntoIterator<Item = RunView<'r>>,
@@ -402,10 +395,7 @@ impl<'r> LogicalCursor<'r> {
     }
 
     /// Moves before the first live key at or above `target`, with no bound.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tested component API the engine does not use")
-    )]
+    #[cfg(test)]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), ReadError> {
         self.reposition(|merge| merge.seek(target))
     }
@@ -451,26 +441,12 @@ impl<'r> LogicalCursor<'r> {
             self.key.extend_from_slice(record.key);
             self.has_key = true;
             let tombstone = record.value == Value::Tombstone;
-            self.collapse_copies()?;
+            self.merge.collapse_copies()?;
             if !tombstone {
                 return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    /// Removes identical copies of the current record and rejects any that
-    /// differ. This compares values only when an internal key is duplicated.
-    fn collapse_copies(&mut self) -> Result<(), ReadError> {
-        while let Some(at) = self.merge.next_copy() {
-            if let Some([(first, record), (other, copy)]) = self.merge.copies(at)
-                && record.value != copy.value
-            {
-                return Err(conflict(record.key, record.seq, first, other));
-            }
-            self.merge.drop_copy(at)?;
-        }
-        Ok(())
     }
 
     /// Returns the record the last read stopped on, if it found one.

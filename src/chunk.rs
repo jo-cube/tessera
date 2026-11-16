@@ -24,9 +24,9 @@ struct Pool {
 /// Cumulative work performed by this engine, including abandoned builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BuildCounters {
-    /// Compressed frames shared into compaction outputs.
+    /// Always zero; compaction re-encodes every block.
     pub blocks_reused: u64,
-    /// Frame bytes shared into compaction outputs, including their headers.
+    /// Always zero; compaction re-encodes every block.
     pub bytes_reused: u64,
     /// Newly encoded output blocks (including uncompressed output).
     pub blocks_compressed: u64,
@@ -36,33 +36,29 @@ pub struct BuildCounters {
     pub raw_bytes_compressed: u64,
     /// Admitted key and value bytes; deletes count their keys.
     pub raw_bytes_ingested: u64,
-    /// New blocks ended below their target to append a shared block.
+    /// Always zero; compaction re-encodes every block.
     pub forced_undersized_blocks: u64,
-    /// Raw block bytes decoded to rebuild filters for reused blocks.
+    /// Always zero; compaction re-encodes every block.
     pub filter_decoded_bytes: u64,
 }
 #[derive(Default, Debug)]
 struct Counters {
-    blocks_reused: AtomicU64,
-    bytes_reused: AtomicU64,
     blocks_compressed: AtomicU64,
     bytes_compressed: AtomicU64,
     raw_bytes_compressed: AtomicU64,
     raw_bytes_ingested: AtomicU64,
-    forced_undersized_blocks: AtomicU64,
-    filter_decoded_bytes: AtomicU64,
 }
 impl Counters {
     fn snapshot(&self) -> BuildCounters {
         BuildCounters {
-            blocks_reused: self.blocks_reused.load(Ordering::Relaxed),
-            bytes_reused: self.bytes_reused.load(Ordering::Relaxed),
+            blocks_reused: 0,
+            bytes_reused: 0,
             blocks_compressed: self.blocks_compressed.load(Ordering::Relaxed),
             bytes_compressed: self.bytes_compressed.load(Ordering::Relaxed),
             raw_bytes_compressed: self.raw_bytes_compressed.load(Ordering::Relaxed),
             raw_bytes_ingested: self.raw_bytes_ingested.load(Ordering::Relaxed),
-            forced_undersized_blocks: self.forced_undersized_blocks.load(Ordering::Relaxed),
-            filter_decoded_bytes: self.filter_decoded_bytes.load(Ordering::Relaxed),
+            forced_undersized_blocks: 0,
+            filter_decoded_bytes: 0,
         }
     }
 }

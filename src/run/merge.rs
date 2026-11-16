@@ -2,9 +2,10 @@ use std::ops::Range;
 
 use crate::block::{Record, cmp_internal};
 
-use super::CorruptRun;
 use super::group::{GroupCursor, RunList};
+use super::logical::conflict;
 use super::reader::{ReadWorkspace, RunView};
+use super::{CorruptRun, ReadError};
 
 /// Reusable storage for merging runs: a decoding buffer per input and the
 /// merge order. It retains the largest fan-in it has served. A group of
@@ -166,13 +167,6 @@ impl<'a> MergeCursor<'a> {
     /// the merge reaches its first key. Any other input decodes one block. If
     /// this fails, [`next_record`](Self::next_record) reports the same error
     /// until a later seek succeeds.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "tested component API the engine does not use; Rust 1.89 does not see it as dead"
-        )
-    )]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.reposition(|cursor| cursor.seek(target))
     }
@@ -254,6 +248,22 @@ impl<'a> MergeCursor<'a> {
     /// Removes the copy at heap position `at` from the stream.
     pub(super) fn drop_copy(&mut self, at: usize) -> Result<(), CorruptRun> {
         self.advance_at(at)
+    }
+
+    /// Removes identical copies of the current internal key, rejecting any
+    /// disagreement, and returns the number removed.
+    pub(crate) fn collapse_copies(&mut self) -> Result<usize, ReadError> {
+        let mut count = 0;
+        while let Some(at) = self.next_copy() {
+            if let Some([(first, record), (other, copy)]) = self.copies(at)
+                && record.value != copy.value
+            {
+                return Err(conflict(record.key, record.seq, first, other));
+            }
+            self.drop_copy(at)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Makes the heap's first entry the record to return.

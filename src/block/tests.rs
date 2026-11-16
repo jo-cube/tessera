@@ -54,21 +54,7 @@ fn collect<B: AsRef<[u8]>>(block: &Block<B>) -> Vec<Owned> {
 }
 
 /// Deterministic SplitMix64, so failures reproduce from the seed alone.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, bound: usize) -> usize {
-        (self.next() % bound as u64) as usize
-    }
-}
+use crate::test_support::Rng;
 
 // Hand encoders, independent of the crate, that state the format directly and
 // can produce blocks the builder never would.

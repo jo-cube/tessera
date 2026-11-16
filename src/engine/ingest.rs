@@ -36,12 +36,7 @@ impl Core {
                 })
                 .add(key, 0, value)
                 .expect("validated unique sorted records");
-            bytes += key.len()
-                + match value {
-                    Value::Bytes(v) => v.len(),
-                    Value::Tombstone => 0,
-                }
-                + RECORD_INPUT_OVERHEAD;
+            bytes += crate::run::input_len(key, value);
             if bytes >= self.target_run_len {
                 runs.push(builder.take().unwrap().finish());
                 bytes = 0;
@@ -78,8 +73,7 @@ impl Core {
             // The final unique records are built with zero placeholders too.
             keys.sort_unstable();
             keys.dedup();
-            let budget = batch.validate(self.memtable_budget)?;
-            let mut table = Memtable::in_pool(budget, None, &self.chunks);
+            let mut table = Memtable::in_pool(input, None, &self.chunks);
             for (index, (key, value)) in batch.records().enumerate() {
                 let seq = index as u64 + 1;
                 match value {
@@ -101,14 +95,7 @@ impl Core {
         let held: usize = runs.iter().map(Run::held_bytes).sum();
         let logical = batch
             .records()
-            .map(|(key, value)| {
-                key.len()
-                    + match value {
-                        Value::Bytes(v) => v.len(),
-                        Value::Tombstone => 0,
-                    }
-                    + RECORD_INPUT_OVERHEAD
-            })
+            .map(|(key, value)| crate::run::input_len(key, value))
             .sum();
         charge.finished(bytes + held);
         let mut runs: Vec<_> = published(runs).collect();

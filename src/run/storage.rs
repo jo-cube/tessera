@@ -131,6 +131,10 @@ impl Segmented {
 /// and recovery fill chunks and retain only exact index/footer buffers beside them.
 #[derive(Clone, Debug)]
 pub(super) enum RunData<B> {
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "borrowed storage keeps format tests generic")
+    )]
     Contiguous(B),
     Segmented(Segmented),
 }
@@ -175,7 +179,7 @@ impl<B: AsRef<[u8]>> RunData<B> {
             }
         }
     }
-    /// The v5 file layout: all frames, all dictionaries, then the index/footer.
+    /// File order: all frames, all dictionaries, then the index/footer.
     pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
         let count = match self {
             Self::Contiguous(_) => 1,
