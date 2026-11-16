@@ -116,6 +116,9 @@ filters; other builders may omit them to bound temporary memory.
 Higher `level_ratio` usually favors memory and reads; lower ratios favor writes.
 Larger blocks reduce metadata while increasing point-read decoding. Larger
 memtables reduce flush frequency at greater transient memory cost.
+The 64 MiB memtable default keeps write amplification within the counter
+workloads' 15% limit; 32 and 16 MiB cause extra rewrites on smaller random-update
+workloads. An active table plus two frozen tables can charge about 192 MiB.
 
 ## Threading and errors
 

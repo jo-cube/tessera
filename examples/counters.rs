@@ -1,4 +1,9 @@
 //! Deterministic, counter-only compaction scenarios; no clocks or timings.
+//!
+//! No arguments: fixed 4,096-record flushes for locality comparisons.
+//! `buffers 64` (or 32/16): automatic flushes and 384 MiB of A-large ingestion.
+//! Frozen-buffer comparisons change the private MAX_FROZEN_MEMTABLES constant
+//! between builds; it intentionally has no public configuration switch.
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
 // Measure the same private filter implementation without expanding the engine API.
 #[allow(dead_code)]
@@ -123,7 +128,10 @@ fn scenario(
     }
     flush(&engine);
     let mut merge = MergeWorkspace::new();
-    while engine.compact(&mut merge).unwrap().is_some() {}
+    let mut manual_output = 0u64;
+    while let Some(report) = engine.compact(&mut merge).unwrap() {
+        manual_output += report.output_bytes as u64;
+    }
     engine.wait_for_compaction().unwrap();
     let mut scans = EngineWorkspace::new();
     for _ in 0..100 {
@@ -149,7 +157,14 @@ fn scenario(
         .count();
     // All reader paths are checked against the independent version oracle.
     let mut ws = EngineWorkspace::new();
-    for (i, &changed) in updated.iter().enumerate() {
+    // Multi-get and the scan below check every record. Sample individual gets
+    // on the scaled buffer workload to avoid decoding hundreds of GiB again.
+    let stride = if budget.is_some() {
+        (records / RECORDS).max(1)
+    } else {
+        1
+    };
+    for (i, &changed) in updated.iter().enumerate().step_by(stride) {
         assert_eq!(
             engine.get(&key(i), &mut ws).unwrap().unwrap().value,
             value(i, u8::from(changed), weak)
@@ -193,6 +208,9 @@ fn scenario(
     }
     let s = engine.stats();
     assert_eq!(s.build.raw_bytes_ingested, ingested);
+    let background = engine.background_status().unwrap();
+    assert_eq!(background.failures, 0);
+    assert!(background.panic.is_none());
     println!(
         "{name},{},{},{},{},{:.3},{:.3},{},{},{:.3},{:.6},{peak},{},{},{},{},{:.6},{:.6},{ingested}",
         s.run_bytes,
@@ -209,7 +227,10 @@ fn scenario(
         s.runs,
         s.level0_flushes,
         s.level0_runs,
-        ratio(s.build.bytes_compressed, s.flushed_bytes),
+        ratio(
+            s.flushed_bytes + background.output_bytes + manual_output,
+            s.flushed_bytes
+        ),
         ratio(s.build.raw_bytes_compressed, ingested),
     );
     engine.close().unwrap();
