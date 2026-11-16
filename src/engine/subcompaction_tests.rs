@@ -1,3 +1,7 @@
+//! Serial and parallel compaction must agree on records and sequence bounds.
+//! Independent physical output and snapshot checks cover shared publication
+//! and workspace allowances without depending on builder scheduling.
+
 use super::*;
 
 fn physical(runs: &[Run<Vec<u8>>]) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {

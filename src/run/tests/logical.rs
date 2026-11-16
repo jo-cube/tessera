@@ -943,8 +943,8 @@ fn a_copy_of_the_newest_version_is_still_checked() {
         get_bounded(&identical, b"k"),
         (Ok(Some((7, b"x".to_vec()))), 2)
     );
-    // Copies of an older version never decided a lookup, and runs holding
-    // only them are now skipped.
+    // An older version cannot decide the lookup, so runs holding only
+    // older versions are skipped.
     let older = [
         build(Codec::Zstd, &[put(b"k", 8, b"new")], SMALL_BLOCK),
         build(Codec::Zstd, &[put(b"k", 3, b"p")], SMALL_BLOCK),

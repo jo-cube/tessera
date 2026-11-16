@@ -1402,8 +1402,8 @@ mod tests {
     use crate::engine::EngineWorkspace;
 
     #[test]
-    fn the_previous_filter_envelope_is_rejected_even_with_a_repaired_checksum() {
-        let dir = scratch("old-filter-envelope");
+    fn an_unsupported_manifest_version_is_rejected_with_a_valid_checksum() {
+        let dir = scratch("unsupported-manifest-version");
         let engine = Engine::new(manual()).unwrap();
         engine.put(b"key", b"value").unwrap();
         engine
@@ -1412,13 +1412,16 @@ mod tests {
         engine.close().unwrap();
         let (_, _, manifest) = committed_manifest(&dir).unwrap();
         let mut bytes = manifest.encode();
-        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         let end = bytes.len() - 4;
         let sum = crc(&[&bytes[..end]]);
         bytes[end..].copy_from_slice(&sum.to_le_bytes());
         assert!(matches!(
             Manifest::decode(&bytes),
-            Err(Damage::Unsupported { version: 3, .. })
+            Err(Damage::Unsupported {
+                version: u32::MAX,
+                ..
+            })
         ));
         fs::remove_dir_all(dir).unwrap();
     }

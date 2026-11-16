@@ -159,11 +159,9 @@ mod resources;
 mod worker;
 
 #[cfg(test)]
-mod capacity_tests;
+mod compaction_model_tests;
 #[cfg(test)]
-mod leveled_tests;
-#[cfg(test)]
-mod leveling_tests;
+mod level_invariants_tests;
 #[cfg(test)]
 mod staged_tests;
 

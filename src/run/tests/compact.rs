@@ -1,5 +1,6 @@
-//! Compaction's merge: what it keeps and the limits that stop it. How the
-//! engine selects, replaces and retains runs is tested in `tests/compaction.rs`.
+//! Compaction merge correctness, output cuts and workspace allowances.
+//! Independent records check version collapse, tombstone retention and bounded
+//! output; engine selection and publication are covered in `tests/compaction.rs`.
 
 use crate::block::Value;
 use crate::run::{
@@ -219,8 +220,8 @@ fn measured_codec_contexts_fit_their_allowance() {
     }
 }
 
-/// Output runs end before the record that would take them past the target
-/// (5AT), so a run is at most the target unless it holds one record longer
+/// Output runs end before the record that would take them past the target,
+/// so a run is at most the target unless it holds one record longer
 /// than the target, which is a run of its own. No run is empty, and every
 /// record survives in order.
 #[test]

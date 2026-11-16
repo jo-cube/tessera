@@ -1,3 +1,6 @@
+//! Packed and contiguous runs must agree on restart searches and decoding.
+//! Round trips check byte identity, shared chunk retention and exact tails.
+
 use super::*;
 use crate::block::BlockBuilder;
 use crate::run::RunBuilder;

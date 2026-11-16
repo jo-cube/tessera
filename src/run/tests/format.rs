@@ -451,7 +451,7 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
 
     #[rustfmt::skip]
     let expected: Vec<u8> = [
-        // frame: codec, reserved, decoded_len, checksum, stored
+        // frame: codec, dictionary_ref, decoded_len, checksum, stored
         &header0[..],
         &checksum(&header0, block0).to_le_bytes(),
         block0,
@@ -463,7 +463,8 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
         &[26, 0, 0, 0, 7, 0, 0, 0],
         // key area: the minimum key, then each block's last key
         b"a\0\0a\0\0b",
-        // footer: index_offset, record_count, block_count, min_key_len, version, magic
+        // footer: index_offset, record_count, block_count, min_key_len,
+    // dictionaries_offset, segment_count, index_crc, version, magic
         &[51, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0, 0, 0, 0, 0],
         &[2, 0, 0, 0],
@@ -1198,8 +1199,8 @@ fn malformed_structures_are_rejected() {
     #[rustfmt::skip]
     let cases: &[(&str, Mutation, RunCorruption)] = &[
         ("magic", |b, l| b[l.footer + 47] ^= 1, InvalidMagic),
-        ("version 2", |b, l| put_u32(b, l.footer + 40, 2), UnsupportedVersion),
-        ("version 5", |b, l| put_u32(b, l.footer + 40, 5), UnsupportedVersion),
+        ("zero version", |b, l| put_u32(b, l.footer + 40, 0), UnsupportedVersion),
+        ("maximum version", |b, l| put_u32(b, l.footer + 40, u32::MAX), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),
         ("block count too large", |b, l| put_u32(b, l.footer + 16, u32::MAX), InvalidFooter),
@@ -1546,7 +1547,7 @@ fn magicless_zstd_frames_omit_redundant_fields_and_round_trip() {
     let frames = [(1, block.len() as u32, stored)];
     let bytes = assemble_frames(&frames, &[b"a"], 1);
     assert_eq!(all(&Run::new(bytes).unwrap()), [rec(b"a", 1, None)]);
-    // The previous standard envelope is no longer accepted, even without size.
+    // Stored frames must be magicless, including when content size is omitted.
     let mut ctx = zstd_safe::CCtx::create();
     ctx.set_parameter(zstd_safe::CParameter::ContentSizeFlag(false))
         .unwrap();

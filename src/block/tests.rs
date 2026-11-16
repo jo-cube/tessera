@@ -728,8 +728,8 @@ fn only_full_validation_detects_disordered_keys() {
     assert_eq!(walk(view).unwrap().len(), 2);
 }
 
-/// The shape of a future run iterator: one struct owns the block buffer and
-/// its traversal state, which a borrowing cursor cannot share with its block.
+/// A reusable block buffer and traversal state can share one owner because
+/// the position holds no borrow into its block.
 struct RunIterator<'f> {
     frames: std::slice::Iter<'f, Vec<u8>>,
     scratch: Vec<u8>,

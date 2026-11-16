@@ -1,7 +1,7 @@
-//! Leveled compaction in production (5AT): level membership and
+//! Leveled compaction invariants: level membership and
 //! disjointness after every publication, reads unaffected by levels,
-//! recovery into one level, moves, splits, neighbour merges, refusals and
-//! growth past the old run ceiling.
+//! recovered level membership, moves, splits, neighbour merges and
+//! growth across many runs.
 //!
 //! Every publication in a test build checks the level invariants
 //! (`Levels::check`, from `State::order_runs` and after each move), so every
@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 
-use super::capacity_tests::Rng;
+use super::compaction_model_tests::Rng;
 use super::*;
 
 const TARGET: usize = 4 << 10;
@@ -39,7 +39,7 @@ fn key(index: u64) -> Vec<u8> {
 }
 
 fn value(seed: u64) -> Vec<u8> {
-    super::capacity_tests::value_for(seed)
+    super::compaction_model_tests::value_for(seed)
 }
 
 /// What compaction did until it had nothing to do or refused.
@@ -182,7 +182,7 @@ fn a_merge_replaces_only_its_range_and_a_move_keeps_its_run() {
         }
     }
     let runs = engine.stats().runs;
-    assert!(runs > 64, "{runs} runs, past the old limit of 64");
+    assert!(runs > 64, "{runs} runs, expected a multi-level fixture");
     assert!(engine.stats().levels >= 2);
 
     // A database of one level: overwrite a narrow range and compact level
@@ -291,10 +291,9 @@ fn recovery_preserves_run_ids_and_levels() {
     assert_eq!(scan(&engine.snapshot()), model);
 }
 
-/// Until compaction inserts levels above them, recovered runs are level 1,
-/// so the first flushes after recovery are split at the checkpoint's run
-/// boundaries: puts and deletes split there read back exactly, a snapshot
-/// taken before them is unchanged, and a second checkpoint of the result
+/// A checkpoint whose runs occupy level 1 supplies split boundaries for
+/// the first flushes after recovery. Puts and deletes at those boundaries
+/// read back exactly, held snapshots stay stable, and a second checkpoint
 /// recovers the same contents.
 #[test]
 fn flushes_after_recovery_split_at_the_recovered_runs() {
@@ -397,10 +396,10 @@ fn small_neighbours_merge() {
     }
 }
 
-/// The run count passes the old ceiling of 64 with the default options
-/// scaled to small runs: `max_runs` is a safety valve, not capacity.
+/// A growing dataset spans many runs and levels while directory overlap
+/// stays bounded by level-0 flushes and disjoint deeper levels.
 #[test]
-fn runs_grow_past_the_old_ceiling() {
+fn growing_data_spans_many_runs_with_bounded_read_overlap() {
     let engine = Engine::new(EngineOptions {
         background_compaction: Some(compaction()),
         ..options()
@@ -425,7 +424,7 @@ fn runs_grow_past_the_old_ceiling() {
     engine.close().unwrap();
 }
 
-// 5AU: flush splitting and level-0 backpressure.
+// Flush splitting and level-0 backpressure.
 
 /// The same writes into an engine that splits flushes at level 1's
 /// boundaries and one that does not: reads agree with a model in both, and
