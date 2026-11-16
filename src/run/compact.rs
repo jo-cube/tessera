@@ -97,6 +97,8 @@ pub struct OutputCuts {
     /// Write one run whatever its length: for merging two small runs into
     /// one, which must lower the run count to be worth doing.
     pub single: bool,
+    /// The destination is the bottom level at selection time.
+    pub omit_filter: bool,
 }
 
 /// What a compaction read and wrote.
@@ -557,7 +559,11 @@ impl<'c> Output<'c> {
                 &self.pool,
             );
             builder.limit_segment_len(self.segment_len);
-            builder.limit_filter_build_bytes(self.hash_bytes);
+            builder.limit_filter_build_bytes(if self.cuts.omit_filter {
+                0
+            } else {
+                self.hash_bytes
+            });
             builder
         });
         builder

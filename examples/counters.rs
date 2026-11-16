@@ -56,9 +56,16 @@ fn flush(engine: &Engine) {
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
 }
-fn scenario(name: &str, weak: bool, clustered: bool) {
+fn scenario(name: &str, weak: bool, clustered: bool, records: usize, small: bool) {
+    let value = |i, version, weak| {
+        let mut out = value(i, version, weak);
+        if small {
+            out.truncate(48);
+        }
+        out
+    };
     let engine = Engine::new(EngineOptions::default()).unwrap();
-    let mut order: Vec<_> = (0..RECORDS).collect();
+    let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
     if !clustered {
         rng.shuffle(&mut order);
@@ -69,15 +76,15 @@ fn scenario(name: &str, weak: bool, clustered: bool) {
             flush(&engine);
         }
     }
-    let mut updated = vec![false; RECORDS];
+    let mut updated = vec![false; records];
     let mut updates: Vec<_> = if clustered {
-        (ENTITIES * 9 / 10 * MEMBERS..RECORDS).collect()
+        (records / MEMBERS * 9 / 10 * MEMBERS..records).collect()
     } else {
-        (0..RECORDS).collect()
+        (0..records).collect()
     };
     if !clustered {
         rng.shuffle(&mut updates);
-        updates.truncate(RECORDS / 2);
+        updates.truncate(records / 2);
     }
     for (at, &i) in updates.iter().enumerate() {
         engine.put(&key(i), &value(i, 1, weak)).unwrap();
@@ -98,7 +105,7 @@ fn scenario(name: &str, weak: bool, clustered: bool) {
             value(i, u8::from(changed), weak)
         );
     }
-    for start in (0..RECORDS).step_by(128) {
+    for start in (0..records).step_by(128) {
         let keys: Vec<_> = (start..start + 128).rev().map(key).collect();
         engine
             .multi_get(&keys, &mut ws, |at, got| {
@@ -117,32 +124,43 @@ fn scenario(name: &str, weak: bool, clustered: bool) {
     assert!(scan.next_record().unwrap().is_none());
     drop(scan);
     drop(guard);
+    // Fixed present keys and in-range gaps. Each get has its own block load;
+    // workspace buffers are reused, but decoded blocks are never cached.
+    let mut hits = EngineWorkspace::new();
+    for at in 0..10_000 {
+        let i = at * 7919 % records;
+        assert_eq!(
+            engine.get(&key(i), &mut hits).unwrap().unwrap().value,
+            value(i, u8::from(updated[i]), weak)
+        );
+    }
+    let mut misses = EngineWorkspace::new();
+    for at in 0..1_000 {
+        let i = at * 7919 % (records - 1);
+        let mut missing = key(i).to_vec();
+        missing.push(0);
+        assert!(engine.get(&missing, &mut misses).unwrap().is_none());
+    }
     let s = engine.stats();
-    let c = s.build;
     println!(
-        "{name},{:.6},{:.6},{:.6},{:.6},{},{},{},{:.6},{},{},{},{},{},{}",
-        ratio(c.raw_bytes_compressed, c.raw_bytes_ingested),
-        ratio(c.bytes_compressed + c.bytes_reused, c.raw_bytes_ingested),
-        ratio(c.blocks_reused, c.blocks_reused + c.blocks_compressed),
-        ratio(c.bytes_reused, c.bytes_reused + c.bytes_compressed),
+        "{name},{},{},{},{},{:.3},{:.3},{},{}",
         s.run_bytes,
-        s.chunk_bytes_held,
+        s.filter_bytes,
+        s.index_bytes,
         s.block_bytes_live,
-        ratio(s.block_bytes_live as u64, s.chunk_bytes_held as u64),
-        c.forced_undersized_blocks,
-        c.filter_decoded_bytes,
-        c.raw_bytes_ingested,
-        c.raw_bytes_compressed,
-        c.blocks_compressed,
-        c.blocks_reused
+        ratio(hits.decoded_bytes(), 10_000),
+        ratio(misses.decoded_bytes(), 1_000),
+        hits.blocks_loaded(),
+        misses.blocks_loaded()
     );
     engine.close().unwrap();
 }
 fn main() {
     println!(
-        "scenario,compressed_raw_per_ingested_raw,logical_frame_write_amplification,blocks_reused_fraction,bytes_reused_fraction,stored_bytes,chunk_bytes_held,block_bytes_live,live_fraction,forced_undersized_blocks,filter_decoded_bytes,ingested_raw_bytes,compressed_raw_bytes,new_blocks,reused_blocks"
+        "scenario,stored_bytes,filter_bytes,index_bytes,frame_bytes,hit_decoded_bytes_per_get,miss_decoded_bytes_per_get,hit_blocks,miss_blocks"
     );
-    scenario("B-random", true, false);
-    scenario("clustered", false, true);
-    scenario("A-random", false, false);
+    scenario("B-random", true, false, RECORDS, false);
+    scenario("clustered", false, true, RECORDS, false);
+    scenario("A-random", false, false, RECORDS, false);
+    scenario("A-large", false, false, 200_704, true);
 }

@@ -32,6 +32,11 @@ impl MergeWorkspace {
         self.runs.iter().map(ReadWorkspace::blocks_loaded).sum()
     }
 
+    /// Raw bytes in blocks loaded through this workspace.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.runs.iter().map(ReadWorkspace::decoded_bytes).sum()
+    }
+
     /// Returns the bytes held by decompression contexts, which Zstandard
     /// allocates outside the Rust heap.
     pub fn context_bytes(&self) -> usize {

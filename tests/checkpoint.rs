@@ -946,3 +946,56 @@ fn multi_segment_checkpoint_streams_one_v5_run_and_recovers() {
         }
     }
 }
+
+#[test]
+fn checkpoints_preserve_bottom_runs_without_filters() {
+    for compression in [Compression::Uncompressed, Compression::Zstd] {
+        let dir = Scratch::new(&format!("bottom-no-filter-{compression:?}"));
+        let options = EngineOptions {
+            compression,
+            ..manual()
+        };
+        let engine = Engine::new(options).unwrap();
+        for version in [b"old", b"new"] {
+            for key in [b"a", b"c", b"e"] {
+                engine.put(key, version).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        assert!(engine.stats().filter_bytes > 0);
+        compact_all(&engine);
+        assert_eq!(engine.stats().filter_bytes, 0);
+        assert!(
+            engine
+                .core
+                .read_state()
+                .runs
+                .iter()
+                .all(|run| run.run.filter().is_none())
+        );
+        let mut ws = EngineWorkspace::new();
+        assert_eq!(engine.get(b"c", &mut ws).unwrap().unwrap().value, b"new");
+        assert!(engine.get(b"b", &mut ws).unwrap().is_none());
+        assert_eq!(ws.blocks_loaded(), 2);
+        assert!(ws.decoded_bytes() > 0);
+        engine
+            .checkpoint(&dir.0, CheckpointOptions::default())
+            .unwrap();
+        let recovered = Engine::recover(&dir.0, options).unwrap();
+        assert_eq!(recovered.stats().filter_bytes, 0);
+        assert!(
+            recovered
+                .core
+                .read_state()
+                .runs
+                .iter()
+                .all(|run| run.run.filter().is_none())
+        );
+        assert_eq!(get(&recovered, b"c").unwrap(), b"new");
+        assert_eq!(get(&recovered, b"b"), None);
+        // A new level-0 flush still receives a filter beside an unfiltered bottom.
+        recovered.put(b"c", b"latest").unwrap();
+        recovered.flush().unwrap();
+        assert!(recovered.stats().filter_bytes > 0);
+    }
+}

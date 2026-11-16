@@ -308,6 +308,10 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub(crate) fn frame_bytes(&self) -> usize {
         self.view().frame_bytes()
     }
+    pub(crate) fn index_bytes(&self) -> usize {
+        let view = self.view();
+        view.table.len() * TABLE_ENTRY_LEN + view.keys.len()
+    }
     /// Serialized byte count, excluding filters and physical segment metadata.
     pub fn stored_len(&self) -> usize {
         self.data.stored_len()
@@ -446,6 +450,7 @@ pub struct ReadWorkspace {
     position: BlockPosition,
     prefix: Vec<u8>,
     blocks_loaded: u64,
+    decoded_bytes: u64,
 }
 
 impl ReadWorkspace {
@@ -475,10 +480,16 @@ impl ReadWorkspace {
         self.blocks_loaded
     }
 
+    /// Raw bytes in blocks loaded through this workspace.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+
     /// Returns a frame's block, decoding and verifying it if it is compressed.
     /// The frame borrows its raw segment dictionary from the stored run.
     pub(super) fn load<'r>(&'r mut self, frame: &Frame<'r>) -> Result<&'r [u8], CorruptRun> {
         self.blocks_loaded += 1;
+        self.decoded_bytes += frame.decoded_len as u64;
         decode(frame, &mut self.scratch, &mut self.decompressor)
     }
 }
@@ -547,6 +558,7 @@ pub(crate) struct LookupWorkspace {
     buffers: [Vec<u8>; 2],
     decompressor: Decompressor,
     blocks_loaded: u64,
+    decoded_bytes: u64,
 }
 
 /// A version [`LookupWorkspace::get`] found, located rather than borrowed so
@@ -584,6 +596,10 @@ impl LookupWorkspace {
         self.blocks_loaded
     }
 
+    pub(crate) fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+
     /// Returns the sequence number and location of the newest version of
     /// `target` in `view`, as [`RunView::get`] does, decoding into `buffer`
     /// (0 or 1) and leaving the other buffer as it was.
@@ -599,6 +615,7 @@ impl LookupWorkspace {
             scratch,
             &mut self.decompressor,
             &mut self.blocks_loaded,
+            &mut self.decoded_bytes,
         )?;
         let Some((block, version)) = found else {
             return Ok(None);
@@ -1172,9 +1189,10 @@ impl<'a> RunView<'a> {
             scratch,
             decompressor,
             blocks_loaded,
+            decoded_bytes,
             ..
         } = workspace;
-        let found = self.find(target, scratch, decompressor, blocks_loaded)?;
+        let found = self.find(target, scratch, decompressor, blocks_loaded, decoded_bytes)?;
         Ok(found.map(|(_, version)| version))
     }
 
@@ -1224,6 +1242,7 @@ impl<'a> RunView<'a> {
         scratch: &'r mut Vec<u8>,
         decompressor: &mut Decompressor,
         blocks_loaded: &mut u64,
+        decoded_bytes: &mut u64,
     ) -> Result<Option<(&'r [u8], Version<'r>)>, CorruptRun>
     where
         'a: 'r,
@@ -1236,6 +1255,7 @@ impl<'a> RunView<'a> {
         };
         let frame = self.frame(block)?;
         *blocks_loaded += 1;
+        *decoded_bytes += frame.decoded_len as u64;
         let bytes = decode(&frame, scratch, decompressor)?;
         let version = BlockView::open(bytes)
             .and_then(|view| view.get(target))

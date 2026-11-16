@@ -34,6 +34,11 @@ impl Workspace {
         self.read.blocks_loaded()
     }
 
+    /// Raw bytes in blocks loaded through this workspace.
+    pub(super) fn decoded_bytes(&self) -> u64 {
+        self.read.decoded_bytes()
+    }
+
     fn prepare<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
         self.order.clear();
         self.order.extend(0..keys.len());

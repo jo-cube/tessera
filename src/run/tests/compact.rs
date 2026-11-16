@@ -421,6 +421,7 @@ fn subcompactions_match_serial_versions_tombstones_sequences_and_cuts() {
             .collect(),
         max_overlapped: 1,
         single: false,
+        omit_filter: false,
     };
     for zero_seq in [false, true] {
         let limits = CompactLimits {

@@ -504,6 +504,10 @@ pub struct EngineStats {
     pub chunk_bytes_held: usize,
     /// Frame bytes referenced by published compressed runs.
     pub block_bytes_live: usize,
+    /// Bloom filter payload bytes of published runs.
+    pub filter_bytes: usize,
+    /// Block index bytes (entries and keys) of published runs.
+    pub index_bytes: usize,
     /// The last sequence number used.
     pub last_seq: u64,
     /// Total memory charged to writer admission (sum of the components below).
@@ -1355,7 +1359,7 @@ impl Core {
         } else {
             state.levels.plan(&fit)
         };
-        let (kind, level, inputs, dest, cuts, cursor) = match plan {
+        let (kind, level, inputs, dest, mut cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Move { level, run } => {
                 if state.levels.move_down(level, &run).is_err() {
@@ -1430,6 +1434,7 @@ impl Core {
                 )
             }
         };
+        cuts.omit_filter = matches!(dest, Dest::Level(level) if level == state.levels.depth());
         let others = Self::others(&state, &inputs);
         // Logical reads resolve overlapping runs by sequence. Preserve it if
         // any unselected run could compete, even above the bottom level.
@@ -1545,6 +1550,8 @@ impl Core {
 
         EngineStats {
             build: self.chunks.counters(),
+            filter_bytes: state.runs.iter().map(|run| run.run.filter_bytes()).sum(),
+            index_bytes: state.runs.iter().map(|run| run.run.index_bytes()).sum(),
             chunk_bytes_held: state.runs.iter().map(|run| run.run.chunk_capacity()).sum(),
             block_bytes_live: state.runs.iter().map(|run| run.run.frame_bytes()).sum(),
             used: usage.used,
@@ -2213,6 +2220,11 @@ impl EngineWorkspace {
     /// Returns how many run blocks reads through this workspace have loaded.
     pub fn blocks_loaded(&self) -> u64 {
         self.logical.blocks_loaded() + self.multi.blocks_loaded()
+    }
+
+    /// Raw bytes in run blocks loaded through this workspace, including misses.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.logical.decoded_bytes() + self.multi.decoded_bytes()
     }
 }
 

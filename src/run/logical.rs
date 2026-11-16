@@ -142,6 +142,11 @@ impl LogicalWorkspace {
     pub fn blocks_loaded(&self) -> u64 {
         self.merge.blocks_loaded() + self.lookup.blocks_loaded()
     }
+
+    /// Raw bytes in blocks loaded through this workspace.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.merge.decoded_bytes() + self.lookup.decoded_bytes()
+    }
 }
 
 #[cfg_attr(
