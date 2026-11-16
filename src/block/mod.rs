@@ -2,15 +2,13 @@
 //!
 //! A block stores versioned records ordered by user key ascending, then
 //! sequence number descending. [`BlockBuilder`] encodes records supplied in
-//! that order and [`Block`] validates the bytes once, after which lookups and
-//! iteration cannot fail.
+//! that order. [`RecordWalk`] validates every record during run recovery.
 //!
 //! # Reading
 //!
 //! Full validation costs O(block length), so it is separated from access:
 //!
-//! - [`Block::new`] validates bytes of unknown origin once. Reads on the
-//!   resulting [`Block`] cannot fail.
+//! - [`RecordWalk::validate_block`] validates bytes of unknown origin.
 //! - [`BlockView::open`] costs O(1) and suits bytes already known to be valid,
 //!   such as a validated block decompressed again into a scratch buffer. Its
 //!   reads stay panic free and report what they touch; its documentation
@@ -38,7 +36,7 @@
 //! value      := value_tag - 1 bytes, absent for a tombstone
 //! ```
 //!
-//! Invariants of a valid block, all checked by [`Block::new`]:
+//! Invariants of a valid block, all checked by [`RecordWalk`]:
 //!
 //! - Internal keys `(user key, seq)` strictly increase in block order, where
 //!   user keys compare ascending and sequence numbers descending. Strictness

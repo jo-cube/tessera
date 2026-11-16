@@ -124,6 +124,10 @@
 //! Levels and sequence overrides are restored without compaction. Use
 //! [`Engine::checkpoint_with_metadata`] and [`Engine::recover_with_metadata`]
 //! to store and recover opaque application metadata (up to 16 MiB).
+//! Run format 6 stores magicless Zstandard frames and prefix-compressed index
+//! keys; checkpoint manifests use version 3. Recovery validates file lengths,
+//! checksums, all records, filter membership and cross-run copies before
+//! starting workers. CRC-32 detects damage but does not authenticate files.
 //!
 //! A checkpoint is committed when the directory's `CURRENT` file is renamed
 //! to name it, after its runs and manifest are synced. The previous generation
@@ -133,6 +137,7 @@
 //! older one, before it returns an engine. One engine or process uses a
 //! directory at a time, through an advisory lock on its `LOCK` file, which
 //! the kernel releases if the process dies.
+//! Recovery leaves checkpoint data unchanged and may create the lock file.
 
 mod batch;
 mod checkpoint;
@@ -501,11 +506,11 @@ pub struct FlushReport {
 /// A summary of an engine's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineStats {
-    /// Cumulative encoding and block-reuse work.
+    /// Cumulative encoding and admitted input, with zero block-reuse counters.
     pub build: BuildCounters,
-    /// Physical chunk capacity held by published compressed runs.
+    /// Physical chunk capacity held by published runs.
     pub chunk_bytes_held: usize,
-    /// Frame bytes referenced by published compressed runs.
+    /// Frame bytes referenced by published runs.
     pub block_bytes_live: usize,
     /// Bloom filter payload bytes of published runs.
     pub filter_bytes: usize,
@@ -554,21 +559,21 @@ pub struct EngineStats {
     pub max_overlap: usize,
     /// Live snapshots.
     pub snapshots: usize,
-    /// Memtables and runs the engine has released that snapshots still hold,
-    /// or that an [`Engine::get`] in progress is still reading.
+    /// Released memtables and runs still held by snapshots, readers or
+    /// temporary references during publication cleanup.
     pub retained_sources: usize,
-    /// Bytes kept only for snapshots: the charged or stored bytes of those
-    /// sources with any runs' filters and segment metadata, and history pinned in the engine's
-    /// memtables, which `active` and `frozen` also report as
-    /// [`MemoryUsage::pinned`].
+    /// Bytes of retained sources, including run filters and segment metadata,
+    /// plus history pinned in the engine's memtables. Sources may be held by
+    /// snapshots, readers or publication cleanup. Memtable history is also
+    /// reported as [`MemoryUsage::pinned`] in `active` and `frozen`.
     pub retained_bytes: usize,
     /// The part of `retained_bytes` that is runs: stored bytes of runs that
-    /// compaction replaced and snapshots still hold.
+    /// compaction replaced and snapshots, readers or publication cleanup still hold.
     pub retained_run_bytes: usize,
     /// The part of `retained_bytes` that is runs' filters and segment metadata.
     pub retained_held_bytes: usize,
-    /// Flushes whose runs level 0 holds: at most 12, the level-0 stop, with
-    /// a background worker.
+    /// Flushes whose runs level 0 holds. Writers wait at 12; pending flushes
+    /// can still publish while they wait.
     pub level0_flushes: usize,
     /// Runs in level 0.
     pub level0_runs: usize,
@@ -816,7 +821,8 @@ impl Engine {
     /// is closed once it is the last reference ([`Arc::into_inner`]).
     /// [`Snapshot`]s are unaffected and stay readable.
     ///
-    /// Closing writes nothing: no flush or checkpoint. The engine's data
+    /// Closing starts no flush or checkpoint; an in-flight build may finish.
+    /// It writes nothing to disk. The engine's data
     /// goes with it unless checkpointed first.
     /// Dropping the engine does the same and discards the result.
     ///

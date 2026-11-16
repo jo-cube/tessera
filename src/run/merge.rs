@@ -66,7 +66,7 @@ impl MergeWorkspace {
 /// different values. A merge does not compare values or report conflicts. A
 /// user key and sequence number must name one logical record; a caller that
 /// needs one record per user key should read through a
-/// [`RunSet`](super::RunSet), which collapses identical copies and rejects
+/// [`LogicalCursor`](super::LogicalCursor), which collapses identical copies and rejects
 /// conflicting ones. A caller writing a merged stream to a new run must
 /// resolve duplicates first, because a run rejects them.
 ///

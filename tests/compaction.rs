@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Compaction in the engine: which runs it selects,
 //! and how it replaces runs while reads, writes and flushes continue.
 //!

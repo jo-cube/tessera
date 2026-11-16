@@ -2,7 +2,7 @@
 //!
 //! A [`Memtable`] accepts updates. [`Memtable::freeze`] consumes it and returns
 //! a [`FrozenMemtable`], which has no way to change, and
-//! [`FrozenMemtable::flush`] builds compressed runs from it.
+//! [`FrozenMemtable::flush_with`] builds compressed runs from it.
 //!
 //! # Versions
 //!
@@ -21,7 +21,7 @@
 //!
 //! The caller assigns sequence numbers, and a memtable only checks them. Every
 //! accepted update must have a sequence number above all earlier ones in the
-//! table, and above the `after` given to [`Memtable::new`], so that a table can
+//! table, and above the `after` given to its constructor, so that a table can
 //! continue from its frozen predecessor. Updates are never reordered.
 //!
 //! Every value of `u64` is usable. After `u64::MAX` no number is larger, so
@@ -73,7 +73,7 @@ mod tests;
 /// this is an estimate.
 pub const ENTRY_OVERHEAD: usize = 128;
 
-/// Input per output run suggested for [`FrozenMemtable::flush`].
+/// Input per output run suggested for [`FrozenMemtable::flush_with`].
 pub const TARGET_RUN_LEN: usize = 64 << 20;
 
 pub use crate::run::MAX_TARGET_RUN_LEN;

@@ -1,33 +1,12 @@
 # Tessera
 
-Tessera is a general-purpose, RAM-only compressed LSM key–value engine written
-in safe Rust and embedded in the application's process. The dataset must fit
-in memory. Data can be rebuilt from upstream sources or restored from an
-explicit checkpoint.
+Tessera is a RAM-first compressed LSM key–value engine embedded in the
+application process, written in safe Rust. The dataset must fit in memory.
+Explicit checkpoints restore data after a restart; there is no write-ahead
+log or per-write durability. Closing or dropping an engine writes nothing.
 
-This is a private alpha (`publish = false`). The API and on-disk formats may
-change without migration. Requires Rust 1.89 or later and a C compiler for the
-bundled Zstandard library.
-
-## Supported operations
-
-- Byte-string keys and values, atomic write batches, sorted bulk ingestion,
-  point lookups and batched multi-get.
-- Ordered scans and prefix scans in bytewise key order.
-- Consistent in-memory snapshots that remain readable after the engine closes.
-- Automatic memtable flushing and background leveled compaction; manual
-  maintenance is also available.
-- Zstandard level 1 with raw segment dictionaries and adaptive blocks, or
-  uncompressed blocks.
-- Explicit incremental checkpoints and recovery of the latest committed checkpoint,
-  including format, checksum and corruption checks.
-- One optional memory budget for writer admission, with component accounting.
-  Reads, snapshots and maintenance continue under pressure.
-
-There is no write-ahead log, per-write durability, automatic checkpointing,
-transactions beyond atomic batches, replication or disk tier.
-Closing or dropping an engine writes nothing. Every update after the last
-checkpoint is lost when the process ends unless rebuilt upstream.
+This private alpha has `publish = false`. Its API and formats may change
+without migration. Rust 1.89 and a C compiler for bundled Zstandard are required.
 
 ## Usage
 
@@ -77,125 +56,130 @@ assert_eq!(recovered.get(b"user/2", &mut workspace)?.unwrap().value, b"grace");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`Engine::write(&WriteBatch) -> Result<u64, UpdateError>` returns the batch's
-last sequence number. Memtable batches take a contiguous sequence range;
-batches built directly into runs take one publication sequence. In either case
-all operations become visible together. An empty batch returns the current ceiling.
-`put` and `delete` share the memtable update path. A dedicated flush thread
-builds runs while reads and writes continue; writers wait when the frozen-table
-bound of two tables or the level-0 stop is reached. Each table has
-`memtable_budget` charged bytes. `flush()` always publishes and waits until all
-earlier writes are in runs; a worker panic leaves its tables readable.
+## Operations and consistency
 
-Strictly key-sorted, unique batches use the direct run path when their charged
-input reaches half the memtable budget. `ingest_sorted(&WriteBatch)` forces that path and rejects unsorted or
-duplicate keys. Tables sharing an actual batch key are flushed before atomic
-publication into level 0; range overlap alone causes no wait. Builds release the
-state lock, so concurrent writes proceed. Each ingestion builds once with stored
-placeholders, then assigns one shared sequence at publication, after all
-previous writes. A run-level override supplies this effective sequence to readers
-and merges; compaction writes it into ordinary run records, while checkpoints
-preserve the override.
-An oversized unsorted batch stages its records in a private memtable and uses
-the same single-sequence run path, preserving the last duplicate operation.
-Snapshots and checkpoints taken during a build exclude its unpublished runs;
-a failed or panicked build consumes no sequence.
+Keys and values are byte strings. Keys compare bytewise; empty keys and values
+are valid. Keys are limited to 64 KiB and values to 64 MiB. A record's key,
+value and 128-byte entry charge must also fit the memtable budget.
 
-`multi_get(keys, workspace, |index, value| ...) -> Result<(), ReadError>` is
-available on `Engine`, `ReadGuard` and `Snapshot`. It sees one consistent state
-and reports borrowed values in input order. Indices are sorted once when needed;
-run groups probe Bloom filters and decode each needed block once. Workspaces
-reuse the index, result, value and decode buffers; warm calls allocate nothing
-on the Rust heap. Callbacks run only after a successful read.
+- `put`, `delete` and `write` publish atomically and return a sequence ceiling.
+  A memtable batch takes consecutive sequences, and later duplicate keys win.
+  A batch built into runs takes one shared publication sequence. An empty batch
+  returns the current ceiling. Snapshots never see a partial batch.
+- `ingest_sorted` requires strictly increasing, unique keys and builds runs
+  outside the state lock. Sorted batches reaching half the memtable budget
+  automatically use that path; oversized unsorted batches use private staging.
+  Publication follows concurrent writes and drains tables sharing batch keys.
+- `get` and `multi_get` each see one consistent state. Multi-get callbacks run
+  after successful decoding, in input order, including duplicates and misses.
+- Snapshots preserve the state at `last_seq()` through writes, maintenance and
+  engine closure. They share immutable sources and copy-on-write memtables.
+  Scans yield each live key once in ascending order; prefix scans use raw bytes.
+  A value's sequence may be zero after settled bottom-level compaction, so it
+  is not a stable update identifier.
 
-`EngineOptions::compression` is `Compression::Zstd` by default; the other
-choice is `Compression::Uncompressed`. Zstandard buffers up to 4 MiB of raw
-encoded records per segment and stores one sampled raw dictionary of up to
-16 KiB. `target_block_compressed` defaults to 1024 bytes: a 64 KiB sample
-estimates the ratio used to cut blocks, with a 256 KiB raw cap. One larger
-record gets its own block. Segments use level 1; block sizing retains its
-level-3 ratio probe.
-Uncompressed runs use a fixed 16 KiB raw target.
-Frames and dictionaries share engine-owned 1 MiB chunks, including across
-segments of the same run. A frame larger than a chunk has an exact allocation.
-A finished run copies its partial final chunk into an exact allocation.
-Retired chunks return to a shared pool, whose free reserve is capped at the
-fixed 32 MiB, independent of job size.
-`EngineStats` reports free reserve, its cap and checked-out chunk capacity,
-including padding and snapshots. Index, footer and filter buffers remain exact
-allocations. `used` counts charged memtables, runs and held metadata, retired
-sources, reserve and unused checked-out capacity, plus in-flight build estimates.
-Compaction builds disjoint key ranges of one selected job in parallel, using up
-to `background_threads` builders (default half the available CPUs, capped at 4,
-at least 1). Segment buffers share an internal workspace allowance;
-small jobs and tight memory budgets use fewer builders. Flush builds remain serial.
-Bottom-level compaction can erase settled sequence numbers to zero when no
-snapshot or overlapping unselected run needs them. Snapshot views keep their
-records and visibility, and checkpoint recovery preserves the write ceiling.
-Readers reuse one context and borrow dictionary bytes from the run; there is
-no prepared dictionary or decoded-block cache. Run format 5 and checkpoint
-manifest version 3 replace earlier formats without backward compatibility.
+## Options and memory
 
-Checkpoints flush memtables, then write each immutable compressed run and its
-checksummed Bloom filter once to `runs/<id>`, with no recompression. Manifests
-preserve levels, sequence overrides and the ceiling. Reports count written/reused
-bytes and runs, and deleted run files; GC retains the latest two generations.
-`checkpoint_with_metadata(dir, options, blob)` and `recover_with_metadata` round-trip
-opaque application data (up to 16 MiB) with the same commit.
+`EngineOptions` is fixed when the engine starts:
 
-## Options and errors
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `memory_limit` | `None` | Optional writer admission budget in bytes |
+| `memtable_budget` | 64 MiB | Charged bytes per active or frozen table |
+| `level_ratio` | 10 | Level size multiplier, at least 2 |
+| `background_threads` | Half the CPUs, clamped to 1–4 | Builders per compaction |
+| `compression` | `Compression::Zstd` | Zstandard or `Uncompressed` |
+| `target_block_compressed` | 1024 | Estimated compressed block bytes, 1–256 KiB |
 
-`EngineOptions` contains `memory_limit` (default `None`, unlimited),
-`memtable_budget`, `level_ratio`, `background_threads`, `compression` and
-`target_block_compressed`. Background compaction is always enabled; run sizing,
-flush backlog and compaction scheduling use internal defaults.
+At 90% of the memory budget writers wait briefly for publication. At 100% they
+request maintenance while reclamation can progress, then return `MemoryLimit`
+if live data or held snapshots prevent admission. Reads and maintenance remain
+available. Writers also wait at two frozen memtables or twelve level-0 flushes.
+`flush()` waits until all preceding writes are in runs.
 
-At 90% of the memory budget a writer waits briefly for publication. At 100% it
-waits while maintenance can reclaim memory, then returns
-`UpdateError::MemoryLimit { used, limit }` if live data or held snapshots prevent
-progress. The other write errors are `Rejected(WriteError)` for invalid input
-and `SequencesExhausted`. `snapshot()` is infallible. Flushes and compactions
-have no size or retention refusal; maintenance still reports corruption and
-worker panics. `EngineStats` exposes `used` and its accounting components.
-The budget covers engine estimates, with transient maintenance headroom;
-caller workspaces and allocator overhead are outside it.
+`EngineStats::used` includes charged memtables, stored runs and metadata,
+retained snapshot sources, pool reserve and unused checked-out capacity, plus
+build estimates. This is an admission budget with transient maintenance
+headroom. Caller-owned workspaces and allocator overhead are outside it.
+Memtables charge arena bytes used, including overwritten garbage, entry
+charges and pinned history; the budget does not reserve that memory in advance.
 
-## Tuning
+Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
+finished runs trim their partial final chunk. The free reserve is capped at
+32 MiB. Readers borrow dictionaries and reuse one decode context per workspace;
+there is no decoded-block cache. Zstandard level 1 uses raw dictionaries up to
+16 KiB per 4 MiB segment, with a level-3 ratio probe for adaptive block cuts.
+Ordinary raw blocks are capped at 256 KiB; a larger record gets its own block.
+Uncompressed runs target 16 KiB raw blocks. Bottom-level compactions omit Bloom
+filters; other builders may omit them to bound temporary memory.
 
-- `level_ratio` defaults to 10. Higher ratios generally use less live heap and
-  give faster reads; lower ratios favor faster writes and lower write
-  amplification. Choose 4 when write cost matters more than memory and reads.
-- `target_block_compressed` defaults to 1024 bytes. Larger blocks reduce index
-  and frame overhead, using less memory, but point reads decode more data and
-  become slower. Smaller blocks trade memory for faster point reads.
-- `background_threads` limits builders within a selected compaction job. The
-  default is half the available CPUs, capped at 4 and at least 1. More builders
-  can accelerate large jobs at greater CPU cost; small jobs and tight workspace
-  limits use fewer, and 1 builds serially.
-- `memtable_budget` defaults to 64 MiB for each active or frozen table. A larger
-  budget reduces flush frequency and can improve writes while using more
-  transient memory. A smaller budget lowers that memory cost but flushes more
-  often; the budget charges arena bytes used, including overwritten garbage,
-  plus node overhead and snapshot history. It does not reserve memory in advance.
+Higher `level_ratio` usually favors memory and reads; lower ratios favor writes.
+Larger blocks reduce metadata while increasing point-read decoding. Larger
+memtables reduce flush frequency at greater transient memory cost.
 
-A `ReadGuard` provides a stable view while holding a shared lock and blocks
-writers for its lifetime. Use snapshots for longer reads. See the
-[`engine` module](src/engine.rs) for consistency, memory, maintenance and
-checkpoint contracts. Build API documentation with `cargo doc --no-deps`.
+## Threading and errors
 
-## Tests
+An engine can be shared between threads. State changes use an exclusive lock;
+run decoding and builds happen outside it. A dedicated flush worker and a
+compaction worker perform maintenance. Compaction can use several builders;
+flush builds are serial. Use one reusable `EngineWorkspace` per reading thread.
+A `ReadGuard` holds a shared lock and blocks writers and publication: drop it
+before calling engine methods that need the exclusive lock. Use snapshots for
+long reads. `close()` joins workers; snapshots can outlive the engine.
+
+Invalid configuration returns `OpenError::Config(ConfigError)`. Invalid writes
+return `UpdateError::Rejected(WriteError)`; admission pressure and sequence
+exhaustion return `MemoryLimit` and `SequencesExhausted`. Reads report corruption
+or conflicting copies through `ReadError`. Maintenance reports read failures,
+stale jobs or worker panics. A build panic leaves published sources readable;
+a panic under the exclusive state lock poisons the engine.
+
+## Checkpoints
+
+`checkpoint` flushes and pins one structural snapshot at its sequence ceiling,
+then writes files while updates and compactions continue. Immutable runs are
+written once and reused by stable ID, without recompression. Reports count new,
+reused and deleted files and bytes. GC retains the latest two generations.
+`checkpoint_with_metadata` and `recover_with_metadata` include an opaque blob
+of at most 16 MiB in the same commit.
+
+The layout is `CURRENT`, `LOCK`, `runs/<32-hex-digit ID>` and
+`ckpt-<20-digit generation>/MANIFEST`. Run format 6 uses magicless Zstandard
+frames and a prefix-compressed sparse index. Each run file appends Bloom words
+and their CRC-32. Manifest version 3 records file checksums and lengths, levels,
+flush groups, sequence overrides, the ceiling and application metadata.
+Unsupported versions are rejected.
+
+Runs and the manifest are synced before renaming `CURRENT`, the commit point,
+then the parent directory is synced before GC. An error before the rename keeps
+the old commit. An I/O error after it reports `after_commit_point = true` and
+retains both generations. Durability assumes local POSIX rename and working
+file and directory fsync. An advisory lock excludes cooperating directory users.
+
+Recovery validates exactly the generation named by `CURRENT`, with no fallback.
+It checks lengths, checksums, run structure, Bloom membership, sequence bounds
+and cross-run consistency before starting workers. Allocation is bounded by
+actual file sizes and format limits; a declared decoded length is checked
+against compressed block headers before sizing its buffer. Recovery temporarily
+holds a contiguous run file while packing it into chunks. Cross-run validation
+keeps one decoded block per overlapping group. Recovery leaves checkpoint
+data unchanged and may create `LOCK`. Rejections return typed `OpenError`s.
+CRC-32 detects accidental damage; it does not authenticate files.
+
+## Validation
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo +1.89.0 check --locked --all-targets
+cargo +1.89.0 clippy --locked --all-targets -- -D warnings
+cargo test --locked --lib long_ -- --ignored
 ```
 
-The suite includes model comparisons, corruption and format checks, snapshot
-and checkpoint correctness, compaction, allocation and retention checks.
-Large-allocation boundary tests stay ignored by default.
-
-For resource-limited Linux validation, use `scripts/validate.sh check`;
-`scripts/validate.sh limits` runs the large-allocation boundary tests.
-See [the release checklist](docs/release.md) when cutting a private alpha.
+The default suite includes bounded mutation tests and a concurrent sequence
+model with a 20-second process deadline. Longer campaigns and large-allocation
+boundary tests are ignored by default. `scripts/validate.sh check` runs the full
+checks in a resource-limited Linux container; `limits` runs boundary tests.
+See the [engine contracts](src/engine.rs) and [release checklist](docs/release.md).

@@ -79,7 +79,7 @@ impl<B: AsRef<[u8]>> Block<B> {
 #[cfg(test)]
 const VALIDATED: &str = "block bytes were validated by Block::new";
 
-/// One stored version of a user key, yielded by [`Cursor::next_record`].
+/// One stored version of a user key, yielded by [`BlockPosition::next_record`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record<'a> {
     /// The reconstructed user key.
@@ -90,7 +90,7 @@ pub struct Record<'a> {
     pub value: Value<'a>,
 }
 
-/// The sequence number and payload found by [`Block::get`].
+/// The sequence number and payload found by [`BlockView::get`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version<'a> {
     /// The record's sequence number.
@@ -123,7 +123,7 @@ impl Cursor<'_> {
 ///
 /// Because a position holds only an offset and the rebuilt key, a run iterator
 /// can own it beside the buffer or cached block being read, which a borrowing
-/// [`Cursor`] cannot do without a self-referential struct. The block is passed
+/// lending cursor cannot do without a self-referential struct. The block is passed
 /// to each step, and the key buffer is reused across blocks.
 ///
 /// Between calls to [`reset`](Self::reset) every step must be given the same
@@ -259,7 +259,7 @@ impl BlockPosition {
 ///
 /// A correct answer therefore requires bytes known to be a valid block: built
 /// by [`BlockBuilder`](super::BlockBuilder), or accepted once by
-/// [`Block::new`], and unchanged since. A checksum can show bytes are
+/// [`RecordWalk::validate_block`], and unchanged since. A checksum can show bytes are
 /// unchanged. It cannot show that whoever wrote them produced a valid block.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockView<'a> {
@@ -551,7 +551,7 @@ impl RecordWalk {
     }
 }
 
-/// Why bytes were rejected by [`Block::new`] or a [`BlockView`] read.
+/// Why bytes were rejected by full validation or a [`BlockView`] read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorruptBlock {
     /// Byte offset in the block of the offending record or directory.
@@ -567,9 +567,9 @@ pub enum Corruption {
     Truncated,
     /// A varint overflows `u64` or is not in canonical form.
     InvalidVarint,
-    /// A key exceeds [`MAX_KEY_LEN`](super::MAX_KEY_LEN).
+    /// A key exceeds [`MAX_KEY_LEN`].
     KeyTooLong,
-    /// A value exceeds [`MAX_VALUE_LEN`](super::MAX_VALUE_LEN).
+    /// A value exceeds [`MAX_VALUE_LEN`].
     ValueTooLong,
     /// The block exceeds the 128 MiB format limit.
     BlockTooLong,

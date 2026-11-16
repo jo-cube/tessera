@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Checkpoints and recovery through the public API: what a checkpoint holds,
 //! what recovery accepts and rejects, and what a failed checkpoint leaves.
 //! Interrupted publication is tested beside the code, where crashes can be

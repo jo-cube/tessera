@@ -1,4 +1,3 @@
-#![cfg(test)]
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, UpdateError, WriteBatch};
 
 #[test]

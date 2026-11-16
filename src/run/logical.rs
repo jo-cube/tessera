@@ -212,7 +212,7 @@ where
     latest_from(InOrder(runs.into_iter().enumerate()), key, workspace)
 }
 
-/// [`latest_in`] over the runs `source` offers, each with its position, which
+/// Finds the latest version over the runs `source` offers, each with its position, which
 /// a conflict reports. The source is told the sequence number of the newest
 /// version found so far, and may stop offering runs once none it has left can
 /// hold a version at or above it; one that does can still be checked for a
@@ -297,7 +297,7 @@ where
     }
 }
 
-/// A run as [`latest_in`] reads it: what rules it out without opening it,
+/// A run as [`latest_from`] reads it: what rules it out without opening it,
 /// and the view it reads otherwise.
 pub(crate) trait LookupInput<'a>: Copy {
     /// The largest sequence number of any record, `u64::MAX` if unknown.

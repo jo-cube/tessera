@@ -15,7 +15,7 @@
 //!
 //! Four concerns are kept apart:
 //!
-//! - **Structural validation** is [`Run::new`], for bytes of unknown origin.
+//! - **Structural validation** is [`Run::recover_checkpoint_in`], for checkpoint bytes.
 //!   It verifies every checksum, decompresses every block and walks every
 //!   record, using memory for one decoded block at a time.
 //! - **Trusted runs** come from [`RunBuilder::finish`], which is not walked
@@ -23,7 +23,7 @@
 //! - **Integrity** is a CRC-32 over each frame's header fields and stored
 //!   bytes. Decompressing a frame verifies it first, at a small cost relative
 //!   to decompression. An uncompressed frame is read in place, where a checksum
-//!   would turn a lookup into a read of the whole block, so only [`Run::new`]
+//!   would turn a lookup into a read of the whole block, so recovery
 //!   verifies it. A checksum shows bytes are unchanged. It cannot show that
 //!   whoever wrote them produced a valid run.
 //! - **Checked decoding** is what [`RunView`] reads do on every path: they are
@@ -203,7 +203,7 @@ pub enum RunCorruption {
     MissingDictionary,
     /// A frame's stored bytes do not decompress to its declared length.
     CorruptPayload,
-    /// A persisted Bloom filter has an invalid length.
+    /// A persisted Bloom filter has an invalid length or rules out a stored key.
     InvalidFilter,
     /// A frame holds a block with no records.
     EmptyBlock,

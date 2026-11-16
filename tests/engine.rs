@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! The integrated engine: visibility across memtables and runs, flush stages,
 //! limits, and concurrent use.
 //!

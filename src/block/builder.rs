@@ -9,7 +9,7 @@ use super::{
 /// Encodes records, supplied in block order, into an immutable block.
 ///
 /// Records must arrive by user key ascending, then sequence number descending.
-/// A rejected [`add`](Self::add) leaves the builder unchanged, so a caller can
+/// A rejected [`check`](Self::check) leaves the builder unchanged, so a caller can
 /// respond to [`BuildError::BlockFull`] by finishing this block and retrying
 /// the record in a new one.
 #[derive(Debug, Default)]
@@ -147,7 +147,7 @@ impl BlockBuilder {
         self.record_count == 0
     }
 
-    /// Returns the exact length [`finish`](Self::finish) would produce now.
+    /// Returns the exact encoded length, including the restart directory.
     pub fn encoded_len(&self) -> usize {
         self.entries.len() + self.restarts.len() * U32_LEN + U32_LEN
     }
@@ -199,7 +199,7 @@ fn write_directory(restarts: &[u32], out: &mut Vec<u8>) {
     out.extend_from_slice(&(restarts.len() as u32).to_le_bytes());
 }
 
-/// Why a record was rejected by [`BlockBuilder::add`].
+/// Why a record was rejected by [`BlockBuilder::check`] or [`BlockBuilder::append`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildError {
     /// The user key exceeds [`MAX_KEY_LEN`].

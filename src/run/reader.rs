@@ -25,7 +25,7 @@ use crate::chunk::ChunkPool;
 ///
 /// Holding a `Run` is proof of validity: it comes from
 /// [`RunBuilder::finish`](super::RunBuilder::finish) or from a full check by
-/// [`new`](Self::new). Reads never repeat that check. They still return
+/// [`recover_checkpoint_in`](Self::recover_checkpoint_in). Reads never repeat that check. They still return
 /// errors, because a checksum mismatch in memory is a detectable event and not
 /// a programming error. The storage must keep returning the same bytes from
 /// `as_ref`.
@@ -36,8 +36,8 @@ use crate::chunk::ChunkPool;
 ///
 /// A run its builder made also carries a Bloom filter over its user keys,
 /// kept in memory beside the bytes and not part of them, so that a lookup of
-/// a key the run does not hold usually decodes nothing. A run made with
-/// [`new`](Self::new) has none and reads as before.
+/// a key the run does not hold usually decodes nothing. Runs without a filter
+/// use their key bounds and sparse index directly.
 #[derive(Clone, Debug)]
 pub struct Run<B> {
     data: RunData<B>,
@@ -589,7 +589,7 @@ impl LookupWorkspace {
     }
 
     /// Returns the sequence number and location of the newest version of
-    /// `target` in `view`, as [`RunView::get`] does, decoding into `buffer`
+    /// `target` in `view`, decoding into `buffer`
     /// (0 or 1) and leaving the other buffer as it was.
     pub(crate) fn get<'a>(
         &mut self,
@@ -684,7 +684,7 @@ impl<'a> RunCursor<'a> {
     ///
     /// Uses the sparse index and decodes at most one block, or none if the
     /// target is already in the block being walked or above every key. If this
-    /// fails, [`next_record`](Self::next_record) reports the same error until a
+    /// fails, subsequent reads report the same error until a
     /// later seek succeeds.
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
         self.workspace.prefix.clear();
@@ -922,7 +922,7 @@ impl<'a> RunCursor<'a> {
 /// return a wrong answer instead of an error.
 ///
 /// A correct answer therefore requires bytes known to be a valid run: built by
-/// [`RunBuilder`](super::RunBuilder), or accepted once by [`Run::new`], and
+/// [`RunBuilder`](super::RunBuilder), or accepted once by recovery, and
 /// unchanged since. A checksum can show bytes are unchanged. It cannot show
 /// that whoever wrote them produced a valid run.
 ///
@@ -1221,7 +1221,7 @@ impl<'a> RunView<'a> {
         Ok(())
     }
 
-    /// [`get`](Self::get), with the buffer, context and block count given
+    /// Point lookup, with the buffer, context and block count given
     /// separately. Also returns the block the version is in.
     fn find<'r>(
         self,

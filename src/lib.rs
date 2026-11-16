@@ -40,8 +40,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Writes flush the memtable themselves when it fills, so callers never
-//! flush or retry for room. See the [`engine`] module for the consistency,
+//! Writes rotate full memtables for the flush worker and wait for room when
+//! necessary. See the [`engine`] module for the consistency,
 //! snapshot, maintenance, memory and checkpoint contracts.
 //!
 //! Internally, writes go to a bounded mutable memtable, which the engine

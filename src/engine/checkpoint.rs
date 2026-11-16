@@ -8,7 +8,8 @@
 //! Layout: `runs/<32-hex-digit RunId>` holds the exact v6 run chunks, followed
 //! by little-endian Bloom words and their CRC-32. The manifest records both
 //! lengths and a CRC-32 of the entire file. Filters use the fixed hash defined
-//! in `run/filter.rs`; recovery validates runs fully without rebuilding filters.
+//! in `run/filter.rs`; recovery validates runs and filter membership, then
+//! checks copies across runs, without rebuilding filters.
 //! `ckpt-<20-digit generation>/MANIFEST` records levels, level-0 flush groups,
 //! effective sequence overrides, ceiling, next ID counter and application data.
 //!
@@ -21,7 +22,8 @@
 //! files prevent an interrupted write from becoming a reusable final file.
 //!
 //! LOCK is an advisory exclusive file lock, released on close or process exit.
-//! Recovery reads exactly CURRENT, with no fallback, and changes no files.
+//! Recovery reads exactly CURRENT, with no fallback, and leaves checkpoint data
+//! unchanged. It may create LOCK when the lock file is absent.
 //! Durability assumes local POSIX rename and working file/directory fsync
 //! (Linux ext4/XFS); network filesystems and external writers are unsupported.
 //! Checksums detect damage rather than repairing it. CURRENT visibility after
@@ -1051,7 +1053,7 @@ impl Engine {
         })
     }
 
-    /// Recovers CURRENT without changing disk. Sequences continue after the
+    /// Recovers CURRENT without rewriting checkpoint data. Sequences continue after the
     /// checkpoint ceiling. No fallback.
     pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
         Self::recover_with_metadata(dir, options).map(|(engine, _)| engine)
