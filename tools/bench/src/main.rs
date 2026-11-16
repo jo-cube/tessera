@@ -1,6 +1,6 @@
-//! Tessera vs RocksDB comparison. `bench all OUTDIR` runs one child process
-//! per dataset and engine (`bench case ...`) and writes results.csv and
-//! summary.md. See README.md.
+//! macOS Tessera and RocksDB comparison. `tessera-bench all OUTDIR` isolates
+//! each dataset and engine in a child process with a deadline and memory guard.
+//! Results and oracle checks share deterministic inputs; see README.md.
 mod data;
 mod store;
 mod streaming;
@@ -51,13 +51,13 @@ fn live_heap() -> u64 {
 }
 
 #[derive(Clone, Copy)]
-struct MemoryBaseline {
+struct MemoryReference {
     rss: u64,
     heap: u64,
     footprint: u64,
     disk: u64,
 }
-impl MemoryBaseline {
+impl MemoryReference {
     /// Capture with input/oracle allocated, before opening the engine.
     fn capture() -> Self {
         Self { rss: rss(), heap: live_heap(), footprint: footprint(), disk: disk_used() }
@@ -296,7 +296,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     out.emit("setup", "records", n);
     out.emit("setup", "raw_mib", format!("{:.0}", data.raw as f64 / MIB as f64));
     out.emit("setup", "generate_s", format!("{:.1}", t.elapsed().as_secs_f64()));
-    let memory = MemoryBaseline::capture();
+    let memory = MemoryReference::capture();
     memory.emit(&out);
     thread::spawn(|| {
         loop {

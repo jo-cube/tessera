@@ -2,25 +2,24 @@
 # Engine suites are included as unit modules so scheduling hooks stay private.
 autotests = false
 name = "tessera"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A RAM-first, compressed LSM key-value database"
+description = "A safe Rust, RAM-first compressed LSM key-value engine with explicit checkpoints"
 license = "MIT"
 repository = "https://github.com/jo-cube/tessera"
 readme = "README.md"
-# A private alpha: depended on by path or Git revision, not from crates.io.
-# There is no hosted documentation; `cargo doc --open` builds it.
+# Consume by path or Git revision; build API documentation with `cargo doc`.
+keywords = ["key-value", "lsm", "compression", "in-memory", "embedded"]
+categories = ["database-implementations", "data-structures"]
 publish = false
 
 [dependencies]
 crc32fast = "1"
 zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "experimental"] }
 
-# Tests run in a container and are not stepped through in a debugger, so
-# line tables, which keep file and line numbers in panics and backtraces,
-# are enough. Full debug info made each test binary, which every rebuild
-# writes again, 30–65% larger (the unit-test binary 33 MiB against 20 MiB).
+# Line tables retain file and line numbers in panics and backtraces while
+# bounding test binary size and rebuild writes.
 [profile.dev]
 debug = "line-tables-only"
 [[test]]
@@ -34,3 +33,7 @@ path = "tests/lookup_allocations.rs"
 [[test]]
 name = "retention"
 path = "tests/retention.rs"
+
+[[example]]
+name = "counters"
+path = "tools/counters.rs"

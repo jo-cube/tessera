@@ -171,7 +171,7 @@ impl Permutation {
 
 /// Sample through drains too. The condition variable stops the sampler without
 /// waiting for a sampling interval; all buffers are bounded by the run timeout.
-fn measured<T>(store: &Store, trace: &mut fs::File, base: MemoryBaseline, origin: Instant, phase: &str, f: impl FnOnce() -> T) -> T {
+fn measured<T>(store: &Store, trace: &mut fs::File, base: MemoryReference, origin: Instant, phase: &str, f: impl FnOnce() -> T) -> T {
     let done = (Mutex::new(false), Condvar::new());
     thread::scope(|scope| {
         let done_ref = &done;
@@ -210,7 +210,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
     let out = Out { prefix: format!("{ds},{engine}") };
     let setup = Instant::now();
     let data = StreamData::new(ds, target);
-    let memory = MemoryBaseline::capture();
+    let memory = MemoryReference::capture();
     out.emit("setup", "records", data.n);
     out.emit("setup", "raw_mib", format!("{:.2}", data.raw as f64 / MIB as f64));
     out.emit("setup", "generate_s", format!("{:.2}", setup.elapsed().as_secs_f64()));

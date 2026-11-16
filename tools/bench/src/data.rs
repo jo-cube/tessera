@@ -1,5 +1,6 @@
-//! The spike-04 generators for datasets A (grouped JSON) and B (weak-locality
-//! JSON), scaled up, plus pre-generated update values and an oracle.
+//! Deterministic grouped and weak-locality JSON datasets. Keys, update values
+//! and the independent oracle are generated before in-memory measurements,
+//! keeping timed operations separate from input construction.
 pub const MIB: usize = 1 << 20;
 
 pub fn mix(mut z: u64) -> u64 {

@@ -1,9 +1,8 @@
-//! Deterministic, counter-only compaction scenarios; no clocks or timings.
-//!
-//! No arguments: fixed 4,096-record flushes for locality comparisons.
-//! `buffers 64` (or 32/16): automatic flushes and 384 MiB of A-large ingestion.
-//! Frozen-buffer comparisons change the private MAX_FROZEN_MEMTABLES constant
-//! between builds; it intentionally has no public configuration switch.
+//! Deterministic compaction diagnostics using engine work counters.
+//! Fixed-size flushes compare grouped and weak-locality records; `buffers MiB`
+//! selects automatic flushes for a larger ingestion workload. CSV output covers
+//! stored bytes, decode work, pool accounting and write amplification.
+//! See tools/README.md.
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
 // Measure the same private filter implementation without expanding the engine API.
 #[allow(dead_code)]
