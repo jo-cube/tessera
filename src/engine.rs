@@ -225,7 +225,7 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
 }
 
 /// Engine configuration, fixed at construction. See [Memory](self#memory).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
     /// Writer admission budget; `None` (the default) is unlimited.
     pub memory_limit: Option<usize>,

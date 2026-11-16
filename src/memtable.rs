@@ -592,7 +592,7 @@ impl fmt::Debug for Table {
 }
 
 /// How much memory a table accounts for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryUsage {
     /// Key and value bytes of the table's entries.
     pub payload: usize,
