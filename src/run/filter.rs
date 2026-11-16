@@ -16,6 +16,8 @@ const PROBES: u64 = 7;
 /// compaction run of the default length holds far fewer.
 pub(crate) const MAX_FILTER_KEYS: usize = 1 << 24;
 
+pub(crate) const MAX_FILTER_BYTES: usize = (MAX_FILTER_KEYS * BITS_PER_KEY).div_ceil(64) * 8;
+
 /// Hashes first reserved, after which the buffer doubles up to its limit.
 const FIRST_RESERVE: usize = 1024;
 
@@ -66,10 +68,7 @@ impl KeyFilter {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty()
-            || !bytes.len().is_multiple_of(8)
-            || bytes.len() > (MAX_FILTER_KEYS * BITS_PER_KEY).div_ceil(64) * 8
-        {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(8) || bytes.len() > MAX_FILTER_BYTES {
             return None;
         }
         Some(Self {

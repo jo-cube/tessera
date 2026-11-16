@@ -485,6 +485,19 @@ impl Manifest {
             let flush = u64_at(at + 32);
             let len = u64_at(at + 40);
             let run_len = u64_at(at + 48);
+            if run_len > u32::MAX as u64 {
+                return Err(Damage::Length {
+                    expected: u32::MAX as u64,
+                    found: run_len,
+                });
+            }
+            let max_len = run_len + crate::run::MAX_FILTER_BYTES as u64 + 4;
+            if len > max_len {
+                return Err(Damage::Length {
+                    expected: max_len,
+                    found: len,
+                });
+            }
             if !ids.insert(id)
                 || id as u64 == 0
                 || id as u64 >= next_run_id
@@ -1361,6 +1374,31 @@ mod robustness;
 mod tests {
     use super::*;
     use crate::engine::EngineWorkspace;
+
+    #[test]
+    fn manifest_lengths_are_bounded_by_the_run_and_filter_formats() {
+        let dir = scratch("format-allocation-bounds");
+        let engine = Engine::new(manual()).unwrap();
+        engine.put(b"key", b"value").unwrap();
+        engine
+            .checkpoint(&dir, CheckpointOptions::default())
+            .unwrap();
+        engine.close().unwrap();
+        let (_, _, mut manifest) = committed_manifest(&dir).unwrap();
+        for (run_len, len) in [
+            (u32::MAX as u64 + 1, u32::MAX as u64 + 5),
+            (48, 48 + crate::run::MAX_FILTER_BYTES as u64 + 5),
+            (48, u64::MAX),
+        ] {
+            manifest.runs[0].run_len = run_len;
+            manifest.runs[0].len = len;
+            assert!(matches!(
+                Manifest::decode(&manifest.encode()),
+                Err(Damage::Length { .. })
+            ));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn recovery_rejects_conflicting_copies_hidden_by_a_newer_version() {

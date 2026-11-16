@@ -101,6 +101,7 @@ pub(crate) use compact::compact_parallel_in;
 #[cfg(test)]
 pub(crate) use compact::compact_with;
 pub use compact::{CompactLimits, CompactStats, Compacted, OutputCuts, workspace_estimate};
+pub(crate) use filter::MAX_FILTER_BYTES;
 pub(crate) use group::RunList;
 #[cfg(test)]
 pub(crate) use logical::latest_in;
