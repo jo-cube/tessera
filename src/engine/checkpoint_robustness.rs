@@ -141,7 +141,9 @@ fn mutations(iterations: usize) {
             let scratch = Scratch::new("mutation");
             let options = EngineOptions {
                 compression,
-                memtable_budget: 4096,
+                // Each seeded round fits one table, so worker scheduling
+                // cannot change how tables are grouped into checkpoint runs.
+                memtable_budget: 64 << 10,
                 target_run_len: 2048,
                 background_compaction: None,
                 ..EngineOptions::default()
@@ -174,7 +176,21 @@ fn mutations(iterations: usize) {
                 .checkpoint(&scratch.0, CheckpointOptions::default())
                 .unwrap();
             engine.close().unwrap();
-            let (_, manifest_path, manifest) = committed_manifest(&scratch.0).unwrap();
+            let (_, manifest_path, mut manifest) = committed_manifest(&scratch.0).unwrap();
+            // Namespace randomness must not change mutated bytes or checksums.
+            // Keep the engine's run bytes and all other manifest fields, only
+            // renaming IDs to stable fixture-local values.
+            for (index, entry) in manifest.runs.iter_mut().enumerate() {
+                let id = index as u128 + 1;
+                fs::rename(
+                    scratch.0.join(RUNS).join(run_name(entry.id)),
+                    scratch.0.join(RUNS).join(run_name(id)),
+                )
+                .unwrap();
+                entry.id = id;
+            }
+            manifest.next_run_id = manifest.runs.len() as u64 + 1;
+            fs::write(&manifest_path, manifest.encode()).unwrap();
             assert!(!manifest.runs.is_empty());
             assert_eq!(manifest.runs.iter().any(|r| r.len > r.run_len + 4), filters);
             let current_path = scratch.0.join(CURRENT);
