@@ -99,8 +99,8 @@ value and 128-byte entry charge must also fit the memtable budget.
 
 The memtable budget must be between 128 and `usize::MAX / 2` bytes, the level
 ratio at least 2, the builder count at least 1, and the compressed block target
-between 1 byte and 64 KiB. Zstandard level 1 uses raw dictionaries up to 16 KiB
-per roughly 4 MiB segment. Ordinary raw blocks are capped at 64 KiB; a larger
+between 1 byte and 64 KiB. Zstandard level 1 uses a 4 KiB raw dictionary
+per roughly 4 MiB segment, and readers accept dictionaries up to 16 KiB. Ordinary raw blocks are capped at 64 KiB; a larger
 record gets its own block. Uncompressed runs target 16 KiB raw blocks.
 
 At 90% of the admission budget writers wait briefly for publication. At 100%

@@ -58,7 +58,8 @@
 //! uses magicless frames without a content size, checksum or dictionary ID, and
 //! references segment `dictionary_ref - 1`. The segment table immediately
 //! precedes the block index; dictionary regions tile the bytes between the
-//! frames and that table. Dictionaries contain at most 16 KiB of raw content.
+//! frames and that table. Builders store 4 KiB dictionaries; readers accept up
+//! to 16 KiB of raw content.
 //! The frame CRC covers its first eight header bytes and stored payload.
 //! Dictionary CRCs are checked before decoding. No prepared dictionaries are held.
 //!

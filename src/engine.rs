@@ -390,7 +390,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// How runs store their blocks. Zstandard uses a 16 KiB raw-content dictionary
+/// How runs store their blocks. Zstandard uses a 4 KiB raw-content dictionary
 /// per roughly 4 MiB segment, with independently decoded adaptive blocks.
 /// Every decode loads the dictionary by reference into the reader's context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
