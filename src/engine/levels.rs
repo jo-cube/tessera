@@ -220,7 +220,7 @@ impl Levels {
     }
 
     /// The runs of each level, level 0 first.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) fn runs(&self) -> &[Vec<SharedRun>] {
         &self.levels
     }

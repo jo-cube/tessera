@@ -1,17 +1,16 @@
-//! Deterministic compaction diagnostics using engine work counters.
-//! Fixed-size flushes compare grouped and weak-locality records; `buffers MiB`
-//! selects automatic flushes for a larger ingestion workload. CSV output covers
-//! stored bytes, decode work, pool accounting and write amplification.
-//! See tools/README.md.
+//! Deterministic work and memory counters by level, using the hidden
+//! `diagnostics` feature. Each scenario loads keys in random order with
+//! automatic flushes, updates half of them at random, waits for background
+//! compaction, checks every read path against a version oracle and prints
+//! long-format CSV rows. See tools/README.md.
+//!
+//! `counters [--levels NON_BOTTOM,BOTTOM] [--dictionary BYTES|adaptive]
+//! [--costs] [--settle] [--scale SHIFT] [SCENARIO...]`
+use std::time::Instant;
+use tessera::engine::diagnostics;
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
-// Measure the same private filter implementation without expanding the engine API.
-#[allow(dead_code)]
-#[path = "../src/run/filter.rs"]
-mod filter;
-const ENTITIES: usize = 512;
+
 const MEMBERS: usize = 64;
-const RECORDS: usize = ENTITIES * MEMBERS;
-const FLUSH: usize = 4096;
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -32,8 +31,8 @@ fn key(i: usize) -> [u8; 16] {
     key[8..].copy_from_slice(&(i as u64 % MEMBERS as u64).to_be_bytes());
     key
 }
-fn value(i: usize, version: u8, weak: bool) -> Vec<u8> {
-    if weak {
+fn value(i: usize, version: u8, weak: bool, len: usize) -> Vec<u8> {
+    let mut out = if weak {
         let mut rng =
             Rng((i as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15) ^ (u64::from(version) << 40));
         (0..600)
@@ -55,83 +54,63 @@ fn value(i: usize, version: u8, weak: bool) -> Vec<u8> {
         out.truncate(598);
         out.extend_from_slice(b"\"}");
         out
-    }
-}
-fn flush(engine: &Engine) {
-    engine.flush().unwrap();
-    engine.wait_for_compaction().unwrap();
+    };
+    out.truncate(len);
+    out
 }
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
 }
-fn scenario(
-    name: &str,
+fn slot_name(slot: usize) -> String {
+    match slot {
+        0 => "flush".into(),
+        1..8 => format!("L{slot}"),
+        _ => format!("L{}-bottom", slot - 8),
+    }
+}
+
+struct Scenario {
+    name: &'static str,
     weak: bool,
-    clustered: bool,
     records: usize,
-    small: bool,
-    budget: Option<usize>,
-) {
-    let value = |i, version, weak| {
-        let mut out = value(i, version, weak);
-        if small {
-            out.truncate(48);
-        }
-        out
-    };
+    value_len: usize,
+}
+
+fn run(s: &Scenario, variant: &str, costs: bool, settle: bool) {
+    let started = Instant::now();
+    let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let engine = Engine::new(EngineOptions {
-        memtable_budget: budget.unwrap_or(EngineOptions::default().memtable_budget),
         background_threads: 1,
         ..EngineOptions::default()
     })
     .unwrap();
-    let mut peak = 0;
     let mut ingested = 0u64;
     let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
-    if !clustered {
-        rng.shuffle(&mut order);
-    }
-    for (at, &i) in order.iter().enumerate() {
-        let v = value(i, 0, weak);
+    rng.shuffle(&mut order);
+    for &i in &order {
+        let v = value(i, 0, weak, len);
         engine.put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
-        if budget.is_some() {
-            peak = peak.max(engine.stats().memtable_bytes);
-        }
-        if budget.is_none() && (at + 1) % FLUSH == 0 {
-            flush(&engine);
-        }
     }
     let mut updated = vec![false; records];
-    let mut updates: Vec<_> = if clustered {
-        (records / MEMBERS * 9 / 10 * MEMBERS..records).collect()
-    } else {
-        (0..records).collect()
-    };
-    if !clustered {
-        rng.shuffle(&mut updates);
-        updates.truncate(records / 2);
-    }
-    for (at, &i) in updates.iter().enumerate() {
-        let v = value(i, 1, weak);
+    let mut updates = order;
+    rng.shuffle(&mut updates);
+    updates.truncate(records / 2);
+    for &i in &updates {
+        let v = value(i, 1, weak, len);
         engine.put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
-        if budget.is_some() {
-            peak = peak.max(engine.stats().memtable_bytes);
-        }
         updated[i] = true;
-        if budget.is_none() && (at + 1) % FLUSH == 0 {
-            flush(&engine);
-        }
     }
-    flush(&engine);
-    let mut merge = MergeWorkspace::new();
-    let mut manual_output = 0u64;
-    while let Some(report) = engine.compact(&mut merge).unwrap() {
-        manual_output += report.output_bytes as u64;
-    }
+    drop(updates);
+    // Steady state: the final memtable flushes on its own only when full,
+    // so publish it, then let the worker settle without eager compaction.
+    engine.flush().unwrap();
     engine.wait_for_compaction().unwrap();
+    let load_seconds = started.elapsed().as_secs_f64();
+
+    let expect = |i: usize| value(i, u8::from(updated[i]), weak, len);
     let mut scans = EngineWorkspace::new();
     for _ in 0..100 {
         let guard = engine.read();
@@ -140,62 +119,40 @@ fn scenario(
             assert!(scan.next_record().unwrap().is_some());
         }
     }
-    // A standalone filter over the scenario's distinct keys, including when
-    // bottom-level runs omit filters. The million probes are all absent.
-    let mut hashes = filter::KeyHashes::new();
-    for i in 0..records {
-        hashes.add(&key(i));
-    }
-    let filter = hashes.finish().unwrap();
-    let positives = (0..1_000_000)
-        .filter(|&at| {
-            let mut absent = key(at % records).to_vec();
-            absent.extend_from_slice(&(at as u64).to_be_bytes());
-            filter.may_contain(filter::hash(&absent))
-        })
-        .count();
-    // All reader paths are checked against the independent version oracle.
+    // Every reader path against the oracle: sampled gets, then multi-get
+    // and a full scan over every record.
     let mut ws = EngineWorkspace::new();
-    // Multi-get and the scan below check every record. Sample individual gets
-    // on the scaled buffer workload to avoid decoding hundreds of GiB again.
-    let stride = if budget.is_some() {
-        (records / RECORDS).max(1)
-    } else {
-        1
-    };
-    for (i, &changed) in updated.iter().enumerate().step_by(stride) {
+    for i in (0..records).step_by(61) {
         assert_eq!(
             engine.get(&key(i), &mut ws).unwrap().unwrap().value,
-            value(i, u8::from(changed), weak)
+            expect(i)
         );
     }
     for start in (0..records).step_by(128) {
-        let keys: Vec<_> = (start..start + 128).rev().map(key).collect();
+        let keys: Vec<_> = (start..(start + 128).min(records)).rev().map(key).collect();
+        let last = start + keys.len() - 1;
         engine
             .multi_get(&keys, &mut ws, |at, got| {
-                let i = start + 127 - at;
-                assert_eq!(got.unwrap(), value(i, u8::from(updated[i]), weak));
+                assert_eq!(got.unwrap(), expect(last - at));
             })
             .unwrap();
     }
-    let guard = engine.read();
-    let mut scan = guard.scan(&mut ws);
-    for (i, &changed) in updated.iter().enumerate() {
-        let rec = scan.next_record().unwrap().unwrap();
-        assert_eq!(rec.key, key(i));
-        assert_eq!(rec.value, value(i, u8::from(changed), weak));
+    {
+        let guard = engine.read();
+        let mut scan = guard.scan(&mut ws);
+        for i in 0..records {
+            let rec = scan.next_record().unwrap().unwrap();
+            assert_eq!(rec.key, key(i));
+            assert_eq!(rec.value, expect(i));
+        }
+        assert!(scan.next_record().unwrap().is_none());
     }
-    assert!(scan.next_record().unwrap().is_none());
-    drop(scan);
-    drop(guard);
-    // Fixed present keys and in-range gaps. Each get has its own block load;
-    // workspace buffers are reused, but decoded blocks are never cached.
     let mut hits = EngineWorkspace::new();
     for at in 0..10_000 {
         let i = at * 7919 % records;
         assert_eq!(
             engine.get(&key(i), &mut hits).unwrap().unwrap().value,
-            value(i, u8::from(updated[i]), weak)
+            expect(i)
         );
     }
     let mut misses = EngineWorkspace::new();
@@ -205,57 +162,191 @@ fn scenario(
         missing.push(0);
         assert!(engine.get(&missing, &mut misses).unwrap().is_none());
     }
-    let s = engine.stats();
-    assert_eq!(s.build.raw_bytes_ingested, ingested);
+    let stats = engine.stats();
+    assert_eq!(stats.build.raw_bytes_ingested, ingested);
     let background = engine.background_status().unwrap();
     assert_eq!(background.failures, 0);
     assert!(background.panic.is_none());
+
+    let work = diagnostics::work(&engine);
+    for (slot, w) in work.iter().enumerate() {
+        if w.raw_out > 0 {
+            println!(
+                "work,{name},{variant},{},{},{},{}",
+                slot_name(slot),
+                w.raw_in,
+                w.raw_out,
+                w.stored
+            );
+        }
+    }
+    let levels = diagnostics::levels(&engine);
+    let depth = levels.len() - 1;
+    for (level, m) in levels.iter().enumerate() {
+        println!(
+            "level,{name},{variant},{level}{},{},{},{},{},{},{},{},{},{},{}",
+            if level == depth { "-bottom" } else { "" },
+            m.runs,
+            m.records,
+            m.raw,
+            m.frames,
+            m.dictionaries,
+            m.segment_table,
+            m.index,
+            m.filters,
+            m.footer,
+            m.physical
+        );
+    }
+    let flush_raw = work[0].raw_out;
+    let raw: u64 = work.iter().map(|w| w.raw_out).sum();
+    let stored: u64 = work.iter().map(|w| w.stored).sum();
     println!(
-        "{name},{},{},{},{},{:.3},{:.3},{},{},{:.3},{:.6},{peak},{},{},{},{},{:.6},{:.6},{ingested}",
-        s.run_bytes,
-        s.filter_bytes,
-        s.index_bytes,
-        s.block_bytes_live,
+        "reads,{name},{variant},{},{},{:.1},{:.1},{:.3},{:.3},{:.3},{},{},{depth},{load_seconds:.1},{:.1}",
+        stats.run_bytes,
+        stats.held_bytes,
         ratio(hits.decoded_bytes(), 10_000),
         ratio(misses.decoded_bytes(), 1_000),
-        hits.blocks_loaded(),
-        misses.blocks_loaded(),
         ratio(scans.blocks_loaded(), 100),
-        ratio(positives as u64, 1_000_000),
-        s.flushes,
-        s.runs,
-        s.level0_flushes,
-        s.level0_runs,
-        ratio(
-            s.flushed_bytes + background.output_bytes + manual_output,
-            s.flushed_bytes
-        ),
-        ratio(s.build.raw_bytes_compressed, ingested),
+        ratio(stored, work[0].stored),
+        ratio(raw, flush_raw),
+        stats.flushes,
+        stats.runs,
+        started.elapsed().as_secs_f64()
     );
+    if settle {
+        // A control without timing effects: rewrite everything into the
+        // bottom level, where sequences are erased, then measure again.
+        let mut merge = MergeWorkspace::new();
+        while engine.compact(&mut merge).unwrap().is_some() {}
+        engine.wait_for_compaction().unwrap();
+        let mut hits = EngineWorkspace::new();
+        for at in 0..10_000 {
+            let i = at * 7919 % records;
+            assert_eq!(
+                engine.get(&key(i), &mut hits).unwrap().unwrap().value,
+                expect(i)
+            );
+        }
+        let mut scans = EngineWorkspace::new();
+        for _ in 0..100 {
+            let guard = engine.read();
+            let mut scan = guard.scan(&mut scans);
+            for _ in 0..100 {
+                assert!(scan.next_record().unwrap().is_some());
+            }
+        }
+        let levels = diagnostics::levels(&engine);
+        let depth = levels.len() - 1;
+        for (level, m) in levels.iter().enumerate() {
+            println!(
+                "level,{name},{variant}+settled,{level}{},{},{},{},{},{},{},{},{},{},{}",
+                if level == depth { "-bottom" } else { "" },
+                m.runs,
+                m.records,
+                m.raw,
+                m.frames,
+                m.dictionaries,
+                m.segment_table,
+                m.index,
+                m.filters,
+                m.footer,
+                m.physical
+            );
+        }
+        println!(
+            "settled,{name},{variant},{},{},{:.1},{:.3}",
+            engine.stats().run_bytes,
+            engine.stats().held_bytes,
+            ratio(hits.decoded_bytes(), 10_000),
+            ratio(scans.blocks_loaded(), 100),
+        );
+    }
+    if costs {
+        for c in diagnostics::level_costs(&engine, &[-3, -1, 1, 3], 64 << 20, 3) {
+            println!(
+                "cost,{name},{variant},{},{},{},{},{}",
+                c.level,
+                c.raw,
+                c.stored,
+                c.compress.as_nanos(),
+                c.decompress.as_nanos()
+            );
+        }
+    }
     engine.close().unwrap();
 }
+
 fn main() {
+    let mut levels = (1, 1);
+    let mut dictionary = Some(16 << 10);
+    let mut costs = false;
+    let mut settle = false;
+    let mut scale = 0;
+    let mut names = Vec::new();
     let mut args = std::env::args().skip(1);
-    let budget = args.next().map(|mode| {
-        assert_eq!(mode, "buffers", "usage: counters [buffers BUDGET_MiB]");
-        args.next()
-            .expect("budget in MiB")
-            .parse::<usize>()
-            .unwrap()
-            << 20
-    });
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--levels" => {
+                let value = args.next().expect("NON_BOTTOM,BOTTOM");
+                let (a, b) = value.split_once(',').expect("NON_BOTTOM,BOTTOM");
+                levels = (a.parse().unwrap(), b.parse().unwrap());
+            }
+            "--dictionary" => {
+                let value = args.next().expect("BYTES or adaptive");
+                dictionary = (value != "adaptive").then(|| value.parse().unwrap());
+            }
+            "--costs" => costs = true,
+            "--settle" => settle = true,
+            "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
+            _ => names.push(arg),
+        }
+    }
+    diagnostics::set_policy(levels.0, levels.1, dictionary);
+    let variant = format!(
+        "z{}/{}-d{}",
+        levels.0,
+        levels.1,
+        dictionary.map_or("adaptive".into(), |n| n.to_string())
+    );
+    let scenarios = [
+        Scenario {
+            name: "A",
+            weak: false,
+            records: 2_097_152 >> scale,
+            value_len: 600,
+        },
+        Scenario {
+            name: "B",
+            weak: true,
+            records: 2_097_152 >> scale,
+            value_len: 600,
+        },
+        Scenario {
+            name: "A-large",
+            weak: false,
+            records: 4_194_304 >> scale,
+            value_len: 48,
+        },
+    ];
+    println!("work,scenario,variant,destination,raw_in,raw_out,stored");
     println!(
-        "scenario,stored_bytes,filter_bytes,index_bytes,frame_bytes,hit_decoded_bytes_per_get,miss_decoded_bytes_per_get,hit_blocks,miss_blocks,blocks_per_100_record_scan,standalone_filter_fp,peak_sampled_memtable_charge,flushes,runs,l0_depth,l0_runs,write_amplification,raw_bytes_compressed_per_ingested_byte,ingested_bytes"
+        "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"
     );
-    scenario("B-random", true, false, RECORDS, false, budget);
-    scenario("clustered", false, true, RECORDS, false, budget);
-    scenario("A-random", false, false, RECORDS, false, budget);
-    scenario(
-        "A-large",
-        false,
-        false,
-        if budget.is_some() { 4_194_304 } else { 200_704 },
-        true,
-        budget,
+    println!(
+        "reads,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,miss_decoded_per_get,blocks_per_100_record_scan,stored_wa,raw_wa,flushes,runs,depth,load_seconds,total_seconds"
     );
+    if settle {
+        println!(
+            "settled,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,blocks_per_100_record_scan"
+        );
+    }
+    if costs {
+        println!("cost,scenario,variant,zstd_level,raw,stored,compress_ns,decompress_ns");
+    }
+    for s in &scenarios {
+        if names.is_empty() || names.iter().any(|n| n == s.name) {
+            run(s, &variant, costs, settle);
+        }
+    }
 }

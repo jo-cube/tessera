@@ -10,7 +10,7 @@ use crate::block::{
 };
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
-use super::dictionary::DICTIONARY_LEN;
+use super::dictionary::MAX_DICTIONARY_LEN;
 #[cfg(test)]
 use super::filter::KeyHashes;
 use super::filter::{self as key_filter, KeyFilter};
@@ -1072,7 +1072,7 @@ impl<'a> RunView<'a> {
             .and_then(|n| n.checked_sub(self.frames.len()))
             .ok_or(invalid)?;
         let len = read_u32(entry, 8) as usize;
-        if len == 0 || len > DICTIONARY_LEN {
+        if len == 0 || len > MAX_DICTIONARY_LEN {
             return Err(invalid);
         }
         let bytes = start
@@ -1481,3 +1481,56 @@ fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(u64, bool, usiz
 #[cfg(test)]
 #[path = "tests/storage.rs"]
 mod storage_tests;
+
+/// Stored bytes of one run by component, and its raw block bytes.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RunMemory {
+    pub records: usize,
+    pub raw: usize,
+    pub frames: usize,
+    pub dictionaries: usize,
+    pub segment_table: usize,
+    pub index: usize,
+    pub filters: usize,
+    pub footer: usize,
+    pub physical: usize,
+}
+
+#[cfg(feature = "diagnostics")]
+impl<B: AsRef<[u8]>> Run<B> {
+    /// Raw bytes of every block, from frame headers.
+    pub(crate) fn raw_len(&self) -> usize {
+        let view = self.view();
+        (0..view.block_count())
+            .map(|block| view.frame(block).expect(VALIDATED).decoded_len)
+            .sum()
+    }
+    pub(crate) fn memory(&self) -> RunMemory {
+        let view = self.view();
+        RunMemory {
+            records: view.len(),
+            raw: self.raw_len(),
+            frames: view.frame_bytes(),
+            dictionaries: view.dictionaries.len(),
+            segment_table: size_of_val(view.segments),
+            index: self.index_bytes(),
+            filters: self.filter_bytes(),
+            footer: FOOTER_LEN,
+            physical: self.data.held_bytes(),
+        }
+    }
+    /// Calls `f` with each block's dictionary and raw bytes, in order, until
+    /// it returns false.
+    pub(crate) fn blocks(&self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> bool {
+        let view = self.view();
+        let mut workspace = ReadWorkspace::new();
+        for block in 0..view.block_count() {
+            let frame = view.frame(block).expect(VALIDATED);
+            if !f(frame.dictionary, workspace.load(&frame).expect(VALIDATED)) {
+                return false;
+            }
+        }
+        true
+    }
+}

@@ -49,6 +49,19 @@ struct Counters {
     bytes_compressed: AtomicU64,
     raw_bytes_compressed: AtomicU64,
     raw_bytes_ingested: AtomicU64,
+    /// Raw input, raw output and stored output bytes by [`work_slot`].
+    #[cfg(feature = "diagnostics")]
+    work: [[AtomicU64; 3]; WORK_SLOTS],
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) const WORK_SLOTS: usize = 16;
+
+/// Slot 0 is flush and ingestion; compaction into level `n` is slot `n`,
+/// or `n + 8` if it is the bottom level.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn work_slot(level: Option<usize>, bottom: bool) -> usize {
+    level.map_or(0, |n| n.min(7) + if bottom { 8 } else { 0 })
 }
 impl Counters {
     fn snapshot(&self) -> BuildCounters {
@@ -103,6 +116,23 @@ impl ChunkPool {
                 .raw_bytes_compressed
                 .fetch_add(raw as u64, Ordering::Relaxed);
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn work(&self, slot: usize, raw_in: usize, raw_out: usize, stored: usize) {
+        for (counter, bytes) in self.0.counters.work[slot]
+            .iter()
+            .zip([raw_in, raw_out, stored])
+        {
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn work_counters(&self) -> [[u64; 3]; WORK_SLOTS] {
+        self.0
+            .counters
+            .work
+            .each_ref()
+            .map(|slot| slot.each_ref().map(|n| n.load(Ordering::Relaxed)))
     }
     pub(crate) fn take(&self) -> Chunk {
         let bytes = {

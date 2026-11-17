@@ -150,6 +150,9 @@
 
 mod batch;
 mod checkpoint;
+#[cfg(feature = "diagnostics")]
+#[doc(hidden)]
+pub mod diagnostics;
 mod directory;
 mod flusher;
 mod ingest;
@@ -1868,6 +1871,13 @@ impl BuiltFlush<'_> {
             .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
             .sum();
         state.levels.push_flush(&runs, logical);
+        #[cfg(feature = "diagnostics")]
+        job.engine.chunks.work(
+            0,
+            0,
+            runs.iter().map(|run| run.run.raw_len()).sum(),
+            report.run_bytes,
+        );
         state.runs.extend(runs.iter().cloned());
         state.order_runs();
         state.run_bytes += report.run_bytes;
@@ -2225,6 +2235,16 @@ impl BuiltCompaction<'_> {
         match &job.cursor {
             Some(Cursor::After(key)) => state.levels.advance(job.level, key),
             None => {}
+        }
+        #[cfg(feature = "diagnostics")]
+        #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
+        if let Dest::Level(level) = job.dest {
+            job.engine.chunks.work(
+                crate::chunk::work_slot(Some(level), job.cuts.omit_filter),
+                job.inputs.iter().map(|run| run.run.raw_len()).sum(),
+                outputs.iter().map(|run| run.run.raw_len()).sum(),
+                report.output_bytes,
+            );
         }
         state.runs.retain(|run| !is_input(run));
         state.runs.extend(outputs);

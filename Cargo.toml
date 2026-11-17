@@ -14,6 +14,11 @@ keywords = ["key-value", "lsm", "compression", "in-memory", "embedded"]
 categories = ["database-implementations", "data-structures"]
 publish = false
 
+[features]
+# Hidden work and memory counters by level, and compression policy overrides
+# for experiments. Not part of the stable API.
+diagnostics = []
+
 [dependencies]
 crc32fast = "1"
 zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "experimental"] }
@@ -37,3 +42,4 @@ path = "tests/retention.rs"
 [[example]]
 name = "counters"
 path = "tools/counters.rs"
+required-features = ["diagnostics"]

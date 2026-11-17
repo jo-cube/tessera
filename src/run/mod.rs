@@ -76,6 +76,8 @@
 mod builder;
 mod codec;
 mod compact;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod diagnostics;
 mod dictionary;
 mod filter;
 mod frame;
@@ -83,6 +85,7 @@ mod group;
 mod index;
 mod logical;
 mod merge;
+mod policy;
 mod reader;
 mod storage;
 
@@ -110,6 +113,8 @@ pub use logical::{
 };
 pub(crate) use logical::{LookupSource, latest_from};
 pub use merge::{MergeCursor, MergeWorkspace};
+#[cfg(feature = "diagnostics")]
+pub(crate) use policy::set as set_policy;
 pub use reader::{Run, RunView};
 
 // Used beyond this module only by its tests.

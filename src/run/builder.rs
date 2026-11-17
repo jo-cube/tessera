@@ -3,12 +3,12 @@
 //! atomically so reads can borrow contiguous bytes from shared chunks.
 
 use super::codec::{Codec, Compressor};
-use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
+use super::dictionary::{self, DICTIONARY_LEN, Length, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
 use super::storage::{Packing, RunData};
 use super::{
     FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
-    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
+    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, policy, reader::Run,
 };
 use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, RESTART_INTERVAL, Value,
@@ -24,6 +24,8 @@ pub struct RunBuilder {
     target: usize,
     segment_len: usize,
     raw_target: Option<usize>,
+    /// Zstandard level for this run's blocks and ratio probes.
+    level: i32,
     compressor: Compressor,
     segment: BlockBuilder,
     last_key: Vec<u8>,
@@ -59,6 +61,7 @@ impl RunBuilder {
             target: target.clamp(1, RAW_BLOCK_CAP),
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
+            level: policy::level(false),
             compressor: Compressor::new(codec),
             segment: BlockBuilder::new(),
             last_key: Vec::new(),
@@ -164,6 +167,10 @@ impl RunBuilder {
     pub fn is_empty(&self) -> bool {
         self.record_count == 0
     }
+    /// Compress as output into the bottom level, or above it (the default).
+    pub(crate) fn set_bottom(&mut self, bottom: bool) {
+        self.level = policy::level(bottom);
+    }
     pub(super) fn limit_segment_len(&mut self, bytes: usize) {
         self.segment_len = bytes.clamp(RAW_BLOCK_CAP, SEGMENT_RAW_LEN);
     }
@@ -243,27 +250,21 @@ impl RunBuilder {
         self.segment.flush_into(&mut raw);
         self.segment.trim_empty(2 * self.segment_len);
         let codec = self.compressor.codec();
-        let dictionary = if codec == Codec::Zstd {
-            dictionary::sample(&raw, count)
+        let length = policy::dictionary();
+        let first_len = match length {
+            Length::Fixed(len) => len,
+            // Probe with the standard length, then size from its ratio.
+            Length::Adaptive => DICTIONARY_LEN,
+        };
+        let mut dictionary = if codec == Codec::Zstd {
+            dictionary::sample(&raw, count, first_len)
         } else {
             Vec::new()
         };
-        // Prepared once for the sample and every block, then dropped before
-        // the next segment. Only the raw dictionary is stored in the run.
-        let prepared = self.compressor.prepare_dictionary(&dictionary);
-        let reference = if codec == Codec::Zstd {
-            let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
-            assert!(id < 1 << 24, "segment reference fits in 24 bits");
-            self.segments
-                .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
-            self.segments
-                .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
-            self.segments
-                .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
-            id as u32
-        } else {
-            0
-        };
+        // Prepared once for the ratio probe, then dropped before the blocks,
+        // which use the context's own copy. Only raw bytes are stored.
+        let prepared = self.compressor.prepare_dictionary(&dictionary, self.level);
+        let mut probe = None;
         let target = self.raw_target.unwrap_or_else(|| {
             if codec == Codec::None {
                 return TARGET_BLOCK_LEN;
@@ -277,13 +278,35 @@ impl RunBuilder {
             let mut compressed = Vec::new();
             self.compressor
                 .compress(sample, prepared.as_ref(), &mut compressed);
+            probe = Some((sample.len(), compressed.len()));
             self.target
                 .saturating_mul(sample.len())
                 .checked_div(compressed.len())
                 .unwrap_or(1)
                 .clamp(1, RAW_BLOCK_CAP)
         });
-        self.compressor.begin_segment(&dictionary, target);
+        drop(prepared);
+        if let (Length::Adaptive, Some((sampled, stored))) = (length, probe) {
+            let len = dictionary::adaptive_len(raw.len(), sampled, stored);
+            if len != first_len {
+                dictionary = dictionary::sample(&raw, count, len);
+            }
+        }
+        let reference = if codec == Codec::Zstd {
+            let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
+            assert!(id < 1 << 24, "segment reference fits in 24 bits");
+            self.segments
+                .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
+            self.segments
+                .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
+            self.segments
+                .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
+            id as u32
+        } else {
+            0
+        };
+        self.compressor
+            .begin_segment(&dictionary, target, self.level);
         let view = BlockView::open(&raw).expect("builder's segment");
         let mut cursor = BlockPosition::new();
         let mut block = std::mem::take(&mut self.block);
@@ -397,7 +420,7 @@ fn run_has_room(stored: usize, raw: usize, records: usize, keys: usize) -> bool 
         .saturating_add(raw.saturating_mul(2))
         .saturating_add(records.saturating_mul(frame::HEADER_LEN + TABLE_ENTRY_LEN + 2 + 128))
         .saturating_add(keys)
-        .saturating_add(2 * (dictionary::DICTIONARY_LEN + SEGMENT_ENTRY_LEN + MAX_KEY_LEN))
+        .saturating_add(2 * (dictionary::MAX_DICTIONARY_LEN + SEGMENT_ENTRY_LEN + MAX_KEY_LEN))
         .saturating_add(FOOTER_LEN);
     bound <= u32::MAX as usize
 }
