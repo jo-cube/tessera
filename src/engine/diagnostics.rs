@@ -68,7 +68,7 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
                 runs: runs.len(),
                 ..LevelMemory::default()
             };
-            for run in runs {
+            for run in super::physical_runs(runs) {
                 let m = run.run.memory();
                 level.records += m.records;
                 level.raw += m.raw;
@@ -132,5 +132,39 @@ pub(super) fn bottom_job(
             output_bytes,
             peak_output_bytes,
         });
+    }
+}
+
+/// Concurrent-piece memory and writer-backpressure counters.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Maintenance {
+    /// Current unpublished bytes, including conservative metadata allowances.
+    pub unpublished_bytes: usize,
+    /// Peak of that counter, measured before output copies are allocated.
+    pub peak_unpublished_bytes: usize,
+    /// Largest job's aggregate output allowance.
+    pub output_limit: usize,
+    /// Largest sum of running pieces' output reservations.
+    pub peak_reserved_bytes: usize,
+    /// Most simultaneously building pieces.
+    pub peak_active_pieces: usize,
+    /// Pieces retried after an estimate proved too small.
+    pub piece_retries: usize,
+    /// Sum of writer nanoseconds waiting at admission, frozen tables and L0 stop.
+    pub writer_wait_ns: u64,
+}
+/// Read counters without acquiring the engine state lock.
+pub fn maintenance(engine: &Engine) -> Maintenance {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = &engine.core.resources;
+    let (current, peak) = p.outputs.snapshot();
+    Maintenance {
+        unpublished_bytes: current,
+        peak_unpublished_bytes: peak,
+        output_limit: p.output_limit.load(Relaxed),
+        peak_reserved_bytes: p.peak_reserved.load(Relaxed),
+        peak_active_pieces: p.peak_active.load(Relaxed),
+        piece_retries: p.piece_retries.load(Relaxed),
+        writer_wait_ns: p.writer_wait_ns.load(Relaxed),
     }
 }

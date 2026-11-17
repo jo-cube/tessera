@@ -2,6 +2,7 @@
 //! Records arrive in internal-key order; frames and dictionaries are packed
 //! atomically so reads can borrow contiguous bytes from shared chunks.
 
+use super::OutputBudget;
 use super::codec::{Codec, Compressor};
 use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
@@ -17,6 +18,7 @@ use crate::block::{
 };
 use crate::chunk::ChunkPool;
 use std::fmt;
+use std::sync::Arc;
 
 /// Encodes sorted records, buffering at most one raw segment before compressing.
 /// Rejected records leave the builder unchanged. A single oversized record is
@@ -46,6 +48,8 @@ pub struct RunBuilder {
     min_seq: u64,
     max_seq: u64,
     key_hashes: KeyHashes,
+    output_budget: Option<Arc<OutputBudget>>,
+    output_refused: bool,
 }
 impl Default for RunBuilder {
     fn default() -> Self {
@@ -82,6 +86,8 @@ impl RunBuilder {
             min_seq: 0,
             max_seq: 0,
             key_hashes: KeyHashes::new(),
+            output_budget: None,
+            output_refused: false,
         }
     }
     pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
@@ -134,6 +140,12 @@ impl RunBuilder {
         {
             self.cut_segment();
         }
+        if self.output_refused {
+            return Ok(());
+        }
+        if self.record_count == 0 && !self.reserve_output(key.len()) {
+            return Ok(());
+        }
         self.segment.append(key, seq, value)?;
         if self.record_count == 0 {
             self.keys.extend_from_slice(key);
@@ -178,12 +190,42 @@ impl RunBuilder {
     pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
         self.key_hashes.limit_to(bytes / size_of::<u64>());
     }
+    pub(super) fn limit_output(&mut self, budget: Arc<OutputBudget>) {
+        self.output_budget = Some(budget);
+        self.reserve_output(FOOTER_LEN + 192);
+    }
+    pub(super) fn output_refused(&self) -> bool {
+        self.output_refused
+    }
+    fn reserve_output(&mut self, bytes: usize) -> bool {
+        if self.output_refused {
+            return false;
+        }
+        if self
+            .output_budget
+            .as_ref()
+            .is_some_and(|budget| !budget.reserve(bytes))
+        {
+            self.output_refused = true;
+            return false;
+        }
+        true
+    }
+
     #[cfg(test)]
     pub fn context_bytes(&self) -> usize {
         self.compressor.context_bytes()
     }
-    pub fn finish(mut self) -> Run<Vec<u8>> {
+    pub fn finish(self) -> Run<Vec<u8>> {
+        self.finish_checked()
+            .expect("unlimited builders cannot exhaust output")
+    }
+
+    pub(super) fn finish_checked(mut self) -> Result<Run<Vec<u8>>, ()> {
         self.cut_segment();
+        if self.output_refused {
+            return Err(());
+        }
         // Store the upper bound whole as well, so range pruning can borrow it.
         // All other restart keys occur exactly every sixteen entries.
         if !self.table.is_empty() {
@@ -232,7 +274,7 @@ impl RunBuilder {
         data.extend_from_slice(&index_crc.to_le_bytes());
         data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         data.extend_from_slice(&MAGIC.to_le_bytes());
-        Run::from_builder(
+        Ok(Run::from_builder(
             RunData::Segmented(self.storage.finish(data.into_boxed_slice())),
             self.key_hashes.finish(),
             Seqs {
@@ -241,10 +283,10 @@ impl RunBuilder {
             },
             self.reclaimable,
             self.build_estimate,
-        )
+        ))
     }
     fn cut_segment(&mut self) {
-        if self.segment.is_empty() {
+        if self.output_refused || self.segment.is_empty() {
             return;
         }
         let count = self.segment.len();
@@ -259,6 +301,16 @@ impl RunBuilder {
         } else {
             Vec::new()
         };
+        if !self.reserve_output(
+            dictionary.len()
+                + if codec == Codec::Zstd {
+                    SEGMENT_ENTRY_LEN + 32
+                } else {
+                    0
+                },
+        ) {
+            return;
+        }
         // Prepared once for the sample and every block, then dropped before
         // the next segment. Only the raw dictionary is stored in the run.
         let prepared = self.compressor.prepare_dictionary(&dictionary);
@@ -320,6 +372,9 @@ impl RunBuilder {
             };
             if !block.is_empty() && cut {
                 self.cut_block(&mut block, &mut uncompressed, reference);
+                if self.output_refused {
+                    break;
+                }
             }
             block
                 .append(record.key, record.seq, record.value)
@@ -328,7 +383,9 @@ impl RunBuilder {
         if !block.is_empty() {
             self.cut_block(&mut block, &mut uncompressed, reference);
         }
-        self.storage.dictionary(&dictionary);
+        if !self.output_refused {
+            self.storage.dictionary(&dictionary);
+        }
         retain_scratch(&mut raw, 2 * self.segment_len);
         retain_scratch(&mut uncompressed, 2 * RAW_BLOCK_CAP);
         block.trim_empty(2 * RAW_BLOCK_CAP);
@@ -350,6 +407,13 @@ impl RunBuilder {
             self.compressor.compress(raw, None, &mut self.frames);
         }
         frame::seal(&mut self.frames, codec, len, reference);
+        // Full keys twice bound both index suffixes and the final unshared key;
+        // 64 bounds restart heads and physical frame/dictionary ownership.
+        if !self
+            .reserve_output(self.frames.len() + TABLE_ENTRY_LEN + 2 * block.last_key().len() + 64)
+        {
+            return;
+        }
         self.storage
             .compressed(len, self.frames.len(), codec == Codec::Zstd);
         self.storage.frame(&self.frames);

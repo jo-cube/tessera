@@ -10,6 +10,17 @@ use std::sync::atomic::Ordering;
 pub(super) struct Progress {
     event: Mutex<Estimates>,
     changed: Condvar,
+    pub(super) outputs: Arc<crate::run::OutputCounters>,
+    #[cfg(feature = "diagnostics")]
+    pub(super) writer_wait_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    pub(super) output_limit: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "diagnostics")]
+    pub(super) peak_reserved: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "diagnostics")]
+    pub(super) peak_active: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "diagnostics")]
+    pub(super) piece_retries: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -18,7 +29,29 @@ struct Estimates {
     workspace: usize,
 }
 
+#[cfg(feature = "diagnostics")]
+pub(super) struct WaitCharge<'a> {
+    progress: &'a Progress,
+    started: std::time::Instant,
+}
+#[cfg(feature = "diagnostics")]
+impl Drop for WaitCharge<'_> {
+    fn drop(&mut self) {
+        let nanos = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.progress
+            .writer_wait_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 impl Progress {
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn waiting(&self) -> WaitCharge<'_> {
+        WaitCharge {
+            progress: self,
+            started: std::time::Instant::now(),
+        }
+    }
     pub(super) fn changed(&self) {
         drop(self.event.lock().unwrap_or_else(PoisonError::into_inner));
         self.changed.notify_all();
@@ -164,6 +197,8 @@ impl Core {
             return state;
         }
         drop(state);
+        #[cfg(feature = "diagnostics")]
+        let _waiting = self.resources.waiting();
         if briefly {
             drop(
                 self.resources
@@ -213,6 +248,8 @@ impl Core {
             }
             if !state.frozen.is_empty() {
                 self.flush_signal.request();
+                #[cfg(feature = "diagnostics")]
+                let _waiting = self.resources.waiting();
                 state = self.wait_for_flush(state);
                 continue;
             }
@@ -233,6 +270,8 @@ impl Core {
                 });
             }
             drop(state);
+            #[cfg(feature = "diagnostics")]
+            let waiting = self.resources.waiting();
             self.reclaim.store(true, Ordering::SeqCst);
             let waited = self
                 .background
@@ -247,6 +286,8 @@ impl Core {
                 }
             }
             state = self.write_state();
+            #[cfg(feature = "diagnostics")]
+            drop(waiting);
         }
     }
 }

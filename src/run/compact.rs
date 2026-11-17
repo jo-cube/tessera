@@ -2,8 +2,10 @@
 //! before publication, and tombstones survive while unselected runs may hold
 //! older values. Disjoint output ranges share a bounded workspace allowance.
 
+use super::OutputBudget;
 use crate::block::{Record, Value};
 use crate::chunk::ChunkPool;
+use std::sync::Arc;
 
 use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
@@ -565,6 +567,49 @@ pub(super) fn partition_starts<K: AsRef<[u8]>>(
     starts
 }
 
+/// A read failure or a bounded builder exhausting its output reservation.
+#[derive(Debug)]
+pub(crate) enum CompactBuildError {
+    Read(ReadError),
+    OutputLimit { bytes: usize, limit: usize },
+}
+impl From<ReadError> for CompactBuildError {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
+    }
+}
+impl From<super::CorruptRun> for CompactBuildError {
+    fn from(error: super::CorruptRun) -> Self {
+        Self::Read(error.into())
+    }
+}
+
+pub(crate) fn compact_limited_in<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    (workspace, pool, floors): (&'a mut MergeWorkspace, &ChunkPool, &[SeqFloor<'_>]),
+    budget: Arc<OutputBudget>,
+) -> Result<Compacted, CompactBuildError> {
+    compact_range_checked(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        BuildRange {
+            pool,
+            floors,
+            start: None,
+            end: None,
+            segment_len: SEGMENT_RAW_LEN,
+            needed: workspace_bytes(inputs)?,
+        },
+        Some(budget),
+    )
+}
+
 struct BuildRange<'a> {
     pool: &'a ChunkPool,
     /// Sorted by `min_key`; only read when `zero_seq` is set.
@@ -577,12 +622,29 @@ struct BuildRange<'a> {
 
 fn compact_range<'a>(
     inputs: &[RunView<'a>],
-    mut keep_tombstone: impl FnMut(&[u8]) -> bool,
+    keep_tombstone: impl FnMut(&[u8]) -> bool,
     limits: CompactLimits,
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
     range: BuildRange<'_>,
 ) -> Result<Compacted, ReadError> {
+    compact_range_checked(inputs, keep_tombstone, limits, cuts, workspace, range, None).map_err(
+        |error| match error {
+            CompactBuildError::Read(error) => error,
+            CompactBuildError::OutputLimit { .. } => unreachable!("unlimited output"),
+        },
+    )
+}
+
+fn compact_range_checked<'a>(
+    inputs: &[RunView<'a>],
+    mut keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    workspace: &'a mut MergeWorkspace,
+    range: BuildRange<'_>,
+    budget: Option<Arc<OutputBudget>>,
+) -> Result<Compacted, CompactBuildError> {
     let needed = range.needed;
     let limits = CompactLimits {
         max_workspace_bytes: limits.max_workspace_bytes.max(needed),
@@ -595,6 +657,14 @@ fn compact_range<'a>(
     let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
     output.pool = range.pool.clone();
     output.segment_len = range.segment_len;
+    output.budget = budget.clone();
+    let refused = || {
+        let budget = budget.as_ref().expect("only bounded output refuses");
+        CompactBuildError::OutputLimit {
+            bytes: budget.refused_bytes(),
+            limit: budget.limit(),
+        }
+    };
     let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
@@ -625,13 +695,15 @@ fn compact_range<'a>(
             stats.tombstones_dropped += 1;
             continue;
         }
-        output.add(Record {
-            seq: eraser.seq(record.key, record.seq),
-            ..record
-        });
+        output
+            .add(Record {
+                seq: eraser.seq(record.key, record.seq),
+                ..record
+            })
+            .map_err(|()| refused())?;
         stats.records_written += 1;
     }
-    output.finish_run();
+    output.finish_run().map_err(|()| refused())?;
     eraser.finish(range.pool);
     Ok(Compacted {
         runs: output.runs,
@@ -661,6 +733,7 @@ struct Output<'c> {
     /// Stored and filter bytes of the finished runs.
     bytes: usize,
     held_bytes: usize,
+    budget: Option<Arc<OutputBudget>>,
 }
 
 impl<'c> Output<'c> {
@@ -687,6 +760,7 @@ impl<'c> Output<'c> {
             runs: Vec::new(),
             bytes: 0,
             held_bytes: 0,
+            budget: None,
         }
     }
 
@@ -695,7 +769,7 @@ impl<'c> Output<'c> {
     /// below. A run with no record yet takes any record, however long, so
     /// that a record longer than the target is a run of its own and every
     /// run has a record.
-    fn add(&mut self, record: Record<'_>) {
+    fn add(&mut self, record: Record<'_>) -> Result<(), ()> {
         let len = super::input_len(record.key, record.value);
         let mut cut = false;
         while let Some(at) = self.cuts.at.get(self.next_cut)
@@ -714,7 +788,7 @@ impl<'c> Output<'c> {
             && ((!self.cuts.overlapped.is_empty() && self.overlapped > self.cuts.max_overlapped)
                 || self.input + len > self.limits.target_run_len);
         if self.builder.is_some() && !self.cuts.single && (cut || over) {
-            self.finish_run();
+            self.finish_run()?;
         }
         if self.builder.is_none() {
             // The run starts here: only the runs below it from this key on
@@ -728,6 +802,9 @@ impl<'c> Output<'c> {
                 &self.pool,
             );
             builder.limit_segment_len(self.segment_len);
+            if let Some(budget) = &self.budget {
+                builder.limit_output(budget.clone());
+            }
             builder.limit_filter_build_bytes(if self.cuts.omit_filter {
                 0
             } else {
@@ -738,20 +815,25 @@ impl<'c> Output<'c> {
         builder
             .add(record.key, record.seq, record.value)
             .expect(BUILDABLE);
+        if builder.output_refused() {
+            return Err(());
+        }
         self.input += len;
         if self.input >= self.limits.target_run_len {
-            self.finish_run();
+            self.finish_run()?;
         }
+        Ok(())
     }
 
-    fn finish_run(&mut self) {
+    fn finish_run(&mut self) -> Result<(), ()> {
         let Some(builder) = self.builder.take() else {
-            return;
+            return Ok(());
         };
-        let run = builder.finish();
+        let run = builder.finish_checked()?;
         self.input = 0;
         self.held_bytes += run.held_bytes();
         self.bytes += run.stored_len() + run.held_bytes();
         self.runs.push(run);
+        Ok(())
     }
 }

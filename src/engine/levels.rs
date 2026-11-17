@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::memtable::FlushCuts;
 use crate::run::workspace_estimate;
 
-use super::{NOT_EMPTY, SharedRun};
+use super::{NOT_EMPTY, SharedRun, physical_runs};
 
 /// Level 1's least target, in segments.
 const BASE_SEGMENTS: usize = 4;
@@ -112,6 +112,10 @@ fn bytes_of(run: &SharedRun) -> usize {
     run.run.stored_len() + run.run.held_bytes()
 }
 
+fn total_bytes(runs: &[SharedRun]) -> usize {
+    physical_runs(runs).map(bytes_of).sum()
+}
+
 fn min_of(run: &SharedRun) -> &[u8] {
     run.run.key_range().expect(NOT_EMPTY).min
 }
@@ -190,6 +194,7 @@ impl Levels {
                 levels.next_flush = levels.next_flush.max(flush + 1);
             }
         }
+        levels.recount();
         levels
     }
 
@@ -337,6 +342,7 @@ impl Levels {
             #[cfg(test)]
             Dest::Anywhere(_) => unreachable!("resolved above"),
         }
+        self.recount();
         Ok(())
     }
 
@@ -350,8 +356,9 @@ impl Levels {
             if level == 0 {
                 self.flushes.remove(at);
             }
-            self.bytes[level] -= bytes_of(&run);
+            let _ = run;
         }
+        self.recount();
     }
 
     /// Publish one bottom piece and narrow its level-0 sources, preserving
@@ -382,15 +389,56 @@ impl Levels {
         let mut replacements: Vec<_> = positions.into_iter().zip(sources).collect();
         replacements.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
         for (at, (old, new)) in replacements {
-            self.bytes[0] -= bytes_of(old);
+            let _ = old;
             if let Some(new) = new {
                 self.levels[0][at] = Arc::clone(new);
-                self.bytes[0] += bytes_of(new);
             } else {
                 self.levels[0].remove(at);
                 self.flushes.remove(at);
             }
         }
+        self.recount();
+        Ok(())
+    }
+
+    fn recount(&mut self) {
+        for (bytes, runs) in self.bytes.iter_mut().zip(&self.levels) {
+            *bytes = total_bytes(runs);
+        }
+    }
+
+    /// Install disjoint views in place of L0 sources without changing their
+    /// flush tags. Each view shares the original physical run and sequences.
+    pub(super) fn split_sources(
+        &mut self,
+        sources: &[(SharedRun, Vec<SharedRun>)],
+    ) -> Result<(), Stale> {
+        let mut positions = Vec::new();
+        for (old, views) in sources {
+            let (level, at) = self.find(old).ok_or(Stale)?;
+            if level != 0
+                || views.is_empty()
+                || views
+                    .iter()
+                    .any(|r| r.run.storage_id() != old.run.storage_id())
+            {
+                return Err(Stale);
+            }
+            for pair in views.windows(2) {
+                if max_of(&pair[0]) >= min_of(&pair[1]) {
+                    return Err(Stale);
+                }
+            }
+            positions.push(at);
+        }
+        let mut replacements: Vec<_> = positions.into_iter().zip(sources).collect();
+        replacements.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
+        for (at, (_, views)) in replacements {
+            let tag = self.flushes[at];
+            self.levels[0].splice(at..at + 1, views.iter().cloned());
+            self.flushes.splice(at..at + 1, views.iter().map(|_| tag));
+        }
+        self.recount();
         Ok(())
     }
 
@@ -683,11 +731,7 @@ impl Levels {
         assert_eq!(self.bytes.len(), self.levels.len());
         assert_eq!(self.cursors.len(), self.levels.len());
         for (level, runs) in self.levels.iter().enumerate() {
-            assert_eq!(
-                self.bytes[level],
-                runs.iter().map(bytes_of).sum::<usize>(),
-                "level {level} bytes"
-            );
+            assert_eq!(self.bytes[level], total_bytes(runs), "level {level} bytes");
             if level > 0 {
                 for pair in runs.windows(2) {
                     assert!(

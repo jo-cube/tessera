@@ -85,8 +85,9 @@ value and 128-byte entry charge must also fit the memtable budget.
   zero after bottom-level compaction, so it is not a stable update identifier.
 
 Compaction keeps disjoint levels below level 0. Large level-0 jobs into the
-bottom run as consecutive key ranges aligned to bottom-run boundaries, with
-about one target run of bottom input per piece. Each piece publishes atomically
+bottom run as disjoint key ranges aligned to bottom-run boundaries, with
+about one target run of bottom input per piece. Up to `background_threads`
+pieces build at once within a shared unpublished-output allowance. Each piece publishes atomically
 and releases its bottom inputs. Bounded views of level-0 sources expose only the
 remaining ranges; snapshots and checkpoints preserve the bounds they captured.
 A later piece failure leaves earlier publications intact and stops the job.
@@ -126,7 +127,9 @@ frozen tables can charge about 192 MiB at the default memtable budget.
 
 Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
 finished runs trim their partial final chunk. The free reserve is capped at
-32 MiB. Piecewise bottom compaction retains only one piece's unpublished output;
+32 MiB. Bottom compaction bounds unpublished output by the builder count times
+one estimated target stored run (at least 128 KiB per builder); a growing piece can use the whole allowance,
+and a range exceeding it stops the job with an output-limit error.
 a level-0 source is released when its final range is merged. Snapshots can keep
 replaced storage alive. Workspaces retain decode buffers and contexts; there is no decoded-block
 cache. Use `Engine::stats()` and workspace counters to inspect memory and work.

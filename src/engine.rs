@@ -46,11 +46,16 @@
 //! target run length and the overlap bound. Nonoverlapping runs move without
 //! rewriting. Optional level-0 inputs fit an internal transient allowance;
 //! the first source and its overlaps always proceed. Large level-0 jobs into
-//! the bottom build and publish consecutive pieces of about one target stored
-//! run, aligned to bottom-run boundaries. Bounded views keep only unmerged
-//! level-0 ranges visible and share the original immutable storage. Each piece
-//! retires its bottom inputs; later failure preserves earlier publications.
-//! Other jobs may build output ranges in parallel and publish together.
+//! the bottom build disjoint pieces of about one target stored run, aligned
+//! to bottom-run boundaries. Up to `background_threads` pieces build at once
+//! and publish independently, in any order. Output reservations share a bound
+//! of that many piece budgets (at least 128 KiB each for one block and metadata).
+//! A growing piece retries alone with the whole
+//! allowance; a range exceeding it reports [`CompactionError::OutputLimit`].
+//! Bounded views keep only unmerged level-0 ranges visible and share the original
+//! immutable storage. Each piece retires its bottom inputs; later failure
+//! preserves earlier publications. Other jobs may build output ranges in
+//! parallel and publish together.
 //! No snapshot or size limit refuses a compaction. Only the latest version survives; tombstones survive while
 //! an unselected run could hold an older value.
 //!
@@ -188,6 +193,7 @@ pub use crate::run::{
     RunCorruption,
 };
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
@@ -216,6 +222,13 @@ struct Published {
     /// The decoded length of its largest block, for sizing a compaction's
     /// workspace before reading anything.
     largest_block: usize,
+}
+
+/// Physical storage is counted once even when disjoint views share it.
+fn physical_runs(runs: &[SharedRun]) -> impl Iterator<Item = &SharedRun> {
+    let mut seen = HashSet::with_capacity(runs.len());
+    runs.iter()
+        .filter(move |run| seen.insert(run.run.storage_id()))
 }
 
 /// Wraps the runs of one flush or compaction, in key order, for publication.
@@ -672,6 +685,22 @@ impl State {
         }
     }
 
+    fn recount_runs(&mut self) {
+        self.run_bytes = physical_runs(&self.runs).map(|r| r.run.stored_len()).sum();
+        self.held_bytes = physical_runs(&self.runs).map(|r| r.run.held_bytes()).sum();
+    }
+
+    fn retire_runs(&mut self, inputs: &[SharedRun]) {
+        let live: HashSet<_> = self.runs.iter().map(|r| r.run.storage_id()).collect();
+        for input in physical_runs(inputs).filter(|r| !live.contains(&r.run.storage_id())) {
+            self.retire(
+                input.run.retirement(),
+                input.run.stored_len(),
+                Some(input.run.held_bytes()),
+            );
+        }
+    }
+
     /// Where a flush beginning now splits its runs.
     fn flush_cuts(&self, target_run_len: usize) -> FlushCuts {
         #[cfg(test)]
@@ -731,6 +760,9 @@ impl State {
     }
 }
 
+#[cfg(test)]
+type PieceHook = Arc<dyn Fn(usize) + Send + Sync>;
+
 /// Everything an engine shares with its background worker.
 struct Core {
     chunks: ChunkPool,
@@ -783,6 +815,10 @@ struct Core {
     piece_budget: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     fail_piece: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    before_piece: Mutex<Option<PieceHook>>,
+    #[cfg(test)]
+    piece_output_budget: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -1140,6 +1176,10 @@ impl Core {
             #[cfg(test)]
             fail_piece: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            before_piece: Mutex::new(None),
+            #[cfg(test)]
+            piece_output_budget: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
@@ -1172,6 +1212,8 @@ impl Core {
     ) -> RwLockWriteGuard<'s, State> {
         state = self.wait_for_level0(state);
         while state.frozen.len() >= self.max_frozen_memtables {
+            #[cfg(feature = "diagnostics")]
+            let _waiting = self.resources.waiting();
             state = self.wait_for_flush(state);
         }
         if !state.active.is_empty() {
@@ -1216,6 +1258,8 @@ impl Core {
         mut state: RwLockWriteGuard<'s, State>,
     ) -> RwLockWriteGuard<'s, State> {
         while state.levels.level0_flushes() >= state.level0_stop {
+            #[cfg(feature = "diagnostics")]
+            let _waiting = self.resources.waiting();
             drop(state);
             #[cfg(test)]
             self.level0_waits
@@ -1645,13 +1689,14 @@ impl Core {
         let state = self.read_state();
         let retained = state.retained();
         let usage = self.usage(&state);
+        let physical: Vec<_> = physical_runs(&state.runs).collect();
 
         EngineStats {
             build: self.chunks.counters(),
-            filter_bytes: state.runs.iter().map(|run| run.run.filter_bytes()).sum(),
-            index_bytes: state.runs.iter().map(|run| run.run.index_bytes()).sum(),
-            chunk_bytes_held: state.runs.iter().map(|run| run.run.chunk_capacity()).sum(),
-            block_bytes_live: state.runs.iter().map(|run| run.run.frame_bytes()).sum(),
+            filter_bytes: physical.iter().map(|run| run.run.filter_bytes()).sum(),
+            index_bytes: physical.iter().map(|run| run.run.index_bytes()).sum(),
+            chunk_bytes_held: physical.iter().map(|run| run.run.chunk_capacity()).sum(),
+            block_bytes_live: physical.iter().map(|run| run.run.frame_bytes()).sum(),
             used: usage.used,
             memory_limit: self.memory_limit,
             memtable_bytes: usage.memtables,
@@ -2000,6 +2045,25 @@ pub enum CompactionError {
     /// publication. This piece was not published; compactions are serialized,
     /// so this is a defect, reported rather than published.
     Stale,
+    /// A single indivisible range exceeds the job's bounded output allowance.
+    /// Earlier pieces remain published and this piece changes nothing.
+    OutputLimit {
+        /// Conservative output bytes needed before the next allocation.
+        bytes: usize,
+        /// The whole job's unpublished-output allowance.
+        limit: usize,
+    },
+}
+
+impl From<crate::run::CompactBuildError> for CompactionError {
+    fn from(error: crate::run::CompactBuildError) -> Self {
+        match error {
+            crate::run::CompactBuildError::Read(error) => Self::Read(error),
+            crate::run::CompactBuildError::OutputLimit { bytes, limit } => {
+                Self::OutputLimit { bytes, limit }
+            }
+        }
+    }
 }
 
 impl From<ReadError> for CompactionError {
@@ -2012,7 +2076,11 @@ impl fmt::Display for CompactionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(error) => error.fmt(f),
-            Self::Stale => f.write_str("compaction found its runs moved and published nothing"),
+            Self::OutputLimit { bytes, limit } => write!(
+                f,
+                "compaction output needs {bytes} bytes, allowance is {limit}"
+            ),
+            Self::Stale => f.write_str("compaction piece found its inputs moved"),
         }
     }
 }
@@ -2123,11 +2191,19 @@ impl<'e> CompactionJob<'e> {
     /// The unselected runs that may contest erasing an output sequence,
     /// sorted by smallest key. A run whose records are all newer than every
     /// input's cannot, nor can any run once the output is not the bottom.
+    #[cfg(test)]
     fn seq_floors(&self) -> Vec<SeqFloor<'_>> {
         if !self.zero_seq {
             return Vec::new();
         }
-        let newest = self.inputs.iter().map(|run| run.run.max_seq()).max();
+        self.seq_floors_for(&self.inputs)
+    }
+
+    fn seq_floors_for(&self, inputs: &[SharedRun]) -> Vec<SeqFloor<'_>> {
+        if !self.zero_seq {
+            return Vec::new();
+        }
+        let newest = inputs.iter().map(|run| run.run.max_seq()).max();
         let mut floors: Vec<_> = self
             .others
             .iter()
@@ -2154,17 +2230,39 @@ impl<'e> CompactionJob<'e> {
         workspace: &mut MergeWorkspace,
         threads: usize,
     ) -> Result<BuiltCompaction<'e>, CompactionError> {
-        let estimate = self.inputs.iter().fold(0usize, |sum, run| {
+        let (output, charge) = self.build_inputs(
+            &self.inputs,
+            workspace,
+            threads,
+            self.options.max_workspace_bytes,
+            None,
+        )?;
+        Ok(BuiltCompaction {
+            job: self,
+            output,
+            charge,
+        })
+    }
+
+    fn build_inputs(
+        &self,
+        inputs: &[SharedRun],
+        workspace: &mut MergeWorkspace,
+        threads: usize,
+        workspace_allowance: usize,
+        budget: Option<Arc<crate::run::OutputBudget>>,
+    ) -> Result<(crate::run::Compacted, resources::BuildCharge<'e>), CompactionError> {
+        let estimate = inputs.iter().fold(0usize, |sum, run| {
             sum.saturating_add(run.run.build_estimate())
         });
-        let workspace_bytes = self
-            .options
-            .max_workspace_bytes
-            .max(crate::run::workspace_estimate(
-                self.inputs.iter().map(|run| run.largest_block),
-            ));
-        let mut charge = self.engine.resources.build(estimate, workspace_bytes);
-        let views: Vec<RunView<'_>> = self.inputs.iter().map(|run| run.run.view()).collect();
+        let workspace_bytes = workspace_allowance.max(crate::run::workspace_estimate(
+            inputs.iter().map(|run| run.largest_block),
+        ));
+        let mut charge = self.engine.resources.build(
+            budget.as_ref().map_or(estimate, |b| b.limit()),
+            workspace_bytes,
+        );
+        let views: Vec<RunView<'_>> = inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = self
             .others
             .iter()
@@ -2175,7 +2273,7 @@ impl<'e> CompactionJob<'e> {
                 .iter()
                 .any(|range| range.min <= key && key <= range.max)
         };
-        let floors = self.seq_floors();
+        let floors = self.seq_floors_for(inputs);
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
             max_workspace_bytes: workspace_bytes,
@@ -2183,15 +2281,26 @@ impl<'e> CompactionJob<'e> {
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
         };
-        let output = compact_parallel_in(
-            &views,
-            keep_tombstone,
-            limits,
-            &self.cuts,
-            threads,
-            self.estimated_run_bytes,
-            (workspace, &self.engine.chunks, &floors),
-        )?;
+        let output = if let Some(budget) = budget {
+            crate::run::compact_limited_in(
+                &views,
+                keep_tombstone,
+                limits,
+                &self.cuts,
+                (workspace, &self.engine.chunks, &floors),
+                budget,
+            )?
+        } else {
+            compact_parallel_in(
+                &views,
+                keep_tombstone,
+                limits,
+                &self.cuts,
+                threads,
+                self.estimated_run_bytes,
+                (workspace, &self.engine.chunks, &floors),
+            )?
+        };
         #[cfg(test)]
         {
             let hook = self.engine.after_build.lock().unwrap().clone();
@@ -2203,11 +2312,7 @@ impl<'e> CompactionJob<'e> {
         drop(ranges);
         drop(views);
         charge.finished(output.output_bytes + output.held_bytes);
-        Ok(BuiltCompaction {
-            job: self,
-            output,
-            charge,
-        })
+        Ok((output, charge))
     }
 }
 
@@ -2231,27 +2336,27 @@ struct BuiltCompaction<'e> {
 }
 
 impl BuiltCompaction<'_> {
-    /// Replaces the inputs with the output in one step under the lock.
-    ///
-    /// Every input must still be published where selection found it, and
-    /// the output must fit its level beside the runs there. Runs published
-    /// since selection, all flushes into level 0, are kept.
-    /// the run limits is accepted if it is no larger than what it replaces.
-    /// On an error the output is dropped and the engine is unchanged. The
-    /// inputs are freed after the lock is released, once no reader holds
-    /// them.
+    /// Publish an ordinary atomic job through the same path as a range piece.
     fn publish(self) -> Result<CompactionReport, CompactionError> {
-        let Self {
-            job,
-            output,
-            charge,
-        } = self;
+        self.job
+            .publish_inputs(&self.job.inputs, self.output, self.charge, true)
+    }
+}
+
+impl<'e> CompactionJob<'e> {
+    fn publish_inputs(
+        &self,
+        inputs: &[SharedRun],
+        output: crate::run::Compacted,
+        charge: resources::BuildCharge<'e>,
+        _record_job: bool,
+    ) -> Result<CompactionReport, CompactionError> {
         let report = CompactionReport {
-            kind: job.kind,
-            level: job.level,
-            inputs: job.inputs.len(),
-            input_bytes: job.input_bytes(),
-            input_held_bytes: job.inputs.iter().map(|run| run.run.held_bytes()).sum(),
+            kind: self.kind,
+            level: self.level,
+            inputs: inputs.len(),
+            input_bytes: inputs.iter().map(|r| r.run.stored_len()).sum(),
+            input_held_bytes: inputs.iter().map(|run| run.run.held_bytes()).sum(),
             outputs: output.runs.len(),
             output_bytes: output.output_bytes,
             output_held_bytes: output.held_bytes,
@@ -2261,20 +2366,20 @@ impl BuiltCompaction<'_> {
                 .map(Run::filter_build_bytes)
                 .max()
                 .unwrap_or(0),
-            complete: job.is_complete(),
+            complete: self.is_complete(),
             stats: output.stats,
             workspace_bytes: output.workspace_bytes,
         };
         #[cfg(feature = "diagnostics")]
-        diagnostics::observe("job_before_publish", job.engine.stats());
-        let is_input = |run: &SharedRun| job.inputs.iter().any(|input| Arc::ptr_eq(input, run));
-        let mut state = job.engine.write_state();
-        if state.runs.iter().filter(|run| is_input(run)).count() != job.inputs.len() {
+        diagnostics::observe("job_before_publish", self.engine.stats());
+        let is_input = |run: &SharedRun| inputs.iter().any(|input| Arc::ptr_eq(input, run));
+        let mut state = self.engine.write_state();
+        if state.runs.iter().filter(|run| is_input(run)).count() != inputs.len() {
             drop(state);
             unreachable!("compactions are serialized, so only this one removes runs");
         }
         #[cfg(feature = "diagnostics")]
-        let bottom_bytes = if job.zero_seq {
+        let bottom_bytes = if self.zero_seq {
             state
                 .levels
                 .runs()
@@ -2287,26 +2392,20 @@ impl BuiltCompaction<'_> {
         } else {
             0
         };
-        let stored = state.run_bytes - report.input_bytes + report.output_bytes;
-        let filters = state.held_bytes - report.input_held_bytes + report.output_held_bytes;
         let outputs: Vec<SharedRun> = published(output.runs).collect();
-        if state
-            .levels
-            .replace(&job.inputs, &outputs, job.dest)
-            .is_err()
-        {
+        if state.levels.replace(inputs, &outputs, self.dest).is_err() {
             return Err(CompactionError::Stale);
         }
-        match &job.cursor {
-            Some(Cursor::After(key)) => state.levels.advance(job.level, key),
+        match &self.cursor {
+            Some(Cursor::After(key)) => state.levels.advance(self.level, key),
             None => {}
         }
         #[cfg(feature = "diagnostics")]
         #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
-        if let Dest::Level(level) = job.dest {
-            job.engine.chunks.work(
-                crate::chunk::work_slot(Some(level), job.cuts.omit_filter),
-                job.inputs.iter().map(|run| run.run.raw_len()).sum(),
+        if let Dest::Level(level) = self.dest {
+            self.engine.chunks.work(
+                crate::chunk::work_slot(Some(level), self.cuts.omit_filter),
+                inputs.iter().map(|run| run.run.raw_len()).sum(),
                 outputs.iter().map(|run| run.run.raw_len()).sum(),
                 report.output_bytes,
             );
@@ -2314,18 +2413,14 @@ impl BuiltCompaction<'_> {
         state.runs.retain(|run| !is_input(run));
         state.runs.extend(outputs);
         state.order_runs();
-        state.run_bytes = stored;
-        state.held_bytes = filters;
-        for input in &job.inputs {
-            let (bytes, filter) = (input.run.stored_len(), input.run.held_bytes());
-            state.retire(input.run.retirement(), bytes, Some(filter));
-        }
+        state.recount_runs();
+        state.retire_runs(inputs);
         drop(charge);
         drop(state);
-        job.engine.resources.changed();
-        job.engine.flush_signal.request();
+        self.engine.resources.changed();
+        self.engine.flush_signal.request();
         #[cfg(feature = "diagnostics")]
-        if job.zero_seq {
+        if _record_job && self.zero_seq {
             diagnostics::bottom_job(
                 1,
                 bottom_bytes,
@@ -2333,7 +2428,6 @@ impl BuiltCompaction<'_> {
                 report.output_bytes + report.output_held_bytes,
             );
         }
-        drop(job);
         Ok(report)
     }
 }

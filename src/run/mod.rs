@@ -83,6 +83,7 @@ mod group;
 mod index;
 mod logical;
 mod merge;
+mod output_budget;
 mod reader;
 mod storage;
 
@@ -97,8 +98,8 @@ pub use builder::RunBuilder;
 pub use codec::Codec;
 #[cfg(test)]
 pub(crate) use compact::compact_parallel;
+pub(crate) use compact::{CompactBuildError, SeqFloor, compact_limited_in, compact_parallel_in};
 pub use compact::{CompactLimits, CompactStats, Compacted, OutputCuts, workspace_estimate};
-pub(crate) use compact::{SeqFloor, compact_parallel_in};
 #[cfg(test)]
 pub(crate) use compact::{compact_erasing, compact_with};
 pub(crate) use filter::MAX_FILTER_BYTES;
@@ -110,6 +111,7 @@ pub use logical::{
 };
 pub(crate) use logical::{LookupSource, latest_from};
 pub use merge::{MergeCursor, MergeWorkspace};
+pub(crate) use output_budget::{OutputBudget, OutputCounters};
 pub use reader::{Run, RunView};
 
 // Used beyond this module only by its tests.

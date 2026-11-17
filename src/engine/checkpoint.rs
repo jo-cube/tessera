@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crc32fast::Hasher;
 
 use crate::run::{CorruptRun, Run};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
 
@@ -506,8 +506,8 @@ impl Manifest {
         {
             return Err(Damage::Order);
         }
-        let mut runs = Vec::with_capacity(count);
-        let mut ids = HashSet::with_capacity(count);
+        let mut runs: Vec<RunEntry> = Vec::with_capacity(count);
+        let mut ids: HashMap<u128, Vec<usize>> = HashMap::with_capacity(count);
         let mut previous = (0, 0);
         let mut bounds_at = MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN;
         let bounds_end = bounds_at + bounds_len as usize;
@@ -553,8 +553,7 @@ impl Manifest {
                     found: len,
                 });
             }
-            if !ids.insert(id)
-                || id as u64 == 0
+            if id as u64 == 0
                 || id as u64 >= next_run_id
                 || level > depth
                 || flags > 3
@@ -567,6 +566,23 @@ impl Manifest {
             {
                 return Err(Damage::Order);
             }
+            if let Some(previous_views) = ids.get(&id) {
+                for &index in previous_views {
+                    let previous = &runs[index];
+                    if previous.len != len
+                        || previous.run_len != run_len
+                        || previous.sum != u32_at(at + 56)
+                        || previous.seq_override != (flags & 1 != 0).then_some(seq)
+                    {
+                        return Err(Damage::Order);
+                    }
+                    match (&previous.bounds, &bounds) {
+                        (Some((a, b)), Some((c, d))) if b < c || d < a => {}
+                        _ => return Err(Damage::Order),
+                    }
+                }
+            }
+            ids.entry(id).or_default().push(runs.len());
             previous = (level, flush);
             runs.push(RunEntry {
                 id,
@@ -848,7 +864,15 @@ fn write_runs(
         manifest: Manifest {
             generation,
             last_seq: image.ceiling,
-            records: image.runs.iter().map(|(_, _, r)| r.run.len() as u64).sum(),
+            records: {
+                let mut seen = HashSet::new();
+                image
+                    .runs
+                    .iter()
+                    .filter(|(_, _, r)| seen.insert(r.id))
+                    .map(|(_, _, r)| r.run.len() as u64)
+                    .sum()
+            },
             next_run_id: image
                 .runs
                 .iter()
@@ -870,9 +894,23 @@ fn write_runs(
         files_deleted: 0,
         largest_run_bytes: 0,
     };
+    let mut physical_sums = HashMap::new();
     for &(level, flush, ref published) in &image.runs {
         let run = &published.run;
         let len = (run.stored_len() + run.filter_bytes() + 4) as u64;
+        if let Some(&sum) = physical_sums.get(&published.id) {
+            written.manifest.runs.push(RunEntry {
+                id: published.id,
+                level,
+                flush,
+                seq_override: run.seq_override(),
+                len,
+                run_len: run.stored_len() as u64,
+                sum,
+                bounds: run.slice().map(|(a, b)| (a.to_vec(), b.to_vec())),
+            });
+            continue;
+        }
         let file = runs_dir.join(run_name(published.id));
         let exists = match fs::metadata(&file) {
             Ok(found) if found.len() == len => true,
@@ -938,6 +976,7 @@ fn write_runs(
             crash_point!(Crash::AfterFirstRun, &file);
             sum
         };
+        physical_sums.insert(published.id, sum);
         written.largest_run_bytes = written.largest_run_bytes.max(len as usize);
         written.manifest.runs.push(RunEntry {
             id: published.id,
@@ -1334,31 +1373,39 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
     let pool = ChunkPool::new(RESERVE_BYTES);
     let mut runs: Vec<(usize, u64, SharedRun)> = Vec::with_capacity(manifest.runs.len());
     let mut records = 0u64;
+    let mut backings: HashMap<u128, Run<Vec<u8>>> = HashMap::new();
     for entry in &manifest.runs {
         let file = dir.join(RUNS).join(run_name(entry.id));
-        let mut data = read_bounded(&file, entry.len)?;
-        if data.len() as u64 != entry.len {
-            return Err(corrupt(
-                &file,
-                Damage::Length {
-                    expected: entry.len,
-                    found: data.len() as u64,
-                },
-            ));
-        }
-        let filter_at = entry.run_len as usize;
-        let filter_end = data.len() - 4;
-        let filter = &data[filter_at..filter_end];
-        if crc(&[filter]).to_le_bytes() != data[filter_end..] {
-            return Err(corrupt(&file, Damage::FilterChecksum));
-        }
-        if crc(&[&data]) != entry.sum {
-            return Err(corrupt(&file, Damage::Checksum));
-        }
-        let filter = filter.to_vec();
-        data.truncate(filter_at);
-        let (mut run, max_seq) = Run::recover_checkpoint_in(data, &filter, &pool)
-            .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+        let (mut run, max_seq) = if let Some(backing) = backings.get(&entry.id) {
+            (backing.clone(), backing.max_seq())
+        } else {
+            let mut data = read_bounded(&file, entry.len)?;
+            if data.len() as u64 != entry.len {
+                return Err(corrupt(
+                    &file,
+                    Damage::Length {
+                        expected: entry.len,
+                        found: data.len() as u64,
+                    },
+                ));
+            }
+            let filter_at = entry.run_len as usize;
+            let filter_end = data.len() - 4;
+            let filter = &data[filter_at..filter_end];
+            if crc(&[filter]).to_le_bytes() != data[filter_end..] {
+                return Err(corrupt(&file, Damage::FilterChecksum));
+            }
+            if crc(&[&data]) != entry.sum {
+                return Err(corrupt(&file, Damage::Checksum));
+            }
+            let filter = filter.to_vec();
+            data.truncate(filter_at);
+            let (run, max_seq) = Run::recover_checkpoint_in(data, &filter, &pool)
+                .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+            records += run.len() as u64;
+            backings.insert(entry.id, run.clone());
+            (run, max_seq)
+        };
         if max_seq > manifest.last_seq
             || entry
                 .seq_override
@@ -1392,7 +1439,6 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         {
             return Err(corrupt(&file, Damage::Order));
         }
-        records += run.len() as u64;
         let largest_block = run
             .view()
             .largest_block_len()
@@ -1441,8 +1487,13 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
             })?;
         }
     }
-    let run_bytes: usize = runs.iter().map(|(_, _, r)| r.run.stored_len()).sum();
-    let held_bytes: usize = runs.iter().map(|(_, _, r)| r.run.held_bytes()).sum();
+    let published: Vec<_> = runs.iter().map(|(_, _, r)| r.clone()).collect();
+    let run_bytes: usize = super::physical_runs(&published)
+        .map(|r| r.run.stored_len())
+        .sum();
+    let held_bytes: usize = super::physical_runs(&published)
+        .map(|r| r.run.held_bytes())
+        .sum();
     Ok(Loaded {
         ceiling: manifest.last_seq,
         metadata: manifest.metadata,

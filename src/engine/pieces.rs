@@ -1,10 +1,14 @@
 //! Bounded bottom-level jobs. Each publication retires one consecutive range.
 use super::*;
 use std::collections::VecDeque;
+mod concurrent;
 
 /// Bottom input bytes per piece, in estimated full stored runs. A single
 /// oversized bottom run is indivisible and is always accepted on its own.
 const PIECE_RUNS: usize = 1;
+/// One ordinary maximum block, a dictionary and ownership/index metadata must
+/// fit even when tiny private test runs make the ratio estimate much smaller.
+const MIN_PIECE_BUDGET: usize = 128 << 10;
 
 impl<'e> CompactionJob<'e> {
     fn piece_budget(&self) -> usize {
@@ -18,7 +22,9 @@ impl<'e> CompactionJob<'e> {
                 return override_bytes;
             }
         }
-        self.estimated_run_bytes.saturating_mul(PIECE_RUNS).max(1)
+        self.estimated_run_bytes
+            .saturating_mul(PIECE_RUNS)
+            .max(MIN_PIECE_BUDGET)
     }
 
     pub(super) fn execute(
@@ -32,7 +38,11 @@ impl<'e> CompactionJob<'e> {
         if self.source_count == 0 || !self.zero_seq || bottom_bytes <= self.piece_budget() {
             return self.build(workspace)?.publish();
         }
-        self.execute_pieces(workspace)
+        if self.engine.background_threads > 1 {
+            self.execute_concurrent()
+        } else {
+            self.execute_pieces(workspace)
+        }
     }
 
     fn execute_pieces(
@@ -205,19 +215,14 @@ impl<'e> BuiltCompaction<'e> {
             .runs
             .extend(sources.iter().filter_map(|(_, r)| r.clone()));
         state.runs.extend(outputs.iter().cloned());
-        state.run_bytes = state.runs.iter().map(|r| r.run.stored_len()).sum();
-        state.held_bytes = state.runs.iter().map(|r| r.run.held_bytes()).sum();
+        state.recount_runs();
         state.order_runs();
-        for input in bottom
+        let removed: Vec<_> = bottom
             .iter()
-            .chain(sources.iter().filter(|(_, r)| r.is_none()).map(|(r, _)| r))
-        {
-            state.retire(
-                input.run.retirement(),
-                input.run.stored_len(),
-                Some(input.run.held_bytes()),
-            );
-        }
+            .chain(sources.iter().map(|(r, _)| r))
+            .cloned()
+            .collect();
+        state.retire_runs(&removed);
         #[cfg(feature = "diagnostics")]
         #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
         if let Dest::Level(level) = job.dest {

@@ -1,7 +1,7 @@
 //! Linux counters-example instrumentation; never linked into the library.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tessera::engine::{Engine, EngineStats};
@@ -13,7 +13,8 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 static PHASE: AtomicU8 = AtomicU8::new(0);
 static META: OnceLock<(String, String, Instant)> = OnceLock::new();
 static OUTPUT: Mutex<()> = Mutex::new(());
-static PHASE_STARTED: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
+static ENGINE: OnceLock<Weak<Engine>> = OnceLock::new();
+static PHASE_STARTED: Mutex<Option<(Instant, f64, u64)>> = Mutex::new(None);
 static TICKS: OnceLock<f64> = OnceLock::new();
 
 fn cpu_seconds() -> f64 {
@@ -94,6 +95,18 @@ pub fn sample_stats(reason: &str, s: EngineStats) {
             * 1024
     };
     let phase = ["load", "update", "drain", "reads"][usize::from(PHASE.load(Relaxed))];
+    if let Some(engine) = ENGINE.get().and_then(Weak::upgrade) {
+        let d = tessera::engine::diagnostics::maintenance(&engine);
+        println!(
+            "unpublished,{name},{variant},{phase},{reason},{},{},{},{},{},{}",
+            d.unpublished_bytes,
+            d.peak_unpublished_bytes,
+            d.output_limit,
+            d.peak_reserved_bytes,
+            d.peak_active_pieces,
+            d.piece_retries
+        );
+    }
     println!(
         "memory,{name},{variant},{phase},{reason},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         started.elapsed().as_secs_f64(),
@@ -122,17 +135,20 @@ pub fn phase_end(engine: &Engine, reason: &str, next: u8) {
     let now = Instant::now();
     let cpu = cpu_seconds();
     let mut started = PHASE_STARTED.lock().unwrap();
-    if let Some((wall_start, cpu_start)) = *started {
+    let wait = tessera::engine::diagnostics::maintenance(engine).writer_wait_ns;
+    if let Some((wall_start, cpu_start, wait_start)) = *started {
         let wall = now.duration_since(wall_start).as_secs_f64();
         let (name, variant, _) = META.get().unwrap();
         let phase = ["load", "update", "drain", "reads"][usize::from(PHASE.load(Relaxed))];
         println!(
-            "phase,{name},{variant},{phase},{wall:.6},{:.6},{:.6}",
+            "phase,{name},{variant},{phase},{wall:.6},{:.6},{:.6},{:.6},{:.6}",
             cpu - cpu_start,
-            (cpu - cpu_start) / wall
+            (cpu - cpu_start) / wall,
+            (wait - wait_start) as f64 / 1e9,
+            (wait - wait_start) as f64 / 1e9 / wall
         );
     }
-    *started = Some((now, cpu));
+    *started = Some((now, cpu, wait));
     drop(started);
     sample_stats(reason, engine.stats());
     PHASE.store(next, Relaxed);
@@ -160,7 +176,12 @@ impl Sampler {
             .parse()
             .unwrap();
         assert!(TICKS.set(ticks).is_ok());
-        *PHASE_STARTED.lock().unwrap() = Some((Instant::now(), cpu_seconds()));
+        assert!(ENGINE.set(Arc::downgrade(&engine)).is_ok());
+        *PHASE_STARTED.lock().unwrap() = Some((
+            Instant::now(),
+            cpu_seconds(),
+            tessera::engine::diagnostics::maintenance(&engine).writer_wait_ns,
+        ));
         println!(
             "memory,scenario,variant,phase,event,seconds,rss,hwm,swap,live,peak_live,used,memtables,build_output,build_workspace,pool_reserve,pool_in_use,pool_unaccounted,run_bytes,held_bytes,snapshots,active_arena,frozen_tables,retained"
         );

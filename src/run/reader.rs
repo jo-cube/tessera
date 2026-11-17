@@ -437,6 +437,29 @@ impl<B: AsRef<[u8]>> Run<B> {
         Ok(())
     }
 
+    pub(crate) fn storage_id(&self) -> usize {
+        Arc::as_ptr(&self.backing).addr()
+    }
+
+    /// Compressed input touching the visible range, plus the physical index
+    /// and dictionaries. This estimates output reservations, not admission.
+    pub(crate) fn range_stored_estimate(&self) -> usize {
+        let view = self.view();
+        let Some((min, max)) = self.slice() else {
+            return self.stored_len();
+        };
+        let bounds = (|| {
+            let start = view.locate(min)?.unwrap_or(view.block_count());
+            let mut after = max.to_vec();
+            after.push(0);
+            let end = view.locate(&after)?.map_or(view.block_count(), |b| b + 1);
+            Ok::<_, CorruptRun>((start..end).map(|b| view.block_bytes(b)).sum::<usize>())
+        })();
+        bounds.map_or(self.stored_len(), |bytes| {
+            bytes + self.stored_len() - self.frame_bytes()
+        })
+    }
+
     /// The lifetime of physical storage, shared by all its bounded views.
     pub(crate) fn retirement(&self) -> Weak<dyn Send + Sync>
     where

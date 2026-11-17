@@ -15,7 +15,14 @@ fn options() -> EngineOptions {
     }
 }
 fn fixture() -> Engine {
-    let engine = Engine::new(options()).unwrap();
+    fixture_with_threads(1)
+}
+fn fixture_with_threads(background_threads: usize) -> Engine {
+    let engine = Engine::new(EngineOptions {
+        background_threads,
+        ..options()
+    })
+    .unwrap();
     let runs: Vec<_> = (0..8)
         .map(|group| {
             let mut builder =
@@ -325,7 +332,18 @@ fn interleaved_skipped_run_contests_erasure_in_every_piece() {
 
 #[test]
 fn randomized_model_forces_many_pieces_per_job() {
-    let engine = fixture();
+    randomized_pieces(1);
+}
+#[test]
+fn randomized_model_forces_many_concurrent_pieces_per_job() {
+    randomized_pieces(4);
+}
+fn randomized_pieces(threads: usize) {
+    let engine = fixture_with_threads(threads);
+    engine
+        .core
+        .piece_output_budget
+        .store(32 << 10, Ordering::Relaxed);
     let publications = Arc::new(AtomicUsize::new(0));
     let count = publications.clone();
     *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
@@ -408,4 +426,119 @@ fn corruption_in_a_middle_piece_preserves_completed_publications() {
         .is_some()
     {}
     check(&engine.snapshot(), ones);
+}
+
+#[test]
+fn pieces_publish_out_of_order_and_recover_holes_with_shared_storage() {
+    let engine = fixture_with_threads(4);
+    engine
+        .core
+        .piece_output_budget
+        .store(32 << 10, Ordering::Relaxed);
+    let before = engine.snapshot();
+    let permission = Arc::new((Mutex::new(1u64 << 1), std::sync::Condvar::new()));
+    let permits = permission.clone();
+    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(move |index| {
+        let (lock, changed) = &*permits;
+        let mut allowed = lock.lock().unwrap();
+        while *allowed & (1 << index) == 0 {
+            allowed = changed.wait(allowed).unwrap();
+        }
+    }));
+    let scratch = Scratch::new("out-of-order-piece-holes");
+    std::thread::scope(|scope| {
+        let job = scope.spawn(|| engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap());
+        crate::test_support::wait_until(|| {
+            engine
+                .get(&32u16.to_be_bytes(), &mut EngineWorkspace::new())
+                .unwrap()
+                .unwrap()
+                .seq
+                == 0
+        });
+        let middle = engine.snapshot();
+        assert_eq!(
+            middle
+                .get(&0u16.to_be_bytes(), &mut EngineWorkspace::new())
+                .unwrap()
+                .unwrap()
+                .seq,
+            1
+        );
+        check(&middle, ones);
+        let expected_bytes = engine.stats().run_bytes;
+        {
+            let state = engine.core.read_state();
+            assert_eq!(state.levels.runs()[0].len(), 7);
+            assert_eq!(physical_runs(&state.levels.runs()[0]).count(), 1);
+            assert_eq!(state.directory.group_count(), deepest_overlap(&state.runs));
+        }
+        engine
+            .checkpoint(&scratch.0, CheckpointOptions::default())
+            .unwrap();
+        let recovered = Engine::recover(&scratch.0, options()).unwrap();
+        assert_eq!(
+            recovered.stats().run_bytes,
+            expected_bytes,
+            "recovery shares one physical file among views"
+        );
+        check(&recovered.snapshot(), ones);
+        while recovered
+            .compact(&mut MergeWorkspace::new())
+            .unwrap()
+            .is_some()
+        {}
+        check(&recovered.snapshot(), ones);
+        // A flush remains independent while all remaining builders are paused.
+        engine.put(&10u16.to_be_bytes(), b"late").unwrap();
+        engine.flush().unwrap();
+        *permission.0.lock().unwrap() = u64::MAX;
+        permission.1.notify_all();
+        assert_eq!(job.join().unwrap().stats.records_written, usize::from(KEYS));
+        check(&before, ones);
+        check(&middle, ones);
+    });
+    check(&engine.snapshot(), |key| {
+        if key == 10 {
+            Some(b"late".to_vec())
+        } else {
+            ones(key)
+        }
+    });
+    drop(before);
+    assert_eq!(engine.stats().retained_run_bytes, 0);
+    #[cfg(feature = "diagnostics")]
+    {
+        let m = diagnostics::maintenance(&engine);
+        assert_eq!(m.unpublished_bytes, 0);
+        assert!(m.peak_active_pieces >= 2 && m.peak_active_pieces <= 4);
+        assert!(m.peak_unpublished_bytes <= m.output_limit);
+        assert!(m.peak_reserved_bytes <= m.output_limit);
+    }
+}
+
+#[test]
+fn concurrent_output_refusal_keeps_every_view_readable_and_checkpointable() {
+    let engine = fixture_with_threads(4);
+    engine.core.piece_output_budget.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        engine.compact(&mut MergeWorkspace::new()),
+        Err(CompactionError::OutputLimit { limit: 4, .. })
+    ));
+    check(&engine.snapshot(), ones);
+    assert_eq!(engine.stats().build_output_bytes, 0);
+    assert_eq!(engine.stats().build_workspace_bytes, 0);
+    let scratch = Scratch::new("concurrent-piece-refusal");
+    engine
+        .checkpoint(&scratch.0, CheckpointOptions::default())
+        .unwrap();
+    let recovered = Engine::recover(&scratch.0, options()).unwrap();
+    assert_eq!(recovered.stats().run_bytes, engine.stats().run_bytes);
+    check(&recovered.snapshot(), ones);
+    while recovered
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    check(&recovered.snapshot(), ones);
 }
