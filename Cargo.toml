@@ -17,6 +17,8 @@ publish = false
 [features]
 # Hidden work and memory counters by level. Not part of the stable API.
 diagnostics = []
+# Counting allocator and Linux process samples in the counters example only.
+tools-memory = []
 
 [dependencies]
 crc32fast = "1"

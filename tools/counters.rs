@@ -9,6 +9,9 @@ use std::time::Instant;
 use tessera::engine::diagnostics;
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
 
+#[cfg(all(feature = "tools-memory", target_os = "linux"))]
+mod memory;
+
 const MEMBERS: usize = 64;
 struct Rng(u64);
 impl Rng {
@@ -75,14 +78,18 @@ struct Scenario {
     value_len: usize,
 }
 
-fn run(s: &Scenario, variant: &str, settle: bool) {
+fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
     let started = Instant::now();
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
-    let engine = Engine::new(EngineOptions {
-        background_threads: 1,
-        ..EngineOptions::default()
-    })
-    .unwrap();
+    let engine = std::sync::Arc::new(
+        Engine::new(EngineOptions {
+            background_threads: threads,
+            ..EngineOptions::default()
+        })
+        .unwrap(),
+    );
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    let sampler = memory::Sampler::start(std::sync::Arc::clone(&engine), name, variant);
     let mut ingested = 0u64;
     let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
@@ -92,6 +99,8 @@ fn run(s: &Scenario, variant: &str, settle: bool) {
         engine.put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
     }
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    memory::phase_end(&engine, "load_end", 1);
     let mut updated = vec![false; records];
     let mut updates = order;
     rng.shuffle(&mut updates);
@@ -102,11 +111,15 @@ fn run(s: &Scenario, variant: &str, settle: bool) {
         ingested += (16 + v.len()) as u64;
         updated[i] = true;
     }
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    memory::phase_end(&engine, "update_end", 2);
     drop(updates);
     // Steady state: the final memtable flushes on its own only when full,
     // so publish it, then let the worker settle without eager compaction.
     engine.flush().unwrap();
     engine.wait_for_compaction().unwrap();
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    memory::phase_end(&engine, "drain_end", 3);
     let load_seconds = started.elapsed().as_secs_f64();
 
     let expect = |i: usize| value(i, u8::from(updated[i]), weak, len);
@@ -266,12 +279,26 @@ fn run(s: &Scenario, variant: &str, settle: bool) {
             ratio(scans.blocks_loaded(), 100),
         );
     }
-    engine.close().unwrap();
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    {
+        println!(
+            "reader_memory,{name},{variant},{},{}",
+            scans.capacity() + ws.capacity() + hits.capacity() + misses.capacity(),
+            scans.context_bytes()
+                + ws.context_bytes()
+                + hits.context_bytes()
+                + misses.context_bytes()
+        );
+        sampler.stop();
+        memory::sample_stats("final", engine.stats());
+    }
+    std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
 }
 
 fn main() {
     let mut variant = String::from("default");
     let mut settle = false;
+    let mut threads = 1;
     let mut scale = 0;
     let mut names = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -279,6 +306,14 @@ fn main() {
         match arg.as_str() {
             "--variant" => variant = args.next().expect("LABEL"),
             "--settle" => settle = true,
+            "--threads" => {
+                let value = args.next().expect("COUNT or default");
+                threads = if value == "default" {
+                    EngineOptions::default().background_threads
+                } else {
+                    value.parse().expect("positive thread count")
+                };
+            }
             "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
             _ => names.push(arg),
         }
@@ -318,7 +353,11 @@ fn main() {
     }
     for s in &scenarios {
         if names.is_empty() || names.iter().any(|n| n == s.name) {
-            run(s, &variant, settle);
+            eprintln!(
+                "config,{},{variant},records={},background_threads={threads}",
+                s.name, s.records
+            );
+            run(s, &variant, settle, threads);
         }
     }
 }

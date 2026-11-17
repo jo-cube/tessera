@@ -22,3 +22,9 @@ stable API. The [basic example](../examples/basic.rs) demonstrates the public
 API.
 
 The macOS [comparison harness](bench/README.md) measures Tessera and RocksDB.
+
+On Linux, add `--features diagnostics,tools-memory` to count current and peak
+Rust allocation bytes and sample `/proc/self/status` plus engine memory
+components every second and at phase ends. Run one named scenario per process.
+Native Zstandard allocations are outside the Rust counter. `--threads COUNT`
+sets builders; `--threads default` uses the engine default (otherwise one).

@@ -122,6 +122,15 @@ finished runs trim their partial final chunk. The free reserve is capped at
 32 MiB. Workspaces retain decode buffers and contexts; there is no decoded-block
 cache. Use `Engine::stats()` and workspace counters to inspect memory and work.
 
+On Linux with glibc, freed buffers can remain resident, so RSS may stay above
+`EngineStats::used` after maintenance. Applications can evaluate
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=524288` at process startup. This
+[fixes the mmap threshold](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
+and lets large freed allocations return to the OS; it affects allocations
+throughout the process and can change throughput. Measure with the application
+workload before adopting it. Allocators that purge freed memory, such as mimalloc
+or jemalloc with default settings, also avoid this retention.
+
 ## Thread safety and errors
 
 `Engine` and `Snapshot` are `Send + Sync`. Share them across threads and use
