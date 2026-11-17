@@ -193,7 +193,8 @@ use crate::chunk::{ChunkPool, RESERVE_BYTES};
 use crate::memtable::{FlushCuts, FrozenMemtable, Memtable, Records, TableError, flush_merged};
 use crate::run::{
     Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP,
-    RECORD_INPUT_OVERHEAD, Run, RunView, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
+    RECORD_INPUT_OVERHEAD, Run, RunView, SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in,
+    latest_from,
 };
 
 use directory::RunDirectory;
@@ -1516,12 +1517,10 @@ impl Core {
         };
         cuts.omit_filter = matches!(dest, Dest::Level(level) if level == state.levels.depth());
         let others = Self::others(&state, &inputs);
-        // Logical reads resolve overlapping runs by sequence. Preserve it if
-        // any unselected run could compete, even above the bottom level.
-        // A snapshot taken after selection retains the original input runs.
-        let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth())
-            && others.is_empty()
-            && Arc::strong_count(&self.snapshots) == 1;
+        // Output into the bottom level erases the sequences no unselected
+        // run can contest; `build` decides record by record. Snapshots and
+        // checkpoints keep the directories, and so the runs, they started from.
+        let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth());
         let estimated_run_bytes = state.levels.segment(&fit);
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
@@ -2066,7 +2065,7 @@ struct CompactionJob<'e> {
     level: usize,
     /// Where the output goes.
     dest: Dest,
-    /// Settled output with no competing unselected run or pre-existing snapshot.
+    /// Output into the bottom level, which erases uncontested sequences.
     zero_seq: bool,
     cuts: OutputCuts,
     /// Where the source level's next job starts once this publishes.
@@ -2100,6 +2099,24 @@ impl<'e> CompactionJob<'e> {
         self.others.is_empty()
     }
 
+    /// The unselected runs that may contest erasing an output sequence,
+    /// sorted by smallest key. A run whose records are all newer than every
+    /// input's cannot, nor can any run once the output is not the bottom.
+    fn seq_floors(&self) -> Vec<SeqFloor<'_>> {
+        if !self.zero_seq {
+            return Vec::new();
+        }
+        let newest = self.inputs.iter().map(|run| run.run.max_seq()).max();
+        let mut floors: Vec<_> = self
+            .others
+            .iter()
+            .filter(|run| Some(run.run.min_seq()) <= newest)
+            .filter_map(|run| SeqFloor::of(&run.run))
+            .collect();
+        floors.sort_unstable_by_key(|floor| floor.min_key);
+        floors
+    }
+
     /// Merges the inputs without the state lock.
     ///
     /// A tombstone is kept if any other run overlapping the inputs has a key
@@ -2128,6 +2145,7 @@ impl<'e> CompactionJob<'e> {
                 .iter()
                 .any(|range| range.min <= key && key <= range.max)
         };
+        let floors = self.seq_floors();
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
             max_workspace_bytes: workspace_bytes,
@@ -2142,7 +2160,7 @@ impl<'e> CompactionJob<'e> {
             &self.cuts,
             self.engine.background_threads,
             self.estimated_run_bytes,
-            (workspace, &self.engine.chunks),
+            (workspace, &self.engine.chunks, &floors),
         )?;
         #[cfg(test)]
         {
@@ -2151,6 +2169,7 @@ impl<'e> CompactionJob<'e> {
                 hook();
             }
         }
+        drop(floors);
         drop(ranges);
         drop(views);
         charge.finished(output.output_bytes + output.held_bytes);

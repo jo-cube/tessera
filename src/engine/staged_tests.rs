@@ -485,6 +485,8 @@ mod compaction {
             .collect();
         let (mut compactions, mut incomplete, mut dropped_tombstones) = (0, 0, 0);
         let (mut snapshots, mut outlived) = (0, 0);
+        // Jobs into the bottom level that an unselected run may contest.
+        let mut contested = 0;
 
         // Then a few seeds again with a background worker compacting beside the
         // staged manual compactions. Counts come from the manual seeds only.
@@ -552,7 +554,12 @@ mod compaction {
                         };
                         stage = match stage {
                             Stage::Idle => match engine.core.begin_compaction(options).unwrap() {
-                                Some(Begun::Job(job)) => Stage::Begun(job),
+                                Some(Begun::Job(job)) => {
+                                    if !background && !job.seq_floors().is_empty() {
+                                        contested += 1;
+                                    }
+                                    Stage::Begun(job)
+                                }
                                 // A move publishes as it is chosen.
                                 Some(Begun::Done(_)) | None => Stage::Idle,
                             },
@@ -659,5 +666,6 @@ mod compaction {
         assert!(compactions > 300, "{compactions}");
         assert!(incomplete > 50, "{incomplete}");
         assert!(dropped_tombstones > 50, "{dropped_tombstones}");
+        assert!(contested > 50, "{contested}");
     }
 }

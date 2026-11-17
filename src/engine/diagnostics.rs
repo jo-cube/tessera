@@ -2,6 +2,7 @@
 //! Built only with the `diagnostics` feature; not part of the stable API.
 
 use super::Engine;
+pub use crate::chunk::Erasure;
 
 /// Bytes one purpose read and wrote.
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,4 +83,9 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
             level
         })
         .collect()
+}
+
+/// What sequence erasure did to the records written into the bottom level.
+pub fn erasure(engine: &Engine) -> Erasure {
+    engine.core.chunks.erasure_counters()
 }

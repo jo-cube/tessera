@@ -10,7 +10,9 @@ checks every read path against an independent value oracle.
 Long-format CSV rows report raw bytes decoded and compressed and stored bytes
 written by flush and by compaction into each level; stored bytes by component
 (frames, dictionaries, segment table, index, filters, footer) and records per
-level; and decoded bytes per get, blocks per scan and write amplification.
+level; records written into the bottom level, how many had their sequence
+erased, the filter probes that took and why the rest kept theirs; and decoded
+bytes per get, blocks per scan and write amplification.
 `--settle` then compacts everything into the bottom level and measures again,
 `--variant LABEL` labels the rows and `--scale SHIFT` runs smaller scenarios;
 name scenarios to run only those.

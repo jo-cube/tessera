@@ -179,6 +179,11 @@ fn run(s: &Scenario, variant: &str, settle: bool) {
             );
         }
     }
+    let e = diagnostics::erasure(&engine);
+    println!(
+        "erasure,{name},{variant},{},{},{},{},{}",
+        e.records, e.erased, e.probes, e.kept_unfiltered, e.kept_filtered
+    );
     let levels = diagnostics::levels(&engine);
     let depth = levels.len() - 1;
     for (level, m) in levels.iter().enumerate() {
@@ -299,6 +304,7 @@ fn main() {
         },
     ];
     println!("work,scenario,variant,destination,raw_in,raw_out,stored");
+    println!("erasure,scenario,variant,records,erased,probes,kept_unfiltered,kept_filtered");
     println!(
         "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"
     );

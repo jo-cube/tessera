@@ -58,7 +58,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             ..CompactionPolicy::default()
         };
         let job = engine.core.begin_job(options).unwrap().unwrap();
-        assert_eq!(job.zero_seq, target_run_len == 4 << 20 && snapshot_at != 1);
+        assert!(job.zero_seq);
         let late = (snapshot_at == 2).then(|| engine.snapshot());
         let views: Vec<_> = job.inputs.iter().map(|run| run.run.view()).collect();
         let ranges: Vec<_> = job
@@ -66,7 +66,8 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             .iter()
             .map(|run| run.run.key_range().unwrap())
             .collect();
-        let serial = crate::run::compact_with(
+        let floors = job.seq_floors();
+        let serial = crate::run::compact_erasing(
             &views,
             |key| ranges.iter().any(|r| r.min <= key && key <= r.max),
             CompactLimits {
@@ -78,9 +79,11 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
                 zero_seq: job.zero_seq,
             },
             &job.cuts,
+            &floors,
             &mut MergeWorkspace::new(),
         )
         .unwrap();
+        drop(floors);
         drop(ranges);
         drop(views);
         let built = job.build(&mut MergeWorkspace::new()).unwrap();

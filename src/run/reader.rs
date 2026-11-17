@@ -49,9 +49,10 @@ pub struct Run<B> {
     restart_heads: Box<[u64]>,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
-    /// The largest stored sequence number, 0 if there are none. The builder
-    /// and validation derive it; `seq_override` supplies the effective bound.
-    max_seq: u64,
+    /// The smallest and largest stored sequence numbers, both 0 if there
+    /// are none. The builder and validation derive them; `seq_override`
+    /// supplies the effective bounds.
+    seqs: Seqs,
     /// Publication sequence of a unique-key ingestion built with placeholders.
     /// Set only while the run is private; materialized when it is rewritten.
     seq_override: Option<u64>,
@@ -61,6 +62,13 @@ pub struct Run<B> {
     bounds: Option<KeyBounds>,
     reclaimable: bool,
     build_estimate: usize,
+}
+
+/// The smallest and largest sequence numbers of a run's records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seqs {
+    pub(crate) min: u64,
+    pub(crate) max: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +112,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
     #[cfg(test)]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        let (max_seq, reclaimable, build_estimate) = validate(data.as_ref(), None)?;
+        let (seqs, reclaimable, build_estimate) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
@@ -112,7 +120,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             restart_heads,
             filter: None,
-            max_seq,
+            seqs,
             seq_override: None,
             bounds,
             reclaimable,
@@ -123,7 +131,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub(super) fn from_builder(
         data: RunData<B>,
         filter: Option<KeyFilter>,
-        max_seq: u64,
+        seqs: Seqs,
         reclaimable: bool,
         build_estimate: usize,
     ) -> Self {
@@ -133,7 +141,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             restart_heads,
             filter: filter.map(Box::new),
-            max_seq,
+            seqs,
             seq_override: None,
             bounds,
             reclaimable,
@@ -160,13 +168,19 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the largest sequence number of any record in the run, or 0
     /// if it has none. No record in the run is newer.
     pub fn max_seq(&self) -> u64 {
-        self.seq_override.unwrap_or(self.max_seq)
+        self.seq_override.unwrap_or(self.seqs.max)
+    }
+
+    /// Returns the smallest sequence number of any record in the run, or 0
+    /// if it has none. No record in the run is older.
+    pub(crate) fn min_seq(&self) -> u64 {
+        self.seq_override.unwrap_or(self.seqs.min)
     }
 
     /// Assigns the effective sequence once, before a placeholder run is shared.
     /// A valid run whose stored sequences are all zero has unique user keys.
     pub(crate) fn set_seq_override(&mut self, seq: u64) {
-        assert!(self.seq_override.is_none() && self.max_seq == 0);
+        assert!(self.seq_override.is_none() && self.seqs.max == 0);
         self.seq_override = Some(seq);
     }
 
@@ -218,7 +232,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             data,
             restart_heads: self.restart_heads.clone(),
             filter: self.filter.clone(),
-            max_seq: self.max_seq,
+            seqs: self.seqs,
             seq_override: self.seq_override,
             bounds: self.bounds.clone(),
             reclaimable: self.reclaimable,
@@ -362,7 +376,7 @@ impl Run<Vec<u8>> {
 
     #[cfg(test)]
     pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
-        let (max_seq, reclaimable, build_estimate) = validate(&data, None)?;
+        let (seqs, reclaimable, build_estimate) = validate(&data, None)?;
         let mut hashes = KeyHashes::new();
         {
             let mut workspace = ReadWorkspace::new();
@@ -376,7 +390,7 @@ impl Run<Vec<u8>> {
             data,
             pool,
             hashes.finish(),
-            max_seq,
+            seqs,
             reclaimable,
             build_estimate,
         )
@@ -395,15 +409,15 @@ impl Run<Vec<u8>> {
                     .ok_or(corrupt(data.len(), RunCorruption::InvalidFilter))?,
             )
         };
-        let (max_seq, reclaimable, build_estimate) = validate(&data, filter.as_ref())?;
-        Self::pack_recovered(data, pool, filter, max_seq, reclaimable, build_estimate)
+        let (seqs, reclaimable, build_estimate) = validate(&data, filter.as_ref())?;
+        Self::pack_recovered(data, pool, filter, seqs, reclaimable, build_estimate)
     }
 
     fn pack_recovered(
         data: Vec<u8>,
         pool: &ChunkPool,
         filter: Option<KeyFilter>,
-        max_seq: u64,
+        seqs: Seqs,
         reclaimable: bool,
         build_estimate: usize,
     ) -> Result<(Self, u64), CorruptRun> {
@@ -425,11 +439,11 @@ impl Run<Vec<u8>> {
         let run = Self::from_builder(
             RunData::Segmented(parts),
             filter,
-            max_seq,
+            seqs,
             reclaimable,
             build_estimate,
         );
-        Ok((run, max_seq))
+        Ok((run, seqs.max))
     }
 }
 
@@ -1405,7 +1419,7 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// index checks.
 ///
 /// Checks all raw dictionaries before decoding any frame. No prepared state.
-fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(u64, bool, usize), CorruptRun> {
+fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(Seqs, bool, usize), CorruptRun> {
     let view = RunView::open(bytes)?;
     let footer_at = bytes.len() - FOOTER_LEN;
     let expected = u32::from_le_bytes(bytes[footer_at + 36..footer_at + 40].try_into().unwrap());
@@ -1475,7 +1489,11 @@ fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(u64, bool, usiz
             RunCorruption::RecordCountMismatch,
         ));
     }
-    Ok((walk.max_seq, walk.reclaimable, walk.build_estimate))
+    let seqs = Seqs {
+        min: walk.min_seq,
+        max: walk.max_seq,
+    };
+    Ok((seqs, walk.reclaimable, walk.build_estimate))
 }
 
 #[cfg(test)]

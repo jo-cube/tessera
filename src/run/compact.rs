@@ -7,6 +7,7 @@ use crate::chunk::ChunkPool;
 
 use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
+use super::filter::{self as key_filter, KeyFilter};
 use super::{
     Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, ReadError, Run, RunBuilder,
     RunView,
@@ -28,8 +29,133 @@ pub struct CompactLimits {
     pub codec: Codec,
     /// Estimated compressed bytes per output block.
     pub target_block_compressed: usize,
-    /// Erase sequences in settled output whose older views retain their own runs.
+    /// The output goes into the bottom level: write sequence 0 for every
+    /// record that no unselected run can contest (see [`SeqFloor`]). Older
+    /// views retain their own runs.
     pub zero_seq: bool,
+}
+
+/// An unselected run overlapping a job into the bottom level. A record of
+/// key k and sequence s keeps s if some such run covers k, may hold k by its
+/// filter, and has a record as old as s; otherwise any version of k outside
+/// the inputs is newer than s and wins against 0 as it does against s.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SeqFloor<'a> {
+    pub(crate) min_key: &'a [u8],
+    pub(crate) max_key: &'a [u8],
+    /// No record of the run is older.
+    pub(crate) min_seq: u64,
+    /// Without a filter the run may hold every key in its range.
+    pub(crate) filter: Option<&'a KeyFilter>,
+}
+
+impl<'a> SeqFloor<'a> {
+    /// The floor of `run`, or `None` if it has no records.
+    pub(crate) fn of(run: &'a Run<Vec<u8>>) -> Option<Self> {
+        let range = run.key_range()?;
+        Some(Self {
+            min_key: range.min,
+            max_key: range.max,
+            min_seq: run.min_seq(),
+            filter: run.filter(),
+        })
+    }
+}
+
+/// Decides each output record's sequence in key order, with a forward-only
+/// cursor over floors sorted by `min_key`.
+struct Eraser<'f> {
+    enabled: bool,
+    floors: &'f [SeqFloor<'f>],
+    /// The first floor whose range has not yet been entered.
+    next: usize,
+    /// Indexes of the entered floors whose ranges may still cover the key.
+    covering: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    counts: crate::chunk::Erasure,
+}
+
+impl<'f> Eraser<'f> {
+    fn new(enabled: bool, floors: &'f [SeqFloor<'f>]) -> Self {
+        debug_assert!(floors.is_sorted_by_key(|floor| floor.min_key));
+        Self {
+            enabled,
+            floors,
+            next: 0,
+            covering: Vec::with_capacity(if enabled { floors.len() } else { 0 }),
+            #[cfg(feature = "diagnostics")]
+            counts: crate::chunk::Erasure::default(),
+        }
+    }
+
+    /// The sequence to write for the record (`key`, `seq`). Keys must come
+    /// in ascending order.
+    fn seq(&mut self, key: &[u8], seq: u64) -> u64 {
+        if !self.enabled {
+            return seq;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.counts.records += 1;
+        }
+        let out = self.decide(key, seq);
+        #[cfg(feature = "diagnostics")]
+        if out == 0 {
+            self.counts.erased += 1;
+        }
+        out
+    }
+
+    fn decide(&mut self, key: &[u8], seq: u64) -> u64 {
+        if seq == 0 || self.floors.is_empty() {
+            return 0;
+        }
+        let floors = self.floors;
+        while let Some(floor) = floors.get(self.next)
+            && floor.min_key <= key
+        {
+            self.covering.push(self.next);
+            self.next += 1;
+        }
+        self.covering.retain(|&at| key <= floors[at].max_key);
+        let contesting = || {
+            self.covering
+                .iter()
+                .map(|&at| &floors[at])
+                .filter(|floor| floor.min_seq <= seq)
+        };
+        // A run without a filter refuses without a probe.
+        if contesting().any(|floor| floor.filter.is_none()) {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.counts.kept_unfiltered += 1;
+            }
+            return seq;
+        }
+        let mut hash = None;
+        for floor in contesting() {
+            let filter = floor.filter.expect("runs without a filter refused above");
+            #[cfg(feature = "diagnostics")]
+            {
+                self.counts.probes += 1;
+            }
+            if filter.may_contain(*hash.get_or_insert_with(|| key_filter::hash(key))) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.counts.kept_filtered += 1;
+                }
+                return seq;
+            }
+        }
+        0
+    }
+
+    fn finish(self, _pool: &ChunkPool) {
+        #[cfg(feature = "diagnostics")]
+        if self.enabled {
+            _pool.erasure(self.counts);
+        }
+    }
 }
 
 /// Conservative allowance for a Zstandard compression or decompression context.
@@ -185,7 +311,27 @@ pub(crate) fn compact_with<'a>(
         limits,
         cuts,
         workspace,
-        &ChunkPool::new(0),
+        (&ChunkPool::new(0), &[]),
+    )
+}
+
+/// [`compact_with`], erasing bottom-level sequences against `floors`.
+#[cfg(test)]
+pub(crate) fn compact_erasing<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: impl FnMut(&[u8]) -> bool,
+    limits: CompactLimits,
+    cuts: &OutputCuts,
+    floors: &[SeqFloor<'_>],
+    workspace: &'a mut MergeWorkspace,
+) -> Result<Compacted, ReadError> {
+    compact_with_in(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        (&ChunkPool::new(0), floors),
     )
 }
 
@@ -195,7 +341,7 @@ fn compact_with_in<'a>(
     limits: CompactLimits,
     cuts: &OutputCuts,
     workspace: &'a mut MergeWorkspace,
-    pool: &ChunkPool,
+    (pool, floors): (&ChunkPool, &[SeqFloor<'_>]),
 ) -> Result<Compacted, ReadError> {
     compact_range(
         inputs,
@@ -205,6 +351,7 @@ fn compact_with_in<'a>(
         workspace,
         BuildRange {
             pool,
+            floors,
             start: None,
             end: None,
             segment_len: SEGMENT_RAW_LEN,
@@ -232,7 +379,7 @@ pub fn compact_parallel<'a>(
         cuts,
         threads,
         estimated_run_bytes,
-        (workspace, &ChunkPool::new(0)),
+        (workspace, &ChunkPool::new(0), &[]),
     )
 }
 
@@ -243,9 +390,9 @@ pub(crate) fn compact_parallel_in<'a>(
     cuts: &OutputCuts,
     threads: usize,
     estimated_run_bytes: usize,
-    build: (&'a mut MergeWorkspace, &ChunkPool),
+    build: (&'a mut MergeWorkspace, &ChunkPool, &[SeqFloor<'_>]),
 ) -> Result<Compacted, ReadError> {
-    let (workspace, pool) = build;
+    let (workspace, pool, floors) = build;
     let needed = workspace_bytes(inputs)?;
     let limits = CompactLimits {
         max_workspace_bytes: limits.max_workspace_bytes.max(needed),
@@ -258,7 +405,14 @@ pub(crate) fn compact_parallel_in<'a>(
     let full_runs = stored / estimated_run_bytes;
     let threads = threads.min(full_runs).min(stored / (256 << 10)).max(1);
     if threads == 1 || cuts.single {
-        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
+        return compact_with_in(
+            inputs,
+            keep_tombstone,
+            limits,
+            cuts,
+            workspace,
+            (pool, floors),
+        );
     }
     // Reconstruct sparse-index keys, weighted by compressed input bytes. Equal user
     // keys stay together even when their versions span several input blocks.
@@ -270,7 +424,14 @@ pub(crate) fn compact_parallel_in<'a>(
         }
     }
     if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
-        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
+        return compact_with_in(
+            inputs,
+            keep_tombstone,
+            limits,
+            cuts,
+            workspace,
+            (pool, floors),
+        );
     }
     let mut boundaries = Vec::with_capacity(count);
     for input in inputs {
@@ -295,12 +456,26 @@ pub(crate) fn compact_parallel_in<'a>(
         }
         threads -= 1;
         if threads == 1 {
-            return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
+            return compact_with_in(
+                inputs,
+                keep_tombstone,
+                limits,
+                cuts,
+                workspace,
+                (pool, floors),
+            );
         }
     };
     let starts = partition_starts(&boundaries, estimated_run_bytes, threads);
     if starts.is_empty() {
-        return compact_with_in(inputs, keep_tombstone, limits, cuts, workspace, pool);
+        return compact_with_in(
+            inputs,
+            keep_tombstone,
+            limits,
+            cuts,
+            workspace,
+            (pool, floors),
+        );
     }
     let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
     let parts = std::thread::scope(|scope| {
@@ -321,6 +496,7 @@ pub(crate) fn compact_parallel_in<'a>(
                         &mut MergeWorkspace::new(),
                         BuildRange {
                             pool,
+                            floors,
                             start,
                             end,
                             segment_len,
@@ -391,6 +567,8 @@ pub(super) fn partition_starts<K: AsRef<[u8]>>(
 
 struct BuildRange<'a> {
     pool: &'a ChunkPool,
+    /// Sorted by `min_key`; only read when `zero_seq` is set.
+    floors: &'a [SeqFloor<'a>],
     start: Option<&'a [u8]>,
     end: Option<&'a [u8]>,
     segment_len: usize,
@@ -420,6 +598,7 @@ fn compact_range<'a>(
     let mut stats = CompactStats::default();
     let mut key = Vec::new();
     let mut has_key = false;
+    let mut eraser = Eraser::new(limits.zero_seq, range.floors);
 
     while let Some(record) = merge.next_record()? {
         if range.end.is_some_and(|end| record.key >= end) {
@@ -447,12 +626,13 @@ fn compact_range<'a>(
             continue;
         }
         output.add(Record {
-            seq: if limits.zero_seq { 0 } else { record.seq },
+            seq: eraser.seq(record.key, record.seq),
             ..record
         });
         stats.records_written += 1;
     }
     output.finish_run();
+    eraser.finish(range.pool);
     Ok(Compacted {
         runs: output.runs,
         output_bytes: output.bytes - output.held_bytes,

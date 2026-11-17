@@ -1016,13 +1016,13 @@ fn runs_work_over_shared_and_borrowed_storage() {
     }
 }
 
-/// Beside its storage a run holds its restart-head slice, filter pointer, largest stored sequence,
-/// optional publication sequence, and four key-bound offsets with an option tag.
+/// Beside its storage a run holds its restart-head slice, filter pointer, smallest and largest
+/// stored sequences, optional publication sequence, and four key-bound offsets with an option tag.
 #[test]
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
     let extra = size_of::<Box<[u64]>>()
         + size_of::<usize>()
-        + size_of::<u64>()
+        + 2 * size_of::<u64>()
         + size_of::<Option<u64>>()
         + 7 * size_of::<usize>();
     assert_eq!(

@@ -8,7 +8,8 @@ use super::filter::KeyHashes;
 use super::storage::{Packing, RunData};
 use super::{
     FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
-    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame, reader::Run,
+    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame,
+    reader::{Run, Seqs},
 };
 use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, RESTART_INTERVAL, Value,
@@ -42,6 +43,7 @@ pub struct RunBuilder {
     record_count: usize,
     reclaimable: bool,
     build_estimate: usize,
+    min_seq: u64,
     max_seq: u64,
     key_hashes: KeyHashes,
 }
@@ -77,6 +79,7 @@ impl RunBuilder {
             record_count: 0,
             reclaimable: false,
             build_estimate: 0,
+            min_seq: 0,
             max_seq: 0,
             key_hashes: KeyHashes::new(),
         }
@@ -151,6 +154,11 @@ impl RunBuilder {
         self.last_key.extend_from_slice(key);
         self.last_seq = seq;
         self.pending_key_bytes += key.len();
+        self.min_seq = if self.record_count == 0 {
+            seq
+        } else {
+            self.min_seq.min(seq)
+        };
         self.record_count += 1;
         self.max_seq = self.max_seq.max(seq);
         self.key_hashes.add(key);
@@ -227,7 +235,10 @@ impl RunBuilder {
         Run::from_builder(
             RunData::Segmented(self.storage.finish(data.into_boxed_slice())),
             self.key_hashes.finish(),
-            self.max_seq,
+            Seqs {
+                min: self.min_seq,
+                max: self.max_seq,
+            },
             self.reclaimable,
             self.build_estimate,
         )

@@ -631,7 +631,7 @@ fn snapshots_before_compaction_and_snapshots_of_seq_zero_data_stay_visible() {
     let mut reads = EngineWorkspace::new();
     let found = before.get(b"key", &mut reads).unwrap().unwrap();
     assert_eq!((found.seq, found.value), (1, &b"one"[..]));
-    assert!(engine.get(b"key", &mut reads).unwrap().unwrap().seq > 0);
+    assert_eq!(engine.get(b"key", &mut reads).unwrap().unwrap().seq, 0);
     drop(before);
     engine.put(b"key", b"three").unwrap();
     engine.flush().unwrap();
@@ -669,7 +669,7 @@ fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
     engine.flush().unwrap();
     let job = engine.core.begin_job(limits).unwrap().unwrap();
     assert!(!job.others.is_empty());
-    assert!(!job.zero_seq);
+    assert!(job.zero_seq);
     job.build(&mut MergeWorkspace::new())
         .unwrap()
         .publish()
@@ -679,4 +679,145 @@ fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
     let mut reads = EngineWorkspace::new();
     let found = engine.get(b"key", &mut reads).unwrap().unwrap();
     assert_eq!((found.seq, found.value), (0, &b"three"[..]));
+}
+
+/// The bottom level's records by key, with their stored sequences.
+fn bottom_seqs(engine: &Engine) -> BTreeMap<Vec<u8>, u64> {
+    let state = engine.core.read_state();
+    let bottom = state.levels.runs().last().unwrap();
+    let mut out = BTreeMap::new();
+    for run in bottom {
+        let mut workspace = crate::run::ReadWorkspace::new();
+        let mut cursor = run.run.cursor(&mut workspace);
+        while let Some(record) = cursor.next_record().unwrap() {
+            out.insert(record.key.to_vec(), record.seq);
+        }
+    }
+    out
+}
+
+/// A level-0 run left out of a job into the bottom while a newer one is
+/// taken contests only the keys it may hold: the output run mixes erased and
+/// kept sequences. Reads match the model before and after the skipped run is
+/// merged, through a snapshot from before the job and checkpoints taken
+/// across it and after it.
+#[test]
+fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
+    let engine = Engine::new(EngineOptions {
+        compression: Compression::Uncompressed,
+        ..options()
+    })
+    .unwrap();
+    let mut model = BTreeMap::new();
+    let mut flush = |records: &[(&[u8], usize)], tag: &str| {
+        for &(key, len) in records {
+            let value = format!("{tag}-{}", "x".repeat(len)).into_bytes();
+            engine.put(key, &value).unwrap();
+            model.insert(key.to_vec(), value);
+        }
+        engine.flush().unwrap();
+        engine.stats().last_seq
+    };
+    let eager = CompactionPolicy {
+        max_overlap: 1,
+        ..compaction()
+    };
+    // Two bottom runs, each over half a segment so that they stay apart.
+    let wide = 400;
+    flush(
+        &[b"a", b"b", b"c", b"d", b"e", b"f"].map(|key| (&key[..], wide)),
+        "r1",
+    );
+    settle_with(&engine, eager, &mut Steps::default());
+    flush(&[b"p", b"q", b"z"].map(|key| (&key[..], 2 * wide)), "r2");
+    settle_with(&engine, eager, &mut Steps::default());
+    assert_eq!(
+        engine.core.read_state().levels.runs().last().unwrap().len(),
+        2
+    );
+    // Level 0, oldest first: the source, a run reaching both bottom runs,
+    // and a newer run over the source's bottom run only.
+    flush(&[(b"b", 1), (b"d", 1)], "o1");
+    let skipped_min = engine.stats().last_seq + 1;
+    flush(&[(b"c", 1), (b"e", 1), (b"q", 1)], "o2");
+    let newest = flush(&[(b"b", 1), (b"e", 1)], "o3");
+    let job = engine
+        .core
+        .begin_job(CompactionPolicy {
+            max_inputs: 3,
+            ..eager
+        })
+        .unwrap()
+        .unwrap();
+    assert!(job.zero_seq);
+    assert_eq!(job.inputs.len(), 3);
+    assert_eq!(job.others.len(), 1);
+    assert_eq!(job.others[0].run.min_seq(), skipped_min);
+    assert_eq!(job.seq_floors().len(), 1);
+    let before = engine.snapshot();
+    let before_seqs = bottom_seqs(&engine);
+    let base = std::env::temp_dir().join(format!("tessera-mixed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let built = job.build(&mut MergeWorkspace::new()).unwrap();
+    engine
+        .checkpoint(&base.join("across"), CheckpointOptions::default())
+        .unwrap();
+    built.publish().unwrap();
+    // Only `e` keeps its sequence: the skipped run holds an older `e`. Its
+    // `c` is newer than the output's, and it does not cover `b` or `f`.
+    let seqs = bottom_seqs(&engine);
+    // The other bottom run was not rewritten.
+    let kept: Vec<&[u8]> = seqs
+        .iter()
+        .filter(|&(_, &seq)| seq != 0)
+        .map(|(key, _)| key.as_slice())
+        .collect();
+    assert_eq!(kept, [&b"e"[..], b"p", b"q", b"z"]);
+    assert_eq!(seqs[&b"e"[..]], newest);
+    assert_eq!(seqs[&b"a"[..]], 0);
+    assert_eq!(scan(&engine.snapshot()), model);
+    let mut reads = EngineWorkspace::new();
+    assert_eq!(engine.get(b"e", &mut reads).unwrap().unwrap().seq, newest);
+    assert_eq!(engine.get(b"b", &mut reads).unwrap().unwrap().seq, 0);
+    // The snapshot from before the job still reads its own sequences.
+    assert_eq!(
+        before.get(b"b", &mut reads).unwrap().unwrap().seq,
+        newest - 1
+    );
+    assert_eq!(
+        before.get(b"d", &mut reads).unwrap().unwrap().seq,
+        skipped_min - 1
+    );
+    assert_eq!(scan(&before), model);
+    drop(before);
+    engine
+        .checkpoint(&base.join("after"), CheckpointOptions::default())
+        .unwrap();
+    for (name, bottom) in [("across", before_seqs), ("after", seqs)] {
+        let recovered = Engine::recover(&base.join(name), options()).unwrap();
+        assert_eq!(scan(&recovered.snapshot()), model, "{name}");
+        assert_eq!(bottom_seqs(&recovered), bottom, "{name}");
+        let state = recovered.core.read_state();
+        for run in &state.runs {
+            let records = bottom_seqs_of(&run.run);
+            assert_eq!(run.run.min_seq(), records.iter().copied().min().unwrap());
+            assert_eq!(run.run.max_seq(), records.iter().copied().max().unwrap());
+        }
+    }
+    // Once the skipped run is merged, nothing contests any key.
+    settle_with(&engine, eager, &mut Steps::default());
+    assert_eq!(scan(&engine.snapshot()), model);
+    assert_eq!(engine.core.read_state().levels.runs()[0].len(), 0);
+    assert!(bottom_seqs(&engine).values().all(|&seq| seq == 0));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+fn bottom_seqs_of(run: &Run<Vec<u8>>) -> Vec<u64> {
+    let mut workspace = crate::run::ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    let mut out = Vec::new();
+    while let Some(record) = cursor.next_record().unwrap() {
+        out.push(record.seq);
+    }
+    out
 }

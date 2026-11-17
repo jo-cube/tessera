@@ -1,8 +1,8 @@
 //! In-memory publication sequences must survive every read and rewrite path.
 use crate::block::Value;
 use crate::run::{
-    Codec, CompactLimits, LogicalWorkspace, MergeCursor, MergeWorkspace, ReadError, ReadWorkspace,
-    Run, RunBuilder, RunSet, RunView, compact, latest_in,
+    Codec, CompactLimits, LogicalWorkspace, MergeCursor, MergeWorkspace, OutputCuts, ReadError,
+    ReadWorkspace, Run, RunBuilder, RunSet, RunView, SeqFloor, compact, compact_erasing, latest_in,
 };
 
 fn build(codec: Codec, records: &[(&[u8], u64, Value<'_>)]) -> Run<Vec<u8>> {
@@ -169,4 +169,139 @@ fn effective_sequences_detect_conflicting_copies_and_collapse_identical_ones() {
     .unwrap();
     assert_eq!(output.stats.copies_collapsed, 1);
     assert_eq!(output.runs[0].max_seq(), 17);
+}
+
+#[test]
+fn min_seq_follows_the_builder_overrides_erasure_and_recovery() {
+    let run = build(
+        Codec::Zstd,
+        &[
+            (b"a", 7, Value::Bytes(b"one")),
+            (b"b", 3, Value::Tombstone),
+            (b"c", 9, Value::Bytes(b"three")),
+        ],
+    );
+    assert_eq!((run.min_seq(), run.max_seq()), (3, 9));
+    let (recovered, max) = Run::recover(run.as_bytes().to_vec()).unwrap();
+    assert_eq!((recovered.min_seq(), recovered.max_seq(), max), (3, 9, 9));
+    let mut ingested = build(
+        Codec::Zstd,
+        &[
+            (b"b", 0, Value::Bytes(b"new")),
+            (b"d", 0, Value::Bytes(b"four")),
+        ],
+    );
+    assert_eq!((ingested.min_seq(), ingested.max_seq()), (0, 0));
+    ingested.set_seq_override(12);
+    assert_eq!((ingested.min_seq(), ingested.max_seq()), (12, 12));
+    for zero_seq in [false, true] {
+        let output = compact(
+            &[run.view(), ingested.view()],
+            |_| true,
+            limits(zero_seq),
+            &mut MergeWorkspace::new(),
+        )
+        .unwrap();
+        let out = &output.runs[0];
+        let expected = if zero_seq { (0, 0) } else { (7, 12) };
+        assert_eq!((out.min_seq(), out.max_seq()), expected);
+        let (recovered, _) = Run::recover(out.as_bytes().to_vec()).unwrap();
+        assert_eq!((recovered.min_seq(), recovered.max_seq()), expected);
+    }
+}
+
+fn key(index: usize) -> Vec<u8> {
+    format!("key/{index:06}").into_bytes()
+}
+
+/// A run holding `keys`, each at sequence `seq`.
+fn run_of(keys: impl IntoIterator<Item = usize>, seq: u64) -> Run<Vec<u8>> {
+    let mut builder = RunBuilder::with_raw_block_target(Codec::Zstd, 1024);
+    for index in keys {
+        builder.add(&key(index), seq, Value::Bytes(b"v")).unwrap();
+    }
+    builder.finish()
+}
+
+/// Erases `input`'s sequences into the bottom level against `floors`, and
+/// returns which keys kept theirs.
+fn kept(input: &Run<Vec<u8>>, floors: &[SeqFloor<'_>]) -> Vec<Vec<u8>> {
+    let output = compact_erasing(
+        &[input.view()],
+        |_| true,
+        limits(true),
+        &OutputCuts::default(),
+        floors,
+        &mut MergeWorkspace::new(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for run in &output.runs {
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = run.cursor(&mut workspace);
+        while let Some(record) = cursor.next_record().unwrap() {
+            if record.seq != 0 {
+                assert_eq!(record.seq, input.max_seq());
+                out.push(record.key.to_vec());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_covering_run_contests_only_the_keys_its_filter_may_hold() {
+    // Every key at sequence 20; the skipped run holds the even keys of
+    // 1000..3000 at sequence 10.
+    let input = run_of(0..4000, 20);
+    let skipped = run_of((1000..3000).step_by(2), 10);
+    let filter = skipped.filter().expect("built runs carry a filter");
+    let floors = [SeqFloor::of(&skipped).unwrap()];
+    let held = kept(&input, &floors);
+    let positive = |index: usize| filter.may_contain(crate::run::filter::hash(&key(index)));
+    let expected: Vec<_> = (1000..=2998).filter(|&i| positive(i)).map(key).collect();
+    assert_eq!(held, expected);
+    // Some odd key is a false positive: the run does not hold it, but it
+    // still keeps its sequence.
+    assert!(
+        (1001..2998)
+            .step_by(2)
+            .any(|i| positive(i) && held.contains(&key(i)))
+    );
+    // Without a filter, every key in the range keeps its sequence.
+    let unfiltered = [SeqFloor {
+        filter: None,
+        ..floors[0]
+    }];
+    assert_eq!(
+        kept(&input, &unfiltered),
+        (1000..=2998).map(key).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn erasure_refuses_only_where_an_unselected_run_may_hold_an_older_or_equal_version() {
+    let input = run_of(0..100, 20);
+    for (seq, refused) in [(5, true), (20, true), (21, false)] {
+        let other = run_of([10, 50], seq);
+        let floors = [SeqFloor::of(&other).unwrap()];
+        let expected = if refused {
+            vec![key(10), key(50)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(kept(&input, &floors), expected, "{seq}");
+    }
+    // Several covering runs, entered and left in key order: each contests
+    // only its own keys, and runs that do not overlap cost nothing.
+    let low = run_of([5, 30], 10);
+    let high = run_of([20, 80], 10);
+    let newer = run_of([25, 40], 30);
+    let mut floors: Vec<_> = [&low, &high, &newer]
+        .into_iter()
+        .map(|run| SeqFloor::of(run).unwrap())
+        .collect();
+    floors.sort_by_key(|floor| floor.min_key);
+    assert_eq!(kept(&input, &floors), [key(5), key(20), key(30), key(80)]);
+    assert!(kept(&input, &[]).is_empty());
 }

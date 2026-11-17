@@ -52,6 +52,25 @@ struct Counters {
     /// Raw input, raw output and stored output bytes by [`work_slot`].
     #[cfg(feature = "diagnostics")]
     work: [[AtomicU64; 3]; WORK_SLOTS],
+    /// Records written into the bottom level, by [`Erasure`] field.
+    #[cfg(feature = "diagnostics")]
+    erasure: [AtomicU64; 5],
+}
+
+/// What sequence erasure did to the records of jobs into the bottom level.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Erasure {
+    /// Records written.
+    pub records: u64,
+    /// Records written with sequence 0.
+    pub erased: u64,
+    /// Filter probes of unselected runs that cover a record's key.
+    pub probes: u64,
+    /// Records kept because a covering run without a filter may hold the key.
+    pub kept_unfiltered: u64,
+    /// Records kept because a covering run's filter may hold the key.
+    pub kept_filtered: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -124,6 +143,35 @@ impl ChunkPool {
             .zip([raw_in, raw_out, stored])
         {
             counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn erasure(&self, add: Erasure) {
+        let fields = [
+            add.records,
+            add.erased,
+            add.probes,
+            add.kept_unfiltered,
+            add.kept_filtered,
+        ];
+        for (counter, n) in self.0.counters.erasure.iter().zip(fields) {
+            counter.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn erasure_counters(&self) -> Erasure {
+        let [records, erased, probes, kept_unfiltered, kept_filtered] = self
+            .0
+            .counters
+            .erasure
+            .each_ref()
+            .map(|n| n.load(Ordering::Relaxed));
+        Erasure {
+            records,
+            erased,
+            probes,
+            kept_unfiltered,
+            kept_filtered,
         }
     }
     #[cfg(feature = "diagnostics")]

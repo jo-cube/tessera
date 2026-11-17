@@ -481,7 +481,8 @@ pub(crate) struct RecordWalk {
     seq: u64,
     /// Records walked so far, across every block.
     pub(crate) record_count: usize,
-    /// The largest sequence number walked so far.
+    /// The smallest and largest sequence numbers walked so far.
+    pub(crate) min_seq: u64,
     pub(crate) max_seq: u64,
     /// Tombstones or older versions that a complete merge could discard.
     pub(crate) reclaimable: bool,
@@ -542,6 +543,11 @@ impl RecordWalk {
                     .saturating_add(256),
             );
             self.seq = record.seq;
+            self.min_seq = if self.record_count == 0 {
+                record.seq
+            } else {
+                self.min_seq.min(record.seq)
+            };
             self.max_seq = self.max_seq.max(record.seq);
             self.record_count += 1;
         }

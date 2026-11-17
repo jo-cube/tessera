@@ -513,7 +513,7 @@ mod tests {
                 );
                 let pin = pinned.then(|| engine.snapshot());
                 // Export overrides before a compaction has materialized them,
-                // then repeat after either preserving sequences or zeroing them.
+                // then repeat after zeroing them; a pinned snapshot keeps its own.
                 let dir = std::env::temp_dir().join(format!(
                     "tessera-effective-ingest-{}-{compression:?}-{pinned}",
                     std::process::id()
@@ -522,7 +522,7 @@ mod tests {
                     if compacted {
                         settle(&engine);
                     }
-                    let expected = if compacted && !pinned { 0 } else { seq };
+                    let expected = if compacted { 0 } else { seq };
                     check_engine(&engine, [Some(b"ingest"), None, Some(b"ingest")]);
                     let mut ws = EngineWorkspace::new();
                     for key in [b"a", b"c"] {
