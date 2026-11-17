@@ -56,8 +56,9 @@
 //! immutable storage. Each piece retires its bottom inputs; later failure
 //! preserves earlier publications. Other jobs may build output ranges in
 //! parallel and publish together.
-//! No snapshot or size limit refuses a compaction. Only the latest version survives; tombstones survive while
-//! an unselected run could hold an older value.
+//! Snapshots and writer admission do not refuse maintenance. Only the latest
+//! version survives; tombstones survive while an unselected run could hold an
+//! older value.
 //!
 //! # Memory
 //!
@@ -255,7 +256,8 @@ pub struct EngineOptions {
     pub memtable_budget: usize,
     /// Size multiplier between adjacent levels, at least 2 (default 10).
     pub level_ratio: usize,
-    /// Parallel builders per compaction, at least 1 (default half the CPUs, capped at 4).
+    /// Maximum concurrent compaction pieces and builders, at least 1
+    /// (default half the CPUs, capped at 4). One uses serial piece publication.
     pub background_threads: usize,
     /// Compression used for new runs.
     pub compression: Compression,
@@ -638,6 +640,8 @@ struct State {
     /// The same runs as compaction sees them, in levels. Changed in the same
     /// write section as `runs`, and never read by lookups or scans.
     levels: Levels,
+    /// Stable flush boundaries while a concurrent bottom job publishes ranges.
+    piece_flush_cuts: Option<FlushCuts>,
     /// Level-0 writer stop; deterministic tests may change it.
     level0_stop: usize,
     /// Whether flushes are split at level 1's boundaries; tests turn it off
@@ -707,7 +711,9 @@ impl State {
         if !self.split_flushes {
             return FlushCuts::default();
         }
-        self.levels.flush_cuts(target_run_len)
+        self.piece_flush_cuts
+            .clone()
+            .unwrap_or_else(|| self.levels.flush_cuts(target_run_len))
     }
 
     /// `held_bytes` is `Some` for a run.
@@ -1131,6 +1137,7 @@ impl Core {
                 run_bytes: 0,
                 held_bytes: 0,
                 levels: Levels::new(options.level_ratio),
+                piece_flush_cuts: None,
                 level0_stop: if background.is_some() {
                     LEVEL0_STOP
                 } else {
