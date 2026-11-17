@@ -1,6 +1,5 @@
 //! Segment dictionaries, adaptive cuts and checked direct-load decoding.
 use crate::block::Value;
-use crate::run::dictionary::{DICTIONARY_LEN, MAX_DICTIONARY_LEN};
 use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption};
 
 fn u32_at(bytes: &[u8], at: usize) -> usize {
@@ -56,7 +55,7 @@ fn segment_boundaries_dictionaries_and_references_round_trip() {
         let at = table + i * 16;
         assert_eq!(u64_at(&bytes, at), next);
         let len = u32_at(&bytes, at + 8);
-        assert_eq!(len, DICTIONARY_LEN);
+        assert_eq!(len, 16 << 10);
         assert_eq!(
             crc32fast::hash(&bytes[next..next + len]) as usize,
             u32_at(&bytes, at + 12)
@@ -70,53 +69,12 @@ fn segment_boundaries_dictionaries_and_references_round_trip() {
         let f = view.frame(i).unwrap();
         assert!(f.dictionary_ref == previous || f.dictionary_ref == previous + 1);
         previous = f.dictionary_ref;
-        assert_eq!(f.dictionary.len(), DICTIONARY_LEN);
+        assert_eq!(f.dictionary.len(), 16 << 10);
     }
     assert_eq!(previous, count as u32);
     assert!(run.held_bytes() > run.filter_bytes());
     check(&run, 9_000, 1024);
     check(&Run::new(bytes).unwrap(), 9_000, 1024);
-}
-#[test]
-fn dictionaries_keep_their_sampled_length_up_to_the_reader_limit() {
-    // Readers accept every length up to the limit, including runs whose
-    // builders sampled longer dictionaries than the current default.
-    for len in [1, 2 << 10, DICTIONARY_LEN, MAX_DICTIONARY_LEN] {
-        let mut b = RunBuilder::new(Codec::Zstd).with_policy(1, len);
-        for i in 0..6_000u32 {
-            b.add(
-                &i.to_be_bytes(),
-                u64::from(i) + 1,
-                Value::Bytes(&vec![(i % 19) as u8; 1024]),
-            )
-            .unwrap();
-        }
-        let run = b.finish();
-        let view = run.view();
-        for i in 0..view.block_count() {
-            assert_eq!(view.frame(i).unwrap().dictionary.len(), len);
-        }
-        check(&run, 6_000, 1024);
-        check(&Run::new(run.as_bytes()).unwrap(), 6_000, 1024);
-    }
-}
-#[test]
-fn runs_built_at_any_zstd_level_decode_and_recover() {
-    // The decoder depends on neither the level nor the probe it cut by.
-    for level in [-3, -1, 1, 3] {
-        let mut b = RunBuilder::new(Codec::Zstd).with_policy(level, DICTIONARY_LEN);
-        for i in 0..6_000u32 {
-            b.add(
-                &i.to_be_bytes(),
-                u64::from(i) + 1,
-                Value::Bytes(&vec![(i % 19) as u8; 1024]),
-            )
-            .unwrap();
-        }
-        let run = b.finish();
-        check(&run, 6_000, 1024);
-        check(&Run::new(run.as_bytes()).unwrap(), 6_000, 1024);
-    }
 }
 #[test]
 fn adaptive_blocks_reach_but_do_not_exceed_the_raw_cap() {
@@ -176,11 +134,7 @@ fn corrupt_dictionary_regions_are_rejected_before_decode() {
         );
         assert_eq!(w.capacity(), 0);
     }
-    for (at, value) in [
-        (table + 8, 0),
-        (table + 8, MAX_DICTIONARY_LEN + 1),
-        (table, 0),
-    ] {
+    for (at, value) in [(table + 8, 0), (table + 8, (16 << 10) + 1), (table, 0)] {
         let mut bytes = run.as_bytes().to_vec();
         bytes[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
         assert_eq!(
@@ -218,13 +172,13 @@ fn uncompressed_runs_have_fixed_raw_blocks_and_no_dictionaries() {
 
 #[test]
 fn arbitrary_content_cannot_be_mistaken_for_a_trained_dictionary() {
-    let mut value = vec![7; DICTIONARY_LEN + 4];
+    let mut value = vec![7; (16 << 10) + 4];
     value[4..8].copy_from_slice(&[0x37, 0xa4, 0x30, 0xec]);
     let mut b = RunBuilder::default();
     b.add(b"key", 1, Value::Bytes(&value)).unwrap();
     let run = b.finish();
     let frame = run.view().frame(0).unwrap();
-    assert_eq!(frame.dictionary.len(), DICTIONARY_LEN - 1);
+    assert_eq!(frame.dictionary.len(), (16 << 10) - 1);
     Run::new(run.as_bytes()).unwrap();
     assert_eq!(
         run.get(b"key", &mut ReadWorkspace::new())

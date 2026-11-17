@@ -5,13 +5,10 @@
 use crate::block::{BlockPosition, BlockView, Value};
 
 pub(super) const SEGMENT_RAW_LEN: usize = 4 << 20;
-/// The length builders sample. Even highly compressible segments store
-/// several times this in frames, and longer samples gain nothing on data
-/// with weak locality.
-pub(super) const DICTIONARY_LEN: usize = 4 << 10;
+pub(super) const DICTIONARY_LEN: usize = 16 << 10;
 /// The longest dictionary a run may store, which readers accept.
 #[cfg(not(feature = "diagnostics"))]
-pub(super) const MAX_DICTIONARY_LEN: usize = 16 << 10;
+pub(super) const MAX_DICTIONARY_LEN: usize = DICTIONARY_LEN;
 #[cfg(feature = "diagnostics")]
 pub(super) const MAX_DICTIONARY_LEN: usize = 64 << 10;
 pub(super) const SAMPLE_LEN: usize = 64 << 10;

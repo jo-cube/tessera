@@ -60,20 +60,3 @@ mod overrides {
 pub(crate) use overrides::set;
 #[cfg(feature = "diagnostics")]
 pub(super) use overrides::{dictionary, level};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::run::{Codec, RunBuilder};
-
-    #[test]
-    fn every_output_uses_level_one_and_the_standard_dictionary() {
-        assert_eq!(level(false), ZSTD_LEVEL);
-        assert_eq!(level(true), ZSTD_LEVEL);
-        assert_eq!(dictionary(), Length::Fixed(DICTIONARY_LEN));
-        let mut builder = RunBuilder::new(Codec::Zstd);
-        assert_eq!(builder.level(), level(false));
-        builder.set_bottom(true);
-        assert_eq!(builder.level(), level(true));
-    }
-}

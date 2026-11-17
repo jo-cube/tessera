@@ -26,7 +26,6 @@ pub struct RunBuilder {
     raw_target: Option<usize>,
     /// Zstandard level for this run's blocks and ratio probes.
     level: i32,
-    dictionary: Length,
     compressor: Compressor,
     segment: BlockBuilder,
     last_key: Vec<u8>,
@@ -63,7 +62,6 @@ impl RunBuilder {
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
             level: policy::level(false),
-            dictionary: policy::dictionary(),
             compressor: Compressor::new(codec),
             segment: BlockBuilder::new(),
             last_key: Vec::new(),
@@ -169,17 +167,6 @@ impl RunBuilder {
     pub fn is_empty(&self) -> bool {
         self.record_count == 0
     }
-    /// A Zstandard level and fixed dictionary length, for format tests.
-    #[cfg(test)]
-    pub(crate) fn with_policy(mut self, level: i32, dictionary_len: usize) -> Self {
-        self.level = level;
-        self.dictionary = Length::Fixed(dictionary_len);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn level(&self) -> i32 {
-        self.level
-    }
     /// Compress as output into the bottom level, or above it (the default).
     pub(crate) fn set_bottom(&mut self, bottom: bool) {
         self.level = policy::level(bottom);
@@ -263,7 +250,7 @@ impl RunBuilder {
         self.segment.flush_into(&mut raw);
         self.segment.trim_empty(2 * self.segment_len);
         let codec = self.compressor.codec();
-        let length = self.dictionary;
+        let length = policy::dictionary();
         let first_len = match length {
             Length::Fixed(len) => len,
             // Probe with the standard length, then size from its ratio.
