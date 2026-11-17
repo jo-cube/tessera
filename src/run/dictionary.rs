@@ -6,20 +6,14 @@ use crate::block::{BlockPosition, BlockView, Value};
 
 pub(super) const SEGMENT_RAW_LEN: usize = 4 << 20;
 pub(super) const DICTIONARY_LEN: usize = 16 << 10;
-/// The longest dictionary a run may store, which readers accept.
-#[cfg(not(feature = "diagnostics"))]
-pub(super) const MAX_DICTIONARY_LEN: usize = DICTIONARY_LEN;
-#[cfg(feature = "diagnostics")]
-pub(super) const MAX_DICTIONARY_LEN: usize = 64 << 10;
 pub(super) const SAMPLE_LEN: usize = 64 << 10;
 
 /// Concatenate independently encoded records at evenly spaced positions,
-/// retaining the final `len` bytes, at most [`MAX_DICTIONARY_LEN`].
-pub(super) fn sample(bytes: &[u8], records: usize, len: usize) -> Vec<u8> {
-    let len = len.clamp(1, MAX_DICTIONARY_LEN);
+/// retaining the final 16 KiB.
+pub(super) fn sample(bytes: &[u8], records: usize) -> Vec<u8> {
     let block = BlockView::open(bytes).expect("builder's segment");
     let mut cursor = BlockPosition::new();
-    let mut out = Vec::with_capacity(len);
+    let mut out = Vec::with_capacity(DICTIONARY_LEN);
     let mut count = 1;
     let mut sample = 0;
     let mut at = 0;
@@ -29,7 +23,7 @@ pub(super) fn sample(bytes: &[u8], records: usize, len: usize) -> Vec<u8> {
             Value::Tombstone => &[],
         };
         if at == 0 {
-            count = (len / (record.key.len() + value.len() + 4))
+            count = (DICTIONARY_LEN / (record.key.len() + value.len() + 4))
                 .max(1)
                 .min(records.saturating_sub(1).max(1));
         }
@@ -40,15 +34,15 @@ pub(super) fn sample(bytes: &[u8], records: usize, len: usize) -> Vec<u8> {
             };
             for mut n in [0, record.key.len() as u64, tag, record.seq] {
                 while n >= 128 {
-                    tail(&mut out, &[(n as u8) | 128], len);
+                    tail(&mut out, &[(n as u8) | 128]);
                     n >>= 7;
                 }
-                tail(&mut out, &[n as u8], len);
+                tail(&mut out, &[n as u8]);
             }
-            tail(&mut out, record.key, len);
-            tail(&mut out, value, len);
+            tail(&mut out, record.key);
+            tail(&mut out, value);
             sample += 1;
-            if out.len() == len || records == 1 {
+            if out.len() == DICTIONARY_LEN || records == 1 {
                 return raw_content(out);
             }
         }
@@ -57,12 +51,12 @@ pub(super) fn sample(bytes: &[u8], records: usize, len: usize) -> Vec<u8> {
     raw_content(out)
 }
 
-fn tail(out: &mut Vec<u8>, bytes: &[u8], len: usize) {
-    if bytes.len() >= len {
+fn tail(out: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= DICTIONARY_LEN {
         out.clear();
-        out.extend_from_slice(&bytes[bytes.len() - len..]);
+        out.extend_from_slice(&bytes[bytes.len() - DICTIONARY_LEN..]);
     } else {
-        let discard = (out.len() + bytes.len()).saturating_sub(len);
+        let discard = (out.len() + bytes.len()).saturating_sub(DICTIONARY_LEN);
         out.drain(..discard);
         out.extend_from_slice(bytes);
     }
@@ -76,23 +70,4 @@ fn raw_content(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.remove(0);
     }
     bytes
-}
-
-/// How long a segment's dictionary is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Length {
-    Fixed(usize),
-    /// About 1/32 of the segment's estimated compressed size, from 2 to 64 KiB.
-    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-    Adaptive,
-}
-
-/// The adaptive length for a segment of `raw` bytes whose ratio probe
-/// compressed `probe_raw` bytes into `probe_stored`.
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-pub(super) fn adaptive_len(raw: usize, probe_raw: usize, probe_stored: usize) -> usize {
-    let estimate = (raw as u128 * probe_stored as u128 / probe_raw.max(1) as u128) as usize;
-    (estimate / 32)
-        .next_power_of_two()
-        .clamp(2 << 10, MAX_DICTIONARY_LEN.max(2 << 10))
 }

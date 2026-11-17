@@ -10,7 +10,7 @@ use crate::block::{
 };
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
-use super::dictionary::MAX_DICTIONARY_LEN;
+use super::dictionary::DICTIONARY_LEN;
 #[cfg(test)]
 use super::filter::KeyHashes;
 use super::filter::{self as key_filter, KeyFilter};
@@ -1072,7 +1072,7 @@ impl<'a> RunView<'a> {
             .and_then(|n| n.checked_sub(self.frames.len()))
             .ok_or(invalid)?;
         let len = read_u32(entry, 8) as usize;
-        if len == 0 || len > MAX_DICTIONARY_LEN {
+        if len == 0 || len > DICTIONARY_LEN {
             return Err(invalid);
         }
         let bytes = start
@@ -1519,18 +1519,5 @@ impl<B: AsRef<[u8]>> Run<B> {
             footer: FOOTER_LEN,
             physical: self.data.held_bytes(),
         }
-    }
-    /// Calls `f` with each block's dictionary and raw bytes, in order, until
-    /// it returns false.
-    pub(crate) fn blocks(&self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> bool {
-        let view = self.view();
-        let mut workspace = ReadWorkspace::new();
-        for block in 0..view.block_count() {
-            let frame = view.frame(block).expect(VALIDATED);
-            if !f(frame.dictionary, workspace.load(&frame).expect(VALIDATED)) {
-                return false;
-            }
-        }
-        true
     }
 }

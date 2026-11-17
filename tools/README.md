@@ -11,13 +11,12 @@ Long-format CSV rows report raw bytes decoded and compressed and stored bytes
 written by flush and by compaction into each level; stored bytes by component
 (frames, dictionaries, segment table, index, filters, footer) and records per
 level; and decoded bytes per get, blocks per scan and write amplification.
-`--costs` also times Zstandard levels -3, -1, 1 and 3 on 64 MiB of the
-scenario's own blocks. `--levels NON_BOTTOM,BOTTOM`, `--dictionary
-BYTES|adaptive` and `--scale SHIFT` select an experiment policy or smaller
-runs; name scenarios to run only those.
+`--settle` then compacts everything into the bottom level and measures again,
+`--variant LABEL` labels the rows and `--scale SHIFT` runs smaller scenarios;
+name scenarios to run only those.
 
-The hidden `diagnostics` feature provides the counters and policy overrides.
-It is not part of the stable API. The [basic example](../examples/basic.rs)
-demonstrates the public API.
+The hidden `diagnostics` feature provides the counters. It is not part of the
+stable API. The [basic example](../examples/basic.rs) demonstrates the public
+API.
 
 The macOS [comparison harness](bench/README.md) measures Tessera and RocksDB.

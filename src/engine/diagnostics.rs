@@ -1,8 +1,7 @@
-//! Repository diagnostics: work and memory by level, and experiment policy.
+//! Repository diagnostics: work and memory by level.
 //! Built only with the `diagnostics` feature; not part of the stable API.
 
 use super::Engine;
-pub use crate::run::diagnostics::LevelCost;
 
 /// Bytes one purpose read and wrote.
 #[derive(Clone, Copy, Debug, Default)]
@@ -83,47 +82,4 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
             level
         })
         .collect()
-}
-
-/// Sets the process-wide compression policy for runs built from now on:
-/// Zstandard levels above and at the bottom, and a fixed dictionary length,
-/// or the adaptive rule if `None`.
-pub fn set_policy(non_bottom: i32, bottom: i32, dictionary: Option<usize>) {
-    crate::run::set_policy(non_bottom, bottom, dictionary);
-}
-
-/// Copies up to `raw_limit` raw block bytes, bottom level first, with their
-/// segment dictionaries, then times compressing them at each of `levels`,
-/// keeping the fastest of `rounds`.
-pub fn level_costs(
-    engine: &Engine,
-    levels: &[i32],
-    raw_limit: usize,
-    rounds: usize,
-) -> Vec<LevelCost> {
-    let mut blocks = Vec::new();
-    let mut dictionaries: Vec<Vec<u8>> = Vec::new();
-    let mut raw = 0;
-    {
-        let state = engine.core.read_state();
-        'levels: for runs in state.levels.runs().iter().rev() {
-            for run in runs {
-                let more = run.run.blocks(|dictionary, block| {
-                    if dictionaries
-                        .last()
-                        .is_none_or(|last| last.as_slice() != dictionary)
-                    {
-                        dictionaries.push(dictionary.to_vec());
-                    }
-                    blocks.push((dictionaries.len() - 1, block.to_vec()));
-                    raw += block.len();
-                    raw < raw_limit
-                });
-                if !more {
-                    break 'levels;
-                }
-            }
-        }
-    }
-    crate::run::diagnostics::level_costs(&blocks, &dictionaries, levels, rounds)
 }

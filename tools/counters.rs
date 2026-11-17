@@ -4,8 +4,7 @@
 //! compaction, checks every read path against a version oracle and prints
 //! long-format CSV rows. See tools/README.md.
 //!
-//! `counters [--levels NON_BOTTOM,BOTTOM] [--dictionary BYTES|adaptive]
-//! [--costs] [--settle] [--scale SHIFT] [SCENARIO...]`
+//! `counters [--variant LABEL] [--settle] [--scale SHIFT] [SCENARIO...]`
 use std::time::Instant;
 use tessera::engine::diagnostics;
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
@@ -76,7 +75,7 @@ struct Scenario {
     value_len: usize,
 }
 
-fn run(s: &Scenario, variant: &str, costs: bool, settle: bool) {
+fn run(s: &Scenario, variant: &str, settle: bool) {
     let started = Instant::now();
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let engine = Engine::new(EngineOptions {
@@ -262,53 +261,23 @@ fn run(s: &Scenario, variant: &str, costs: bool, settle: bool) {
             ratio(scans.blocks_loaded(), 100),
         );
     }
-    if costs {
-        for c in diagnostics::level_costs(&engine, &[-3, -1, 1, 3], 64 << 20, 3) {
-            println!(
-                "cost,{name},{variant},{},{},{},{},{}",
-                c.level,
-                c.raw,
-                c.stored,
-                c.compress.as_nanos(),
-                c.decompress.as_nanos()
-            );
-        }
-    }
     engine.close().unwrap();
 }
 
 fn main() {
-    let mut levels = (1, 1);
-    let mut dictionary = Some(16 << 10);
-    let mut costs = false;
+    let mut variant = String::from("default");
     let mut settle = false;
     let mut scale = 0;
     let mut names = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--levels" => {
-                let value = args.next().expect("NON_BOTTOM,BOTTOM");
-                let (a, b) = value.split_once(',').expect("NON_BOTTOM,BOTTOM");
-                levels = (a.parse().unwrap(), b.parse().unwrap());
-            }
-            "--dictionary" => {
-                let value = args.next().expect("BYTES or adaptive");
-                dictionary = (value != "adaptive").then(|| value.parse().unwrap());
-            }
-            "--costs" => costs = true,
+            "--variant" => variant = args.next().expect("LABEL"),
             "--settle" => settle = true,
             "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
             _ => names.push(arg),
         }
     }
-    diagnostics::set_policy(levels.0, levels.1, dictionary);
-    let variant = format!(
-        "z{}/{}-d{}",
-        levels.0,
-        levels.1,
-        dictionary.map_or("adaptive".into(), |n| n.to_string())
-    );
     let scenarios = [
         Scenario {
             name: "A",
@@ -341,12 +310,9 @@ fn main() {
             "settled,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,blocks_per_100_record_scan"
         );
     }
-    if costs {
-        println!("cost,scenario,variant,zstd_level,raw,stored,compress_ns,decompress_ns");
-    }
     for s in &scenarios {
         if names.is_empty() || names.iter().any(|n| n == s.name) {
-            run(s, &variant, costs, settle);
+            run(s, &variant, settle);
         }
     }
 }

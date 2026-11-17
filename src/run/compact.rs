@@ -73,7 +73,7 @@ fn workspace_for_segment(
         // segment scratch (2x), plus reusable raw block and block builder.
         .saturating_add(largest.max(segment_len).saturating_mul(6))
         .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(4))
-        .saturating_add(super::dictionary::MAX_DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)
+        .saturating_add(super::dictionary::DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)
 }
 
 /// Where a compaction's output runs end, beside the target length.
@@ -548,8 +548,6 @@ impl<'c> Output<'c> {
                 &self.pool,
             );
             builder.limit_segment_len(self.segment_len);
-            // Filters are omitted exactly where output enters the bottom level.
-            builder.set_bottom(self.cuts.omit_filter);
             builder.limit_filter_build_bytes(if self.cuts.omit_filter {
                 0
             } else {

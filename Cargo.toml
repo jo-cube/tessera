@@ -15,8 +15,7 @@ categories = ["database-implementations", "data-structures"]
 publish = false
 
 [features]
-# Hidden work and memory counters by level, and compression policy overrides
-# for experiments. Not part of the stable API.
+# Hidden work and memory counters by level. Not part of the stable API.
 diagnostics = []
 
 [dependencies]

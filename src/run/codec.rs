@@ -16,12 +16,6 @@ pub enum Codec {
 
 pub(super) const ZSTD_LEVEL: i32 = 1;
 
-/// Level of the prepared dictionary behind a segment's ratio probe. Level-1
-/// output keeps its level-3 probe; other output levels probe at their own.
-pub(super) fn probe_level(level: i32) -> i32 {
-    if level == ZSTD_LEVEL { 3 } else { level }
-}
-
 /// Conservative allowance for prepared tables and their dictionary copy.
 pub(super) const CDICT_ALLOWANCE: usize = 2 << 20;
 
@@ -72,21 +66,15 @@ impl Compressor {
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)
     }
-    pub(super) fn prepare_dictionary(
-        &self,
-        dictionary: &[u8],
-        level: i32,
-    ) -> Option<CDict<'static>> {
-        self.zstd
-            .as_ref()
-            .map(|_| CDict::create(dictionary, probe_level(level)))
+    pub(super) fn prepare_dictionary(&self, dictionary: &[u8]) -> Option<CDict<'static>> {
+        self.zstd.as_ref().map(|_| CDict::create(dictionary, 3))
     }
     /// Cache a dictionary whose tables are sized for the estimated raw block.
     /// load_dictionary lazily constructs one CDict from these parameters on
     /// the first compress2 call; subsequent frames reuse it and the CCtx.
-    pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize, level: i32) {
+    pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize) {
         if let Some(ctx) = &mut self.zstd {
-            ctx.set_parameter(CParameter::CompressionLevel(level))
+            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
                 .expect("supported level");
             ctx.set_parameter(CParameter::SrcSizeHint(block_len as u32))
                 .expect("bounded block size hint");
@@ -215,7 +203,7 @@ mod tests {
         let mut decompressor = Decompressor::default();
         for len in [0, 1, 256, dictionary.len()] {
             let raw = &dictionary[..len];
-            let prepared = compressor.prepare_dictionary(raw, ZSTD_LEVEL).unwrap();
+            let prepared = compressor.prepare_dictionary(raw).unwrap();
             assert!(
                 prepared.sizeof() <= CDICT_ALLOWANCE,
                 "{} at {len}",
@@ -229,7 +217,7 @@ mod tests {
                 let mut probe = Vec::new();
                 compressor.compress(input, Some(&prepared), &mut probe);
                 assert_eq!(&probe[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
-                compressor.begin_segment(raw, input.len(), ZSTD_LEVEL);
+                compressor.begin_segment(raw, input.len());
                 compressor.compress(input, None, &mut stored);
                 assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
                 assert_eq!(stored[0], 0, "no size, checksum or dictionary-ID fields");
@@ -244,7 +232,7 @@ mod tests {
         }
         assert!(
             Compressor::new(Codec::None)
-                .prepare_dictionary(&dictionary, ZSTD_LEVEL)
+                .prepare_dictionary(&dictionary)
                 .is_none()
         );
     }
