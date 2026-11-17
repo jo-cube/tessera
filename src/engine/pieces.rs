@@ -22,9 +22,14 @@ impl<'e> CompactionJob<'e> {
                 return override_bytes;
             }
         }
+        let minimum = if self.engine.background_threads == 1 {
+            1
+        } else {
+            MIN_PIECE_BUDGET
+        };
         self.estimated_run_bytes
             .saturating_mul(PIECE_RUNS)
-            .max(MIN_PIECE_BUDGET)
+            .max(minimum)
     }
 
     pub(super) fn execute(

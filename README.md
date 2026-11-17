@@ -101,7 +101,7 @@ A later piece failure leaves earlier publications intact and stops the job.
 | `memory_limit` | `None` | Writer admission budget; held snapshots can prevent admission |
 | `memtable_budget` | 64 MiB | Larger tables flush less often and retain more transient memory |
 | `level_ratio` | 10 | Larger ratios favor reads and memory; smaller ratios reduce rewriting |
-| `background_threads` | Half the CPUs, clamped to 1–4 | More builders use more temporary workspace |
+| `background_threads` | Half the CPUs, clamped to 1–4 | Bounds concurrent compaction pieces and builders; trades write throughput for CPU and transient memory |
 | `compression` | `Compression::Zstd` | Compression costs CPU; `Uncompressed` reads blocks in place |
 | `target_block_compressed` | 1024 bytes | Larger blocks reduce metadata and increase point-read decoding |
 
