@@ -442,7 +442,7 @@ fn run_payloads(dir: &Path) -> Vec<(PathBuf, usize)> {
     let count = u32::from_le_bytes(manifest[68..72].try_into().unwrap()) as usize;
     (0..count)
         .map(|i| {
-            let at = 72 + i * 60;
+            let at = 80 + i * 68;
             let id = u128::from_le_bytes(manifest[at..at + 16].try_into().unwrap());
             let len = u64::from_le_bytes(manifest[at + 48..at + 56].try_into().unwrap()) as usize;
             (dir.join("runs").join(format!("{id:032x}")), len)

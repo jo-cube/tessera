@@ -1016,23 +1016,12 @@ fn runs_work_over_shared_and_borrowed_storage() {
     }
 }
 
-/// Beside its storage a run holds its restart-head slice, filter pointer, smallest and largest
-/// stored sequences, optional publication sequence, and four key-bound offsets with an option tag.
+/// Views own two pointers plus effective sequence and build metadata; storage
+/// type does not enlarge a view because its immutable backing is shared.
 #[test]
 fn runtime_descriptor_owns_its_storage_and_an_optional_filter() {
-    let extra = size_of::<Box<[u64]>>()
-        + size_of::<usize>()
-        + 2 * size_of::<u64>()
-        + size_of::<Option<u64>>()
-        + 7 * size_of::<usize>();
-    assert_eq!(
-        size_of::<Run<Vec<u8>>>(),
-        size_of::<super::super::storage::RunData<Vec<u8>>>() + extra
-    );
-    assert_eq!(
-        size_of::<Run<&[u8]>>(),
-        size_of::<super::super::storage::RunData<&[u8]>>() + extra
-    );
+    assert_eq!(size_of::<Run<Vec<u8>>>(), size_of::<[usize; 8]>());
+    assert_eq!(size_of::<Run<&[u8]>>(), size_of::<Run<Vec<u8>>>());
 }
 
 #[test]

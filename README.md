@@ -84,6 +84,13 @@ value and 128-byte entry charge must also fit the memtable budget.
   key once in ascending order; prefixes use raw bytes. A value's sequence may be
   zero after bottom-level compaction, so it is not a stable update identifier.
 
+Compaction keeps disjoint levels below level 0. Large level-0 jobs into the
+bottom run as consecutive key ranges aligned to bottom-run boundaries, with
+about one target run of bottom input per piece. Each piece publishes atomically
+and releases its bottom inputs. Bounded views of level-0 sources expose only the
+remaining ranges; snapshots and checkpoints preserve the bounds they captured.
+A later piece failure leaves earlier publications intact and stops the job.
+
 ## Options and memory
 
 `EngineOptions` is fixed when the engine starts:
@@ -119,7 +126,9 @@ frozen tables can charge about 192 MiB at the default memtable budget.
 
 Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
 finished runs trim their partial final chunk. The free reserve is capped at
-32 MiB. Workspaces retain decode buffers and contexts; there is no decoded-block
+32 MiB. Piecewise bottom compaction retains only one piece's unpublished output;
+a level-0 source is released when its final range is merged. Snapshots can keep
+replaced storage alive. Workspaces retain decode buffers and contexts; there is no decoded-block
 cache. Use `Engine::stats()` and workspace counters to inspect memory and work.
 
 On Linux with glibc, freed buffers can remain resident, so RSS may stay above

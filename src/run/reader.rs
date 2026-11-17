@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::{Arc, Weak};
 
 use crate::block::{
     BlockPosition, BlockView, MAX_KEY_LEN, RESTART_INTERVAL, Record, RecordWalk, Value, Version,
@@ -44,24 +45,26 @@ use crate::chunk::ChunkPool;
 /// use their key bounds and sparse index directly.
 #[derive(Clone, Debug)]
 pub struct Run<B> {
+    backing: Arc<RunBacking<B>>,
+    /// Exact inclusive keys visible through this view, if restricted.
+    slice: Option<Box<(Vec<u8>, Vec<u8>)>>,
+    seqs: Seqs,
+    seq_override: Option<u64>,
+    reclaimable: bool,
+    build_estimate: usize,
+}
+
+#[derive(Debug)]
+struct RunBacking<B> {
     data: RunData<B>,
     /// One contiguous search head per index restart, rebuilt from stored keys.
     restart_heads: Box<[u64]>,
     /// Boxed so that a run without one costs no more than a pointer.
     filter: Option<Box<KeyFilter>>,
-    /// The smallest and largest stored sequence numbers, both 0 if there
-    /// are none. The builder and validation derive them; `seq_override`
-    /// supplies the effective bounds.
-    seqs: Seqs,
-    /// Publication sequence of a unique-key ingestion built with placeholders.
-    /// Set only while the run is private; materialized when it is rewritten.
-    seq_override: Option<u64>,
     /// Where the smallest and largest user keys lie in `data`, or `None` for
     /// an empty run, found once so that a lookup can rule the run out
     /// without opening it.
     bounds: Option<KeyBounds>,
-    reclaimable: bool,
-    build_estimate: usize,
 }
 
 /// The smallest and largest sequence numbers of a run's records.
@@ -117,12 +120,15 @@ impl<B: AsRef<[u8]>> Run<B> {
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
         Ok(Self {
-            data,
-            restart_heads,
-            filter: None,
+            backing: Arc::new(RunBacking {
+                data,
+                restart_heads,
+                filter: None,
+                bounds,
+            }),
+            slice: None,
             seqs,
             seq_override: None,
-            bounds,
             reclaimable,
             build_estimate,
         })
@@ -138,12 +144,15 @@ impl<B: AsRef<[u8]>> Run<B> {
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
         Self {
-            data,
-            restart_heads,
-            filter: filter.map(Box::new),
+            backing: Arc::new(RunBacking {
+                data,
+                restart_heads,
+                filter: filter.map(Box::new),
+                bounds,
+            }),
+            slice: None,
             seqs,
             seq_override: None,
-            bounds,
             reclaimable,
             build_estimate,
         }
@@ -187,16 +196,19 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// Returns the bytes of the run's key filter, held beside the stored
     /// bytes: about 1.25 per distinct user key, or 0 without a filter.
     pub fn filter_bytes(&self) -> usize {
-        self.filter.as_deref().map_or(0, KeyFilter::bytes)
+        self.backing.filter.as_deref().map_or(0, KeyFilter::bytes)
     }
 
     /// The bytes the builder held for key hashes while building the filter.
     pub(crate) fn filter_build_bytes(&self) -> usize {
-        self.filter.as_deref().map_or(0, KeyFilter::build_bytes)
+        self.backing
+            .filter
+            .as_deref()
+            .map_or(0, KeyFilter::build_bytes)
     }
 
     pub(crate) fn filter(&self) -> Option<&KeyFilter> {
-        self.filter.as_deref()
+        self.backing.filter.as_deref()
     }
 
     /// The run with one stored byte inverted and everything found at
@@ -204,7 +216,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// read.
     #[cfg(test)]
     pub(crate) fn damaged_at(&self, offset: usize) -> Run<Vec<u8>> {
-        let mut data: RunData<Vec<u8>> = match &self.data {
+        let mut data: RunData<Vec<u8>> = match &self.backing.data {
             RunData::Contiguous(bytes) => RunData::Contiguous(bytes.as_ref().to_vec()),
             RunData::Segmented(parts) => RunData::Segmented(parts.clone()),
         };
@@ -229,12 +241,15 @@ impl<B: AsRef<[u8]>> Run<B> {
             }
         }
         Run {
-            data,
-            restart_heads: self.restart_heads.clone(),
-            filter: self.filter.clone(),
+            backing: Arc::new(RunBacking {
+                data,
+                restart_heads: self.backing.restart_heads.clone(),
+                filter: self.backing.filter.clone(),
+                bounds: self.backing.bounds.clone(),
+            }),
+            slice: self.slice.clone(),
             seqs: self.seqs,
             seq_override: self.seq_override,
-            bounds: self.bounds.clone(),
             reclaimable: self.reclaimable,
             build_estimate: self.build_estimate,
         }
@@ -242,7 +257,9 @@ impl<B: AsRef<[u8]>> Run<B> {
 
     /// Key filter, restart heads and physical segment metadata, charged beside stored bytes.
     pub fn held_bytes(&self) -> usize {
-        self.filter_bytes() + size_of_val(&*self.restart_heads) + self.data.held_bytes()
+        self.filter_bytes()
+            + size_of_val(&*self.backing.restart_heads)
+            + self.backing.data.held_bytes()
     }
 
     /// Returns the number of stored records, counting every version.
@@ -266,8 +283,14 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// They were found when the run was built or validated, so this reads
     /// only the two keys.
     pub fn key_range(&self) -> Option<KeyRange<'_>> {
-        let bounds = self.bounds.as_ref()?;
-        let data = self.data.key_data();
+        if let Some(slice) = &self.slice {
+            return Some(KeyRange {
+                min: &slice.0,
+                max: &slice.1,
+            });
+        }
+        let bounds = self.backing.bounds.as_ref()?;
+        let data = self.backing.data.key_data();
         Some(KeyRange {
             min: &data[bounds.min.clone()],
             max: &data[bounds.max.clone()],
@@ -319,29 +342,127 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn view(&self) -> RunView<'_> {
         RunView {
             seq_override: self.seq_override,
-            restart_heads: Some(&self.restart_heads),
-            ..self.data.view().expect(VALIDATED)
+            restart_heads: Some(&self.backing.restart_heads),
+            slice: self.slice.as_ref().map(|r| KeyRange {
+                min: &r.0,
+                max: &r.1,
+            }),
+            ..self.backing.data.view().expect(VALIDATED)
         }
     }
 
+    /// A view of the same immutable bytes within [lo, hi). Empty views are omitted.
+    pub(crate) fn bounded(
+        &self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        workspace: &mut ReadWorkspace,
+    ) -> Result<Option<Self>, CorruptRun>
+    where
+        B: Clone,
+    {
+        let Some(range) = self.key_range() else {
+            return Ok(None);
+        };
+        let lo = lo.map_or(range.min, |lo| lo.max(range.min));
+        if lo > range.max || hi.is_some_and(|hi| lo >= hi) {
+            return Ok(None);
+        }
+        let view = self.view();
+        let first = {
+            let mut cursor = view.cursor(workspace);
+            cursor.seek(lo)?;
+            cursor.fill_head()?;
+            let Some((first, _)) = cursor.head_key() else {
+                return Ok(None);
+            };
+            if hi.is_some_and(|hi| first >= hi) {
+                return Ok(None);
+            }
+            first.to_vec()
+        };
+        let mut last = range.max.to_vec();
+        if let Some(hi) = hi.filter(|hi| *hi <= range.max) {
+            let block = view.locate(hi)?.expect("hi lies within the run");
+            let mut cursor = view.cursor(workspace);
+            cursor.load_block(block)?;
+            last = if block > 0 {
+                view.last_key(block - 1)?.to_vec()
+            } else {
+                first.clone()
+            };
+            loop {
+                cursor.fill_head()?;
+                let Some(record) = cursor.head_record() else {
+                    break;
+                };
+                if record.key >= hi {
+                    break;
+                }
+                last.clear();
+                last.extend_from_slice(record.key);
+                cursor.head = None;
+            }
+        }
+        last = last.min(range.max.to_vec());
+        let mut bounded = self.clone();
+        bounded.slice = Some(Box::new((first, last)));
+        Ok(Some(bounded))
+    }
+
+    pub(crate) fn slice(&self) -> Option<(&[u8], &[u8])> {
+        self.slice
+            .as_ref()
+            .map(|r| (r.0.as_slice(), r.1.as_slice()))
+    }
+
+    /// Restore checked inclusive bounds without changing physical bytes.
+    pub(crate) fn restore_slice(&mut self, min: Vec<u8>, max: Vec<u8>) -> Result<(), CorruptRun> {
+        let range = self
+            .key_range()
+            .ok_or(corrupt(0, RunCorruption::InvalidIndex))?;
+        if min.as_slice() < range.min || max.as_slice() > range.max || min > max {
+            return Err(corrupt(0, RunCorruption::InvalidIndex));
+        }
+        let mut workspace = ReadWorkspace::new();
+        let mut cursor = self.view().cursor(&mut workspace);
+        for edge in [&min, &max] {
+            cursor.seek(edge)?;
+            cursor.fill_head()?;
+            if cursor.head_key().is_none_or(|(key, _)| key != edge) {
+                return Err(corrupt(0, RunCorruption::InvalidIndex));
+            }
+        }
+        self.slice = Some(Box::new((min, max)));
+        Ok(())
+    }
+
+    /// The lifetime of physical storage, shared by all its bounded views.
+    pub(crate) fn retirement(&self) -> Weak<dyn Send + Sync>
+    where
+        B: Send + Sync + 'static,
+    {
+        Arc::downgrade(&self.backing) as Weak<dyn Send + Sync>
+    }
+
     pub(crate) fn chunk_capacity(&self) -> usize {
-        self.data.chunk_capacity()
+        self.backing.data.chunk_capacity()
     }
     pub(crate) fn frame_bytes(&self) -> usize {
         self.view().frame_bytes()
     }
     pub(crate) fn index_bytes(&self) -> usize {
         let view = self.view();
-        view.index_len() + size_of_val(&*self.restart_heads)
+        view.index_len() + size_of_val(&*self.backing.restart_heads)
     }
     /// Serialized byte count, excluding filters and physical segment metadata.
     pub fn stored_len(&self) -> usize {
-        self.data.stored_len()
+        self.backing.data.stored_len()
     }
 
     /// Regions in checkpoint file order, without materializing a whole run.
     pub(crate) fn chunks(&self) -> impl Iterator<Item = &[u8]> {
-        self.data.chunks()
+        self.backing.data.chunks()
     }
 
     pub(crate) fn seq_override(&self) -> Option<u64> {
@@ -349,13 +470,16 @@ impl<B: AsRef<[u8]>> Run<B> {
     }
 
     pub(crate) fn filter_words(&self) -> impl Iterator<Item = [u8; 8]> + '_ {
-        self.filter.iter().flat_map(|filter| filter.encoded())
+        self.backing
+            .filter
+            .iter()
+            .flat_map(|filter| filter.encoded())
     }
 
     /// Contiguous serialization only for tests of the on-disk format.
     #[cfg(test)]
     pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
-        match &self.data {
+        match &self.backing.data {
             RunData::Contiguous(bytes) => std::borrow::Cow::Borrowed(bytes.as_ref()),
             RunData::Segmented(_) => {
                 std::borrow::Cow::Owned(self.chunks().flatten().copied().collect())
@@ -760,6 +884,15 @@ impl<'a> RunCursor<'a> {
     }
 
     fn position_at(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
+        let target = if let Some(range) = self.view.slice {
+            if target > range.max {
+                self.finish();
+                return Ok(());
+            }
+            target.max(range.min)
+        } else {
+            target
+        };
         let first_block_held = self.loaded.is_some() && self.next_block == 1;
         if !self.view.table.is_empty() && target <= self.view.min_key && !first_block_held {
             // The whole run is at or above the target, so its first record is
@@ -856,7 +989,9 @@ impl<'a> RunCursor<'a> {
                 Value::Tombstone => None,
             },
         };
-        if record.key.starts_with(&workspace.prefix) {
+        if record.key.starts_with(&workspace.prefix)
+            && self.view.slice.is_none_or(|range| record.key <= range.max)
+        {
             self.head = Some(head);
         } else {
             self.finish();
@@ -881,7 +1016,7 @@ impl<'a> RunCursor<'a> {
     /// the merge reaches that key.
     pub(super) fn deferred_key(&self) -> Option<&'a [u8]> {
         // Loading any block advances `next_block`, so zero means none has been.
-        (self.next_block == 0).then_some(self.view.min_key)
+        (self.next_block == 0).then_some(self.view.slice.map_or(self.view.min_key, |r| r.min))
     }
 
     /// Returns the held head, if any.
@@ -909,6 +1044,11 @@ impl<'a> RunCursor<'a> {
 
     /// Returns the block holding the next record, decoding blocks as needed.
     fn block_with_records(&mut self) -> Result<Option<LoadedBlock<'a>>, CorruptRun> {
+        if self.next_block == 0
+            && let Some(range) = self.view.slice.filter(|r| r.min > self.view.min_key)
+        {
+            self.position_at(range.min)?;
+        }
         loop {
             if let Some(block) = self.loaded {
                 if self.workspace.position.offset() < block.entries_len {
@@ -974,6 +1114,7 @@ pub struct RunView<'a> {
     // Raw borrowed views used during validation allocate nothing. Owned runs
     // attach their once-built heads to every view used for reads.
     restart_heads: Option<&'a [u64]>,
+    slice: Option<KeyRange<'a>>,
 }
 
 impl<'a> RunView<'a> {
@@ -1052,6 +1193,7 @@ impl<'a> RunView<'a> {
             record_count,
             seq_override: None,
             restart_heads: None,
+            slice: None,
         };
         match (view.table.first(), view.table.last()) {
             (Some(&first), Some(&last)) => {
@@ -1145,6 +1287,9 @@ impl<'a> RunView<'a> {
     /// Returns the smallest and largest user keys, or `None` for an empty run.
     /// Decodes nothing.
     pub fn key_range(self) -> Result<Option<KeyRange<'a>>, CorruptRun> {
+        if let Some(range) = self.slice {
+            return Ok(Some(range));
+        }
         let Some(last) = self.table.len().checked_sub(1) else {
             return Ok(None);
         };
@@ -1160,7 +1305,8 @@ impl<'a> RunView<'a> {
     /// start with it is above that whole interval, which needs no successor
     /// of the prefix, so a prefix of `0xFF` bytes needs no special case.
     fn min_above_prefix(self, prefix: &[u8]) -> bool {
-        !self.table.is_empty() && self.min_key > prefix && !self.min_key.starts_with(prefix)
+        let min = self.slice.map_or(self.min_key, |r| r.min);
+        !self.table.is_empty() && min > prefix && !min.starts_with(prefix)
     }
 
     /// Returns the index of the only block that can contain `target`, or
@@ -1238,7 +1384,7 @@ impl<'a> RunView<'a> {
         let mut next = 0;
         while next < indices.len() {
             let key = keys[indices[next]].as_ref();
-            if key < self.min_key {
+            if key < self.min_key || self.slice.is_some_and(|r| key < r.min || key > r.max) {
                 found(indices[next], None);
                 next += 1;
                 continue;
@@ -1255,9 +1401,12 @@ impl<'a> RunView<'a> {
             let bytes = workspace.load(&frame)?;
             let view = BlockView::open(bytes).map_err(|error| frame.block_error(error))?;
             for &index in &indices[start..next] {
-                let version = view
-                    .get(keys[index].as_ref())
-                    .map_err(|error| frame.block_error(error))?;
+                let key = keys[index].as_ref();
+                if self.slice.is_some_and(|r| key < r.min || key > r.max) {
+                    found(index, None);
+                    continue;
+                }
+                let version = view.get(key).map_err(|error| frame.block_error(error))?;
                 found(index, version.map(|version| self.effective(version)));
             }
         }
@@ -1277,7 +1426,7 @@ impl<'a> RunView<'a> {
     where
         'a: 'r,
     {
-        if target < self.min_key {
+        if target < self.min_key || self.slice.is_some_and(|r| target < r.min || target > r.max) {
             return Ok(None);
         }
         let Some(block) = self.locate(target)? else {
@@ -1535,7 +1684,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             index: self.index_bytes(),
             filters: self.filter_bytes(),
             footer: FOOTER_LEN,
-            physical: self.data.held_bytes(),
+            physical: self.backing.data.held_bytes(),
         }
     }
 }

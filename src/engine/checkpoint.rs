@@ -64,13 +64,13 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-// Manifest version 4 specifies aligned 512-bit Bloom blocks in run files.
+// Manifest version 5 persists exact inclusive bounds of shared run views.
 // Run payloads use format version 6.
-const MANIFEST_VERSION: u32 = 4;
+const MANIFEST_VERSION: u32 = 5;
 // Magic/version/flags, generation/ceiling/records/next-id/previous,
 // depth, metadata length, run count. Entries include both file and run lengths.
-const MANIFEST_HEADER_LEN: usize = 72;
-const MANIFEST_ENTRY_LEN: usize = 60;
+const MANIFEST_HEADER_LEN: usize = 80;
+const MANIFEST_ENTRY_LEN: usize = 68;
 const MAX_METADATA_BYTES: usize = 16 << 20;
 const RUNS: &str = "runs";
 // Keep namespace and counter together, including when recovery advances the
@@ -383,6 +383,7 @@ struct RunEntry {
     len: u64,
     run_len: u64,
     sum: u32,
+    bounds: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -399,8 +400,18 @@ struct Manifest {
 
 impl Manifest {
     fn encode(&self) -> Vec<u8> {
+        let bounds_len: usize = self
+            .runs
+            .iter()
+            .filter_map(|r| r.bounds.as_ref())
+            .map(|(a, b)| a.len() + b.len())
+            .sum();
         let mut bytes = Vec::with_capacity(
-            MANIFEST_HEADER_LEN + self.runs.len() * MANIFEST_ENTRY_LEN + self.metadata.len() + 4,
+            MANIFEST_HEADER_LEN
+                + self.runs.len() * MANIFEST_ENTRY_LEN
+                + bounds_len
+                + self.metadata.len()
+                + 4,
         );
         bytes.extend_from_slice(&MANIFEST_MAGIC);
         bytes.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
@@ -417,15 +428,28 @@ impl Manifest {
         bytes.extend_from_slice(&(self.depth as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.metadata.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&(self.runs.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(bounds_len as u64).to_le_bytes());
         for run in &self.runs {
             bytes.extend_from_slice(&run.id.to_le_bytes());
             bytes.extend_from_slice(&(run.level as u32).to_le_bytes());
-            bytes.extend_from_slice(&u32::from(run.seq_override.is_some()).to_le_bytes());
+            let flags =
+                u32::from(run.seq_override.is_some()) | (u32::from(run.bounds.is_some()) << 1);
+            bytes.extend_from_slice(&flags.to_le_bytes());
             bytes.extend_from_slice(&run.seq_override.unwrap_or(0).to_le_bytes());
             bytes.extend_from_slice(&run.flush.to_le_bytes());
             bytes.extend_from_slice(&run.len.to_le_bytes());
             bytes.extend_from_slice(&run.run_len.to_le_bytes());
             bytes.extend_from_slice(&run.sum.to_le_bytes());
+            let (min, max) = run
+                .bounds
+                .as_ref()
+                .map_or((0, 0), |(a, b)| (a.len(), b.len()));
+            bytes.extend_from_slice(&(min as u32).to_le_bytes());
+            bytes.extend_from_slice(&(max as u32).to_le_bytes());
+        }
+        for (min, max) in self.runs.iter().filter_map(|r| r.bounds.as_ref()) {
+            bytes.extend_from_slice(min);
+            bytes.extend_from_slice(max);
         }
         bytes.extend_from_slice(&self.metadata);
         let sum = crc(&[&bytes]);
@@ -452,6 +476,10 @@ impl Manifest {
         }
         let count = u32_at(68) as usize;
         let metadata_len = u64_at(60);
+        let bounds_len = u64_at(72);
+        if bounds_len > count as u64 * 2 * crate::block::MAX_KEY_LEN as u64 {
+            return Err(Damage::Order);
+        }
         if metadata_len > MAX_METADATA_BYTES as u64 {
             return Err(length(
                 (MANIFEST_HEADER_LEN + MAX_METADATA_BYTES + 4) as u64,
@@ -460,6 +488,7 @@ impl Manifest {
         let expected = MANIFEST_HEADER_LEN as u64
             + count as u64 * MANIFEST_ENTRY_LEN as u64
             + metadata_len
+            + bounds_len
             + 4;
         if bytes.len() as u64 != expected {
             return Err(length(expected));
@@ -480,6 +509,8 @@ impl Manifest {
         let mut runs = Vec::with_capacity(count);
         let mut ids = HashSet::with_capacity(count);
         let mut previous = (0, 0);
+        let mut bounds_at = MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN;
+        let bounds_end = bounds_at + bounds_len as usize;
         for index in 0..count {
             let at = MANIFEST_HEADER_LEN + index * MANIFEST_ENTRY_LEN;
             let id = u128::from_le_bytes(bytes[at..at + 16].try_into().unwrap());
@@ -489,6 +520,26 @@ impl Manifest {
             let flush = u64_at(at + 32);
             let len = u64_at(at + 40);
             let run_len = u64_at(at + 48);
+            let (min_len, max_len) = (u32_at(at + 60) as usize, u32_at(at + 64) as usize);
+            if min_len > crate::block::MAX_KEY_LEN
+                || max_len > crate::block::MAX_KEY_LEN
+                || min_len + max_len > bounds_end - bounds_at
+                || (flags & 2 == 0 && min_len + max_len != 0)
+            {
+                return Err(Damage::Order);
+            }
+            let bounds = if flags & 2 != 0 {
+                let min = bytes[bounds_at..bounds_at + min_len].to_vec();
+                bounds_at += min_len;
+                let max = bytes[bounds_at..bounds_at + max_len].to_vec();
+                bounds_at += max_len;
+                if min > max {
+                    return Err(Damage::Order);
+                }
+                Some((min, max))
+            } else {
+                None
+            };
             if run_len > u32::MAX as u64 {
                 return Err(Damage::Length {
                     expected: u32::MAX as u64,
@@ -506,8 +557,8 @@ impl Manifest {
                 || id as u64 == 0
                 || id as u64 >= next_run_id
                 || level > depth
-                || flags > 1
-                || (flags == 0 && seq != 0)
+                || flags > 3
+                || (flags & 1 == 0 && seq != 0)
                 || (level > 0 && flush != 0)
                 || (level, flush) < previous
                 || flush == u64::MAX
@@ -521,13 +572,17 @@ impl Manifest {
                 id,
                 level,
                 flush,
-                seq_override: (flags == 1).then_some(seq),
+                seq_override: (flags & 1 != 0).then_some(seq),
                 len,
                 run_len,
                 sum: u32_at(at + 56),
+                bounds,
             });
         }
-        let metadata_at = MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN;
+        if bounds_at != bounds_end {
+            return Err(Damage::Order);
+        }
+        let metadata_at = bounds_end;
         Ok(Self {
             generation: u64_at(16),
             last_seq: u64_at(24),
@@ -892,6 +947,7 @@ fn write_runs(
             len,
             run_len: run.stored_len() as u64,
             sum,
+            bounds: run.slice().map(|(a, b)| (a.to_vec(), b.to_vec())),
         });
     }
     sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
@@ -1236,11 +1292,14 @@ fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manifest), OpenEr
         .map_err(read_error(&manifest_path))?;
     let count = u32::from_le_bytes(header[68..72].try_into().unwrap()) as u64;
     let metadata = u64::from_le_bytes(header[60..68].try_into().unwrap());
+    let bounds = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let max_bounds = count * 2 * crate::block::MAX_KEY_LEN as u64;
     let expected = MANIFEST_HEADER_LEN as u64
         + count * MANIFEST_ENTRY_LEN as u64
         + metadata.min(MAX_METADATA_BYTES as u64)
+        + bounds.min(max_bounds)
         + 4;
-    if found != expected || metadata > MAX_METADATA_BYTES as u64 {
+    if found != expected || metadata > MAX_METADATA_BYTES as u64 || bounds > max_bounds {
         return Err(corrupt(&manifest_path, Damage::Length { expected, found }));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(expected).map_err(|_| {
@@ -1318,6 +1377,10 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
                 return Err(corrupt(&file, Damage::Order));
             }
             run.set_seq_override(seq);
+        }
+        if let Some((min, max)) = &entry.bounds {
+            run.restore_slice(min.clone(), max.clone())
+                .map_err(|error| corrupt(&file, Damage::Run(error)))?;
         }
         let Some(range) = run.key_range() else {
             return Err(corrupt(&file, Damage::Order));
@@ -1648,6 +1711,7 @@ mod tests {
                     len: 100,
                     run_len: 88,
                     sum: 0xdead_beef,
+                    bounds: None,
                 },
                 RunEntry {
                     id: 2,
@@ -1657,6 +1721,7 @@ mod tests {
                     len: 100,
                     run_len: 88,
                     sum: 1,
+                    bounds: None,
                 },
             ],
         };
@@ -1697,6 +1762,7 @@ mod tests {
                     len: 100,
                     run_len: 88,
                     sum: 0,
+                    bounds: None,
                 },
                 RunEntry {
                     id: 2,
@@ -1706,6 +1772,7 @@ mod tests {
                     len: 100,
                     run_len: 88,
                     sum: 0,
+                    bounds: None,
                 },
             ],
         };

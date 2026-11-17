@@ -354,6 +354,46 @@ impl Levels {
         }
     }
 
+    /// Publish one bottom piece and narrow its level-0 sources, preserving
+    /// publication order and flush tags. Validate everything before changing it.
+    pub(super) fn replace_piece(
+        &mut self,
+        sources: &[(SharedRun, Option<SharedRun>)],
+        bottom: &[SharedRun],
+        outputs: &[SharedRun],
+        dest: Dest,
+    ) -> Result<(), Stale> {
+        let mut positions = Vec::with_capacity(sources.len());
+        for (old, new) in sources {
+            let (level, at) = self.find(old).ok_or(Stale)?;
+            if level != 0 {
+                return Err(Stale);
+            }
+            if let Some(new) = new {
+                let (old_range, new_range) =
+                    (old.run.key_range().unwrap(), new.run.key_range().unwrap());
+                if new_range.min < old_range.min || new_range.max > old_range.max {
+                    return Err(Stale);
+                }
+            }
+            positions.push(at);
+        }
+        self.replace(bottom, outputs, dest)?;
+        let mut replacements: Vec<_> = positions.into_iter().zip(sources).collect();
+        replacements.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
+        for (at, (old, new)) in replacements {
+            self.bytes[0] -= bytes_of(old);
+            if let Some(new) = new {
+                self.levels[0][at] = Arc::clone(new);
+                self.bytes[0] += bytes_of(new);
+            } else {
+                self.levels[0].remove(at);
+                self.flushes.remove(at);
+            }
+        }
+        Ok(())
+    }
+
     /// Relabels `run` from `level` to the next level, which must have no
     /// run overlapping it.
     pub(super) fn move_down(&mut self, level: usize, run: &SharedRun) -> Result<(), Stale> {

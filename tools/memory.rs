@@ -13,6 +13,20 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 static PHASE: AtomicU8 = AtomicU8::new(0);
 static META: OnceLock<(String, String, Instant)> = OnceLock::new();
 static OUTPUT: Mutex<()> = Mutex::new(());
+static PHASE_STARTED: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
+static TICKS: OnceLock<f64> = OnceLock::new();
+
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields: Vec<_> = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    (fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()) as f64
+        / TICKS.get().unwrap()
+}
 
 fn add(bytes: usize) {
     let now = LIVE.fetch_add(bytes, Relaxed) + bytes;
@@ -105,6 +119,21 @@ pub fn sample_stats(reason: &str, s: EngineStats) {
 }
 
 pub fn phase_end(engine: &Engine, reason: &str, next: u8) {
+    let now = Instant::now();
+    let cpu = cpu_seconds();
+    let mut started = PHASE_STARTED.lock().unwrap();
+    if let Some((wall_start, cpu_start)) = *started {
+        let wall = now.duration_since(wall_start).as_secs_f64();
+        let (name, variant, _) = META.get().unwrap();
+        let phase = ["load", "update", "drain", "reads"][usize::from(PHASE.load(Relaxed))];
+        println!(
+            "phase,{name},{variant},{phase},{wall:.6},{:.6},{:.6}",
+            cpu - cpu_start,
+            (cpu - cpu_start) / wall
+        );
+    }
+    *started = Some((now, cpu));
+    drop(started);
     sample_stats(reason, engine.stats());
     PHASE.store(next, Relaxed);
 }
@@ -120,6 +149,18 @@ impl Sampler {
                 .is_ok(),
             "memory instrumentation requires one scenario per process"
         );
+        let ticks = std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .unwrap();
+        assert!(ticks.status.success());
+        let ticks = std::str::from_utf8(&ticks.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(TICKS.set(ticks).is_ok());
+        *PHASE_STARTED.lock().unwrap() = Some((Instant::now(), cpu_seconds()));
         println!(
             "memory,scenario,variant,phase,event,seconds,rss,hwm,swap,live,peak_live,used,memtables,build_output,build_workspace,pool_reserve,pool_in_use,pool_unaccounted,run_bytes,held_bytes,snapshots,active_arena,frozen_tables,retained"
         );

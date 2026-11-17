@@ -23,16 +23,16 @@ fn restart_heads_search_equal_heads_and_short_zero_padded_keys() {
         let bytes = built.as_bytes().into_owned();
         let (recovered, _) = Run::recover(bytes.clone()).unwrap();
         let wrapped = Run::new(bytes.as_slice()).unwrap();
-        assert_eq!(built.restart_heads, recovered.restart_heads);
-        assert_eq!(built.restart_heads, wrapped.restart_heads);
+        assert_eq!(built.backing.restart_heads, recovered.backing.restart_heads);
+        assert_eq!(built.backing.restart_heads, wrapped.backing.restart_heads);
         assert_eq!(recovered.as_bytes(), bytes);
         assert_eq!(
-            built.restart_heads.len(),
+            built.backing.restart_heads.len(),
             keys.len().div_ceil(RESTART_INTERVAL)
         );
         assert_eq!(
             built.index_bytes(),
-            built.view().index_len() + built.restart_heads.len() * 8
+            built.view().index_len() + built.backing.restart_heads.len() * 8
         );
         let raw = RunView::open(&bytes).unwrap();
         for target in keys.iter().cloned().chain(keys.iter().map(|key| {
@@ -92,7 +92,7 @@ fn build(codec: Codec) -> Run<Vec<u8>> {
     builder.finish()
 }
 fn parts(run: &Run<Vec<u8>>) -> &Segmented {
-    let RunData::Segmented(parts) = &run.data else {
+    let RunData::Segmented(parts) = &run.backing.data else {
         panic!("expected segmented storage");
     };
     parts
@@ -263,5 +263,114 @@ fn every_frame_and_dictionary_stays_in_one_allocation_including_oversized_frames
         );
         let (restored, _) = Run::recover_in(bytes.clone(), &pool).unwrap();
         assert_eq!(restored.as_bytes(), bytes);
+    }
+}
+
+#[test]
+fn bounded_views_cover_empty_single_binary_and_maximum_key_edges() {
+    let max = vec![255; crate::block::MAX_KEY_LEN];
+    let keys = [
+        vec![],
+        vec![0],
+        vec![0, 0],
+        vec![0, 255],
+        vec![1],
+        vec![255],
+        max.clone(),
+    ];
+    for codec in [Codec::None, Codec::Zstd] {
+        let mut builder = RunBuilder::with_raw_block_target(codec, 32);
+        for key in &keys {
+            for seq in (1..=3).rev() {
+                builder.add(key, seq, Value::Bytes(b"v")).unwrap();
+            }
+        }
+        let run = builder.finish();
+        let mut ws = ReadWorkspace::new();
+        assert!(
+            run.bounded(Some(b"x"), Some(b"x"), &mut ws)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            run.bounded(Some(&max), Some(&max), &mut ws)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            run.bounded(Some(&[255, 255]), Some(&[255, 255, 0]), &mut ws)
+                .unwrap()
+                .is_none()
+        );
+        for (lo, hi) in [
+            (None, None),
+            (Some(&[][..]), Some(&[0][..])),
+            (Some(&[0][..]), Some(&[0, 0][..])),
+            (Some(&[0, 1][..]), Some(&[1][..])),
+            (Some(max.as_slice()), None),
+        ] {
+            let bounded = run.bounded(lo, hi, &mut ws).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&run.backing, &bounded.backing));
+            assert_eq!(run.as_bytes(), bounded.as_bytes());
+            let expected: Vec<_> = keys
+                .iter()
+                .filter(|k| {
+                    lo.is_none_or(|lo| k.as_slice() >= lo) && hi.is_none_or(|hi| k.as_slice() < hi)
+                })
+                .collect();
+            assert_eq!(bounded.key_range().unwrap().min, expected[0]);
+            assert_eq!(bounded.key_range().unwrap().max, *expected.last().unwrap());
+            {
+                let mut cursor = bounded.cursor(&mut ws);
+                for key in &expected {
+                    for seq in (1..=3).rev() {
+                        let got = cursor.next_record().unwrap().unwrap();
+                        assert_eq!(got.key, key.as_slice());
+                        assert_eq!(got.seq, seq);
+                    }
+                }
+                assert!(cursor.next_record().unwrap().is_none());
+                cursor.seek(&[]).unwrap();
+                assert_eq!(
+                    cursor.next_record().unwrap().unwrap().key,
+                    expected[0].as_slice()
+                );
+                cursor.seek_prefix(&[0]).unwrap();
+                let mut prefixed = expected
+                    .iter()
+                    .filter(|k| k.starts_with(&[0]))
+                    .flat_map(|k| std::iter::repeat_n(k.as_slice(), 3));
+                while let Some(record) = cursor.next_record().unwrap() {
+                    assert_eq!(record.key, prefixed.next().unwrap());
+                }
+                assert!(prefixed.next().is_none());
+            }
+            for key in &keys {
+                let want = expected.contains(&key);
+                assert_eq!(bounded.get(key, &mut ws).unwrap().is_some(), want);
+                assert_eq!(bounded.view().get(key, &mut ws).unwrap().is_some(), want);
+                assert_eq!(bounded.excludes(key, &mut None), !want);
+            }
+            let mut seen = 0;
+            bounded
+                .view()
+                .get_many(
+                    &keys,
+                    &(0..keys.len()).collect::<Vec<_>>(),
+                    &mut ws,
+                    |index, version| {
+                        assert_eq!(
+                            version.is_some(),
+                            expected.iter().any(|k| **k == keys[index])
+                        );
+                        seen += 1;
+                    },
+                )
+                .unwrap();
+            assert_eq!(seen, keys.len());
+        }
+        let mut invalid = run.clone();
+        assert!(invalid.restore_slice(vec![0, 1], vec![1]).is_err());
+        assert!(invalid.restore_slice(vec![1], vec![0]).is_err());
     }
 }

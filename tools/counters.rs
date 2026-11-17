@@ -90,6 +90,8 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
     );
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     let sampler = memory::Sampler::start(std::sync::Arc::clone(&engine), name, variant);
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    diagnostics::set_memory_observer(memory::sample_stats);
     let mut ingested = 0u64;
     let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
@@ -296,6 +298,13 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
 }
 
 fn main() {
+    diagnostics::set_bottom_job_observer(|job| {
+        eprintln!(
+            "bottom_job,{},{},{},{}",
+            job.pieces, job.bottom_bytes, job.output_bytes, job.peak_output_bytes
+        )
+    });
+
     let mut variant = String::from("default");
     let mut settle = false;
     let mut threads = 1;

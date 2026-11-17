@@ -89,3 +89,48 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
 pub fn erasure(engine: &Engine) -> Erasure {
     engine.core.chunks.erasure_counters()
 }
+
+static MEMORY_OBSERVER: std::sync::OnceLock<fn(&str, super::EngineStats)> =
+    std::sync::OnceLock::new();
+
+/// Install a process-wide maintenance boundary sampler for repository tools.
+pub fn set_memory_observer(observer: fn(&str, super::EngineStats)) {
+    assert!(MEMORY_OBSERVER.set(observer).is_ok());
+}
+pub(super) fn observe(reason: &str, stats: super::EngineStats) {
+    if let Some(observer) = MEMORY_OBSERVER.get() {
+        observer(reason, stats);
+    }
+}
+/// One completed bottom job, including all its separately published pieces.
+#[derive(Clone, Copy, Debug)]
+pub struct BottomJob {
+    /// Atomic range publications.
+    pub pieces: usize,
+    /// Stored bytes of bottom inputs rewritten, counted once.
+    pub bottom_bytes: usize,
+    /// Stored output of all pieces.
+    pub output_bytes: usize,
+    /// Largest piece output, including held metadata, before publication.
+    pub peak_output_bytes: usize,
+}
+static JOB_OBSERVER: std::sync::OnceLock<fn(BottomJob)> = std::sync::OnceLock::new();
+/// Install the repository tool's per-job counter sink.
+pub fn set_bottom_job_observer(observer: fn(BottomJob)) {
+    assert!(JOB_OBSERVER.set(observer).is_ok());
+}
+pub(super) fn bottom_job(
+    pieces: usize,
+    bottom_bytes: usize,
+    output_bytes: usize,
+    peak_output_bytes: usize,
+) {
+    if let Some(observer) = JOB_OBSERVER.get() {
+        observer(BottomJob {
+            pieces,
+            bottom_bytes,
+            output_bytes,
+            peak_output_bytes,
+        });
+    }
+}

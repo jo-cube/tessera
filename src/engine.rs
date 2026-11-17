@@ -45,9 +45,13 @@
 //! then level 0 at four flushes, then small neighbours. Outputs are cut at the
 //! target run length and the overlap bound. Nonoverlapping runs move without
 //! rewriting. Optional level-0 inputs fit an internal transient allowance;
-//! the first source and its overlaps always proceed. Independent output ranges
-//! build in parallel and publish together. No snapshot or size limit refuses
-//! a compaction. Only the latest version survives; tombstones survive while
+//! the first source and its overlaps always proceed. Large level-0 jobs into
+//! the bottom build and publish consecutive pieces of about one target stored
+//! run, aligned to bottom-run boundaries. Bounded views keep only unmerged
+//! level-0 ranges visible and share the original immutable storage. Each piece
+//! retires its bottom inputs; later failure preserves earlier publications.
+//! Other jobs may build output ranges in parallel and publish together.
+//! No snapshot or size limit refuses a compaction. Only the latest version survives; tombstones survive while
 //! an unselected run could hold an older value.
 //!
 //! # Memory
@@ -130,11 +134,11 @@
 //! Checkpoints use the normal flush builder, then stream immutable run chunks
 //! and persisted Bloom filters once per stable run ID. Later checkpoints reuse
 //! those files and report written/reused bytes and runs, plus deleted run files.
-//! Levels and sequence overrides are restored without compaction. Use
+//! Levels, bounded views and sequence overrides are restored without compaction. Use
 //! [`Engine::checkpoint_with_metadata`] and [`Engine::recover_with_metadata`]
 //! to store and recover opaque application metadata (up to 16 MiB).
 //! Run format 6 stores magicless Zstandard frames and prefix-compressed index
-//! keys; checkpoint manifests use version 4. Recovery validates file lengths,
+//! keys; checkpoint manifests use version 5. Recovery validates file lengths,
 //! checksums, all records, filter membership and cross-run copies before
 //! starting workers. CRC-32 detects damage but does not authenticate files.
 //!
@@ -158,6 +162,7 @@ mod flusher;
 mod ingest;
 mod levels;
 mod multi;
+mod pieces;
 mod resources;
 mod worker;
 
@@ -775,6 +780,10 @@ struct Core {
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    piece_budget: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_piece: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -1127,6 +1136,10 @@ impl Core {
             #[cfg(test)]
             after_build: Mutex::new(None),
             #[cfg(test)]
+            piece_budget: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_piece: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
@@ -1406,7 +1419,7 @@ impl Core {
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
         match self.begin_compaction(options)? {
-            Some(Begun::Job(job)) => job.build(workspace)?.publish().map(Some),
+            Some(Begun::Job(job)) => job.execute(workspace).map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
         }
@@ -1440,6 +1453,7 @@ impl Core {
         } else {
             state.levels.plan(&fit)
         };
+        let mut source_count = 0;
         let (kind, level, inputs, dest, mut cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Move { level, run } => {
@@ -1480,6 +1494,9 @@ impl Core {
                     max_overlapped: self.level_ratio - 1,
                     ..OutputCuts::default()
                 };
+                if level == 0 {
+                    source_count = sources.len();
+                }
                 let inputs = sources.into_iter().chain(dests).collect();
                 let dest = Dest::Level(level + 1);
                 (
@@ -1536,6 +1553,7 @@ impl Core {
             cuts,
             cursor,
             estimated_run_bytes,
+            source_count,
         })))
     }
 
@@ -1611,6 +1629,7 @@ impl Core {
             cuts: OutputCuts::default(),
             cursor: None,
             estimated_run_bytes,
+            source_count: 0,
         })
     }
 
@@ -1970,15 +1989,15 @@ impl CompactionPolicy {
     }
 }
 
-/// Why a compaction changed nothing.
+/// Why a compaction stopped. Earlier pieces of a bottom job remain published.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionError {
     /// An input run is damaged, or two runs disagree about one update. The
-    /// runs are unchanged; this is corruption, not a limit, and retrying
-    /// meets it again.
+    /// current piece is unchanged; earlier pieces stay published. Retrying
+    /// damaged inputs meets the same corruption.
     Read(ReadError),
     /// The selected runs do not occupy their expected positions at
-    /// publication. Nothing was published; compactions are serialized,
+    /// publication. This piece was not published; compactions are serialized,
     /// so this is a defect, reported rather than published.
     Stale,
 }
@@ -2048,11 +2067,11 @@ pub struct CompactionReport {
 
 /// A compaction whose inputs are chosen and whose output is not built yet.
 ///
-/// It holds its inputs and the other runs that overlap them, which stay
-/// allocated until it is dropped even if no longer published. Holding it
-/// blocks other compactions, including the background worker's, but not
-/// reads, writes or flushes. Dropping it abandons the compaction and changes
-/// nothing.
+/// It owns the current inputs and overlapping unselected runs. A piecewise
+/// job releases each completed range's inputs before building the next.
+/// Holding it blocks other compactions, including the background worker's,
+/// but not reads, writes or flushes. Abandoning a build changes no directory;
+/// pieces published earlier remain visible.
 struct CompactionJob<'e> {
     engine: &'e Core,
     _serial: MutexGuard<'e, ()>,
@@ -2072,6 +2091,8 @@ struct CompactionJob<'e> {
     cursor: Option<Cursor>,
     /// Stored size of a full target-length run, using the planner estimate.
     estimated_run_bytes: usize,
+    /// Number of leading level-0 sources, for bottom-range publication.
+    source_count: usize,
 }
 
 /// How a published job moves its source level's cursor.
@@ -2124,6 +2145,15 @@ impl<'e> CompactionJob<'e> {
     /// published later come from flushes and hold only newer updates. On an
     /// error nothing is built and the engine is unchanged.
     fn build(self, workspace: &mut MergeWorkspace) -> Result<BuiltCompaction<'e>, CompactionError> {
+        let threads = self.engine.background_threads;
+        self.build_with_threads(workspace, threads)
+    }
+
+    fn build_with_threads(
+        self,
+        workspace: &mut MergeWorkspace,
+        threads: usize,
+    ) -> Result<BuiltCompaction<'e>, CompactionError> {
         let estimate = self.inputs.iter().fold(0usize, |sum, run| {
             sum.saturating_add(run.run.build_estimate())
         });
@@ -2158,7 +2188,7 @@ impl<'e> CompactionJob<'e> {
             keep_tombstone,
             limits,
             &self.cuts,
-            self.engine.background_threads,
+            threads,
             self.estimated_run_bytes,
             (workspace, &self.engine.chunks, &floors),
         )?;
@@ -2235,12 +2265,28 @@ impl BuiltCompaction<'_> {
             stats: output.stats,
             workspace_bytes: output.workspace_bytes,
         };
+        #[cfg(feature = "diagnostics")]
+        diagnostics::observe("job_before_publish", job.engine.stats());
         let is_input = |run: &SharedRun| job.inputs.iter().any(|input| Arc::ptr_eq(input, run));
         let mut state = job.engine.write_state();
         if state.runs.iter().filter(|run| is_input(run)).count() != job.inputs.len() {
             drop(state);
             unreachable!("compactions are serialized, so only this one removes runs");
         }
+        #[cfg(feature = "diagnostics")]
+        let bottom_bytes = if job.zero_seq {
+            state
+                .levels
+                .runs()
+                .last()
+                .unwrap()
+                .iter()
+                .filter(|r| is_input(r))
+                .map(|r| r.run.stored_len())
+                .sum()
+        } else {
+            0
+        };
         let stored = state.run_bytes - report.input_bytes + report.output_bytes;
         let filters = state.held_bytes - report.input_held_bytes + report.output_held_bytes;
         let outputs: Vec<SharedRun> = published(output.runs).collect();
@@ -2272,16 +2318,21 @@ impl BuiltCompaction<'_> {
         state.held_bytes = filters;
         for input in &job.inputs {
             let (bytes, filter) = (input.run.stored_len(), input.run.held_bytes());
-            state.retire(
-                Arc::downgrade(input) as Weak<dyn Send + Sync>,
-                bytes,
-                Some(filter),
-            );
+            state.retire(input.run.retirement(), bytes, Some(filter));
         }
         drop(charge);
         drop(state);
         job.engine.resources.changed();
         job.engine.flush_signal.request();
+        #[cfg(feature = "diagnostics")]
+        if job.zero_seq {
+            diagnostics::bottom_job(
+                1,
+                bottom_bytes,
+                report.output_bytes,
+                report.output_bytes + report.output_held_bytes,
+            );
+        }
         drop(job);
         Ok(report)
     }
