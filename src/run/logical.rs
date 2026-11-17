@@ -40,6 +40,8 @@ pub struct LogicalWorkspace {
     merge: MergeWorkspace,
     lookup: LookupWorkspace,
     key: Vec<u8>,
+    #[cfg(feature = "diagnostics")]
+    filter_probes: u64,
 }
 
 /// The latest live value of a key.
@@ -136,6 +138,11 @@ impl LogicalWorkspace {
     /// Returns how many blocks reads through this workspace have loaded.
     pub fn blocks_loaded(&self) -> u64 {
         self.merge.blocks_loaded() + self.lookup.blocks_loaded()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn filter_probes(&self) -> u64 {
+        self.filter_probes
     }
 
     /// Raw bytes in blocks loaded through this workspace.
@@ -239,6 +246,10 @@ where
         if newest.is_some_and(|(_, seq, _)| run.max_seq() < seq) {
             continue;
         }
+        #[cfg(feature = "diagnostics")]
+        if run.probes_filter(key) {
+            workspace.filter_probes += 1;
+        }
         if run.excludes(key, &mut hash) {
             continue;
         }
@@ -312,6 +323,11 @@ pub(crate) trait LookupInput<'a>: Copy {
     fn excludes(self, key: &[u8], hash: &mut Option<u64>) -> bool;
 
     fn view(self) -> RunView<'a>;
+
+    #[cfg(feature = "diagnostics")]
+    fn probes_filter(self, _key: &[u8]) -> bool {
+        false
+    }
 }
 
 /// A bare view has no filter and no sequence bound, so it is always read; a
@@ -338,6 +354,14 @@ impl<'a, B: AsRef<[u8]>> LookupInput<'a> for &'a Run<B> {
 
     fn excludes(self, key: &[u8], hash: &mut Option<u64>) -> bool {
         Run::excludes(self, key, hash)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn probes_filter(self, key: &[u8]) -> bool {
+        self.filter().is_some()
+            && self
+                .key_range()
+                .is_some_and(|range| range.min <= key && key <= range.max)
     }
 
     fn view(self) -> RunView<'a> {

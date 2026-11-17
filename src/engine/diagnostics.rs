@@ -85,6 +85,58 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
         .collect()
 }
 
+/// Drained run shape for the streaming comparison harness.
+#[derive(Clone, Debug, Default)]
+pub struct StreamingShape {
+    /// Published run counts, level 0 first and bottom level last.
+    pub runs_per_level: Vec<usize>,
+    /// Maximum number of runs whose key ranges overlap.
+    pub max_overlap: usize,
+    /// Number of level-0 runs.
+    pub level0_runs: usize,
+    /// Number of physical bottom runs.
+    pub bottom_runs: usize,
+    /// Mean serialized bytes per physical bottom run.
+    pub bottom_mean_stored_bytes: usize,
+    /// Published bounded views (aliases of a physical run).
+    pub bounded_views: usize,
+    /// Serialized bytes of all published physical runs.
+    pub stored_bytes: usize,
+}
+
+/// Summarizes the currently published shape after the caller drains the engine.
+pub fn streaming_shape(engine: &Engine) -> StreamingShape {
+    let state = engine.core.read_state();
+    let levels = state.levels.runs();
+    let bottom = levels.last().map_or(&[][..], Vec::as_slice);
+    // Aliases retain their physical file ID; this also works on Part 1,
+    // where only one current view per physical run can remain.
+    let mut seen = std::collections::HashSet::new();
+    let stored_bytes: usize = state
+        .runs
+        .iter()
+        .filter(|run| seen.insert(run.id))
+        .map(|run| run.run.stored_len())
+        .sum();
+    seen.clear();
+    let physical_bottom: Vec<_> = bottom.iter().filter(|run| seen.insert(run.id)).collect();
+    let bottom_runs = physical_bottom.len();
+    let bottom_bytes: usize = physical_bottom.iter().map(|run| run.run.stored_len()).sum();
+    StreamingShape {
+        runs_per_level: levels.iter().map(Vec::len).collect(),
+        max_overlap: state.directory.group_count(),
+        level0_runs: levels.first().map_or(0, Vec::len),
+        bottom_runs,
+        bottom_mean_stored_bytes: bottom_bytes.checked_div(bottom_runs).unwrap_or(0),
+        bounded_views: levels
+            .iter()
+            .flatten()
+            .filter(|run| run.run.slice().is_some())
+            .count(),
+        stored_bytes,
+    }
+}
+
 /// What sequence erasure did to the records written into the bottom level.
 pub fn erasure(engine: &Engine) -> Erasure {
     engine.core.chunks.erasure_counters()
@@ -166,5 +218,39 @@ pub fn maintenance(engine: &Engine) -> Maintenance {
         peak_active_pieces: p.peak_active.load(Relaxed),
         piece_retries: p.piece_retries.load(Relaxed),
         writer_wait_ns: p.writer_wait_ns.load(Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::engine::{EngineOptions, EngineWorkspace};
+
+    #[test]
+    fn point_filter_probes_exclude_range_and_sequence_pruning() {
+        let engine = Engine::new(EngineOptions {
+            background_compaction: None,
+            ..EngineOptions::default()
+        })
+        .unwrap();
+        for value in [b"old", b"new"] {
+            engine.put(b"a", value).unwrap();
+            engine.put(b"z", value).unwrap();
+            engine.flush().unwrap();
+        }
+        let mut ws = EngineWorkspace::new();
+        assert!(engine.get(b"b", &mut ws).unwrap().is_none());
+        assert_eq!(ws.filter_probes(), 2);
+        assert_eq!(engine.get(b"a", &mut ws).unwrap().unwrap().value, b"new");
+        assert_eq!(ws.filter_probes(), 3);
+        assert!(engine.get(b"0", &mut ws).unwrap().is_none());
+        assert_eq!(ws.filter_probes(), 3);
+        let shape = streaming_shape(&engine);
+        assert_eq!(
+            shape.runs_per_level.iter().sum::<usize>(),
+            engine.stats().runs
+        );
+        assert_eq!(shape.stored_bytes, engine.stats().run_bytes);
+        assert_eq!(shape.bounded_views, 0);
     }
 }

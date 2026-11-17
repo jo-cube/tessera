@@ -59,6 +59,9 @@ impl Reader {
     pub fn new() -> Self {
         Self { ws: EngineWorkspace::new(), r: unsafe { tb_reader() }, keys: Vec::new() }
     }
+    pub fn read_counters(&self) -> (u64, u64, u64) {
+        (self.ws.decoded_bytes(), self.ws.blocks_loaded(), self.ws.filter_probes())
+    }
 }
 impl Drop for Reader {
     fn drop(&mut self) {
@@ -188,6 +191,18 @@ impl Store {
                 assert!(s.failures == 0 && s.panic.is_none(), "compaction failed: {s:?}");
             }
             Self::R(p) => unsafe { tb_drain(*p) },
+        }
+    }
+    pub fn emit_shape(&self, phase: &str, out: &super::Out) {
+        if let Self::T(engine) = self {
+            let shape = tessera::engine::diagnostics::streaming_shape(engine);
+            out.emit(phase, "runs_per_level", shape.runs_per_level.iter().map(usize::to_string).collect::<Vec<_>>().join(";"));
+            out.emit(phase, "max_overlap", shape.max_overlap);
+            out.emit(phase, "level0_runs", shape.level0_runs);
+            out.emit(phase, "bottom_runs", shape.bottom_runs);
+            out.emit(phase, "bottom_mean_stored_bytes", shape.bottom_mean_stored_bytes);
+            out.emit(phase, "bounded_views", shape.bounded_views);
+            out.emit(phase, "stored_bytes", shape.stored_bytes);
         }
     }
     /// Stored runs plus held filters/segment metadata, after a drain.

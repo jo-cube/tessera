@@ -307,6 +307,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         }
         amplification(&out, phase, before, store.counters());
         memory.report(&store, &out, phase, live);
+        store.emit_shape(phase, &out);
         let mut rng = Rng(0x67617465 ^ ds as u64);
         let mut reader = Reader::new();
         let mut bad = 0;
@@ -330,6 +331,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
 }
 
 fn point_reads(store: &Store, data: &StreamData, out: &Out) {
+    store.emit_shape("pre_get", out);
     let mut rng = Rng(0x7265616473 ^ data.name as u64);
     // A bounded 200k query sample is independent of dataset size. Regenerate
     // expectations before timing, and check full values in the gates above.
@@ -348,21 +350,28 @@ fn point_reads(store: &Store, data: &StreamData, out: &Out) {
         .collect();
     for threads in [1, 4] {
         let span = Span::new();
-        let bad: usize = thread::scope(|scope| {
+        let (bad, decoded, blocks, filters): (usize, u64, u64, u64) = thread::scope(|scope| {
             let handles: Vec<_> = queries
                 .chunks(queries.len() / threads)
                 .map(|chunk| {
                     scope.spawn(move || {
                         let mut reader = Reader::new();
-                        chunk.iter().filter(|(key, expected)| store.get(key, &mut reader, |v| v.map(<[u8]>::len)) != *expected).count()
+                        let bad = chunk.iter().filter(|(key, expected)| store.get(key, &mut reader, |v| v.map(<[u8]>::len)) != *expected).count();
+                        let (decoded, blocks, filters) = reader.read_counters();
+                        (bad, decoded, blocks, filters)
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).sum()
+            handles.into_iter().map(|h| h.join().unwrap()).fold((0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
         });
         let case = format!("get_{threads}t");
         span.finish(out, &case, queries.len(), 0);
         out.emit(&case, "errors", bad);
+        if matches!(store, Store::T(_)) {
+        out.emit(&case, "decoded_bytes_per_get", format!("{:.2}", decoded as f64 / queries.len() as f64));
+        out.emit(&case, "blocks_per_get", format!("{:.6}", blocks as f64 / queries.len() as f64));
+        out.emit(&case, "filter_probes_per_get", format!("{:.6}", filters as f64 / queries.len() as f64));
+        }
         assert_eq!(bad, 0, "streaming timed reads");
     }
 }

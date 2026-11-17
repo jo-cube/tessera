@@ -2485,6 +2485,13 @@ impl EngineWorkspace {
         self.logical.blocks_loaded() + self.multi.blocks_loaded()
     }
 
+    /// Bloom-filter probes by point reads through this workspace, including
+    /// probes that rule a run out. Scans and multi-get are excluded.
+    #[cfg(feature = "diagnostics")]
+    pub fn filter_probes(&self) -> u64 {
+        self.logical.filter_probes()
+    }
+
     /// Raw bytes in run blocks loaded through this workspace, including misses.
     pub fn decoded_bytes(&self) -> u64 {
         self.logical.decoded_bytes() + self.multi.decoded_bytes()
