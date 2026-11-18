@@ -65,6 +65,9 @@ struct RunBacking<B> {
     /// an empty run, found once so that a lookup can rule the run out
     /// without opening it.
     bounds: Option<KeyBounds>,
+    /// The decoded length of the largest block, recorded when the run was
+    /// built or validated.
+    largest_block: usize,
 }
 
 /// The smallest and largest sequence numbers of a run's records.
@@ -115,7 +118,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
     #[cfg(test)]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        let (seqs, reclaimable, build_estimate) = validate(data.as_ref(), None)?;
+        let (seqs, reclaimable, build_estimate, largest_block) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
@@ -125,6 +128,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 restart_heads,
                 filter: None,
                 bounds,
+                largest_block,
             }),
             slice: None,
             seqs,
@@ -139,7 +143,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         filter: Option<KeyFilter>,
         seqs: Seqs,
         reclaimable: bool,
-        build_estimate: usize,
+        (build_estimate, largest_block): (usize, usize),
     ) -> Self {
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
@@ -149,6 +153,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 restart_heads,
                 filter: filter.map(Box::new),
                 bounds,
+                largest_block,
             }),
             slice: None,
             seqs,
@@ -168,6 +173,12 @@ impl<B: AsRef<[u8]>> Run<B> {
 
     pub(crate) fn build_estimate(&self) -> usize {
         self.build_estimate
+    }
+
+    /// Returns the decoded length of the largest block, which is the most a
+    /// reader of this run must hold for one block. Reads nothing.
+    pub(crate) fn largest_block(&self) -> usize {
+        self.backing.largest_block
     }
 
     pub(crate) fn reclaimable(&self) -> bool {
@@ -246,6 +257,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 restart_heads: self.backing.restart_heads.clone(),
                 filter: self.backing.filter.clone(),
                 bounds: self.backing.bounds.clone(),
+                largest_block: self.backing.largest_block,
             }),
             slice: self.slice.clone(),
             seqs: self.seqs,
@@ -343,6 +355,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         RunView {
             seq_override: self.seq_override,
             restart_heads: Some(&self.backing.restart_heads),
+            largest_block: Some(self.backing.largest_block),
             slice: self.slice.as_ref().map(|r| KeyRange {
                 min: &r.0,
                 max: &r.1,
@@ -523,7 +536,7 @@ impl Run<Vec<u8>> {
 
     #[cfg(test)]
     pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
-        let (seqs, reclaimable, build_estimate) = validate(&data, None)?;
+        let (seqs, reclaimable, build_estimate, largest_block) = validate(&data, None)?;
         let mut hashes = KeyHashes::new();
         {
             let mut workspace = ReadWorkspace::new();
@@ -539,7 +552,7 @@ impl Run<Vec<u8>> {
             hashes.finish(),
             seqs,
             reclaimable,
-            build_estimate,
+            (build_estimate, largest_block),
         )
     }
 
@@ -556,8 +569,15 @@ impl Run<Vec<u8>> {
                     .ok_or(corrupt(data.len(), RunCorruption::InvalidFilter))?,
             )
         };
-        let (seqs, reclaimable, build_estimate) = validate(&data, filter.as_ref())?;
-        Self::pack_recovered(data, pool, filter, seqs, reclaimable, build_estimate)
+        let (seqs, reclaimable, build_estimate, largest_block) = validate(&data, filter.as_ref())?;
+        Self::pack_recovered(
+            data,
+            pool,
+            filter,
+            seqs,
+            reclaimable,
+            (build_estimate, largest_block),
+        )
     }
 
     fn pack_recovered(
@@ -566,7 +586,7 @@ impl Run<Vec<u8>> {
         filter: Option<KeyFilter>,
         seqs: Seqs,
         reclaimable: bool,
-        build_estimate: usize,
+        sizes: (usize, usize),
     ) -> Result<(Self, u64), CorruptRun> {
         let view = RunView::open(&data)?;
         let mut packing = Packing::new(pool);
@@ -583,13 +603,7 @@ impl Run<Vec<u8>> {
         }
         let tail_start = view.frames.len() + view.dictionaries.len();
         let parts = packing.finish(data[tail_start..].into());
-        let run = Self::from_builder(
-            RunData::Segmented(parts),
-            filter,
-            seqs,
-            reclaimable,
-            build_estimate,
-        );
+        let run = Self::from_builder(RunData::Segmented(parts), filter, seqs, reclaimable, sizes);
         Ok((run, seqs.max))
     }
 }
@@ -1137,6 +1151,8 @@ pub struct RunView<'a> {
     // Raw borrowed views used during validation allocate nothing. Owned runs
     // attach their once-built heads to every view used for reads.
     restart_heads: Option<&'a [u64]>,
+    // Owned runs attach the largest block length found when they were built.
+    largest_block: Option<usize>,
     slice: Option<KeyRange<'a>>,
 }
 
@@ -1216,6 +1232,7 @@ impl<'a> RunView<'a> {
             record_count,
             seq_override: None,
             restart_heads: None,
+            largest_block: None,
             slice: None,
         };
         match (view.table.first(), view.table.last()) {
@@ -1240,7 +1257,26 @@ impl<'a> RunView<'a> {
         Ok(view)
     }
 
+    /// The raw dictionary of segment `reference`, its location and length
+    /// checked but not its CRC: dictionaries of built and validated runs are
+    /// trusted like their structure.
     fn dictionary(self, reference: u32) -> Result<&'a [u8], CorruptRun> {
+        Ok(self.dictionary_entry(reference)?.0)
+    }
+
+    /// [`dictionary`](Self::dictionary), with its CRC verified, for validation.
+    fn checked_dictionary(self, reference: u32) -> Result<&'a [u8], CorruptRun> {
+        let (bytes, start, crc) = self.dictionary_entry(reference)?;
+        if crc32fast::hash(bytes) != crc {
+            return Err(corrupt(
+                self.frames.len() + start,
+                RunCorruption::ChecksumMismatch,
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn dictionary_entry(self, reference: u32) -> Result<(&'a [u8], usize, u32), CorruptRun> {
         let invalid = corrupt(self.frames.len(), RunCorruption::InvalidDictionary);
         let entry = reference
             .checked_sub(1)
@@ -1261,13 +1297,7 @@ impl<'a> RunView<'a> {
         if bytes.starts_with(&[0x37, 0xa4, 0x30, 0xec]) {
             return Err(invalid);
         }
-        if crc32fast::hash(bytes) != read_u32(entry, 12) {
-            return Err(corrupt(
-                self.frames.len() + start,
-                RunCorruption::ChecksumMismatch,
-            ));
-        }
-        Ok(bytes)
+        Ok((bytes, start, read_u32(entry, 12)))
     }
 
     /// Returns the number of stored records, as declared by the footer.
@@ -1294,9 +1324,13 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns the decoded length of the largest block, which is the most a
-    /// reader of this run must hold for one block. Checks frame metadata and
-    /// referenced dictionaries without decoding.
+    /// reader of this run must hold for one block. A view of a [`Run`] reads
+    /// the length recorded when the run was built or validated; a view of
+    /// borrowed bytes checks every frame header without decoding.
     pub fn largest_block_len(self) -> Result<usize, CorruptRun> {
+        if let Some(largest) = self.largest_block {
+            return Ok(largest);
+        }
         (0..self.table.len()).try_fold(0, |largest, block| {
             Ok(largest.max(self.frame(block)?.decoded_len))
         })
@@ -1591,7 +1625,10 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 /// index checks.
 ///
 /// Checks all raw dictionaries before decoding any frame. No prepared state.
-fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(Seqs, bool, usize), CorruptRun> {
+fn validate(
+    bytes: &[u8],
+    filter: Option<&KeyFilter>,
+) -> Result<(Seqs, bool, usize, usize), CorruptRun> {
     let view = RunView::open(bytes)?;
     let footer_at = bytes.len() - FOOTER_LEN;
     let expected = u32::from_le_bytes(bytes[footer_at + 36..footer_at + 40].try_into().unwrap());
@@ -1606,15 +1643,17 @@ fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(Seqs, bool, usi
         if read_u64(entry, 0) != next as u64 {
             return Err(corrupt(next, RunCorruption::InvalidDictionary));
         }
-        next += view.dictionary((i + 1) as u32)?.len();
+        next += view.checked_dictionary((i + 1) as u32)?.len();
     }
     if next != view.frames.len() + view.dictionaries.len() {
         return Err(corrupt(next, RunCorruption::InvalidDictionary));
     }
     let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
+    let mut largest_block = 0;
     for block in 0..view.table.len() {
         let frame = view.frame(block)?;
+        largest_block = largest_block.max(frame.decoded_len);
         // Decoding verifies compressed frames.
         if frame.codec == Codec::None {
             frame.verify_checksum()?;
@@ -1665,7 +1704,7 @@ fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(Seqs, bool, usi
         min: walk.min_seq,
         max: walk.max_seq,
     };
-    Ok((seqs, walk.reclaimable, walk.build_estimate))
+    Ok((seqs, walk.reclaimable, walk.build_estimate, largest_block))
 }
 
 #[cfg(test)]

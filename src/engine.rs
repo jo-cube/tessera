@@ -234,9 +234,7 @@ fn physical_runs(runs: &[SharedRun]) -> impl Iterator<Item = &SharedRun> {
 /// Wraps the runs of one flush or compaction, in key order, for publication.
 fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
     runs.into_iter().map(|run| {
-        // A run that cannot report its blocks is damaged, which the merge
-        // that reads it reports; until then it is sized as one empty block.
-        let largest_block = run.view().largest_block_len().unwrap_or(0);
+        let largest_block = run.largest_block();
         Arc::new(Published {
             id: checkpoint::new_run_id(),
             checkpoint_crc: std::sync::OnceLock::new(),

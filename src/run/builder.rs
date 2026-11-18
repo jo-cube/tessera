@@ -45,6 +45,7 @@ pub struct RunBuilder {
     record_count: usize,
     reclaimable: bool,
     build_estimate: usize,
+    largest_block: usize,
     min_seq: u64,
     max_seq: u64,
     key_hashes: KeyHashes,
@@ -83,6 +84,7 @@ impl RunBuilder {
             record_count: 0,
             reclaimable: false,
             build_estimate: 0,
+            largest_block: 0,
             min_seq: 0,
             max_seq: 0,
             key_hashes: KeyHashes::new(),
@@ -282,7 +284,7 @@ impl RunBuilder {
                 max: self.max_seq,
             },
             self.reclaimable,
-            self.build_estimate,
+            (self.build_estimate, self.largest_block),
         ))
     }
     fn cut_segment(&mut self) {
@@ -414,6 +416,7 @@ impl RunBuilder {
         {
             return;
         }
+        self.largest_block = self.largest_block.max(len);
         self.storage
             .compressed(len, self.frames.len(), codec == Codec::Zstd);
         self.storage.frame(&self.frames);

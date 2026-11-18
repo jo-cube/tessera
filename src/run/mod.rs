@@ -26,6 +26,12 @@
 //!   would turn a lookup into a read of the whole block, so recovery
 //!   verifies it. A checksum shows bytes are unchanged. It cannot show that
 //!   whoever wrote them produced a valid run.
+//!   Segment dictionaries also carry a CRC-32, which only structural
+//!   validation verifies, once per dictionary. Reads trust the dictionaries
+//!   of built and validated runs like their structure, so damage to a
+//!   dictionary in memory after validation is not guaranteed to be reported:
+//!   it surfaces as a decode failure or a decoded-length mismatch where
+//!   Zstandard detects it, and otherwise as wrong records.
 //! - **Checked decoding** is what [`RunView`] reads do on every path: they are
 //!   panic free and report whatever malformed structure they touch, through
 //!   [`CorruptRun`], whether or not the run was validated. Memory corruption
@@ -60,7 +66,8 @@
 //! precedes the block index; dictionary regions tile the bytes between the
 //! frames and that table. Dictionaries contain at most 16 KiB of raw content.
 //! The frame CRC covers its first eight header bytes and stored payload.
-//! Dictionary CRCs are checked before decoding. No prepared dictionaries are held.
+//! Validation checks every dictionary CRC before decoding any frame. No prepared
+//! dictionaries are held.
 //!
 //! The key area starts with the minimum key, then prefix-compressed last keys.
 //! Every sixteenth key and the final key have zero shared prefix. Shared lengths

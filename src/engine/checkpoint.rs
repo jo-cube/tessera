@@ -1439,10 +1439,7 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         {
             return Err(corrupt(&file, Damage::Order));
         }
-        let largest_block = run
-            .view()
-            .largest_block_len()
-            .map_err(|error| corrupt(&file, Damage::Run(error)))?;
+        let largest_block = run.largest_block();
         runs.push((
             entry.level,
             entry.flush,

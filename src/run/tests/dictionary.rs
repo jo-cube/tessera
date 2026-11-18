@@ -1,6 +1,6 @@
 //! Segment dictionaries, adaptive cuts and checked direct-load decoding.
 use crate::block::Value;
-use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption};
+use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption, RunView};
 
 fn u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
@@ -111,10 +111,21 @@ fn an_oversized_record_has_its_own_block() {
         run.get(b"b", &mut w).unwrap().unwrap().value,
         Value::Bytes(&large)
     );
-    Run::new(run.as_bytes()).unwrap();
+    // Built and validated runs record the same largest block, which a view
+    // of the borrowed bytes recomputes from the frame headers.
+    let bytes = run.as_bytes();
+    assert_eq!(run.largest_block(), f.decoded_len);
+    assert_eq!(Run::new(&bytes).unwrap().largest_block(), f.decoded_len);
+    assert_eq!(
+        RunView::open(&bytes).unwrap().largest_block_len(),
+        Ok(f.decoded_len)
+    );
 }
+/// Validation checks each dictionary CRC once. Reads trust the dictionaries
+/// of built runs: damage after validation is a decode failure where
+/// Zstandard detects it, and never a panic.
 #[test]
-fn corrupt_dictionary_regions_are_rejected_before_decode() {
+fn corrupt_dictionary_regions_are_rejected_by_validation() {
     let run = build(Codec::Zstd, 1024, 4_200, 1024);
     let (start, table, count) = segments(&run.as_bytes());
     assert_eq!(count, 2);
@@ -127,12 +138,11 @@ fn corrupt_dictionary_regions_are_rejected_before_decode() {
         );
         let damaged = run.damaged_at(at);
         let mut w = ReadWorkspace::new();
-        let key = if at == start { 0u32 } else { 4199u32 };
-        assert_eq!(
-            damaged.get(&key.to_be_bytes(), &mut w).unwrap_err().kind,
-            RunCorruption::ChecksumMismatch
-        );
-        assert_eq!(w.capacity(), 0);
+        for key in 0..4_200u32 {
+            if let Err(error) = damaged.get(&key.to_be_bytes(), &mut w) {
+                assert_eq!(error.kind, RunCorruption::CorruptPayload);
+            }
+        }
     }
     for (at, value) in [(table + 8, 0), (table + 8, (16 << 10) + 1), (table, 0)] {
         let mut bytes = run.as_bytes().to_vec();
