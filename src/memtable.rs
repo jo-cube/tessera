@@ -67,11 +67,12 @@ mod tests;
 
 /// Bytes charged per entry beyond its key and value.
 ///
-/// This covers, on 64-bit targets, the entry's slot in a leaf at the half
-/// occupancy every leaf off the tree's right edge keeps (about 66 bytes), the
-/// arena metadata and its share of branch nodes, with room to spare. Allocator rounding is not included, so
-/// this is an estimate.
-pub const ENTRY_OVERHEAD: usize = 128;
+/// This is an upper bound on the worst case, on 64-bit targets: the entry's
+/// slot in a leaf at the half occupancy every leaf off the tree's right edge
+/// keeps (about 66 bytes), plus its share of branch nodes. A table filled with
+/// random keys measures about 55 bytes per entry. Allocator rounding is not
+/// included, so this is an estimate.
+pub const ENTRY_OVERHEAD: usize = 80;
 
 /// Input per output run suggested for [`FrozenMemtable::flush_with`].
 pub const TARGET_RUN_LEN: usize = 64 << 20;

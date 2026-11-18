@@ -67,7 +67,7 @@ Run the same code with `cargo run --example basic`. API contracts are in the
 
 Keys and values are byte strings. Keys compare bytewise; empty keys and values
 are valid. Keys are limited to 64 KiB and values to 64 MiB. A record's key,
-value and 128-byte entry charge must also fit the memtable budget.
+value and 80-byte entry charge must also fit the memtable budget.
 
 - `put`, `delete` and `write` publish atomically and return a sequence ceiling.
   Memtable batches take consecutive sequences; later duplicate keys win.
@@ -105,7 +105,7 @@ A later piece failure leaves earlier publications intact and stops the job.
 | `compression` | `Compression::Zstd` | Compression costs CPU; `Uncompressed` reads blocks in place |
 | `target_block_compressed` | 1024 bytes | Larger blocks reduce metadata and increase point-read decoding |
 
-The memtable budget must be between 128 and `usize::MAX / 2` bytes, the level
+The memtable budget must be between 80 and `usize::MAX / 2` bytes, the level
 ratio at least 2, the builder count at least 1, and the compressed block target
 between 1 byte and 64 KiB. Zstandard level 1 uses raw dictionaries up to 16 KiB
 per roughly 4 MiB segment. Ordinary raw blocks are capped at 64 KiB; a larger
