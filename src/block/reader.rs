@@ -172,13 +172,6 @@ impl BlockPosition {
         self.offset
     }
 
-    /// Moves before the record at restart `restart` of `block`, which holds
-    /// no shared prefix. `restart` must be below the block's restart count.
-    pub(crate) fn seek_restart(&mut self, block: BlockView<'_>, restart: usize) {
-        self.key.clear();
-        self.offset = restart_offset(block.restarts[restart]);
-    }
-
     /// Moves before the first record of `block` whose user key is at or above
     /// `target`, or to the end of the block if there is none.
     ///

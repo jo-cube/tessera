@@ -2,7 +2,7 @@
 //! fields supplied by the run header; size checks bound decode allocations.
 //! Contexts are reused, and raw dictionaries are borrowed for each decode.
 
-use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat};
+use zstd_safe::{CCtx, CDict, CParameter, DCtx, DParameter, FrameFormat};
 
 /// Block compression used by a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -16,8 +16,7 @@ pub enum Codec {
 
 pub(super) const ZSTD_LEVEL: i32 = 1;
 
-/// Conservative allowance for a segment's prepared tables and their
-/// dictionary copy, held by the compression context.
+/// Conservative allowance for prepared tables and their dictionary copy.
 pub(super) const CDICT_ALLOWANCE: usize = 2 << 20;
 
 impl Codec {
@@ -67,6 +66,9 @@ impl Compressor {
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, CCtx::sizeof)
     }
+    pub(super) fn prepare_dictionary(&self, dictionary: &[u8]) -> Option<CDict<'static>> {
+        self.zstd.as_ref().map(|_| CDict::create(dictionary, 3))
+    }
     /// Cache a dictionary whose tables are sized for the estimated raw block.
     /// load_dictionary lazily constructs one CDict from these parameters on
     /// the first compress2 call; subsequent frames reuse it and the CCtx.
@@ -81,23 +83,12 @@ impl Compressor {
         }
     }
 
-    /// Compressed length of `sample` at level 1 without a dictionary, for a
-    /// ratio estimate before a segment's dictionary exists. The next
-    /// [`begin_segment`](Self::begin_segment) replaces these settings.
-    pub(super) fn probe(&mut self, sample: &[u8], out: &mut Vec<u8>) -> usize {
-        if let Some(ctx) = &mut self.zstd {
-            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
-                .expect("supported level");
-            ctx.set_parameter(CParameter::SrcSizeHint(sample.len() as u32))
-                .expect("bounded sample size hint");
-            ctx.load_dictionary(&[]).expect("no dictionary");
-        }
-        out.clear();
-        self.compress(sample, out);
-        out.len()
-    }
-
-    pub(super) fn compress(&mut self, block: &[u8], out: &mut Vec<u8>) {
+    pub(super) fn compress(
+        &mut self,
+        block: &[u8],
+        dictionary: Option<&CDict<'_>>,
+        out: &mut Vec<u8>,
+    ) {
         let start = out.len();
         let bound = if self.codec == Codec::None {
             block.len()
@@ -107,9 +98,12 @@ impl Compressor {
         out.resize(start + bound, 0);
         let output = &mut out[start..];
         let written = match &mut self.zstd {
-            Some(ctx) => ctx
-                .compress2(output, block)
-                .expect("codec worst-case output bound"),
+            Some(ctx) => match dictionary {
+                // Keep the level-3 ratio probe and therefore block cuts stable.
+                Some(dictionary) => ctx.compress_using_cdict(output, block, dictionary),
+                None => ctx.compress2(output, block),
+            }
+            .expect("codec worst-case output bound"),
             None => {
                 output.copy_from_slice(block);
                 block.len()
@@ -200,7 +194,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segment_contexts_fit_the_build_allowance_and_round_trip() {
+    fn prepared_dictionaries_fit_the_build_allowance_and_round_trip() {
         let dictionary: Vec<_> = (0..super::super::dictionary::DICTIONARY_LEN)
             .map(|i| (i.wrapping_mul(37) ^ (i >> 8)) as u8)
             .collect();
@@ -209,30 +203,37 @@ mod tests {
         let mut decompressor = Decompressor::default();
         for len in [0, 1, 256, dictionary.len()] {
             let raw = &dictionary[..len];
+            let prepared = compressor.prepare_dictionary(raw).unwrap();
+            assert!(
+                prepared.sizeof() <= CDICT_ALLOWANCE,
+                "{} at {len}",
+                prepared.sizeof()
+            );
+            // Reuse exactly the same prepared dictionary for multiple blocks.
             for input in [&block[..1024], block.as_slice()] {
-                // A probe before the segment leaves no dictionary behind.
+                let mut stored = Vec::new();
+                // Ratio probes intentionally retain their standard level-3
+                // envelope, preserving the estimated block cuts.
                 let mut probe = Vec::new();
-                assert!(compressor.probe(input, &mut probe) > 0);
+                compressor.compress(input, Some(&prepared), &mut probe);
+                assert_eq!(&probe[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+                compressor.begin_segment(raw, input.len());
+                compressor.compress(input, None, &mut stored);
+                assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
+                assert_eq!(stored[0], 0, "no size, checksum or dictionary-ID fields");
+                assert!(plausible_decoded_len(Codec::Zstd, &stored, input.len()));
                 let mut decoded = vec![0; input.len()];
                 assert_eq!(
-                    decompressor.decompress(Codec::Zstd, &probe, &mut decoded, &[]),
+                    decompressor.decompress(Codec::Zstd, &stored, &mut decoded, raw),
                     Some(input.len())
                 );
-                // Reuse the same segment dictionary for several blocks.
-                compressor.begin_segment(raw, input.len());
-                for _ in 0..2 {
-                    let mut stored = Vec::new();
-                    compressor.compress(input, &mut stored);
-                    assert!(compressor.context_bytes() <= CDICT_ALLOWANCE + (2 << 20));
-                    assert_eq!(stored[0], 0, "no size, checksum or dictionary-ID fields");
-                    assert!(plausible_decoded_len(Codec::Zstd, &stored, input.len()));
-                    assert_eq!(
-                        decompressor.decompress(Codec::Zstd, &stored, &mut decoded, raw),
-                        Some(input.len())
-                    );
-                    assert_eq!(decoded, input);
-                }
+                assert_eq!(decoded, input);
             }
         }
+        assert!(
+            Compressor::new(Codec::None)
+                .prepare_dictionary(&dictionary)
+                .is_none()
+        );
     }
 }

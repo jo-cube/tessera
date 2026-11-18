@@ -1,18 +1,16 @@
 //! Sorted-run encoding with bounded segment buffers and adaptive block cuts.
-//! Records arrive in internal-key order and are cut into raw blocks as they
-//! are added; each segment's blocks are compressed with its dictionary once
-//! the segment is complete. Frames and dictionaries are packed atomically so
-//! reads can borrow contiguous bytes from shared chunks.
+//! Records arrive in internal-key order; frames and dictionaries are packed
+//! atomically so reads can borrow contiguous bytes from shared chunks.
 
 use super::OutputBudget;
 use super::codec::{Codec, Compressor};
-use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN, Segment};
+use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN};
 use super::filter::KeyHashes;
 use super::storage::{Packing, RunData};
 use super::{
     FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
     TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame,
-    reader::{BlockSizes, Run, Seqs},
+    reader::{Run, Seqs},
 };
 use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, RESTART_INTERVAL, Value,
@@ -20,37 +18,25 @@ use crate::block::{
 };
 use crate::chunk::ChunkPool;
 use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 
-/// Encodes sorted records, buffering at most one segment of raw blocks before
-/// compressing. Rejected records leave the builder unchanged. A single
-/// oversized record is stored in its own block and, if necessary, its own
-/// segment.
-///
-/// Blocks are cut at a raw length estimated to compress to the target, from
-/// the ratio of each segment's first 64 KiB, encoded as one block and
-/// compressed at level 1 without a dictionary. The records of that sample are
-/// then cut at the estimate; later records are cut as they are added.
+/// Encodes sorted records, buffering at most one raw segment before compressing.
+/// Rejected records leave the builder unchanged. A single oversized record is
+/// stored in its own block and, if necessary, its own segment.
 pub struct RunBuilder {
     target: usize,
     segment_len: usize,
     raw_target: Option<usize>,
-    /// Raw block length for the open segment, or `None` until its probe.
-    block_target: Option<usize>,
     compressor: Compressor,
-    block: BlockBuilder,
+    segment: BlockBuilder,
     last_key: Vec<u8>,
     last_seq: u64,
-    /// Key bytes of the records in the open block.
     pending_key_bytes: usize,
-    /// The open segment's finished raw blocks, concatenated.
-    pending: Vec<u8>,
-    /// Each pending block's end and the segment's record count through it.
-    pending_blocks: Vec<(u32, u32)>,
     frames: Vec<u8>,
     storage: Packing,
-    scratch: Vec<u8>,
+    raw: Vec<u8>,
+    uncompressed: Vec<u8>,
+    block: BlockBuilder,
     segments: Vec<u8>,
     table: Vec<u8>,
     keys: Vec<u8>,
@@ -80,17 +66,16 @@ impl RunBuilder {
             target: target.clamp(1, RAW_BLOCK_CAP),
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
-            block_target: (codec == Codec::None).then_some(TARGET_BLOCK_LEN),
             compressor: Compressor::new(codec),
-            block: BlockBuilder::new(),
+            segment: BlockBuilder::new(),
             last_key: Vec::new(),
             last_seq: 0,
             pending_key_bytes: 0,
-            pending: Vec::new(),
-            pending_blocks: Vec::new(),
             frames: Vec::new(),
             storage: Packing::new(&ChunkPool::new(0)),
-            scratch: Vec::new(),
+            raw: Vec::new(),
+            uncompressed: Vec::new(),
+            block: BlockBuilder::new(),
             segments: Vec::new(),
             table: Vec::new(),
             keys: Vec::new(),
@@ -117,19 +102,10 @@ impl RunBuilder {
     pub fn with_raw_block_target(codec: Codec, target: usize) -> Self {
         let mut builder = Self::new(codec);
         builder.raw_target = Some(target.clamp(1, RAW_BLOCK_CAP));
-        builder.block_target = builder.raw_target;
         builder
     }
-    /// The raw block length expected to compress to the target.
-    fn target_for(&self, raw: usize, stored: usize) -> usize {
-        self.target
-            .saturating_mul(raw)
-            .checked_div(stored)
-            .unwrap_or(1)
-            .clamp(1, RAW_BLOCK_CAP)
-    }
     pub fn add(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
-        self.block.check(key, seq, value)?;
+        self.segment.check(key, seq, value)?;
         if self.record_count > 0 {
             match cmp_internal(&self.last_key, self.last_seq, key, seq) {
                 std::cmp::Ordering::Less => {}
@@ -137,17 +113,15 @@ impl RunBuilder {
                 std::cmp::Ordering::Greater => return Err(BuildError::OutOfOrder),
             }
         }
-        // Reserve index room even for an open block cut into singletons.
+        // Reserve index room even for a segment made entirely of singleton blocks.
         if !index_has_room(
-            self.table.len() / TABLE_ENTRY_LEN + self.block.len(),
+            self.table.len() / TABLE_ENTRY_LEN + self.segment.len(),
             self.keys.len().saturating_add(self.pending_key_bytes),
         ) {
             return Err(BuildError::RunFull);
         }
         // Bound the complete serialized run, including the buffered segment,
         // before accepting a record. No truncating offset casts can follow.
-        // The record adds at most a block of its own to the raw bytes.
-        let single = BlockBuilder::single_len(key, seq, value);
         let stored = self
             .storage
             .frames_len
@@ -157,31 +131,14 @@ impl RunBuilder {
             .saturating_add(self.keys.len());
         if !run_has_room(
             stored,
-            self.pending
-                .len()
-                .saturating_add(self.block.encoded_len())
-                .saturating_add(single),
-            self.pending_blocks.len() + self.block.len() + 1,
+            self.segment.encoded_len_after(key, seq, value),
+            self.segment.len().saturating_add(1),
             self.pending_key_bytes.saturating_add(key.len()),
         ) {
             return Err(BuildError::RunFull);
         }
-        if !self.block.is_empty() {
-            let projected = self.block.encoded_len_after(key, seq, value);
-            if self.block_target.is_none() && projected > SAMPLE_LEN {
-                self.probe();
-            }
-            if self.cuts_before(key, seq, value) {
-                self.finish_block();
-            }
-        }
-        let projected = if self.block.is_empty() {
-            single
-        } else {
-            self.block.encoded_len_after(key, seq, value)
-        };
-        if !(self.block.is_empty() && self.pending_blocks.is_empty())
-            && self.pending.len() + projected > self.segment_len
+        if !self.segment.is_empty()
+            && self.segment.encoded_len_after(key, seq, value) > self.segment_len
         {
             self.cut_segment();
         }
@@ -191,7 +148,7 @@ impl RunBuilder {
         if self.record_count == 0 && !self.reserve_output(key.len()) {
             return Ok(());
         }
-        self.block.append(key, seq, value)?;
+        self.segment.append(key, seq, value)?;
         if self.record_count == 0 {
             self.keys.extend_from_slice(key);
             self.min_key_len = key.len();
@@ -220,31 +177,6 @@ impl RunBuilder {
         self.max_seq = self.max_seq.max(seq);
         self.key_hashes.add(key);
         Ok(())
-    }
-    /// Whether the open block ends before this record. Without a target yet,
-    /// the block grows to the probe length.
-    fn cuts_before(&self, key: &[u8], seq: u64, value: Value<'_>) -> bool {
-        let projected = self.block.encoded_len_after(key, seq, value);
-        let Some(target) = self.block_target else {
-            return projected > SAMPLE_LEN;
-        };
-        if self.raw_target.is_some() {
-            let record_len = key.len()
-                + match value {
-                    Value::Bytes(v) => v.len(),
-                    Value::Tombstone => 0,
-                };
-            let limit = if self.block.last_key() == key {
-                2 * target
-            } else {
-                target
-            };
-            record_len >= target
-                || self.block.encoded_len() + record_len / 2 >= limit
-                || projected > RAW_BLOCK_CAP
-        } else {
-            projected > target
-        }
     }
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -352,55 +284,144 @@ impl RunBuilder {
                 max: self.max_seq,
             },
             self.reclaimable,
-            BlockSizes {
-                build_estimate: self.build_estimate,
-                largest_block: self.largest_block,
-            },
+            (self.build_estimate, self.largest_block),
         ))
     }
-    /// Sets the segment's target from the open block's first 64 KiB,
-    /// compressed at level 1 without a dictionary, then cuts the block's
-    /// records again at that target.
-    fn probe(&mut self) {
-        let mut raw = std::mem::take(&mut self.scratch);
-        raw.clear();
-        self.block.flush_into(&mut raw);
+    fn cut_segment(&mut self) {
+        if self.output_refused || self.segment.is_empty() {
+            return;
+        }
+        let count = self.segment.len();
         self.pending_key_bytes = 0;
-        let sample = &raw[..raw.len().min(SAMPLE_LEN)];
-        let mut compressed = std::mem::take(&mut self.frames);
-        let stored = self.compressor.probe(sample, &mut compressed);
-        self.block_target = Some(self.target_for(sample.len(), stored));
-        self.frames = compressed;
-        let view = BlockView::open(&raw).expect("builder's block");
-        let mut cursor = BlockPosition::new();
-        while let Some(record) = cursor.next_record(view).expect("builder's record") {
-            if !self.block.is_empty() && self.cuts_before(record.key, record.seq, record.value) {
-                self.finish_block();
+        let mut raw = std::mem::take(&mut self.raw);
+        raw.clear();
+        self.segment.flush_into(&mut raw);
+        self.segment.trim_empty(2 * self.segment_len);
+        let codec = self.compressor.codec();
+        let dictionary = if codec == Codec::Zstd {
+            dictionary::sample(&raw, count)
+        } else {
+            Vec::new()
+        };
+        if !self.reserve_output(
+            dictionary.len()
+                + if codec == Codec::Zstd {
+                    SEGMENT_ENTRY_LEN + 32
+                } else {
+                    0
+                },
+        ) {
+            return;
+        }
+        // Prepared once for the sample and every block, then dropped before
+        // the next segment. Only the raw dictionary is stored in the run.
+        let prepared = self.compressor.prepare_dictionary(&dictionary);
+        let reference = if codec == Codec::Zstd {
+            let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
+            assert!(id < 1 << 24, "segment reference fits in 24 bits");
+            self.segments
+                .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
+            self.segments
+                .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
+            self.segments
+                .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
+            id as u32
+        } else {
+            0
+        };
+        let target = self.raw_target.unwrap_or_else(|| {
+            if codec == Codec::None {
+                return TARGET_BLOCK_LEN;
             }
-            self.pending_key_bytes += record.key.len();
-            self.block
+            let start = if raw.len() <= SAMPLE_LEN {
+                0
+            } else {
+                raw.len() / 2
+            };
+            let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
+            let mut compressed = Vec::new();
+            self.compressor
+                .compress(sample, prepared.as_ref(), &mut compressed);
+            self.target
+                .saturating_mul(sample.len())
+                .checked_div(compressed.len())
+                .unwrap_or(1)
+                .clamp(1, RAW_BLOCK_CAP)
+        });
+        self.compressor.begin_segment(&dictionary, target);
+        let view = BlockView::open(&raw).expect("builder's segment");
+        let mut cursor = BlockPosition::new();
+        let mut block = std::mem::take(&mut self.block);
+        let mut uncompressed = std::mem::take(&mut self.uncompressed);
+        while let Some(record) = cursor.next_record(view).expect("builder's record") {
+            let projected = block.encoded_len_after(record.key, record.seq, record.value);
+            let cut = if self.raw_target.is_some() {
+                let record_len = record.key.len()
+                    + match record.value {
+                        Value::Bytes(v) => v.len(),
+                        Value::Tombstone => 0,
+                    };
+                let limit = if block.last_key() == record.key {
+                    2 * target
+                } else {
+                    target
+                };
+                record_len >= target
+                    || block.encoded_len() + record_len / 2 >= limit
+                    || projected > RAW_BLOCK_CAP
+            } else {
+                projected > target
+            };
+            if !block.is_empty() && cut {
+                self.cut_block(&mut block, &mut uncompressed, reference);
+                if self.output_refused {
+                    break;
+                }
+            }
+            block
                 .append(record.key, record.seq, record.value)
                 .expect("one record fits a block");
         }
-        retain_scratch(&mut raw, 2 * RAW_BLOCK_CAP);
-        self.scratch = raw;
+        if !block.is_empty() {
+            self.cut_block(&mut block, &mut uncompressed, reference);
+        }
+        if !self.output_refused {
+            self.storage.dictionary(&dictionary);
+        }
+        retain_scratch(&mut raw, 2 * self.segment_len);
+        retain_scratch(&mut uncompressed, 2 * RAW_BLOCK_CAP);
+        block.trim_empty(2 * RAW_BLOCK_CAP);
+        self.raw = raw;
+        self.uncompressed = uncompressed;
+        self.block = block;
     }
-    /// Moves the open block into the segment buffer and writes its index
-    /// entry, whose frame offset is filled in when the segment is compressed.
-    fn finish_block(&mut self) {
-        if self.block.is_empty() {
-            return;
+    fn cut_block(&mut self, block: &mut BlockBuilder, raw: &mut Vec<u8>, reference: u32) {
+        self.frames.clear();
+        let offset = self.storage.frames_len;
+        let len = block.encoded_len();
+        let codec = self.compressor.codec();
+        self.frames.resize(frame::HEADER_LEN, 0);
+        if codec == Codec::None {
+            block.flush_into(&mut self.frames);
+        } else {
+            raw.clear();
+            block.flush_into(raw);
+            self.compressor.compress(raw, None, &mut self.frames);
         }
-        if self.block_target.is_none() {
-            self.probe();
-        }
-        let last = self.block.last_key();
+        frame::seal(&mut self.frames, codec, len, reference);
         // Full keys twice bound both index suffixes and the final unshared key;
         // 64 bounds restart heads and physical frame/dictionary ownership.
-        if !self.reserve_output(TABLE_ENTRY_LEN + 2 * last.len() + 64) {
+        if !self
+            .reserve_output(self.frames.len() + TABLE_ENTRY_LEN + 2 * block.last_key().len() + 64)
+        {
             return;
         }
-        let last = self.block.last_key();
+        self.largest_block = self.largest_block.max(len);
+        self.storage
+            .compressed(len, self.frames.len(), codec == Codec::Zstd);
+        self.storage.frame(&self.frames);
+        retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
+        let last = block.last_key();
         let shared = if (self.table.len() / TABLE_ENTRY_LEN).is_multiple_of(RESTART_INTERVAL) {
             0
         } else {
@@ -415,108 +436,14 @@ impl RunBuilder {
         self.keys.extend_from_slice(&last[shared..]);
         self.index_last_key.clear();
         self.index_last_key.extend_from_slice(last);
-        self.table.extend_from_slice(&0u32.to_le_bytes());
+        self.table.extend_from_slice(
+            &u32::try_from(offset)
+                .expect("bounded run offset")
+                .to_le_bytes(),
+        );
         self.table.extend_from_slice(
             &u32::try_from(self.keys.len())
                 .expect("bounded key area")
-                .to_le_bytes(),
-        );
-        let records = self.pending_blocks.last().map_or(0, |&(_, n)| n as usize) + self.block.len();
-        self.block.flush_into(&mut self.pending);
-        self.pending_blocks.push((
-            u32::try_from(self.pending.len()).expect("bounded segment"),
-            u32::try_from(records).expect("bounded segment"),
-        ));
-        self.pending_key_bytes = 0;
-    }
-    fn cut_segment(&mut self) {
-        self.finish_block();
-        if self.output_refused || self.pending_blocks.is_empty() {
-            return;
-        }
-        let codec = self.compressor.codec();
-        let dictionary = if codec == Codec::Zstd {
-            dictionary::sample(&Segment {
-                raw: &self.pending,
-                blocks: &self.pending_blocks,
-            })
-        } else {
-            Vec::new()
-        };
-        if !self.reserve_output(
-            dictionary.len()
-                + if codec == Codec::Zstd {
-                    SEGMENT_ENTRY_LEN + 32
-                } else {
-                    0
-                },
-        ) {
-            return;
-        }
-        let reference = if codec == Codec::Zstd {
-            let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
-            assert!(id < 1 << 24, "segment reference fits in 24 bits");
-            self.segments
-                .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
-            self.segments
-                .extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
-            self.segments
-                .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
-            id as u32
-        } else {
-            0
-        };
-        let target = self.block_target.expect("a finished block has a target");
-        // The context prepares the dictionary once for every block.
-        self.compressor.begin_segment(&dictionary, target);
-        let mut start = 0;
-        let first = self.table.len() / TABLE_ENTRY_LEN - self.pending_blocks.len();
-        for i in 0..self.pending_blocks.len() {
-            let end = self.pending_blocks[i].0 as usize;
-            self.compress_block(first + i, start..end, reference);
-            if self.output_refused {
-                return;
-            }
-            start = end;
-        }
-        // The next segment measures its own ratio.
-        if codec == Codec::Zstd && self.raw_target.is_none() {
-            self.block_target = None;
-        }
-        if !self.output_refused {
-            self.storage.dictionary(&dictionary);
-        }
-        retain_scratch(&mut self.pending, 2 * self.segment_len);
-        self.pending_blocks.clear();
-        self.block.trim_empty(2 * RAW_BLOCK_CAP);
-    }
-    /// Compresses the pending bytes of block `number` into its frame and
-    /// records the frame's offset in the index.
-    fn compress_block(&mut self, number: usize, bytes: Range<usize>, reference: u32) {
-        let block = &self.pending[bytes];
-        self.frames.clear();
-        let offset = self.storage.frames_len;
-        let len = block.len();
-        let codec = self.compressor.codec();
-        self.frames.resize(frame::HEADER_LEN, 0);
-        if codec == Codec::None {
-            self.frames.extend_from_slice(block);
-        } else {
-            self.compressor.compress(block, &mut self.frames);
-        }
-        frame::seal(&mut self.frames, codec, len, reference);
-        if !self.reserve_output(self.frames.len()) {
-            return;
-        }
-        self.largest_block = self.largest_block.max(len);
-        self.storage
-            .compressed(len, self.frames.len(), codec == Codec::Zstd);
-        self.storage.frame(&self.frames);
-        retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
-        let at = number * TABLE_ENTRY_LEN;
-        self.table[at..at + 4].copy_from_slice(
-            &u32::try_from(offset)
-                .expect("bounded run offset")
                 .to_le_bytes(),
         );
     }
@@ -592,7 +519,7 @@ mod tests {
                 Err(BuildError::RunFull)
             );
             assert_eq!(builder.len(), 0);
-            assert!(builder.table.is_empty() && builder.block.is_empty());
+            assert!(builder.table.is_empty() && builder.segment.is_empty());
         }
         assert!(!run_has_room(usize::MAX, 0, 0, 0));
         assert!(!run_has_room(0, usize::MAX, 1, 0));
