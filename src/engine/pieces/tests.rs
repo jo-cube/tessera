@@ -526,7 +526,6 @@ fn concurrent_output_refusal_keeps_every_view_readable_and_checkpointable() {
         Err(CompactionError::OutputLimit { limit: 4, .. })
     ));
     check(&engine.snapshot(), ones);
-    assert!(engine.core.read_state().piece_flush_cuts.is_none());
     assert_eq!(engine.stats().build_output_bytes, 0);
     assert_eq!(engine.stats().build_workspace_bytes, 0);
     let scratch = Scratch::new("concurrent-piece-refusal");
@@ -542,96 +541,4 @@ fn concurrent_output_refusal_keeps_every_view_readable_and_checkpointable() {
         .is_some()
     {}
     check(&recovered.snapshot(), ones);
-}
-
-#[test]
-fn one_builder_publishes_small_bottom_ranges_before_building_the_next() {
-    let engine = fixture_with_threads(1);
-    // Use the real planner estimate, rather than the forced-piece test mode.
-    engine.core.piece_budget.store(0, Ordering::Relaxed);
-    let first = engine.core.read_state().levels.runs()[1][0]
-        .run
-        .retirement();
-    let builds = Arc::new(AtomicUsize::new(0));
-    let count = builds.clone();
-    *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
-        if count.fetch_add(1, Ordering::Relaxed) > 0 {
-            assert_eq!(first.strong_count(), 0, "the prior small range has retired");
-        }
-    }));
-    engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
-    assert!(builds.load(Ordering::Relaxed) > 1);
-    check(&engine.snapshot(), ones);
-}
-
-#[test]
-fn concurrent_pieces_keep_flush_cuts_stable_until_the_job_finishes() {
-    let engine = fixture_with_threads(4);
-    let original = {
-        let mut state = engine.core.write_state();
-        state.split_flushes = true;
-        let bytes = state.levels.runs()[1][0].run.stored_len();
-        engine
-            .core
-            .piece_budget
-            .store(bytes * 2 + bytes / 2, Ordering::Relaxed);
-        state.flush_cuts(engine.core.target_run_len)
-    };
-    engine
-        .core
-        .piece_output_budget
-        .store(32 << 10, Ordering::Relaxed);
-    let permission = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-    let permits = permission.clone();
-    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(move |index| {
-        if index != 1 {
-            let (lock, changed) = &*permits;
-            let mut allowed = lock.lock().unwrap();
-            while !*allowed {
-                allowed = changed.wait(allowed).unwrap();
-            }
-        }
-    }));
-    std::thread::scope(|scope| {
-        let job = scope.spawn(|| engine.compact(&mut MergeWorkspace::new()).unwrap());
-        crate::test_support::wait_until(|| {
-            engine
-                .get(&64u16.to_be_bytes(), &mut EngineWorkspace::new())
-                .unwrap()
-                .unwrap()
-                .seq
-                == 0
-        });
-        let observed = {
-            let state = engine.core.read_state();
-            (
-                state.flush_cuts(engine.core.target_run_len),
-                state.levels.flush_cuts(engine.core.target_run_len),
-            )
-        };
-        engine.put(&10u16.to_be_bytes(), b"late").unwrap();
-        engine.flush().unwrap();
-        *permission.0.lock().unwrap() = true;
-        permission.1.notify_all();
-        job.join().unwrap();
-        assert_eq!(observed.0, original);
-        assert_ne!(
-            observed.1, original,
-            "published piece replaced two bottom boundaries with one"
-        );
-    });
-    let state = engine.core.read_state();
-    assert!(state.piece_flush_cuts.is_none());
-    assert_eq!(
-        state.flush_cuts(engine.core.target_run_len),
-        state.levels.flush_cuts(engine.core.target_run_len)
-    );
-    drop(state);
-    check(&engine.snapshot(), |key| {
-        if key == 10 {
-            Some(b"late".to_vec())
-        } else {
-            ones(key)
-        }
-    });
 }

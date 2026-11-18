@@ -69,22 +69,8 @@ impl Pipeline {
     }
 }
 
-/// Compaction is serialized, so one job owns the pinned cut set. Restore normal
-/// cuts on success, refusal, corruption or unwinding from a worker panic.
-struct FlushCutLease<'a>(&'a Core);
-impl Drop for FlushCutLease<'_> {
-    fn drop(&mut self) {
-        self.0
-            .state
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .piece_flush_cuts = None;
-    }
-}
-
 impl CompactionJob<'_> {
     pub(super) fn execute_concurrent(mut self) -> Result<CompactionReport, CompactionError> {
-        let _cuts = FlushCutLease(self.engine);
         let mut report = CompactionReport {
             kind: self.kind,
             level: self.level,
@@ -168,11 +154,6 @@ impl CompactionJob<'_> {
         // piece now owns actual directory entries and can finish in any order.
         {
             let mut state = self.engine.write_state();
-            // A flush should not inherit temporary boundaries formed by a mix
-            // of finished outputs and unfinished bottom inputs. Keep the job's
-            // initial level-1 cuts until every builder has joined.
-            debug_assert!(state.piece_flush_cuts.is_none());
-            state.piece_flush_cuts = Some(state.flush_cuts(self.engine.target_run_len));
             state
                 .levels
                 .split_sources(&split)

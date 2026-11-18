@@ -127,12 +127,10 @@ frozen tables can charge about 192 MiB at the default memtable budget.
 
 Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
 finished runs trim their partial final chunk. The free reserve is capped at
-32 MiB. Concurrent bottom compaction bounds unpublished output by the builder
-count times one estimated target stored run.
-A growing piece can use the whole allowance; a range exceeding it stops the job
-with an output-limit error. With one builder, bottom pieces publish consecutively
-using the serial piece budget. A level-0 source is released when its final range
-is merged. Snapshots can keep
+32 MiB. Bottom compaction bounds unpublished output by the builder count times
+one estimated target stored run (at least 128 KiB per builder); a growing piece can use the whole allowance,
+and a range exceeding it stops the job with an output-limit error.
+a level-0 source is released when its final range is merged. Snapshots can keep
 replaced storage alive. Workspaces retain decode buffers and contexts; there is no decoded-block
 cache. Use `Engine::stats()` and workspace counters to inspect memory and work.
 
