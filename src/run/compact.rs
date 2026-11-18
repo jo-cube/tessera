@@ -486,7 +486,11 @@ pub(crate) fn compact_parallel_in<'a>(
                 let start = at.checked_sub(1).map(|i| starts[i]);
                 let end = starts.get(at).copied();
                 let keep = &keep_tombstone;
+                #[cfg(feature = "diagnostics")]
+                let bottom = super::copy_audit::bottom_inputs();
                 scope.spawn(move || {
+                    #[cfg(feature = "diagnostics")]
+                    super::copy_audit::set_bottom_inputs(bottom);
                     compact_range(
                         inputs,
                         keep,
@@ -669,6 +673,8 @@ fn compact_range_checked<'a>(
     let mut key = Vec::new();
     let mut has_key = false;
     let mut eraser = Eraser::new(limits.zero_seq, range.floors);
+    #[cfg(feature = "diagnostics")]
+    let mut audit = super::copy_audit::CopyAudit::new(inputs, range.start);
 
     while let Some(record) = merge.next_record()? {
         if range.end.is_some_and(|end| record.key >= end) {
@@ -684,6 +690,17 @@ fn compact_range_checked<'a>(
         let copies = merge.collapse_copies()?;
         stats.records_read += copies;
         stats.copies_collapsed += copies;
+        #[cfg(feature = "diagnostics")]
+        if let Some(audit) = audit.as_mut()
+            && let (Some(input), Some(record)) = (merge.current_input(), merge.current())
+        {
+            audit.record(
+                input,
+                record.key,
+                record.seq,
+                record.value == Value::Tombstone,
+            );
+        }
         if !newest {
             stats.versions_dropped += 1;
             continue;
@@ -705,6 +722,10 @@ fn compact_range_checked<'a>(
     }
     output.finish_run().map_err(|()| refused())?;
     eraser.finish(range.pool);
+    #[cfg(feature = "diagnostics")]
+    if let Some(audit) = audit {
+        audit.finish(range.end);
+    }
     Ok(Compacted {
         runs: output.runs,
         output_bytes: output.bytes - output.held_bytes,

@@ -1672,6 +1672,53 @@ fn validate(bytes: &[u8], filter: Option<&KeyFilter>) -> Result<(Seqs, bool, usi
 #[path = "tests/storage.rs"]
 mod storage_tests;
 
+/// One stored segment, for offline recompression.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Debug)]
+pub struct SegmentSample {
+    /// The raw-content dictionary stored for the segment.
+    pub dictionary: Vec<u8>,
+    /// The raw block-size hint the builder passed to Zstandard.
+    pub hint: usize,
+    /// Decoded blocks, in order.
+    pub blocks: Vec<Vec<u8>>,
+}
+
+/// Recomputes the builder's ratio probe: the segment re-encoded as one raw
+/// block, its middle 64 KiB compressed with the level-3 prepared dictionary.
+#[cfg(feature = "diagnostics")]
+fn builder_hint(blocks: &[Vec<u8>], dictionary: &[u8]) -> usize {
+    use super::dictionary::SAMPLE_LEN;
+    let mut segment = crate::block::BlockBuilder::new();
+    for bytes in blocks {
+        let view = BlockView::open(bytes).expect(VALIDATED);
+        let mut cursor = BlockPosition::new();
+        while let Some(record) = cursor.next_record(view).expect(VALIDATED) {
+            segment
+                .append(record.key, record.seq, record.value)
+                .expect(VALIDATED);
+        }
+    }
+    let mut raw = Vec::new();
+    segment.flush_into(&mut raw);
+    let start = if raw.len() <= SAMPLE_LEN {
+        0
+    } else {
+        raw.len() / 2
+    };
+    let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
+    let compressor = super::codec::Compressor::new(Codec::Zstd);
+    let prepared = compressor.prepare_dictionary(dictionary);
+    let mut compressed = Vec::new();
+    let mut compressor = compressor;
+    compressor.compress(sample, prepared.as_ref(), &mut compressed);
+    super::TARGET_BLOCK_COMPRESSED
+        .saturating_mul(sample.len())
+        .checked_div(compressed.len())
+        .unwrap_or(1)
+        .clamp(1, super::RAW_BLOCK_CAP)
+}
+
 /// Stored bytes of one run by component, and its raw block bytes.
 #[cfg(feature = "diagnostics")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -1695,6 +1742,42 @@ impl<B: AsRef<[u8]>> Run<B> {
         (0..view.block_count())
             .map(|block| view.frame(block).expect(VALIDATED).decoded_len)
             .sum()
+    }
+    /// Each segment's raw blocks, its dictionary and the block-size hint its
+    /// builder used, for segments `keep` accepts by their ordinal.
+    pub(crate) fn segment_samples(
+        &self,
+        keep: &mut dyn FnMut() -> bool,
+        out: &mut Vec<SegmentSample>,
+    ) {
+        let view = self.view();
+        let mut workspace = ReadWorkspace::new();
+        let mut block = 0;
+        while block < view.block_count() {
+            let first = view.frame(block).expect(VALIDATED);
+            let mut end = block + 1;
+            while end < view.block_count()
+                && view.frame(end).expect(VALIDATED).dictionary_ref == first.dictionary_ref
+            {
+                end += 1;
+            }
+            if first.codec == Codec::Zstd && keep() {
+                let blocks: Vec<Vec<u8>> = (block..end)
+                    .map(|at| {
+                        let frame = view.frame(at).expect(VALIDATED);
+                        workspace.load(&frame).expect(VALIDATED).to_vec()
+                    })
+                    .collect();
+                let dictionary = first.dictionary.to_vec();
+                let hint = builder_hint(&blocks, &dictionary);
+                out.push(SegmentSample {
+                    dictionary,
+                    hint,
+                    blocks,
+                });
+            }
+            block = end;
+        }
     }
     pub(crate) fn memory(&self) -> RunMemory {
         let view = self.view();

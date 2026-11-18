@@ -224,6 +224,12 @@ impl<'a> MergeCursor<'a> {
         self.cursors[input].head_record()
     }
 
+    /// The input position holding the current record.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn current_input(&self) -> Option<usize> {
+        Some(self.cursors[*self.heap.first()?].position())
+    }
+
     /// Finds another copy of the current record: the same user key and
     /// sequence number, held by another input. Returns its heap position.
     ///

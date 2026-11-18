@@ -142,6 +142,50 @@ pub fn erasure(engine: &Engine) -> Erasure {
     engine.core.chunks.erasure_counters()
 }
 
+pub use crate::run::SegmentSample;
+pub use crate::run::copy_audit::SegmentCopy;
+
+/// Starts auditing, for every later level-0 → bottom merge in this
+/// process, which bottom input blocks could be copied verbatim.
+pub fn enable_copy_audit() {
+    crate::run::copy_audit::enable();
+}
+
+/// Drains the bottom input segments audited so far, one entry per segment
+/// and merge (a segment split between parallel builders appears twice), and
+/// the raw bytes of the other (level-0) inputs' blocks those merges decoded.
+pub fn take_copy_audit() -> (Vec<SegmentCopy>, u64) {
+    crate::run::copy_audit::take()
+}
+
+/// Every `every`-th Zstandard segment of the bottom level's physical runs,
+/// decoded, with its dictionary and the builder's block-size hint.
+pub fn bottom_segments(engine: &Engine, every: usize) -> Vec<SegmentSample> {
+    let state = engine.core.read_state();
+    let levels = state.levels.runs();
+    let bottom = levels.last().map_or(&[][..], Vec::as_slice);
+    let mut out = Vec::new();
+    let mut ordinal = 0usize;
+    let mut keep = || {
+        ordinal += 1;
+        (ordinal - 1).is_multiple_of(every.max(1))
+    };
+    for run in super::physical_runs(bottom) {
+        run.run.segment_samples(&mut keep, &mut out);
+    }
+    out
+}
+
+/// Raw block bytes of the bottom level's physical runs.
+pub fn bottom_raw(engine: &Engine) -> usize {
+    let state = engine.core.read_state();
+    let levels = state.levels.runs();
+    let bottom = levels.last().map_or(&[][..], Vec::as_slice);
+    super::physical_runs(bottom)
+        .map(|run| run.run.raw_len())
+        .sum()
+}
+
 static MEMORY_OBSERVER: std::sync::OnceLock<fn(&str, super::EngineStats)> =
     std::sync::OnceLock::new();
 

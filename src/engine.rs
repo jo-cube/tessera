@@ -2281,6 +2281,19 @@ impl<'e> CompactionJob<'e> {
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
         };
+        #[cfg(feature = "diagnostics")]
+        crate::run::copy_audit::set_bottom_inputs(
+            (crate::run::copy_audit::enabled() && self.zero_seq && self.source_count > 0).then(
+                || {
+                    let state = self.engine.read_state();
+                    let bottom = state.levels.runs().last().expect("a bottom level");
+                    inputs
+                        .iter()
+                        .map(|run| bottom.iter().any(|b| Arc::ptr_eq(b, run)))
+                        .collect()
+                },
+            ),
+        );
         let output = if let Some(budget) = budget {
             crate::run::compact_limited_in(
                 &views,
@@ -2301,6 +2314,8 @@ impl<'e> CompactionJob<'e> {
                 (workspace, &self.engine.chunks, &floors),
             )?
         };
+        #[cfg(feature = "diagnostics")]
+        crate::run::copy_audit::set_bottom_inputs(None);
         #[cfg(test)]
         {
             let hook = self.engine.after_build.lock().unwrap().clone();
