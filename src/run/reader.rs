@@ -1736,10 +1736,38 @@ pub(crate) struct RunMemory {
 
 #[cfg(feature = "diagnostics")]
 impl<B: AsRef<[u8]>> Run<B> {
-    /// Raw bytes of every block, from frame headers.
+    /// Raw bytes of every stored block, from frame headers.
     pub(crate) fn raw_len(&self) -> usize {
         let view = self.view();
         (0..view.block_count())
+            .map(|block| view.frame(block).expect(VALIDATED).decoded_len)
+            .sum()
+    }
+    /// Raw bytes of the blocks a merge of this view decodes, from frame
+    /// headers: every block, or for a bounded view only the blocks from the
+    /// one holding its first key through the last holding its final key.
+    pub(crate) fn merged_raw_len(&self) -> usize {
+        let view = self.view();
+        let blocks = match self.slice() {
+            None => 0..view.block_count(),
+            Some((min, max)) => {
+                let first = view.locate(min).expect(VALIDATED);
+                let mut last = view.locate(max).expect(VALIDATED);
+                // Older versions of the final key may continue in later blocks.
+                while let Some(block) = last
+                    && block + 1 < view.block_count()
+                    && view.last_key(block).expect(VALIDATED).cmp(max).is_eq()
+                {
+                    last = Some(block + 1);
+                }
+                match (first, last) {
+                    (Some(first), Some(last)) => first..last + 1,
+                    (Some(first), None) => first..view.block_count(),
+                    _ => 0..0,
+                }
+            }
+        };
+        blocks
             .map(|block| view.frame(block).expect(VALIDATED).decoded_len)
             .sum()
     }

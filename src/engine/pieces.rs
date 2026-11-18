@@ -233,7 +233,7 @@ impl<'e> BuiltCompaction<'e> {
         if let Dest::Level(level) = job.dest {
             job.engine.chunks.work(
                 crate::chunk::work_slot(Some(level), true),
-                job.inputs.iter().map(|r| r.run.raw_len()).sum(),
+                job.inputs.iter().map(|r| r.run.merged_raw_len()).sum(),
                 outputs.iter().map(|r| r.run.raw_len()).sum(),
                 report.output_bytes,
             );

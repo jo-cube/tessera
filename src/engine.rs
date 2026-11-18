@@ -2420,7 +2420,7 @@ impl<'e> CompactionJob<'e> {
         if let Dest::Level(level) = self.dest {
             self.engine.chunks.work(
                 crate::chunk::work_slot(Some(level), self.cuts.omit_filter),
-                inputs.iter().map(|run| run.run.raw_len()).sum(),
+                inputs.iter().map(|run| run.run.merged_raw_len()).sum(),
                 outputs.iter().map(|run| run.run.raw_len()).sum(),
                 report.output_bytes,
             );
