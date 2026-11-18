@@ -39,13 +39,12 @@ pub struct RunBuilder {
     /// Raw block length for the open segment, or `None` until its probe.
     block_target: Option<usize>,
     compressor: Compressor,
+    /// The open segment's finished raw blocks, sealed in place, then the
+    /// open block.
     block: BlockBuilder,
-    last_key: Vec<u8>,
     last_seq: u64,
     /// Key bytes of the records in the open block.
     pending_key_bytes: usize,
-    /// The open segment's finished raw blocks, concatenated.
-    pending: Vec<u8>,
     /// Each pending block's end and the segment's record count through it.
     pending_blocks: Vec<(u32, u32)>,
     frames: Vec<u8>,
@@ -83,10 +82,8 @@ impl RunBuilder {
             block_target: (codec == Codec::None).then_some(TARGET_BLOCK_LEN),
             compressor: Compressor::new(codec),
             block: BlockBuilder::new(),
-            last_key: Vec::new(),
             last_seq: 0,
             pending_key_bytes: 0,
-            pending: Vec::new(),
             pending_blocks: Vec::new(),
             frames: Vec::new(),
             storage: Packing::new(&ChunkPool::new(0)),
@@ -129,9 +126,9 @@ impl RunBuilder {
             .clamp(1, RAW_BLOCK_CAP)
     }
     pub fn add(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
-        self.block.check(key, seq, value)?;
+        BlockBuilder::check_limits(key, value)?;
         if self.record_count > 0 {
-            match cmp_internal(&self.last_key, self.last_seq, key, seq) {
+            match cmp_internal(self.block.last_key(), self.last_seq, key, seq) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Equal => return Err(BuildError::DuplicateKey),
                 std::cmp::Ordering::Greater => return Err(BuildError::OutOfOrder),
@@ -144,10 +141,12 @@ impl RunBuilder {
         ) {
             return Err(BuildError::RunFull);
         }
+        // The record's lengths, computed once and kept while the open block
+        // is unchanged.
+        let mut projection = self.block.project(key, seq, value);
         // Bound the complete serialized run, including the buffered segment,
         // before accepting a record. No truncating offset casts can follow.
         // The record adds at most a block of its own to the raw bytes.
-        let single = BlockBuilder::single_len(key, seq, value);
         let stored = self
             .storage
             .frames_len
@@ -157,33 +156,32 @@ impl RunBuilder {
             .saturating_add(self.keys.len());
         if !run_has_room(
             stored,
-            self.pending
+            self.block
+                .sealed()
                 .len()
                 .saturating_add(self.block.encoded_len())
-                .saturating_add(single),
+                .saturating_add(projection.single),
             self.pending_blocks.len() + self.block.len() + 1,
             self.pending_key_bytes.saturating_add(key.len()),
         ) {
             return Err(BuildError::RunFull);
         }
         if !self.block.is_empty() {
-            let projected = self.block.encoded_len_after(key, seq, value);
-            if self.block_target.is_none() && projected > SAMPLE_LEN {
+            if self.block_target.is_none() && projection.after > SAMPLE_LEN {
+                // Re-cutting the sample leaves its last records open.
                 self.probe();
+                projection = self.block.project(key, seq, value);
             }
-            if self.cuts_before(key, seq, value) {
+            if !self.block.is_empty() && self.cuts_before(key, value, projection.after) {
                 self.finish_block();
+                projection = projection.in_new_block();
             }
         }
-        let projected = if self.block.is_empty() {
-            single
-        } else {
-            self.block.encoded_len_after(key, seq, value)
-        };
         if !(self.block.is_empty() && self.pending_blocks.is_empty())
-            && self.pending.len() + projected > self.segment_len
+            && self.block.sealed().len() + projection.after > self.segment_len
         {
             self.cut_segment();
+            projection = projection.in_new_block();
         }
         if self.output_refused {
             return Ok(());
@@ -191,7 +189,8 @@ impl RunBuilder {
         if self.record_count == 0 && !self.reserve_output(key.len()) {
             return Ok(());
         }
-        self.block.append(key, seq, value)?;
+        let duplicate = self.record_count > 0 && self.block.last_key() == key;
+        self.block.append_projected(key, seq, value, projection)?;
         if self.record_count == 0 {
             self.keys.extend_from_slice(key);
             self.min_key_len = key.len();
@@ -205,10 +204,7 @@ impl RunBuilder {
                 .saturating_mul(4)
                 .saturating_add(256),
         );
-        self.reclaimable |=
-            value == Value::Tombstone || (self.record_count > 0 && self.last_key == key);
-        self.last_key.clear();
-        self.last_key.extend_from_slice(key);
+        self.reclaimable |= value == Value::Tombstone || duplicate;
         self.last_seq = seq;
         self.pending_key_bytes += key.len();
         self.min_seq = if self.record_count == 0 {
@@ -223,8 +219,7 @@ impl RunBuilder {
     }
     /// Whether the open block ends before this record. Without a target yet,
     /// the block grows to the probe length.
-    fn cuts_before(&self, key: &[u8], seq: u64, value: Value<'_>) -> bool {
-        let projected = self.block.encoded_len_after(key, seq, value);
+    fn cuts_before(&self, key: &[u8], value: Value<'_>, projected: usize) -> bool {
         let Some(target) = self.block_target else {
             return projected > SAMPLE_LEN;
         };
@@ -374,12 +369,16 @@ impl RunBuilder {
         let view = BlockView::open(&raw).expect("builder's block");
         let mut cursor = BlockPosition::new();
         while let Some(record) = cursor.next_record(view).expect("builder's record") {
-            if !self.block.is_empty() && self.cuts_before(record.key, record.seq, record.value) {
+            let mut projection = self.block.project(record.key, record.seq, record.value);
+            if !self.block.is_empty()
+                && self.cuts_before(record.key, record.value, projection.after)
+            {
                 self.finish_block();
+                projection = projection.in_new_block();
             }
             self.pending_key_bytes += record.key.len();
             self.block
-                .append(record.key, record.seq, record.value)
+                .append_projected(record.key, record.seq, record.value, projection)
                 .expect("one record fits a block");
         }
         retain_scratch(&mut raw, 2 * RAW_BLOCK_CAP);
@@ -422,9 +421,9 @@ impl RunBuilder {
                 .to_le_bytes(),
         );
         let records = self.pending_blocks.last().map_or(0, |&(_, n)| n as usize) + self.block.len();
-        self.block.flush_into(&mut self.pending);
+        self.block.seal();
         self.pending_blocks.push((
-            u32::try_from(self.pending.len()).expect("bounded segment"),
+            u32::try_from(self.block.sealed().len()).expect("bounded segment"),
             u32::try_from(records).expect("bounded segment"),
         ));
         self.pending_key_bytes = 0;
@@ -437,7 +436,7 @@ impl RunBuilder {
         let codec = self.compressor.codec();
         let dictionary = if codec == Codec::Zstd {
             dictionary::sample(&Segment {
-                raw: &self.pending,
+                raw: self.block.sealed(),
                 blocks: &self.pending_blocks,
             })
         } else {
@@ -486,14 +485,15 @@ impl RunBuilder {
         if !self.output_refused {
             self.storage.dictionary(&dictionary);
         }
-        retain_scratch(&mut self.pending, 2 * self.segment_len);
+        self.block.clear_sealed();
         self.pending_blocks.clear();
-        self.block.trim_empty(2 * RAW_BLOCK_CAP);
+        self.block
+            .trim_empty(2 * (self.segment_len + RAW_BLOCK_CAP));
     }
     /// Compresses the pending bytes of block `number` into its frame and
     /// records the frame's offset in the index.
     fn compress_block(&mut self, number: usize, bytes: Range<usize>, reference: u32) {
-        let block = &self.pending[bytes];
+        let block = &self.block.sealed()[bytes];
         self.frames.clear();
         let offset = self.storage.frames_len;
         let len = block.len();
@@ -604,4 +604,93 @@ mod tests {
         assert!(!index_has_room(usize::MAX, 0));
         assert!(!index_has_room(0, usize::MAX));
     }
+
+    /// Record sets covering prefix sharing, tombstones, versions, oversized
+    /// records and every target mode, with the length and CRC of the run
+    /// each builds.
+    fn fingerprints() -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let builders: [fn() -> RunBuilder; 6] = [
+            || RunBuilder::new(Codec::Zstd),
+            || RunBuilder::new(Codec::None),
+            || RunBuilder::with_target_block_compressed(Codec::Zstd, 1),
+            || RunBuilder::with_target_block_compressed(Codec::Zstd, RAW_BLOCK_CAP),
+            || RunBuilder::with_raw_block_target(Codec::Zstd, 300),
+            || {
+                let mut b = RunBuilder::new(Codec::Zstd);
+                b.limit_segment_len(RAW_BLOCK_CAP);
+                b
+            },
+        ];
+        for make in builders {
+            for shape in 0..4u64 {
+                let mut builder = make();
+                let count = [20_000, 3_000, 1, 300][shape as usize];
+                for i in 0..count {
+                    let key = format!("k{:07}", i / 2).into_bytes();
+                    let seq = u64::MAX / 2 - i;
+                    let len = match shape {
+                        0 => (next() % 120) as usize,
+                        1 => 600,
+                        2 => 0,
+                        _ => [8, 70_000, 3, 200_000][(i % 4) as usize],
+                    };
+                    let byte = (next() % 7) as u8;
+                    let value: Vec<u8> = (0..len)
+                        .map(|j| if j % 5 == 0 { byte } else { (j % 31) as u8 })
+                        .collect();
+                    let value = if next() % 9 == 0 {
+                        Value::Tombstone
+                    } else {
+                        Value::Bytes(&value)
+                    };
+                    builder.add(&key, seq, value).unwrap();
+                }
+                let run = builder.finish();
+                let bytes = run.as_bytes();
+                out.push((bytes.len(), crc32fast::hash(&bytes)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn runs_encode_to_the_recorded_bytes() {
+        assert_eq!(fingerprints(), EXPECTED);
+    }
+
+    /// Recorded from the builder before its per-record lengths were shared.
+    const EXPECTED: &[(usize, u32)] = &[
+        (241484, 1553911650),
+        (45296, 1780263009),
+        (140, 3784151790),
+        (113980, 1718054167),
+        (1332504, 3283846391),
+        (1641128, 3501827953),
+        (114, 1579890194),
+        (18045179, 1053523189),
+        (1157999, 1478202278),
+        (234491, 3346845624),
+        (140, 3784151790),
+        (114259, 231486511),
+        (210018, 4281895862),
+        (46623, 3916375195),
+        (140, 3784151790),
+        (113681, 4196691420),
+        (466540, 3026956633),
+        (224799, 1869669876),
+        (140, 3784151790),
+        (113387, 1029857924),
+        (473901, 509761888),
+        (424337, 3928125405),
+        (140, 3784151790),
+        (2252776, 3811102267),
+    ];
 }

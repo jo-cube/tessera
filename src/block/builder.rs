@@ -2,12 +2,11 @@
 //! Records must arrive in internal-key order; preflight checks let callers
 //! finish a full block and retry without losing the rejected record.
 
-use std::cmp::Ordering;
 use std::fmt;
 
 use super::{
-    MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL, U32_LEN, Value, cmp_internal,
-    common_prefix_len, varint,
+    MAX_BLOCK_LEN, MAX_KEY_LEN, MAX_VALUE_LEN, RESTART_INTERVAL, U32_LEN, Value, common_prefix_len,
+    varint,
 };
 
 /// Encodes records, supplied in block order, into an immutable block.
@@ -18,7 +17,9 @@ use super::{
 /// the record in a new one.
 #[derive(Debug, Default)]
 pub struct BlockBuilder {
+    /// Sealed blocks, then the open block's records from `start`.
     entries: Vec<u8>,
+    start: usize,
     restarts: Vec<u32>,
     last_key: Vec<u8>,
     last_seq: u64,
@@ -39,12 +40,28 @@ impl BlockBuilder {
     }
 
     /// Checks limits and order against the previous record.
+    #[cfg(test)]
     pub(crate) fn check(
         &self,
         user_key: &[u8],
         seq: u64,
         value: Value<'_>,
     ) -> Result<(), BuildError> {
+        Self::check_limits(user_key, value)?;
+        if self.record_count > 0 {
+            use std::cmp::Ordering;
+            match super::cmp_internal(&self.last_key, self.last_seq, user_key, seq) {
+                Ordering::Less => {}
+                Ordering::Equal => return Err(BuildError::DuplicateKey),
+                Ordering::Greater => return Err(BuildError::OutOfOrder),
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the key and value length limits only, for callers that order
+    /// records themselves.
+    pub(crate) fn check_limits(user_key: &[u8], value: Value<'_>) -> Result<(), BuildError> {
         if user_key.len() > MAX_KEY_LEN {
             return Err(BuildError::KeyTooLong {
                 len: user_key.len(),
@@ -55,20 +72,19 @@ impl BlockBuilder {
         {
             return Err(BuildError::ValueTooLong { len: bytes.len() });
         }
-        if self.record_count > 0 {
-            match cmp_internal(&self.last_key, self.last_seq, user_key, seq) {
-                Ordering::Less => {}
-                Ordering::Equal => return Err(BuildError::DuplicateKey),
-                Ordering::Greater => return Err(BuildError::OutOfOrder),
-            }
-        }
         Ok(())
     }
 
     /// Exact encoded length after an already checked record, including restarts.
-    /// Run builders use this to cut at raw byte limits without over-counting
-    /// the shared part of a prefix-compressed key.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn encoded_len_after(&self, key: &[u8], seq: u64, value: Value<'_>) -> usize {
+        self.project(key, seq, value).after
+    }
+
+    /// The encoded lengths of an already checked record, computed once: in
+    /// this block, and in a block of its own, which bounds the bytes it adds
+    /// to any block.
+    pub(crate) fn project(&self, key: &[u8], seq: u64, value: Value<'_>) -> Projection {
         let restart = self.record_count.is_multiple_of(RESTART_INTERVAL);
         let shared = if restart {
             0
@@ -79,59 +95,54 @@ impl BlockBuilder {
             Value::Bytes(v) => (v.len() as u64 + 1, v.len()),
             Value::Tombstone => (0, 0),
         };
+        let fixed = varint::encoded_len(tag) + varint::encoded_len(seq) + len;
         let suffix = key.len() - shared;
-        self.encoded_len()
-            + varint::encoded_len(shared as u64)
+        let record = varint::encoded_len(shared as u64)
             + varint::encoded_len(suffix as u64)
-            + varint::encoded_len(tag)
-            + varint::encoded_len(seq)
-            + suffix
-            + len
-            + if restart { U32_LEN } else { 0 }
-    }
-
-    /// Exact encoded length of a block holding only this record, which
-    /// bounds the bytes the record adds to any block, a new one included.
-    pub(crate) fn single_len(key: &[u8], seq: u64, value: Value<'_>) -> usize {
-        Self::new().encoded_len_after(key, seq, value)
+            + fixed
+            + suffix;
+        Projection {
+            shared,
+            record,
+            after: self.encoded_len() + record + if restart { U32_LEN } else { 0 },
+            single: 1 + varint::encoded_len(key.len() as u64) + fixed + key.len() + 2 * U32_LEN,
+        }
     }
 
     /// Encodes a record that has passed [`check`](Self::check).
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn append(
         &mut self,
         user_key: &[u8],
         seq: u64,
         value: Value<'_>,
     ) -> Result<(), BuildError> {
+        let projection = self.project(user_key, seq, value);
+        self.append_projected(user_key, seq, value, projection)
+    }
+
+    /// [`append`](Self::append) with the record's [`project`](Self::project)
+    /// result, taken since the last change to this builder.
+    pub(crate) fn append_projected(
+        &mut self,
+        user_key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+        projection: Projection,
+    ) -> Result<(), BuildError> {
         let (value_tag, value_bytes): (u64, &[u8]) = match value {
             Value::Tombstone => (0, &[]),
             Value::Bytes(bytes) => (bytes.len() as u64 + 1, bytes),
         };
-
-        let is_restart = self.record_count.is_multiple_of(RESTART_INTERVAL);
-        let shared = if is_restart {
-            0
-        } else {
-            common_prefix_len(&self.last_key, user_key)
-        };
-        let suffix = &user_key[shared..];
-
-        // Every term is bounded by the limits above and the current length by
-        // MAX_BLOCK_LEN, so this sum cannot overflow.
-        let record_len = varint::encoded_len(shared as u64)
-            + varint::encoded_len(suffix.len() as u64)
-            + varint::encoded_len(value_tag)
-            + varint::encoded_len(seq)
-            + suffix.len()
-            + value_bytes.len();
-        let directory_growth = if is_restart { U32_LEN } else { 0 };
-        if self.encoded_len() + record_len + directory_growth > MAX_BLOCK_LEN {
+        if projection.after > MAX_BLOCK_LEN {
             return Err(BuildError::BlockFull);
         }
-
-        if is_restart {
+        let shared = projection.shared;
+        let suffix = &user_key[shared..];
+        self.entries.reserve(projection.record);
+        if self.record_count.is_multiple_of(RESTART_INTERVAL) {
             // Offsets are below MAX_BLOCK_LEN, which fits in u32.
-            self.restarts.push(self.entries.len() as u32);
+            self.restarts.push((self.entries.len() - self.start) as u32);
         }
         varint::write(&mut self.entries, shared as u64);
         varint::write(&mut self.entries, suffix.len() as u64);
@@ -159,7 +170,7 @@ impl BlockBuilder {
 
     /// Returns the exact encoded length, including the restart directory.
     pub fn encoded_len(&self) -> usize {
-        self.entries.len() + self.restarts.len() * U32_LEN + U32_LEN
+        self.entries.len() - self.start + self.restarts.len() * U32_LEN + U32_LEN
     }
 
     /// Writes the restart directory and returns the finished block bytes.
@@ -178,16 +189,38 @@ impl BlockBuilder {
     /// its buffers. The last key stays readable until the next record.
     pub(crate) fn flush_into(&mut self, out: &mut Vec<u8>) {
         out.reserve(self.encoded_len());
-        out.extend_from_slice(&self.entries);
+        out.extend_from_slice(&self.entries[self.start..]);
         write_directory(&self.restarts, out);
-        self.entries.clear();
+        self.entries.truncate(self.start);
         self.restarts.clear();
         self.record_count = 0;
     }
 
+    /// Finishes the open block in place, after the blocks sealed before it,
+    /// and empties the open block. The last key stays readable until the
+    /// next record.
+    pub(crate) fn seal(&mut self) {
+        write_directory(&self.restarts, &mut self.entries);
+        self.start = self.entries.len();
+        self.restarts.clear();
+        self.record_count = 0;
+    }
+
+    /// The finished blocks sealed since the last [`clear_sealed`](Self::clear_sealed).
+    pub(crate) fn sealed(&self) -> &[u8] {
+        &self.entries[..self.start]
+    }
+
+    /// Discards the sealed blocks; the open block must be empty.
+    pub(crate) fn clear_sealed(&mut self) {
+        debug_assert!(self.is_empty());
+        self.entries.clear();
+        self.start = 0;
+    }
+
     /// Release unusually large empty build buffers after an oversized record.
     pub(crate) fn trim_empty(&mut self, limit: usize) {
-        debug_assert!(self.is_empty());
+        debug_assert!(self.is_empty() && self.start == 0);
         if self.entries.capacity() > limit {
             self.entries = Vec::new();
         }
@@ -199,6 +232,31 @@ impl BlockBuilder {
     /// Returns the user key of the most recently added record.
     pub(crate) fn last_key(&self) -> &[u8] {
         &self.last_key
+    }
+}
+
+/// A record's encoded lengths from [`BlockBuilder::project`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Projection {
+    shared: usize,
+    /// The record's bytes, excluding any restart entry.
+    record: usize,
+    /// The open block's encoded length with the record.
+    pub after: usize,
+    /// The encoded length of a block holding only the record.
+    pub single: usize,
+}
+
+impl Projection {
+    /// The projection after the open block was finished, which makes the
+    /// record a new block's first.
+    pub(crate) fn in_new_block(self) -> Self {
+        Self {
+            shared: 0,
+            record: self.single - 2 * U32_LEN,
+            after: self.single,
+            single: self.single,
+        }
     }
 }
 
