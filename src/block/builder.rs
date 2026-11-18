@@ -90,6 +90,12 @@ impl BlockBuilder {
             + if restart { U32_LEN } else { 0 }
     }
 
+    /// Exact encoded length of a block holding only this record, which
+    /// bounds the bytes the record adds to any block, a new one included.
+    pub(crate) fn single_len(key: &[u8], seq: u64, value: Value<'_>) -> usize {
+        Self::new().encoded_len_after(key, seq, value)
+    }
+
     /// Encodes a record that has passed [`check`](Self::check).
     pub(crate) fn append(
         &mut self,

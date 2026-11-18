@@ -166,7 +166,8 @@ pub const CONTEXT_ALLOWANCE: usize = 2 << 20;
 /// Upper estimate beside the output: a block and context per input, plus
 /// segment and block buffers, a compression context and one prepared segment
 /// dictionary for the builder.
-/// Checks frame metadata and dictionaries without decoding. Existing retained
+/// Reads the largest block lengths recorded for built and validated runs, and
+/// otherwise checks frame headers without decoding. Existing retained
 /// workspace capacity is excluded.
 pub fn workspace_bytes(inputs: &[RunView<'_>]) -> Result<usize, CorruptRun> {
     let blocks = inputs
@@ -193,12 +194,14 @@ fn workspace_for_segment(
         largest = largest.max(block);
         total = total.saturating_add(block.saturating_add(1 << 20));
     }
-    // One encoded segment plus its builder storage; output blocks can grow
-    // to the raw cap even when all input blocks are small. Oversized records
-    // need corresponding buffers as well. Include bounded dictionary scratch.
+    // One segment of raw blocks plus its builder storage; output blocks can
+    // grow to the raw cap even when all input blocks are small. Oversized
+    // records need corresponding buffers as well. Include bounded dictionary
+    // scratch.
     total
-        // Segment builder (up to 2x growth), raw scratch (2x), encoded
-        // segment scratch (2x), plus reusable raw block and block builder.
+        // Buffered raw blocks (up to 2x growth) and their block list (at most
+        // 8 bytes per block of at least 12 bytes, with 2x growth), with
+        // room to spare, plus the open block builder, probe and frame scratch.
         .saturating_add(largest.max(segment_len).saturating_mul(6))
         .saturating_add(largest.max(super::RAW_BLOCK_CAP).saturating_mul(4))
         .saturating_add(super::dictionary::DICTIONARY_LEN + super::dictionary::SAMPLE_LEN)

@@ -70,6 +70,13 @@ struct RunBacking<B> {
     largest_block: usize,
 }
 
+/// What a builder or a validation pass found in a run's blocks.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BlockSizes {
+    pub build_estimate: usize,
+    pub largest_block: usize,
+}
+
 /// The smallest and largest sequence numbers of a run's records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seqs {
@@ -118,7 +125,7 @@ impl<B: AsRef<[u8]>> Run<B> {
     /// [`MAX_BLOCK_LEN`](crate::block::MAX_BLOCK_LEN).
     #[cfg(test)]
     pub fn new(data: B) -> Result<Self, CorruptRun> {
-        let (seqs, reclaimable, build_estimate, largest_block) = validate(data.as_ref(), None)?;
+        let (seqs, reclaimable, sizes) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
@@ -128,13 +135,13 @@ impl<B: AsRef<[u8]>> Run<B> {
                 restart_heads,
                 filter: None,
                 bounds,
-                largest_block,
+                largest_block: sizes.largest_block,
             }),
             slice: None,
             seqs,
             seq_override: None,
             reclaimable,
-            build_estimate,
+            build_estimate: sizes.build_estimate,
         })
     }
 
@@ -143,7 +150,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         filter: Option<KeyFilter>,
         seqs: Seqs,
         reclaimable: bool,
-        (build_estimate, largest_block): (usize, usize),
+        sizes: BlockSizes,
     ) -> Self {
         let bounds = KeyBounds::of(&data);
         let restart_heads = Self::restart_heads(&data);
@@ -153,13 +160,13 @@ impl<B: AsRef<[u8]>> Run<B> {
                 restart_heads,
                 filter: filter.map(Box::new),
                 bounds,
-                largest_block,
+                largest_block: sizes.largest_block,
             }),
             slice: None,
             seqs,
             seq_override: None,
             reclaimable,
-            build_estimate,
+            build_estimate: sizes.build_estimate,
         }
     }
 
@@ -536,7 +543,7 @@ impl Run<Vec<u8>> {
 
     #[cfg(test)]
     pub(crate) fn recover_in(data: Vec<u8>, pool: &ChunkPool) -> Result<(Self, u64), CorruptRun> {
-        let (seqs, reclaimable, build_estimate, largest_block) = validate(&data, None)?;
+        let (seqs, reclaimable, sizes) = validate(&data, None)?;
         let mut hashes = KeyHashes::new();
         {
             let mut workspace = ReadWorkspace::new();
@@ -546,14 +553,7 @@ impl Run<Vec<u8>> {
                 hashes.add(record.key);
             }
         }
-        Self::pack_recovered(
-            data,
-            pool,
-            hashes.finish(),
-            seqs,
-            reclaimable,
-            (build_estimate, largest_block),
-        )
+        Self::pack_recovered(data, pool, hashes.finish(), seqs, reclaimable, sizes)
     }
 
     pub(crate) fn recover_checkpoint_in(
@@ -569,15 +569,8 @@ impl Run<Vec<u8>> {
                     .ok_or(corrupt(data.len(), RunCorruption::InvalidFilter))?,
             )
         };
-        let (seqs, reclaimable, build_estimate, largest_block) = validate(&data, filter.as_ref())?;
-        Self::pack_recovered(
-            data,
-            pool,
-            filter,
-            seqs,
-            reclaimable,
-            (build_estimate, largest_block),
-        )
+        let (seqs, reclaimable, sizes) = validate(&data, filter.as_ref())?;
+        Self::pack_recovered(data, pool, filter, seqs, reclaimable, sizes)
     }
 
     fn pack_recovered(
@@ -586,7 +579,7 @@ impl Run<Vec<u8>> {
         filter: Option<KeyFilter>,
         seqs: Seqs,
         reclaimable: bool,
-        sizes: (usize, usize),
+        sizes: BlockSizes,
     ) -> Result<(Self, u64), CorruptRun> {
         let view = RunView::open(&data)?;
         let mut packing = Packing::new(pool);
@@ -1151,7 +1144,8 @@ pub struct RunView<'a> {
     // Raw borrowed views used during validation allocate nothing. Owned runs
     // attach their once-built heads to every view used for reads.
     restart_heads: Option<&'a [u64]>,
-    // Owned runs attach the largest block length found when they were built.
+    // Owned runs attach the largest block length found when they were built
+    // or validated.
     largest_block: Option<usize>,
     slice: Option<KeyRange<'a>>,
 }
@@ -1628,7 +1622,7 @@ fn key_end(entry: [u8; TABLE_ENTRY_LEN]) -> usize {
 fn validate(
     bytes: &[u8],
     filter: Option<&KeyFilter>,
-) -> Result<(Seqs, bool, usize, usize), CorruptRun> {
+) -> Result<(Seqs, bool, BlockSizes), CorruptRun> {
     let view = RunView::open(bytes)?;
     let footer_at = bytes.len() - FOOTER_LEN;
     let expected = u32::from_le_bytes(bytes[footer_at + 36..footer_at + 40].try_into().unwrap());
@@ -1650,10 +1644,10 @@ fn validate(
     }
     let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
-    let mut largest_block = 0;
+    let mut sizes = BlockSizes::default();
     for block in 0..view.table.len() {
         let frame = view.frame(block)?;
-        largest_block = largest_block.max(frame.decoded_len);
+        sizes.largest_block = sizes.largest_block.max(frame.decoded_len);
         // Decoding verifies compressed frames.
         if frame.codec == Codec::None {
             frame.verify_checksum()?;
@@ -1704,7 +1698,8 @@ fn validate(
         min: walk.min_seq,
         max: walk.max_seq,
     };
-    Ok((seqs, walk.reclaimable, walk.build_estimate, largest_block))
+    sizes.build_estimate = walk.build_estimate;
+    Ok((seqs, walk.reclaimable, sizes))
 }
 
 #[cfg(test)]
@@ -1723,37 +1718,33 @@ pub struct SegmentSample {
     pub blocks: Vec<Vec<u8>>,
 }
 
-/// Recomputes the builder's ratio probe: the segment re-encoded as one raw
-/// block, its middle 64 KiB compressed with the level-3 prepared dictionary.
+/// Recomputes the builder's ratio probe: the segment's first 64 KiB of
+/// records encoded as one block, compressed at level 1 without a dictionary.
 #[cfg(feature = "diagnostics")]
-fn builder_hint(blocks: &[Vec<u8>], dictionary: &[u8]) -> usize {
-    use super::dictionary::SAMPLE_LEN;
-    let mut segment = crate::block::BlockBuilder::new();
-    for bytes in blocks {
+fn builder_hint(blocks: &[Vec<u8>]) -> usize {
+    let mut sample = crate::block::BlockBuilder::new();
+    'blocks: for bytes in blocks {
         let view = BlockView::open(bytes).expect(VALIDATED);
         let mut cursor = BlockPosition::new();
         while let Some(record) = cursor.next_record(view).expect(VALIDATED) {
-            segment
+            if !sample.is_empty()
+                && sample.encoded_len_after(record.key, record.seq, record.value)
+                    > super::dictionary::SAMPLE_LEN
+            {
+                break 'blocks;
+            }
+            sample
                 .append(record.key, record.seq, record.value)
                 .expect(VALIDATED);
         }
     }
     let mut raw = Vec::new();
-    segment.flush_into(&mut raw);
-    let start = if raw.len() <= SAMPLE_LEN {
-        0
-    } else {
-        raw.len() / 2
-    };
-    let sample = &raw[start..(start + SAMPLE_LEN).min(raw.len())];
-    let compressor = super::codec::Compressor::new(Codec::Zstd);
-    let prepared = compressor.prepare_dictionary(dictionary);
-    let mut compressed = Vec::new();
-    let mut compressor = compressor;
-    compressor.compress(sample, prepared.as_ref(), &mut compressed);
+    sample.flush_into(&mut raw);
+    let raw = &raw[..raw.len().min(super::dictionary::SAMPLE_LEN)];
+    let stored = super::codec::Compressor::new(Codec::Zstd).probe(raw, &mut Vec::new());
     super::TARGET_BLOCK_COMPRESSED
-        .saturating_mul(sample.len())
-        .checked_div(compressed.len())
+        .saturating_mul(raw.len())
+        .checked_div(stored)
         .unwrap_or(1)
         .clamp(1, super::RAW_BLOCK_CAP)
 }
@@ -1836,7 +1827,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                     })
                     .collect();
                 let dictionary = first.dictionary.to_vec();
-                let hint = builder_hint(&blocks, &dictionary);
+                let hint = builder_hint(&blocks);
                 out.push(SegmentSample {
                     dictionary,
                     hint,
