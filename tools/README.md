@@ -15,7 +15,19 @@ erased, the filter probes that took and why the rest kept theirs; and decoded
 bytes per get, blocks per scan and write amplification.
 `--settle` then compacts everything into the bottom level and measures again,
 `--variant LABEL` labels the rows and `--scale SHIFT` runs smaller scenarios;
-name scenarios to run only those.
+name scenarios to run only those. `clustered` (time-ordered load of grouped
+JSON, then updates to the newest 10% of entities) runs only when named.
+
+Audit flags: `--copy-audit` prints, per bottom input segment of every level-0
+→ bottom merge, how many blocks could be copied verbatim (no other input's key
+in range, all sequences 0, no tombstone), and the level-0 block bytes those
+merges decoded. `--c2` recompresses evenly spaced bottom segments (at least
+64 MiB raw) as the builder does, with Zstandard `targetCBlockSize` and
+`maxBlockSize` variants, and prints stored bytes, raw bytes an early-stopping
+point read would decode, and relative decompression time. `--write-only`
+stops after the drain, for profiling. `--memtable VALUE_LEN` (with
+`tools-memory`) fills one memtable to its budget with random keys and prints
+its live heap per entry beyond key and value.
 
 The hidden `diagnostics` feature provides the counters. It is not part of the
 stable API. The [basic example](../examples/basic.rs) demonstrates the public

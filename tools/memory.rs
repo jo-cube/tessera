@@ -29,6 +29,11 @@ fn cpu_seconds() -> f64 {
         / TICKS.get().unwrap()
 }
 
+/// Live counted Rust heap bytes.
+pub fn live() -> usize {
+    LIVE.load(Relaxed)
+}
+
 fn add(bytes: usize) {
     let now = LIVE.fetch_add(bytes, Relaxed) + bytes;
     PEAK.fetch_max(now, Relaxed);

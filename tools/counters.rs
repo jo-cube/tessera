@@ -4,11 +4,13 @@
 //! compaction, checks every read path against a version oracle and prints
 //! long-format CSV rows. See tools/README.md.
 //!
-//! `counters [--variant LABEL] [--settle] [--scale SHIFT] [SCENARIO...]`
+//! `counters [--variant LABEL] [--settle] [--scale SHIFT] [--copy-audit]
+//! [--c2] [--write-only] [--memtable VALUE_LEN] [SCENARIO...]`
 use std::time::Instant;
 use tessera::engine::diagnostics;
 use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
 
+mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
 mod memory;
 
@@ -76,9 +78,40 @@ struct Scenario {
     weak: bool,
     records: usize,
     value_len: usize,
+    /// Time-ordered load, then updates to the newest 10% of entities in order.
+    clustered: bool,
 }
 
-fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
+#[derive(Default)]
+struct Flags {
+    copy_audit: bool,
+    c2: bool,
+    write_only: bool,
+}
+
+/// One row per audited bottom input segment, then the bottom work totals.
+fn print_copy_audit(name: &str, variant: &str) {
+    let (segments, other_raw) = diagnostics::take_copy_audit();
+    println!("copy_other,{name},{variant},{other_raw}");
+    for s in segments {
+        println!(
+            "copy_segment,{name},{variant},{},{},{},{},{},{},{},{},{},{},{}",
+            s.blocks,
+            s.raw,
+            s.stored,
+            s.copyable_blocks,
+            s.copyable_raw,
+            s.copyable_stored,
+            s.only_seq,
+            s.only_tombstone,
+            s.seq_and_tombstone,
+            s.touched,
+            s.edge
+        );
+    }
+}
+
+fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags) {
     let started = Instant::now();
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let engine = std::sync::Arc::new(
@@ -95,7 +128,9 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
     let mut ingested = 0u64;
     let mut order: Vec<_> = (0..records).collect();
     let mut rng = Rng(0x123456789abcdef);
-    rng.shuffle(&mut order);
+    if !s.clustered {
+        rng.shuffle(&mut order);
+    }
     for &i in &order {
         let v = value(i, 0, weak, len);
         engine.put(&key(i), &v).unwrap();
@@ -105,8 +140,12 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
     memory::phase_end(&engine, "load_end", 1);
     let mut updated = vec![false; records];
     let mut updates = order;
-    rng.shuffle(&mut updates);
-    updates.truncate(records / 2);
+    if s.clustered {
+        updates = (records / MEMBERS * 9 / 10 * MEMBERS..records).collect();
+    } else {
+        rng.shuffle(&mut updates);
+        updates.truncate(records / 2);
+    }
     for &i in &updates {
         let v = value(i, 1, weak, len);
         engine.put(&key(i), &v).unwrap();
@@ -123,6 +162,11 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     memory::phase_end(&engine, "drain_end", 3);
     let load_seconds = started.elapsed().as_secs_f64();
+    if flags.write_only {
+        eprintln!("write_only,{name},{load_seconds:.1}");
+        std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        return;
+    }
 
     let expect = |i: usize| value(i, u8::from(updated[i]), weak, len);
     let mut scans = EngineWorkspace::new();
@@ -217,6 +261,15 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
             m.physical
         );
     }
+    if flags.copy_audit {
+        print_copy_audit(name, variant);
+    }
+    if flags.c2 {
+        // At least 64 MiB raw of evenly spaced bottom segments, or all.
+        let every = (diagnostics::bottom_raw(&engine) / (64 << 20)).max(1);
+        let samples = diagnostics::bottom_segments(&engine, every);
+        c2::run(name, &samples);
+    }
     let flush_raw = work[0].raw_out;
     let raw: u64 = work.iter().map(|w| w.raw_out).sum();
     let stored: u64 = work.iter().map(|w| w.stored).sum();
@@ -273,6 +326,20 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize) {
                 m.physical
             );
         }
+        if flags.copy_audit {
+            print_copy_audit(name, &format!("{variant}+settled"));
+            for (slot, w) in diagnostics::work(&engine).iter().enumerate() {
+                if w.raw_out > 0 {
+                    println!(
+                        "work,{name},{variant}+settled,{},{},{},{}",
+                        slot_name(slot),
+                        w.raw_in,
+                        w.raw_out,
+                        w.stored
+                    );
+                }
+            }
+        }
         println!(
             "settled,{name},{variant},{},{},{:.1},{:.3}",
             engine.stats().run_bytes,
@@ -309,6 +376,8 @@ fn main() {
     let mut settle = false;
     let mut threads = 1;
     let mut scale = 0;
+    let mut flags = Flags::default();
+    let mut memtable = None;
     let mut names = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -324,6 +393,10 @@ fn main() {
                 };
             }
             "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
+            "--copy-audit" => flags.copy_audit = true,
+            "--c2" => flags.c2 = true,
+            "--write-only" => flags.write_only = true,
+            "--memtable" => memtable = Some(args.next().expect("VALUE_LEN").parse().unwrap()),
             _ => names.push(arg),
         }
     }
@@ -333,20 +406,45 @@ fn main() {
             weak: false,
             records: 2_097_152 >> scale,
             value_len: 600,
+            clustered: false,
         },
         Scenario {
             name: "B",
             weak: true,
             records: 2_097_152 >> scale,
             value_len: 600,
+            clustered: false,
         },
         Scenario {
             name: "A-large",
             weak: false,
             records: 4_194_304 >> scale,
             value_len: 48,
+            clustered: false,
+        },
+        Scenario {
+            name: "clustered",
+            weak: false,
+            records: 2_097_152 >> scale,
+            value_len: 600,
+            clustered: true,
         },
     ];
+    if let Some(len) = memtable {
+        memtable_overhead(len);
+        return;
+    }
+    if flags.copy_audit {
+        diagnostics::enable_copy_audit();
+        println!(
+            "copy_segment,scenario,variant,blocks,raw,stored,copyable_blocks,copyable_raw,copyable_stored,only_seq,only_tombstone,seq_and_tombstone,touched,edge"
+        );
+    }
+    if flags.c2 {
+        println!(
+            "c2,scenario,setting,stored,stored_ratio,decoded_per_record,zstd_blocks_per_frame,decompress_time_ratio,raw_per_record"
+        );
+    }
     println!("work,scenario,variant,destination,raw_in,raw_out,stored");
     println!("erasure,scenario,variant,records,erased,probes,kept_unfiltered,kept_filtered");
     println!(
@@ -361,12 +459,56 @@ fn main() {
         );
     }
     for s in &scenarios {
-        if names.is_empty() || names.iter().any(|n| n == s.name) {
+        if (names.is_empty() && !s.clustered) || names.iter().any(|n| n == s.name) {
             eprintln!(
                 "config,{},{variant},records={},background_threads={threads}",
                 s.name, s.records
             );
-            run(s, &variant, settle, threads);
+            run(s, &variant, settle, threads, &flags);
         }
+    }
+}
+
+/// Live Rust heap of one memtable filled to its budget, per entry beyond its
+/// key and value, with random keys and no snapshots. Needs the counting
+/// allocator (`tools-memory`, Linux).
+fn memtable_overhead(value_len: usize) {
+    #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+    {
+        let budget = EngineOptions::default().memtable_budget;
+        let charge = 16 + value_len + tessera::engine::ENTRY_OVERHEAD;
+        // Stay just inside one table: a full table rotates before flushing.
+        let entries = budget / charge - 64;
+        let mut order: Vec<_> = (0..entries).collect();
+        Rng(0x123456789abcdef).shuffle(&mut order);
+        let engine = Engine::new(EngineOptions::default()).unwrap();
+        let mut v = vec![0u8; value_len];
+        let before = memory::live();
+        for &i in &order {
+            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            engine.put(&key(i * 7 + 3), &v).unwrap();
+        }
+        let after = memory::live();
+        let stats = engine.stats();
+        assert_eq!(stats.flushes, 0);
+        assert_eq!(stats.frozen_tables, 0);
+        let payload = entries * (16 + value_len);
+        let heap = after - before;
+        let arena = stats.active.arena_bytes;
+        println!(
+            "memtable,value_len,entries,heap,payload,arena_used,chunk_bytes_held,charged,budget,overhead_per_entry,charged_overhead"
+        );
+        println!(
+            "memtable,{value_len},{entries},{heap},{payload},{arena},{},{},{budget},{:.2},{}",
+            stats.chunk_bytes_held,
+            stats.active.charged,
+            (heap - payload) as f64 / entries as f64,
+            tessera::engine::ENTRY_OVERHEAD,
+        );
+    }
+    #[cfg(not(all(feature = "tools-memory", target_os = "linux")))]
+    {
+        let _ = value_len;
+        panic!("--memtable needs the tools-memory feature on Linux");
     }
 }
