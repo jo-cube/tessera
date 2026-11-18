@@ -542,3 +542,23 @@ fn concurrent_output_refusal_keeps_every_view_readable_and_checkpointable() {
     {}
     check(&recovered.snapshot(), ones);
 }
+
+#[test]
+fn one_builder_publishes_small_bottom_ranges_before_building_the_next() {
+    let engine = fixture_with_threads(1);
+    // Use the real planner estimate, rather than the forced-piece test mode.
+    engine.core.piece_budget.store(0, Ordering::Relaxed);
+    let first = engine.core.read_state().levels.runs()[1][0]
+        .run
+        .retirement();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let count = builds.clone();
+    *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
+        if count.fetch_add(1, Ordering::Relaxed) > 0 {
+            assert_eq!(first.strong_count(), 0, "the prior small range has retired");
+        }
+    }));
+    engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+    assert!(builds.load(Ordering::Relaxed) > 1);
+    check(&engine.snapshot(), ones);
+}
