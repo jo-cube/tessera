@@ -2,16 +2,21 @@
 //! Records arrive in internal-key order and are cut into raw blocks as they
 //! are added; each segment's blocks are compressed with its dictionary once
 //! the segment is complete. Frames and dictionaries are packed atomically so
-//! reads can borrow contiguous bytes from shared chunks.
+//! reads can borrow contiguous bytes from shared chunks. A merge into the
+//! bottom level can instead open a segment that inherits an input segment's
+//! dictionary, copy that segment's settled frames into it, and compress its
+//! other blocks as they are cut.
 
 use super::OutputBudget;
 use super::codec::{Codec, Compressor};
 use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN, Segment};
 use super::filter::KeyHashes;
+use super::frame::Frame;
+use super::settled::SettledCounts;
 use super::storage::{Packing, RunData};
 use super::{
-    FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN, TABLE_ENTRY_LEN,
-    TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame,
+    CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RAW_BLOCK_CAP, SEGMENT_ENTRY_LEN,
+    TABLE_ENTRY_LEN, TARGET_BLOCK_COMPRESSED, TARGET_BLOCK_LEN, frame,
     reader::{BlockSizes, Run, Seqs},
 };
 use crate::block::{
@@ -64,7 +69,26 @@ pub struct RunBuilder {
     key_hashes: KeyHashes,
     output_budget: Option<Arc<OutputBudget>>,
     output_refused: bool,
+    /// Per indexed block, its records if all have sequence 0 and a value,
+    /// otherwise 0.
+    settled: Vec<u32>,
+    /// Whether every record of the open block has sequence 0 and a value.
+    open_settled: bool,
+    /// The open segment, if it inherits an input segment's dictionary.
+    inherit: Option<Inherited>,
 }
+
+/// A segment whose dictionary came from a merge input. Its blocks are
+/// compressed as they are cut, and settled input frames are copied into it.
+#[derive(Debug)]
+struct Inherited {
+    dictionary: Vec<u8>,
+    /// The segment's reference, assigned with its first frame.
+    reference: Option<u32>,
+    /// Raw bytes of the segment's frames so far.
+    raw: usize,
+}
+
 impl Default for RunBuilder {
     fn default() -> Self {
         Self::new(Codec::default())
@@ -102,6 +126,9 @@ impl RunBuilder {
             key_hashes: KeyHashes::new(),
             output_budget: None,
             output_refused: false,
+            settled: Vec::new(),
+            open_settled: true,
+            inherit: None,
         }
     }
     pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
@@ -177,7 +204,14 @@ impl RunBuilder {
                 projection = projection.in_new_block();
             }
         }
-        if !(self.block.is_empty() && self.pending_blocks.is_empty())
+        if let Some(inherit) = &self.inherit {
+            // An inherited segment holds at most twice the usual raw bytes;
+            // the rest of its input segment starts a sampled one.
+            if inherit.raw + projection.after > 2 * self.segment_len {
+                self.end_inherited();
+                projection = projection.in_new_block();
+            }
+        } else if !(self.block.is_empty() && self.pending_blocks.is_empty())
             && self.block.sealed().len() + projection.after > self.segment_len
         {
             self.cut_segment();
@@ -205,6 +239,7 @@ impl RunBuilder {
                 .saturating_add(256),
         );
         self.reclaimable |= value == Value::Tombstone || duplicate;
+        self.open_settled &= seq == 0 && value != Value::Tombstone;
         self.last_seq = seq;
         self.pending_key_bytes += key.len();
         self.min_seq = if self.record_count == 0 {
@@ -251,6 +286,171 @@ impl RunBuilder {
     }
     pub(super) fn limit_segment_len(&mut self, bytes: usize) {
         self.segment_len = bytes.clamp(RAW_BLOCK_CAP, SEGMENT_RAW_LEN);
+    }
+    /// Whether the run holds a record.
+    pub(super) fn has_records(&self) -> bool {
+        self.record_count > 0
+    }
+    /// Whether the open segment inherits an input segment's dictionary.
+    pub(super) fn inheriting(&self) -> bool {
+        self.inherit.is_some()
+    }
+
+    /// Ends the open segment and opens one that compresses with
+    /// `dictionary`, a merge input segment's raw dictionary. Blocks are cut
+    /// at the raw length expected to compress to the target, from that
+    /// segment's `raw` decoded and `stored` payload bytes in its frame
+    /// headers. The segment ends with [`end_inherited`](Self::end_inherited),
+    /// when the run finishes, or once it holds twice the usual segment length.
+    pub(super) fn begin_inherited(&mut self, dictionary: &[u8], raw: usize, stored: usize) {
+        self.cut_segment();
+        if self.output_refused || self.compressor.codec() != Codec::Zstd {
+            return;
+        }
+        let target = self.raw_target.unwrap_or(self.target_for(raw, stored));
+        self.compressor.begin_segment(dictionary, target);
+        self.block_target = Some(target);
+        self.inherit = Some(Inherited {
+            dictionary: dictionary.to_vec(),
+            reference: None,
+            raw: 0,
+        });
+    }
+
+    /// Closes an inherited segment; later records start a sampled one.
+    pub(super) fn end_inherited(&mut self) {
+        if self.inherit.is_none() {
+            return;
+        }
+        self.finish_block();
+        self.inherit = None;
+        if self.raw_target.is_none() {
+            self.block_target = None;
+        }
+    }
+
+    /// Appends a settled input frame of `records` records whose last key is
+    /// `last_key` to the inherited segment, after ending the open block.
+    /// `first_key`, the frame's first key, is needed only if the run holds
+    /// no record yet. Returns whether the frame was copied; it is not if the
+    /// segment is full, which ends it, if the run cannot hold it, or if the
+    /// builder keeps a key filter, which needs every key. A frame whose
+    /// stored bytes do not match its checksum is an error.
+    pub(super) fn copy_frame(
+        &mut self,
+        frame: &Frame<'_>,
+        last_key: &[u8],
+        records: usize,
+        first_key: Option<&[u8]>,
+    ) -> Result<bool, CorruptRun> {
+        let Some(inherit) = &self.inherit else {
+            return Ok(false);
+        };
+        if self.output_refused
+            || !self.key_hashes.disabled()
+            || frame.codec != Codec::Zstd
+            || records == 0
+            || (self.record_count == 0 && first_key.is_none())
+        {
+            return Ok(false);
+        }
+        if inherit.raw + frame.decoded_len > 2 * self.segment_len {
+            self.end_inherited();
+            return Ok(false);
+        }
+        self.finish_block();
+        let stored = self
+            .storage
+            .frames_len
+            .saturating_add(self.storage.dictionaries_len)
+            .saturating_add(self.segments.len())
+            .saturating_add(self.table.len())
+            .saturating_add(self.keys.len())
+            .saturating_add(frame::HEADER_LEN + frame.stored.len());
+        let key_bytes = last_key.len() + first_key.map_or(0, <[u8]>::len);
+        if self.output_refused
+            || !index_has_room(
+                self.table.len() / TABLE_ENTRY_LEN,
+                self.keys.len().saturating_add(key_bytes),
+            )
+            || !run_has_room(stored, 0, 1, key_bytes)
+        {
+            return Ok(false);
+        }
+        let Some(reference) = self.inherited_reference() else {
+            return Ok(false);
+        };
+        if !self.reserve_output(
+            frame::HEADER_LEN + frame.stored.len() + TABLE_ENTRY_LEN + 2 * key_bytes + 64,
+        ) {
+            return Ok(false);
+        }
+        let mut copy = std::mem::take(&mut self.frames);
+        copy.clear();
+        let sealed = frame.copy_resealed(&mut copy, reference);
+        if let Err(error) = sealed {
+            self.frames = copy;
+            return Err(error);
+        }
+        let offset = u32::try_from(self.storage.frames_len).expect("bounded run offset");
+        self.storage.reused(copy.len());
+        self.storage.frame(&copy);
+        retain_scratch(&mut copy, 2 * RAW_BLOCK_CAP);
+        self.frames = copy;
+        if self.record_count == 0 {
+            let first = first_key.expect("checked above");
+            self.keys.extend_from_slice(first);
+            self.min_key_len = first.len();
+            self.min_seq = 0;
+        }
+        push_index(
+            &mut self.keys,
+            &mut self.table,
+            &mut self.index_last_key,
+            last_key,
+            offset,
+        );
+        self.settled
+            .push(u32::try_from(records).expect("bounded block"));
+        self.record_count += records;
+        self.min_seq = 0;
+        self.block.set_last_key(last_key);
+        self.last_seq = 0;
+        self.largest_block = self.largest_block.max(frame.decoded_len);
+        self.build_estimate = self.build_estimate.saturating_add(
+            frame
+                .decoded_len
+                .saturating_mul(4)
+                .saturating_add(records.saturating_mul(256)),
+        );
+        if let Some(inherit) = &mut self.inherit {
+            inherit.raw += frame.decoded_len;
+        }
+        Ok(true)
+    }
+
+    /// The inherited segment's reference, storing its dictionary and
+    /// segment entry with its first frame.
+    fn inherited_reference(&mut self) -> Option<u32> {
+        let inherit = self.inherit.as_ref()?;
+        if let Some(reference) = inherit.reference {
+            return Some(reference);
+        }
+        let len = inherit.dictionary.len();
+        if !self.reserve_output(len + SEGMENT_ENTRY_LEN + 32) {
+            return None;
+        }
+        let inherit = self.inherit.as_mut().expect("checked above");
+        let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
+        assert!(id < 1 << 24, "segment reference fits in 24 bits");
+        self.segments
+            .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
+        self.segments.extend_from_slice(&(len as u32).to_le_bytes());
+        self.segments
+            .extend_from_slice(&crc32fast::hash(&inherit.dictionary).to_le_bytes());
+        self.storage.dictionary(&inherit.dictionary);
+        inherit.reference = Some(id as u32);
+        Some(id as u32)
     }
     pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
         self.key_hashes.limit_to(bytes / size_of::<u64>());
@@ -350,6 +550,7 @@ impl RunBuilder {
             BlockSizes {
                 build_estimate: self.build_estimate,
                 largest_block: self.largest_block,
+                settled: SettledCounts::from_blocks(&self.settled),
             },
         ))
     }
@@ -368,6 +569,7 @@ impl RunBuilder {
         self.frames = compressed;
         let view = BlockView::open(&raw).expect("builder's block");
         let mut cursor = BlockPosition::new();
+        self.open_settled = true;
         while let Some(record) = cursor.next_record(view).expect("builder's record") {
             let mut projection = self.block.project(record.key, record.seq, record.value);
             if !self.block.is_empty()
@@ -377,6 +579,7 @@ impl RunBuilder {
                 projection = projection.in_new_block();
             }
             self.pending_key_bytes += record.key.len();
+            self.open_settled &= record.seq == 0 && record.value != Value::Tombstone;
             self.block
                 .append_projected(record.key, record.seq, record.value, projection)
                 .expect("one record fits a block");
@@ -386,6 +589,7 @@ impl RunBuilder {
     }
     /// Moves the open block into the segment buffer and writes its index
     /// entry, whose frame offset is filled in when the segment is compressed.
+    /// An inherited segment compresses the block at once.
     fn finish_block(&mut self) {
         if self.block.is_empty() {
             return;
@@ -399,27 +603,19 @@ impl RunBuilder {
         if !self.reserve_output(TABLE_ENTRY_LEN + 2 * last.len() + 64) {
             return;
         }
-        let last = self.block.last_key();
-        let shared = if (self.table.len() / TABLE_ENTRY_LEN).is_multiple_of(RESTART_INTERVAL) {
-            0
-        } else {
-            self.index_last_key
-                .iter()
-                .zip(last)
-                .take_while(|(a, b)| a == b)
-                .count()
-                .min(u16::MAX as usize)
-        };
-        self.keys.extend_from_slice(&(shared as u16).to_le_bytes());
-        self.keys.extend_from_slice(&last[shared..]);
-        self.index_last_key.clear();
-        self.index_last_key.extend_from_slice(last);
-        self.table.extend_from_slice(&0u32.to_le_bytes());
-        self.table.extend_from_slice(
-            &u32::try_from(self.keys.len())
-                .expect("bounded key area")
-                .to_le_bytes(),
+        push_index(
+            &mut self.keys,
+            &mut self.table,
+            &mut self.index_last_key,
+            self.block.last_key(),
+            0,
         );
+        self.settled.push(if self.open_settled {
+            u32::try_from(self.block.len()).expect("bounded block")
+        } else {
+            0
+        });
+        self.open_settled = true;
         let records = self.pending_blocks.last().map_or(0, |&(_, n)| n as usize) + self.block.len();
         self.block.seal();
         self.pending_blocks.push((
@@ -427,8 +623,29 @@ impl RunBuilder {
             u32::try_from(records).expect("bounded segment"),
         ));
         self.pending_key_bytes = 0;
+        if self.inherit.is_some() {
+            self.compress_inherited();
+        }
+    }
+    /// Compresses the one buffered block of an inherited segment.
+    fn compress_inherited(&mut self) {
+        let Some(reference) = self.inherited_reference() else {
+            return;
+        };
+        let len = self.block.sealed().len();
+        let number = self.table.len() / TABLE_ENTRY_LEN - 1;
+        self.compress_block(number, 0..len, reference);
+        if let Some(inherit) = &mut self.inherit {
+            inherit.raw += len;
+        }
+        self.block.clear_sealed();
+        self.pending_blocks.clear();
     }
     fn cut_segment(&mut self) {
+        if self.inherit.is_some() {
+            self.end_inherited();
+            return;
+        }
         self.finish_block();
         if self.output_refused || self.pending_blocks.is_empty() {
             return;
@@ -520,6 +737,37 @@ impl RunBuilder {
                 .to_le_bytes(),
         );
     }
+}
+
+/// Appends the index entry of a block ending with `last`, with prefix
+/// sharing against the previous index key, at frame `offset`.
+fn push_index(
+    keys: &mut Vec<u8>,
+    table: &mut Vec<u8>,
+    index_last_key: &mut Vec<u8>,
+    last: &[u8],
+    offset: u32,
+) {
+    let shared = if (table.len() / TABLE_ENTRY_LEN).is_multiple_of(RESTART_INTERVAL) {
+        0
+    } else {
+        index_last_key
+            .iter()
+            .zip(last)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(u16::MAX as usize)
+    };
+    keys.extend_from_slice(&(shared as u16).to_le_bytes());
+    keys.extend_from_slice(&last[shared..]);
+    index_last_key.clear();
+    index_last_key.extend_from_slice(last);
+    table.extend_from_slice(&offset.to_le_bytes());
+    table.extend_from_slice(
+        &u32::try_from(keys.len())
+            .expect("bounded key area")
+            .to_le_bytes(),
+    );
 }
 
 /// Keep ordinary scratch, but do not retain a singleton oversized record.

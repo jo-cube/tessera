@@ -17,6 +17,7 @@ use super::filter::KeyHashes;
 use super::filter::{self as key_filter, KeyFilter};
 use super::frame::{self, Frame};
 use super::index::{IndexKey, head};
+use super::settled::SettledCounts;
 use super::storage::{Packing, Region, RunData, Segmented};
 use super::{
     CorruptRun, FOOTER_LEN, FORMAT_VERSION, MAGIC, RunCorruption, SEGMENT_ENTRY_LEN,
@@ -68,13 +69,17 @@ struct RunBacking<B> {
     /// The decoded length of the largest block, recorded when the run was
     /// built or validated.
     largest_block: usize,
+    /// Which blocks are settled, recorded when the run was built or
+    /// validated; `None` if none is.
+    settled: Option<SettledCounts>,
 }
 
 /// What a builder or a validation pass found in a run's blocks.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct BlockSizes {
     pub build_estimate: usize,
     pub largest_block: usize,
+    pub settled: Option<SettledCounts>,
 }
 
 /// The smallest and largest sequence numbers of a run's records.
@@ -136,6 +141,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 filter: None,
                 bounds,
                 largest_block: sizes.largest_block,
+                settled: sizes.settled,
             }),
             slice: None,
             seqs,
@@ -161,6 +167,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 filter: filter.map(Box::new),
                 bounds,
                 largest_block: sizes.largest_block,
+                settled: sizes.settled,
             }),
             slice: None,
             seqs,
@@ -265,6 +272,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 filter: self.backing.filter.clone(),
                 bounds: self.backing.bounds.clone(),
                 largest_block: self.backing.largest_block,
+                settled: self.backing.settled.clone(),
             }),
             slice: self.slice.clone(),
             seqs: self.seqs,
@@ -274,10 +282,16 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
     }
 
-    /// Key filter, restart heads and physical segment metadata, charged beside stored bytes.
+    /// Key filter, restart heads, settled block counts and physical segment
+    /// metadata, charged beside stored bytes.
     pub fn held_bytes(&self) -> usize {
         self.filter_bytes()
             + size_of_val(&*self.backing.restart_heads)
+            + self
+                .backing
+                .settled
+                .as_ref()
+                .map_or(0, SettledCounts::held_bytes)
             + self.backing.data.held_bytes()
     }
 
@@ -363,6 +377,7 @@ impl<B: AsRef<[u8]>> Run<B> {
             seq_override: self.seq_override,
             restart_heads: Some(&self.backing.restart_heads),
             largest_block: Some(self.backing.largest_block),
+            settled: self.backing.settled.as_ref(),
             slice: self.slice.as_ref().map(|r| KeyRange {
                 min: &r.0,
                 max: &r.1,
@@ -1049,6 +1064,41 @@ impl<'a> RunCursor<'a> {
         (self.next_block == 0).then_some(self.view.slice.map_or(self.view.min_key, |r| r.min))
     }
 
+    /// Whether the head is the last record of the loaded block and another
+    /// block follows it.
+    pub(super) fn head_ends_block(&self) -> bool {
+        self.head.is_some()
+            && self.next_block < self.view.table.len()
+            && self
+                .loaded
+                .is_some_and(|block| self.workspace.position.offset() >= block.entries_len)
+    }
+
+    /// Consumes the head without decoding further, so that the next block
+    /// stays undecoded until [`fill_head`](Self::fill_head) or
+    /// [`skip_block`](Self::skip_block).
+    pub(super) fn consume_head(&mut self) {
+        self.head = None;
+    }
+
+    /// The block the cursor reads next, once the loaded one is consumed.
+    pub(super) fn next_block(&self) -> usize {
+        self.next_block
+    }
+
+    /// Passes over the next block without decoding it. The cursor must hold
+    /// no head and have consumed its loaded block.
+    pub(super) fn skip_block(&mut self) {
+        debug_assert!(self.head.is_none());
+        self.loaded = None;
+        self.workspace.position.reset();
+        self.next_block += 1;
+    }
+
+    pub(super) fn view(&self) -> RunView<'a> {
+        self.view
+    }
+
     /// Returns the held head, if any.
     pub(super) fn head_record(&self) -> Option<Record<'_>> {
         self.head.map(|head| self.record_of(head))
@@ -1147,6 +1197,8 @@ pub struct RunView<'a> {
     // Owned runs attach the largest block length found when they were built
     // or validated.
     largest_block: Option<usize>,
+    // Owned runs attach their settled block counts.
+    settled: Option<&'a SettledCounts>,
     slice: Option<KeyRange<'a>>,
 }
 
@@ -1227,6 +1279,7 @@ impl<'a> RunView<'a> {
             seq_override: None,
             restart_heads: None,
             largest_block: None,
+            settled: None,
             slice: None,
         };
         match (view.table.first(), view.table.last()) {
@@ -1315,6 +1368,36 @@ impl<'a> RunView<'a> {
     /// Returns the number of blocks.
     pub fn block_count(self) -> usize {
         self.table.len()
+    }
+
+    /// Returns the number of segments.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn segment_count(self) -> usize {
+        self.segments.len()
+    }
+
+    /// The records of `block` if every one has sequence 0 and a value, or 0.
+    /// Views of borrowed bytes report 0 for every block.
+    pub(super) fn settled_records(self, block: usize) -> usize {
+        self.settled.map_or(0, |counts| counts.records(block))
+    }
+
+    /// Whether whole blocks of this view may be copied into a merge's
+    /// output: it shows the whole run with its stored sequences, and some
+    /// block is settled.
+    pub(super) fn copies_forward(self) -> bool {
+        self.settled.is_some() && self.slice.is_none() && self.seq_override.is_none_or(|s| s == 0)
+    }
+
+    /// The user key of the first record, or empty for an empty run.
+    pub(super) fn min_key(self) -> &'a [u8] {
+        self.min_key
+    }
+
+    /// The raw dictionary of segment `reference`, its CRC verified, for an
+    /// output segment that inherits it.
+    pub(super) fn inherited_dictionary(self, reference: u32) -> Result<&'a [u8], CorruptRun> {
+        self.checked_dictionary(reference)
     }
 
     /// Returns the decoded length of the largest block, which is the most a
@@ -1645,6 +1728,7 @@ fn validate(
     let mut workspace = ReadWorkspace::new();
     let mut walk = RecordWalk::default();
     let mut sizes = BlockSizes::default();
+    let mut settled = Vec::with_capacity(view.table.len());
     for block in 0..view.table.len() {
         let frame = view.frame(block)?;
         sizes.largest_block = sizes.largest_block.max(frame.decoded_len);
@@ -1660,6 +1744,11 @@ fn validate(
         if walk.record_count == records_before {
             return Err(frame.error(RunCorruption::EmptyBlock));
         }
+        settled.push(if walk.block_settled {
+            u32::try_from(walk.record_count - records_before).unwrap_or(u32::MAX)
+        } else {
+            0
+        });
         if block == 0 || filter.is_some() {
             let opened = BlockView::open(decoded).map_err(|error| frame.block_error(error))?;
             let mut position = BlockPosition::new();
@@ -1699,6 +1788,7 @@ fn validate(
         max: walk.max_seq,
     };
     sizes.build_estimate = walk.build_estimate;
+    sizes.settled = SettledCounts::from_blocks(&settled);
     Ok((seqs, walk.reclaimable, sizes))
 }
 

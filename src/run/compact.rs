@@ -1,6 +1,8 @@
 //! Latest-state compaction over immutable inputs. Conflicting copies fail
 //! before publication, and tombstones survive while unselected runs may hold
 //! older values. Disjoint output ranges share a bounded workspace allowance.
+//! A merge into the bottom level copies settled input blocks that no other
+//! input touches into the output without decoding them.
 
 use super::OutputBudget;
 use crate::block::{Record, Value};
@@ -10,9 +12,11 @@ use std::sync::Arc;
 use super::codec::CDICT_ALLOWANCE;
 use super::dictionary::SEGMENT_RAW_LEN;
 use super::filter::{self as key_filter, KeyFilter};
+use super::frame::Frame;
+use super::merge::Step;
 use super::{
-    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, ReadError, Run, RunBuilder,
-    RunView,
+    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
+    ReadError, Run, RunBuilder, RunView,
 };
 
 const BUILDABLE: &str = "merged records are ordered, within the limits, and fit in one run";
@@ -35,6 +39,13 @@ pub struct CompactLimits {
     /// record that no unselected run can contest (see [`SeqFloor`]). Older
     /// views retain their own runs.
     pub zero_seq: bool,
+    /// Copy settled blocks forward: with `zero_seq`, an output without a
+    /// key filter and no cuts beside the target length, a block whose
+    /// records all have sequence 0 and a value, and whose key range holds no
+    /// other input's record, is copied into the output undecoded. An input
+    /// segment where at least half the blocks are expected to be copied
+    /// gives the output a segment that inherits its dictionary.
+    pub copy_forward: bool,
 }
 
 /// An unselected run overlapping a job into the bottom level. A record of
@@ -261,6 +272,30 @@ pub struct Compacted {
     pub workspace_bytes: usize,
     /// What was read and written.
     pub stats: CompactStats,
+    /// Blocks copied forward.
+    pub(crate) copied: CopyStats,
+}
+
+/// What copying forward did in one merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyStats {
+    /// Input blocks copied, and their raw and stored frame bytes.
+    pub(crate) blocks: u64,
+    pub(crate) raw: u64,
+    pub(crate) stored: u64,
+    /// Input segments judged, and those given an inherited output segment.
+    pub(crate) segments: u64,
+    pub(crate) inherited: u64,
+}
+
+impl CopyStats {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.blocks += other.blocks;
+        self.raw += other.raw;
+        self.stored += other.stored;
+        self.segments += other.segments;
+        self.inherited += other.inherited;
+    }
 }
 
 /// Merges `inputs` into new runs with the limits' codec and block length, keeping
@@ -530,6 +565,7 @@ pub(crate) fn compact_parallel_in<'a>(
         held_bytes: 0,
         workspace_bytes: metadata,
         stats: CompactStats::default(),
+        copied: CopyStats::default(),
     };
     for part in parts {
         out.runs.extend(part.runs);
@@ -541,6 +577,7 @@ pub(crate) fn compact_parallel_in<'a>(
         out.stats.versions_dropped += part.stats.versions_dropped;
         out.stats.copies_collapsed += part.stats.copies_collapsed;
         out.stats.tombstones_dropped += part.stats.tombstones_dropped;
+        out.copied.add(part.copied);
     }
     Ok(out)
 }
@@ -678,8 +715,52 @@ fn compact_range_checked<'a>(
     let mut eraser = Eraser::new(limits.zero_seq, range.floors);
     #[cfg(feature = "diagnostics")]
     let mut audit = super::copy_audit::CopyAudit::new(inputs, range.start);
+    let copy = limits.copy_forward
+        && limits.zero_seq
+        && limits.codec == Codec::Zstd
+        && cuts.omit_filter
+        && !cuts.single
+        && cuts.at.is_empty()
+        && cuts.overlapped.is_empty();
+    let copies: Vec<bool> = inputs
+        .iter()
+        .map(|input| copy && input.copies_forward())
+        .collect();
+    let mut forward = Forward {
+        end: range.end,
+        judged: None,
+        stats: CopyStats::default(),
+    };
+    if copies.contains(&true) {
+        merge.copy_blocks(copies);
+    }
 
-    while let Some(record) = merge.next_record()? {
+    loop {
+        match merge.next_step()? {
+            None => break,
+            Some(Step::Record) => {}
+            Some(Step::Block {
+                input,
+                block,
+                clear,
+            }) => {
+                let records = forward
+                    .offer(inputs, input, block, clear, &mut output)
+                    .map_err(|halt| match halt {
+                        Halt::Refused => refused(),
+                        Halt::Corrupt(error) => error.into(),
+                    })?;
+                if records > 0 {
+                    merge.take_block();
+                    stats.records_read += records;
+                    stats.records_written += records;
+                } else {
+                    merge.keep_block()?;
+                }
+                continue;
+            }
+        }
+        let record = merge.current().expect("the merge stands on a record");
         if range.end.is_some_and(|end| record.key >= end) {
             break;
         }
@@ -726,6 +807,8 @@ fn compact_range_checked<'a>(
     output.finish_run().map_err(|()| refused())?;
     eraser.finish(range.pool);
     #[cfg(feature = "diagnostics")]
+    range.pool.copied(forward.stats);
+    #[cfg(feature = "diagnostics")]
     if let Some(audit) = audit {
         audit.finish(range.end);
     }
@@ -735,7 +818,161 @@ fn compact_range_checked<'a>(
         held_bytes: output.held_bytes,
         workspace_bytes: needed,
         stats,
+        copied: forward.stats,
     })
+}
+
+/// Why offering a block to the output stopped the merge.
+enum Halt {
+    Refused,
+    Corrupt(CorruptRun),
+}
+
+impl From<CorruptRun> for Halt {
+    fn from(error: CorruptRun) -> Self {
+        Self::Corrupt(error)
+    }
+}
+
+/// Decides which input blocks a merge copies forward, segment by segment.
+struct Forward<'e> {
+    end: Option<&'e [u8]>,
+    /// The input segment judged last: its input, dictionary reference and
+    /// the block after its last.
+    judged: Option<(usize, u32, usize)>,
+    stats: CopyStats,
+}
+
+impl Forward<'_> {
+    /// Offers block `block` of input `input`, which the merge reports before
+    /// decoding it, to the output. Returns its record count if it was
+    /// copied, or 0 if it must be decoded.
+    ///
+    /// Reaching a new input segment ends any inherited output segment and
+    /// judges the new one: if at least half of its remaining blocks are
+    /// expected to be copied, the output starts a segment with its
+    /// dictionary. The output copies the block if its input segment is the
+    /// inherited one, the block is settled and `clear`, and it lies below
+    /// the builder's range.
+    fn offer(
+        &mut self,
+        inputs: &[RunView<'_>],
+        input: usize,
+        block: usize,
+        clear: bool,
+        output: &mut Output<'_>,
+    ) -> Result<usize, Halt> {
+        let view = inputs[input];
+        let frame = view.frame(block)?;
+        if frame.codec != Codec::Zstd {
+            return Ok(0);
+        }
+        let reference = frame.dictionary_ref;
+        let judged = self
+            .judged
+            .is_some_and(|(i, r, end)| i == input && r == reference && block < end);
+        if !judged {
+            output.end_inherited().map_err(|()| Halt::Refused)?;
+            let segment = InputSegment::from(view, block, reference)?;
+            self.judged = Some((input, reference, segment.end));
+            self.stats.segments += 1;
+            if segment.worth_inheriting(inputs, input, block)? {
+                let dictionary = view.inherited_dictionary(reference)?;
+                let last = view.last_key(segment.end - 1)?.to_vec();
+                output
+                    .begin_inherited(dictionary, segment.raw, segment.stored, last)
+                    .map_err(|()| Halt::Refused)?;
+                self.stats.inherited += u64::from(output.inheriting());
+            }
+        }
+        let records = view.settled_records(block);
+        if !clear || records == 0 || !output.inheriting() {
+            return Ok(0);
+        }
+        let last = view.last_key(block)?;
+        if self.end.is_some_and(|end| last.cmp(end).is_ge()) {
+            return Ok(0);
+        }
+        let first = (block == 0).then(|| view.min_key());
+        if !output.copy(&frame, &last.to_vec(), records, first)? {
+            return Ok(0);
+        }
+        self.stats.blocks += 1;
+        self.stats.raw += frame.decoded_len as u64;
+        self.stats.stored += view.block_bytes(block) as u64;
+        Ok(records)
+    }
+}
+
+/// The blocks of one input segment from the block a merge reached.
+struct InputSegment {
+    /// The block after the segment's last.
+    end: usize,
+    /// Their decoded and stored payload bytes, and the settled ones.
+    raw: usize,
+    stored: usize,
+    settled: usize,
+}
+
+impl InputSegment {
+    /// Reads the frame headers from `block` while they reference `reference`.
+    fn from(view: RunView<'_>, block: usize, reference: u32) -> Result<Self, CorruptRun> {
+        let mut segment = Self {
+            end: block,
+            raw: 0,
+            stored: 0,
+            settled: 0,
+        };
+        while segment.end < view.block_count() {
+            let frame = view.frame(segment.end)?;
+            if frame.codec != Codec::Zstd || frame.dictionary_ref != reference {
+                break;
+            }
+            segment.raw += frame.decoded_len;
+            segment.stored += frame.stored.len();
+            segment.settled += usize::from(view.settled_records(segment.end) > 0);
+            segment.end += 1;
+        }
+        Ok(segment)
+    }
+
+    /// Whether at least half of the blocks from `block` are expected to be
+    /// copied: the settled ones, less one per record the other inputs are
+    /// estimated to hold within the segment's key range, from their indexes.
+    fn worth_inheriting(
+        &self,
+        inputs: &[RunView<'_>],
+        input: usize,
+        block: usize,
+    ) -> Result<bool, CorruptRun> {
+        let blocks = self.end - block;
+        if 2 * self.settled < blocks {
+            return Ok(false);
+        }
+        let view = inputs[input];
+        let low = block.checked_sub(1).map(|b| view.last_key(b)).transpose()?;
+        let low = low.map(|key| key.to_vec());
+        let high = view.last_key(self.end - 1)?.to_vec();
+        let mut touched = 0usize;
+        for (at, other) in inputs.iter().enumerate() {
+            if at == input || other.block_count() == 0 {
+                continue;
+            }
+            let Some(range) = other.key_range()? else {
+                continue;
+            };
+            if range.min > high.as_slice() || low.as_deref().is_some_and(|low| range.max <= low) {
+                continue;
+            }
+            let first = other
+                .locate(low.as_deref().unwrap_or(range.min))?
+                .unwrap_or(other.block_count() - 1);
+            let last = other.locate(&high)?.unwrap_or(other.block_count() - 1);
+            let per_block = other.len().div_ceil(other.block_count());
+            touched = touched.saturating_add((last.saturating_sub(first) + 1) * per_block);
+        }
+        Ok(2 * self.settled.saturating_sub(touched) >= blocks)
+    }
 }
 
 struct Output<'c> {
@@ -758,6 +995,10 @@ struct Output<'c> {
     bytes: usize,
     held_bytes: usize,
     budget: Option<Arc<OutputBudget>>,
+    /// While the open builder's segment inherits an input segment's
+    /// dictionary, that segment's last key. Runs then end only once a
+    /// record passes it.
+    inherited_last: Option<Vec<u8>>,
 }
 
 impl<'c> Output<'c> {
@@ -785,6 +1026,7 @@ impl<'c> Output<'c> {
             bytes: 0,
             held_bytes: 0,
             budget: None,
+            inherited_last: None,
         }
     }
 
@@ -794,6 +1036,14 @@ impl<'c> Output<'c> {
     /// that a record longer than the target is a run of its own and every
     /// run has a record.
     fn add(&mut self, record: Record<'_>) -> Result<(), ()> {
+        if self
+            .inherited_last
+            .as_ref()
+            .is_some_and(|last| record.key > last.as_slice())
+        {
+            self.end_inherited()?;
+        }
+        let inherited = self.inherited_last.is_some();
         let len = super::input_len(record.key, record.value);
         let mut cut = false;
         while let Some(at) = self.cuts.at.get(self.next_cut)
@@ -809,6 +1059,7 @@ impl<'c> Output<'c> {
             self.overlapped += 1;
         }
         let over = !self.cuts.single
+            && !inherited
             && ((!self.cuts.overlapped.is_empty() && self.overlapped > self.cuts.max_overlapped)
                 || self.input + len > self.limits.target_run_len);
         if self.builder.is_some() && !self.cuts.single && (cut || over) {
@@ -819,7 +1070,27 @@ impl<'c> Output<'c> {
             // count against it.
             self.overlapped = 0;
         }
-        let builder = self.builder.get_or_insert_with(|| {
+        let builder = self.builder();
+        builder
+            .add(record.key, record.seq, record.value)
+            .expect(BUILDABLE);
+        if builder.output_refused() {
+            return Err(());
+        }
+        // The builder ends an inherited segment that reaches its limit.
+        if inherited && !builder.inheriting() {
+            self.inherited_last = None;
+        }
+        self.input += len;
+        if self.inherited_last.is_none() && self.input >= self.limits.target_run_len {
+            self.finish_run()?;
+        }
+        Ok(())
+    }
+
+    /// The open builder, created for a new run if there is none.
+    fn builder(&mut self) -> &mut RunBuilder {
+        self.builder.get_or_insert_with(|| {
             let mut builder = RunBuilder::in_pool(
                 self.limits.codec,
                 self.limits.target_block_compressed,
@@ -835,22 +1106,83 @@ impl<'c> Output<'c> {
                 self.hash_bytes
             });
             builder
-        });
-        builder
-            .add(record.key, record.seq, record.value)
-            .expect(BUILDABLE);
+        })
+    }
+
+    fn inheriting(&self) -> bool {
+        self.inherited_last.is_some()
+    }
+
+    /// Ends the open segment and starts one inheriting `dictionary`, for an
+    /// input segment of `raw` decoded and `stored` payload bytes whose last
+    /// key is `last`.
+    fn begin_inherited(
+        &mut self,
+        dictionary: &[u8],
+        raw: usize,
+        stored: usize,
+        last: Vec<u8>,
+    ) -> Result<(), ()> {
+        let builder = self.builder();
+        builder.begin_inherited(dictionary, raw, stored);
         if builder.output_refused() {
             return Err(());
         }
-        self.input += len;
-        if self.input >= self.limits.target_run_len {
+        if builder.inheriting() {
+            self.inherited_last = Some(last);
+        }
+        Ok(())
+    }
+
+    /// Ends an inherited segment, then the run if it has reached its target.
+    fn end_inherited(&mut self) -> Result<(), ()> {
+        if self.inherited_last.take().is_none() {
+            return Ok(());
+        }
+        if let Some(builder) = &mut self.builder {
+            builder.end_inherited();
+            if builder.output_refused() {
+                return Err(());
+            }
+        }
+        if !self.cuts.single && self.input >= self.limits.target_run_len {
             self.finish_run()?;
         }
         Ok(())
     }
 
+    /// Copies a settled input frame into the inherited segment. Returns
+    /// whether it was copied.
+    fn copy(
+        &mut self,
+        frame: &Frame<'_>,
+        last: &[u8],
+        records: usize,
+        first: Option<&[u8]>,
+    ) -> Result<bool, Halt> {
+        let Some(builder) = self.builder.as_mut() else {
+            return Ok(false);
+        };
+        let copied = builder.copy_frame(frame, last, records, first)?;
+        if builder.output_refused() {
+            return Err(Halt::Refused);
+        }
+        if !builder.inheriting() {
+            self.inherited_last = None;
+        }
+        if copied {
+            self.input = self
+                .input
+                .saturating_add(frame.decoded_len + records * RECORD_INPUT_OVERHEAD);
+        }
+        Ok(copied)
+    }
+
     fn finish_run(&mut self) -> Result<(), ()> {
-        let Some(builder) = self.builder.take() else {
+        self.inherited_last = None;
+        // A builder opened for an inherited segment may have received no
+        // record, if the merge dropped every one it read.
+        let Some(builder) = self.builder.take().filter(RunBuilder::has_records) else {
             return Ok(());
         };
         let run = builder.finish_checked()?;

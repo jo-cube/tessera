@@ -44,6 +44,7 @@ const UNLIMITED: CompactLimits = CompactLimits {
     codec: Codec::Zstd,
     target_block_compressed: crate::run::TARGET_BLOCK_LEN,
     zero_seq: false,
+    copy_forward: true,
 };
 
 fn merge(

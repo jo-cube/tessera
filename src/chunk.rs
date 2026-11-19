@@ -26,9 +26,10 @@ struct Pool {
 /// Cumulative work performed by this engine, including abandoned builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BuildCounters {
-    /// Always zero; compaction re-encodes every block.
+    /// Settled blocks a merge into the bottom level copied forward without
+    /// decoding them.
     pub blocks_reused: u64,
-    /// Always zero; compaction re-encodes every block.
+    /// Their frame bytes, including headers.
     pub bytes_reused: u64,
     /// Newly encoded output blocks (including uncompressed output).
     pub blocks_compressed: u64,
@@ -45,6 +46,8 @@ pub struct BuildCounters {
 }
 #[derive(Default, Debug)]
 struct Counters {
+    blocks_reused: AtomicU64,
+    bytes_reused: AtomicU64,
     blocks_compressed: AtomicU64,
     bytes_compressed: AtomicU64,
     raw_bytes_compressed: AtomicU64,
@@ -55,6 +58,31 @@ struct Counters {
     /// Records written into the bottom level, by [`Erasure`] field.
     #[cfg(feature = "diagnostics")]
     erasure: [AtomicU64; 5],
+    /// Copying forward, by [`CopyForward`] field.
+    #[cfg(feature = "diagnostics")]
+    copied: [AtomicU64; 8],
+}
+
+/// What merges into the bottom level copied forward.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyForward {
+    /// Input blocks copied.
+    pub blocks: u64,
+    /// Their raw bytes.
+    pub raw: u64,
+    /// Their stored frame bytes.
+    pub stored: u64,
+    /// Input segments reached and judged.
+    pub segments: u64,
+    /// Judged segments given an output segment with their dictionary.
+    pub inherited: u64,
+    /// Blocks of the bottom-level inputs of merges from level 0.
+    pub input_blocks: u64,
+    /// Their raw bytes.
+    pub input_raw: u64,
+    /// Their segments.
+    pub input_segments: u64,
 }
 
 /// What sequence erasure did to the records of jobs into the bottom level.
@@ -85,8 +113,8 @@ pub(crate) fn work_slot(level: Option<usize>, bottom: bool) -> usize {
 impl Counters {
     fn snapshot(&self) -> BuildCounters {
         BuildCounters {
-            blocks_reused: 0,
-            bytes_reused: 0,
+            blocks_reused: self.blocks_reused.load(Ordering::Relaxed),
+            bytes_reused: self.bytes_reused.load(Ordering::Relaxed),
             blocks_compressed: self.blocks_compressed.load(Ordering::Relaxed),
             bytes_compressed: self.bytes_compressed.load(Ordering::Relaxed),
             raw_bytes_compressed: self.raw_bytes_compressed.load(Ordering::Relaxed),
@@ -119,6 +147,16 @@ impl ChunkPool {
             .counters
             .raw_bytes_ingested
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn reused(&self, stored: usize) {
+        self.0
+            .counters
+            .blocks_reused
+            .fetch_add(1, Ordering::Relaxed);
+        self.0
+            .counters
+            .bytes_reused
+            .fetch_add(stored as u64, Ordering::Relaxed);
     }
     pub(crate) fn compressed(&self, raw: usize, stored: usize, compressed: bool) {
         self.0
@@ -156,6 +194,50 @@ impl ChunkPool {
         ];
         for (counter, n) in self.0.counters.erasure.iter().zip(fields) {
             counter.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn copied(&self, add: crate::run::CopyStats) {
+        let fields = [add.blocks, add.raw, add.stored, add.segments, add.inherited];
+        for (counter, n) in self.0.counters.copied.iter().zip(fields) {
+            counter.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bottom_inputs(&self, blocks: u64, raw: u64, segments: u64) {
+        for (counter, n) in self.0.counters.copied[5..]
+            .iter()
+            .zip([blocks, raw, segments])
+        {
+            counter.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn copy_counters(&self) -> CopyForward {
+        let [
+            blocks,
+            raw,
+            stored,
+            segments,
+            inherited,
+            input_blocks,
+            input_raw,
+            input_segments,
+        ] = self
+            .0
+            .counters
+            .copied
+            .each_ref()
+            .map(|n| n.load(Ordering::Relaxed));
+        CopyForward {
+            blocks,
+            raw,
+            stored,
+            segments,
+            inherited,
+            input_blocks,
+            input_raw,
+            input_segments,
         }
     }
     #[cfg(feature = "diagnostics")]

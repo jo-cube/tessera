@@ -233,6 +233,15 @@ impl BlockBuilder {
     pub(crate) fn last_key(&self) -> &[u8] {
         &self.last_key
     }
+
+    /// Makes `key` the last key for prefix sharing and order, as if a record
+    /// of it ended a block finished elsewhere. The open block must be empty.
+    pub(crate) fn set_last_key(&mut self, key: &[u8]) {
+        debug_assert!(self.is_empty());
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.last_seq = 0;
+    }
 }
 
 /// A record's encoded lengths from [`BlockBuilder::project`].

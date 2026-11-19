@@ -162,6 +162,15 @@ impl<'a> GroupCursor<'a> {
         self.cursor.head_key()
     }
 
+    /// The cursor of a group of one run, for copying its blocks forward.
+    pub(super) fn single(&mut self) -> Option<&mut RunCursor<'a>> {
+        self.runs.is_none().then_some(&mut self.cursor)
+    }
+
+    pub(super) fn single_ref(&self) -> Option<&RunCursor<'a>> {
+        self.runs.is_none().then_some(&self.cursor)
+    }
+
     pub(super) fn head_record(&self) -> Option<Record<'_>> {
         self.cursor.head_record()
     }

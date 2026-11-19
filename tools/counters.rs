@@ -238,6 +238,18 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
             );
         }
     }
+    let c = diagnostics::copy_forward(&engine);
+    println!(
+        "copy,{name},{variant},{},{},{},{},{},{},{},{}",
+        c.blocks,
+        c.raw,
+        c.stored,
+        c.segments,
+        c.inherited,
+        c.input_blocks,
+        c.input_raw,
+        c.input_segments
+    );
     let e = diagnostics::erasure(&engine);
     println!(
         "erasure,{name},{variant},{},{},{},{},{}",
@@ -446,6 +458,9 @@ fn main() {
         );
     }
     println!("work,scenario,variant,destination,raw_in,raw_out,stored");
+    println!(
+        "copy,scenario,variant,blocks,raw,stored,segments,inherited,input_blocks,input_raw,input_segments"
+    );
     println!("erasure,scenario,variant,records,erased,probes,kept_unfiltered,kept_filtered");
     println!(
         "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"

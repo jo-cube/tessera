@@ -8,7 +8,7 @@ use crate::block::{Record, cmp_internal};
 
 use super::group::{GroupCursor, RunList};
 use super::logical::conflict;
-use super::reader::{ReadWorkspace, RunView};
+use super::reader::{ReadWorkspace, RunCursor, RunView};
 use super::{CorruptRun, ReadError};
 
 /// Reusable storage for merging runs: a decoding buffer per input and the
@@ -92,6 +92,38 @@ pub struct MergeCursor<'a> {
     /// Whether the heap's first entry has been yielded and not yet advanced.
     yielded: bool,
     failure: Option<CorruptRun>,
+    /// Inputs whose blocks may be passed over whole; see
+    /// [`next_step`](Self::next_step).
+    copies: Vec<bool>,
+    /// An input of `copies` standing before an undecoded block, out of the
+    /// heap until the caller takes or keeps that block.
+    boundary: Option<Boundary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Boundary {
+    input: usize,
+    /// The block cannot begin with an older version of a key already
+    /// merged: the input's previous record has sequence 0, or the block is
+    /// the input's first and the merge has passed no key at or above it.
+    fresh: bool,
+}
+
+/// Where [`MergeCursor::next_step`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Step {
+    /// The next record, read with [`MergeCursor::current`].
+    Record,
+    /// Input `input` stands before its undecoded block `block`. With
+    /// `clear`, every other input's next key sorts above the block's last
+    /// key, and the block cannot begin with a key already merged, so its
+    /// records come next in the merged stream and no other input holds any
+    /// of their keys.
+    Block {
+        input: usize,
+        block: usize,
+        clear: bool,
+    },
 }
 
 impl<'a> MergeCursor<'a> {
@@ -160,7 +192,102 @@ impl<'a> MergeCursor<'a> {
             positioned: false,
             yielded: false,
             failure: None,
+            copies: Vec::new(),
+            boundary: None,
         }
+    }
+
+    /// Lets [`next_step`](Self::next_step) stop before each block of the
+    /// inputs `copies` marks, which must each be one run.
+    pub(super) fn copy_blocks(&mut self, copies: Vec<bool>) {
+        self.copies = copies;
+    }
+
+    /// Advances like [`next_record`](Self::next_record), except before
+    /// decoding a block of an input marked by
+    /// [`copy_blocks`](Self::copy_blocks): there it reports the block, and the
+    /// caller must [`take_block`](Self::take_block) or
+    /// [`keep_block`](Self::keep_block) before stepping again.
+    pub(super) fn next_step(&mut self) -> Result<Option<Step>, CorruptRun> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.boundary.is_none()
+            && let Err(error) = self.step()
+        {
+            self.failure = Some(error);
+            return Err(error);
+        }
+        let Some(boundary) = self.boundary else {
+            return Ok(self.heap.first().map(|_| Step::Record));
+        };
+        let clear = self.clear(boundary).inspect_err(|&error| {
+            self.failure = Some(error);
+        })?;
+        Ok(Some(Step::Block {
+            input: boundary.input,
+            block: self.boundary_cursor(boundary).next_block(),
+            clear,
+        }))
+    }
+
+    fn boundary_cursor(&self, boundary: Boundary) -> &RunCursor<'a> {
+        self.cursors[boundary.input]
+            .single_ref()
+            .expect("copied inputs are single runs")
+    }
+
+    /// Whether no other input's next key is at or below the last key of the
+    /// boundary's block.
+    fn clear(&self, boundary: Boundary) -> Result<bool, CorruptRun> {
+        if !boundary.fresh {
+            return Ok(false);
+        }
+        let cursor = self.boundary_cursor(boundary);
+        let last = cursor.view().last_key(cursor.next_block())?;
+        let above = |key: Option<&[u8]>| key.is_none_or(|key| last.cmp(key).is_lt());
+        let head = self
+            .heap
+            .first()
+            .and_then(|&root| self.cursors[root].head_key())
+            .map(|(key, _)| key);
+        let pending = self
+            .pending
+            .last()
+            .and_then(|&input| self.cursors[input].deferred_key());
+        Ok(above(head) && above(pending))
+    }
+
+    /// Passes over the reported block undecoded. The caller takes only a
+    /// block whose records all have sequence 0.
+    pub(super) fn take_block(&mut self) {
+        let boundary = self.boundary.expect("standing before a block");
+        let cursor = self.cursors[boundary.input]
+            .single()
+            .expect("copied inputs are single runs");
+        cursor.skip_block();
+        self.boundary = (cursor.next_block() < cursor.view().block_count()).then_some(Boundary {
+            input: boundary.input,
+            fresh: true,
+        });
+    }
+
+    /// Decodes the reported block, returning its input to the merge.
+    pub(super) fn keep_block(&mut self) -> Result<(), CorruptRun> {
+        let Some(boundary) = self.boundary.take() else {
+            return Ok(());
+        };
+        let input = boundary.input;
+        if let Err(error) = self.cursors[input].fill_head() {
+            self.failure = Some(error);
+            return Err(error);
+        }
+        if self.cursors[input].head_key().is_some() {
+            let at = self.heap.len();
+            self.heap.push(input);
+            sift_up(self.heap, &self.cursors, at);
+        }
+        Ok(())
     }
 
     /// Moves every input before its first record at or above `target` and
@@ -190,6 +317,7 @@ impl<'a> MergeCursor<'a> {
         self.failure = None;
         self.yielded = false;
         self.positioned = true;
+        self.boundary = None;
         let result = self
             .cursors
             .iter_mut()
@@ -282,10 +410,13 @@ impl<'a> MergeCursor<'a> {
             self.positioned = true;
             self.build_heap()?;
         } else if self.yielded {
+            self.yielded = false;
             self.advance_at(0)?;
         }
-        self.admit_pending()?;
-        self.yielded = !self.heap.is_empty();
+        if self.boundary.is_none() {
+            self.admit_pending()?;
+        }
+        self.yielded = self.boundary.is_none() && !self.heap.is_empty();
         Ok(())
     }
 
@@ -326,6 +457,11 @@ impl<'a> MergeCursor<'a> {
                 break;
             }
             self.pending.pop();
+            if self.copies.get(input) == Some(&true) {
+                // The merge has passed no key at or above this input's first.
+                self.boundary = Some(Boundary { input, fresh: true });
+                return Ok(());
+            }
             self.cursors[input].fill_head()?;
             if self.cursors[input].head_key().is_some() {
                 let at = self.heap.len();
@@ -340,6 +476,18 @@ impl<'a> MergeCursor<'a> {
     /// child of it, so an entry moved here never needs to rise.
     fn advance_at(&mut self, at: usize) -> Result<(), CorruptRun> {
         let input = self.heap[at];
+        if at == 0
+            && self.copies.get(input) == Some(&true)
+            && let Some(cursor) = self.cursors[input].single()
+            && cursor.head_ends_block()
+        {
+            let fresh = cursor.head_key().is_some_and(|(_, seq)| seq == 0);
+            cursor.consume_head();
+            self.heap.swap_remove(0);
+            sift_down(self.heap, &self.cursors, 0);
+            self.boundary = Some(Boundary { input, fresh });
+            return Ok(());
+        }
         self.cursors[input].advance_head()?;
         if self.cursors[input].head_key().is_none() {
             self.heap.swap_remove(at);

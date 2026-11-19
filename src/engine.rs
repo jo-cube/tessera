@@ -174,6 +174,8 @@ mod worker;
 #[cfg(test)]
 mod compaction_model_tests;
 #[cfg(test)]
+mod copy_forward_tests;
+#[cfg(test)]
 mod level_invariants_tests;
 #[cfg(test)]
 mod staged_tests;
@@ -809,6 +811,9 @@ struct Core {
     /// Runs between building a compaction and returning it.
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Cleared by equivalence tests to rewrite every block.
+    #[cfg(test)]
+    copy_forward: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     piece_budget: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -1169,6 +1174,8 @@ impl Core {
             level0_waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             after_build: Mutex::new(None),
+            #[cfg(test)]
+            copy_forward: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             piece_budget: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -2186,6 +2193,20 @@ impl<'e> CompactionJob<'e> {
         self.others.is_empty()
     }
 
+    /// Whether the merge copies settled bottom blocks forward: it merges
+    /// level 0 into the bottom level.
+    fn copy_forward(&self) -> bool {
+        #[cfg(test)]
+        if !self
+            .engine
+            .copy_forward
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        self.zero_seq && self.source_count > 0
+    }
+
     /// The unselected runs that may contest erasing an output sequence,
     /// sorted by smallest key. A run whose records are all newer than every
     /// input's cannot, nor can any run once the output is not the bottom.
@@ -2234,6 +2255,7 @@ impl<'e> CompactionJob<'e> {
             threads,
             self.options.max_workspace_bytes,
             None,
+            true,
         )?;
         Ok(BuiltCompaction {
             job: self,
@@ -2249,6 +2271,7 @@ impl<'e> CompactionJob<'e> {
         threads: usize,
         workspace_allowance: usize,
         budget: Option<Arc<crate::run::OutputBudget>>,
+        copy: bool,
     ) -> Result<(crate::run::Compacted, resources::BuildCharge<'e>), CompactionError> {
         let estimate = inputs.iter().fold(0usize, |sum, run| {
             sum.saturating_add(run.run.build_estimate())
@@ -2278,6 +2301,7 @@ impl<'e> CompactionJob<'e> {
             codec: self.engine.codec,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
+            copy_forward: copy && self.copy_forward(),
         };
         #[cfg(feature = "diagnostics")]
         crate::run::copy_audit::set_bottom_inputs(
@@ -2393,11 +2417,18 @@ impl<'e> CompactionJob<'e> {
         }
         #[cfg(feature = "diagnostics")]
         let bottom_bytes = if self.zero_seq {
-            state
-                .levels
-                .runs()
-                .last()
-                .unwrap()
+            let bottom = state.levels.runs().last().unwrap();
+            if self.source_count > 0 {
+                let (mut blocks, mut raw, mut segments) = (0, 0, 0);
+                for run in bottom.iter().filter(|r| is_input(r)) {
+                    let view = run.run.view();
+                    blocks += view.block_count() as u64;
+                    raw += run.run.merged_raw_len() as u64;
+                    segments += view.segment_count() as u64;
+                }
+                self.engine.chunks.bottom_inputs(blocks, raw, segments);
+            }
+            bottom
                 .iter()
                 .filter(|r| is_input(r))
                 .map(|r| r.run.stored_len())
@@ -2405,6 +2436,8 @@ impl<'e> CompactionJob<'e> {
         } else {
             0
         };
+        #[cfg(feature = "diagnostics")]
+        let copied_raw = output.copied.raw as usize;
         let outputs: Vec<SharedRun> = published(output.runs).collect();
         if state.levels.replace(inputs, &outputs, self.dest).is_err() {
             return Err(CompactionError::Stale);
@@ -2418,8 +2451,12 @@ impl<'e> CompactionJob<'e> {
         if let Dest::Level(level) = self.dest {
             self.engine.chunks.work(
                 crate::chunk::work_slot(Some(level), self.cuts.omit_filter),
-                inputs.iter().map(|run| run.run.merged_raw_len()).sum(),
-                outputs.iter().map(|run| run.run.raw_len()).sum(),
+                inputs
+                    .iter()
+                    .map(|run| run.run.merged_raw_len())
+                    .sum::<usize>()
+                    - copied_raw,
+                outputs.iter().map(|run| run.run.raw_len()).sum::<usize>() - copied_raw,
                 report.output_bytes,
             );
         }

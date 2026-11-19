@@ -4,6 +4,7 @@
 mod compact;
 mod dictionary;
 mod format;
+mod forward;
 mod logical;
 mod merge;
 mod ranges;

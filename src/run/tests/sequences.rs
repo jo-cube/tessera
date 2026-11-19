@@ -20,6 +20,7 @@ fn limits(zero_seq: bool) -> CompactLimits {
         codec: Codec::Zstd,
         target_block_compressed: 1024,
         zero_seq,
+        copy_forward: true,
     }
 }
 

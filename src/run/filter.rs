@@ -147,6 +147,11 @@ impl KeyHashes {
         }
     }
 
+    /// Whether no filter can be built, so keys need not be noted.
+    pub(crate) fn disabled(&self) -> bool {
+        self.limit == 0
+    }
+
     /// The bytes held for hashes now.
     pub(crate) fn held_bytes(&self) -> usize {
         self.hashes.capacity() * size_of::<u64>()

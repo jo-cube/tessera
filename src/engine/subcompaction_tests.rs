@@ -77,6 +77,7 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
                 codec: engine.core.codec,
                 target_block_compressed: engine.core.target_block_compressed,
                 zero_seq: job.zero_seq,
+                copy_forward: job.copy_forward(),
             },
             &job.cuts,
             &floors,

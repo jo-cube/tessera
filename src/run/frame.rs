@@ -76,6 +76,27 @@ impl<'a> Frame<'a> {
         })
     }
 
+    /// Appends the frame to `out`, which must be empty, under a new
+    /// dictionary reference. The copied stored bytes are verified against
+    /// the original checksum before the copy is sealed with its own, so a
+    /// damaged frame is reported rather than carried forward.
+    pub(super) fn copy_resealed(
+        &self,
+        out: &mut Vec<u8>,
+        dictionary_ref: u32,
+    ) -> Result<(), CorruptRun> {
+        debug_assert!(out.is_empty());
+        out.resize(HEADER_LEN, 0);
+        out.extend_from_slice(self.stored);
+        if checksum(&self.header[..CHECKSUMMED_LEN], &out[HEADER_LEN..]) != read_u32(self.header, 8)
+        {
+            out.clear();
+            return Err(self.error(RunCorruption::ChecksumMismatch));
+        }
+        seal(out, self.codec, self.decoded_len, dictionary_ref);
+        Ok(())
+    }
+
     pub(super) fn verify_checksum(&self) -> Result<(), CorruptRun> {
         if checksum(&self.header[..CHECKSUMMED_LEN], self.stored) == read_u32(self.header, 8) {
             Ok(())

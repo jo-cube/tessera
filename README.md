@@ -92,6 +92,18 @@ and releases its bottom inputs. Bounded views of level-0 sources expose only the
 remaining ranges; snapshots and checkpoints preserve the bounds they captured.
 A later piece failure leaves earlier publications intact and stops the job.
 
+A level-0 merge into the bottom copies settled bottom blocks forward without
+decoding them. A block is settled when every record has sequence 0 and a value,
+and it is copied when no other input holds a key in its range. When at least
+half the blocks of a bottom input segment are expected to be copied, the output
+starts a segment that inherits that segment's dictionary. It copies those frames,
+after checking each one's CRC, and compresses the touched blocks with the same
+dictionary. Such a segment holds at most twice the usual raw length, and output
+runs end only at its edges. Runs keep a one- or two-byte record count per block
+to mark settled blocks. It is held beside the run, counted in its held bytes and
+rebuilt on recovery. A piece that exceeds the whole output allowance while
+copying is retried once without copying.
+
 ## Options and memory
 
 `EngineOptions` is fixed when the engine starts:

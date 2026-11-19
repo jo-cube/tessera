@@ -142,6 +142,13 @@ pub fn erasure(engine: &Engine) -> Erasure {
     engine.core.chunks.erasure_counters()
 }
 
+pub use crate::chunk::CopyForward;
+
+/// What merges into the bottom level copied forward.
+pub fn copy_forward(engine: &Engine) -> CopyForward {
+    engine.core.chunks.copy_counters()
+}
+
 pub use crate::run::SegmentSample;
 pub use crate::run::copy_audit::SegmentCopy;
 

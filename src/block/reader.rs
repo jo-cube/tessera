@@ -495,6 +495,9 @@ pub(crate) struct RecordWalk {
     pub(crate) reclaimable: bool,
     /// Logical output estimate for a run rebuilt with different block cuts.
     pub(crate) build_estimate: usize,
+    /// Whether every record of the last block walked has sequence 0 and a
+    /// value.
+    pub(crate) block_settled: bool,
 }
 
 impl RecordWalk {
@@ -510,9 +513,11 @@ impl RecordWalk {
             .peekable();
 
         let mut rest = entries;
+        self.block_settled = true;
         while !rest.is_empty() {
             let offset = entries.len() - rest.len();
             let record = decode_record(&mut rest).map_err(|kind| corrupt(offset, kind))?;
+            self.block_settled &= record.seq == 0 && record.value != Value::Tombstone;
 
             let is_restart = pending_restarts.next_if_eq(&offset).is_some();
             if is_restart && record.shared != 0 {

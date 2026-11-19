@@ -9,6 +9,10 @@ struct Piece {
     index: usize,
     inputs: Vec<SharedRun>,
     request: usize,
+    /// Copy settled blocks forward. Copied frames can make the output a
+    /// little larger than rewriting it would, so a piece that exceeds the
+    /// whole allowance is retried once without.
+    copy: bool,
 }
 struct Queue {
     pending: VecDeque<Piece>,
@@ -129,6 +133,7 @@ impl CompactionJob<'_> {
                 index,
                 inputs,
                 request: 0,
+                copy: true,
             })
             .collect();
         let mut split = Vec::with_capacity(sources.len());
@@ -265,6 +270,7 @@ impl CompactionJob<'_> {
                 1,
                 self.options.max_workspace_bytes / workers,
                 Some(budget.clone()),
+                piece.copy,
             );
             let mut queue = pipeline
                 .queue
@@ -278,6 +284,12 @@ impl CompactionJob<'_> {
                         // Drop failed output, then retry alone with all slots.
                         // The shared cap is unchanged, and no partial range was exposed.
                         piece.request = pipeline.capacity;
+                        queue.pending.push_front(piece);
+                        #[cfg(feature = "diagnostics")]
+                        self.engine.resources.piece_retries.fetch_add(1, Relaxed);
+                    }
+                    Err(CompactionError::OutputLimit { .. }) if piece.copy => {
+                        piece.copy = false;
                         queue.pending.push_front(piece);
                         #[cfg(feature = "diagnostics")]
                         self.engine.resources.piece_retries.fetch_add(1, Relaxed);

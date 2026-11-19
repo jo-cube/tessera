@@ -87,6 +87,9 @@ impl Packing {
     pub fn compressed(&self, raw: usize, stored: usize, compressed: bool) {
         self.pool.compressed(raw, stored, compressed);
     }
+    pub fn reused(&self, stored: usize) {
+        self.pool.reused(stored);
+    }
     pub fn frame(&mut self, bytes: &[u8]) {
         self.append(bytes, false);
     }
