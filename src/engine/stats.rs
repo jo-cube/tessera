@@ -65,13 +65,14 @@ pub struct EngineStats {
     pub runs: usize,
     /// Stored bytes of the published runs.
     pub run_bytes: usize,
-    /// Key filters, restart heads and physical segment metadata beside `run_bytes`. Dictionaries are
-    /// stored inside the runs.
+    /// Key filters, restart heads and physical segment metadata beside
+    /// `run_bytes`. Dictionaries are stored inside the runs.
     pub held_bytes: usize,
     /// Unused 1 MiB chunks available for reuse by this engine.
     pub pool_reserve_bytes: usize,
     /// Capacity of checked-out pool chunks, including padding and chunks held
-    /// by builders, memtables or snapshots. Exact run tails and oversized allocations are excluded.
+    /// by builders, memtables or snapshots. Exact run tails and oversized
+    /// allocations are excluded.
     pub pool_in_use_bytes: usize,
     /// Maximum free reserve: 32 MiB, independent of job size. The pool does
     /// not preallocate this amount. Reserve bytes are resident engine memory.

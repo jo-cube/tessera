@@ -4,7 +4,8 @@ use super::*;
 
 /// Reusable buffers for reading an engine, created once per reader.
 /// Each concurrent operation needs an exclusive mutable borrow; returned
-/// values borrow this storage. Workspace allocations are outside admission accounting.
+/// values borrow this storage. Workspace allocations are outside admission
+/// accounting.
 #[derive(Debug, Default)]
 pub struct EngineWorkspace {
     pub(super) logical: LogicalWorkspace,
@@ -32,8 +33,8 @@ impl EngineWorkspace {
 
     /// Returns the bytes held by Zstandard decompression contexts, as
     /// Zstandard reports them: one context for point lookups, and one per
-    /// group of runs a scan has decoded Zstandard blocks from. A context is created on
-    /// first use and kept for the workspace's lifetime.
+    /// group of runs a scan has decoded Zstandard blocks from. A context is
+    /// created on first use and kept for the workspace's lifetime.
     ///
     /// These bytes are allocated outside the Rust heap, are not part of
     /// [`capacity`](Self::capacity), and are charged against no limit.
@@ -71,7 +72,8 @@ impl EngineWorkspace {
 ///
 /// Do not call [`Engine`] methods on a thread that holds a guard: a write
 /// would deadlock. The guard borrows the engine, so the engine cannot be
-/// closed while it is held. A guard is not `Send`; keep it on its acquiring thread.
+/// closed while it is held. A guard is not `Send`; keep it on its acquiring
+/// thread.
 ///
 /// ```
 /// use tessera::engine::{Engine, EngineOptions, EngineWorkspace};

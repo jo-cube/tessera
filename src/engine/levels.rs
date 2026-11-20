@@ -85,7 +85,7 @@ pub(super) enum Dest {
     Anywhere(usize),
 }
 
-/// Why levels refused a change: what selection saw no longer holds.
+/// Why levels refused a change: what selection saw has since changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Stale;
 
@@ -540,15 +540,15 @@ impl Levels {
         // Scores as fractions: (numerator, denominator), compared exactly.
         let mut due: Vec<(usize, usize, usize)> = Vec::new();
         // At most the stop, so that level 0 is due whenever flushes wait
-        // for it: a pass of the worker never ends idle with
-        // level 0 at its stop.
+        // for it: a pass of the worker never ends idle with level 0 at its
+        // stop.
         let trigger = fit.trigger.min(fit.level0_stop).max(1);
         let flushes = self.level0_flushes();
         // Level 0's score is 1 however many flushes it holds, so a level
-        // below over its target goes first. Scored by its flushes, a level
-        // 0 backlog (the worker behind the writers) let level 1 grow to the
-        // backlog's multiple of its target, and every level-0 merge then
-        // rewrote that much more of it.
+        // below over its target goes first. Scoring level 0 by its flushes
+        // would let a backlog (the worker behind the writers) grow level 1
+        // to the backlog's multiple of its target, and every level-0 merge
+        // would then rewrite that much more of it.
         if flushes >= trigger {
             due.push((0, 1, 1));
         }

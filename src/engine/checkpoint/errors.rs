@@ -129,8 +129,8 @@ pub enum Damage {
 /// Why [`Engine::new`] or [`Engine::recover`] returned no engine. Nothing is
 /// exposed, no worker is left running and any directory lock is released.
 /// Recovery leaves checkpoint data unchanged and may create `LOCK`. It never
-/// substitutes an empty database or a different checkpoint. [`Engine::new`] fails only with [`Self::Config`]
-/// or [`Self::Worker`].
+/// substitutes an empty database or a different checkpoint. [`Engine::new`]
+/// fails only with [`Self::Config`] or [`Self::Worker`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OpenError {

@@ -794,7 +794,7 @@ impl Memtable {
     }
 }
 
-/// A memtable that can no longer change: a frozen table, or a snapshot of a
+/// A memtable that cannot change: a frozen table, or a snapshot of a
 /// table that may still be written.
 #[derive(Debug)]
 pub struct FrozenMemtable {

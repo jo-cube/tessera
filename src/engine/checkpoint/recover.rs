@@ -3,8 +3,8 @@
 use super::*;
 
 impl Engine {
-    /// Recovers CURRENT without rewriting checkpoint data. Sequences continue after the
-    /// checkpoint ceiling. No fallback.
+    /// Recovers the checkpoint `CURRENT` names, without rewriting checkpoint
+    /// data and with no fallback. Sequences continue after its ceiling.
     ///
     /// # Errors
     /// Returns [`OpenError`] for invalid options, missing or locked checkpoints,

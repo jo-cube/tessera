@@ -54,12 +54,12 @@
 //! metadata; one larger than the whole bound runs alone. A piece that outgrows
 //! its reservation retries with at least the whole bound, doubling each time,
 //! so the output allowance never fails a job.
-//! Bounded views keep only unmerged level-0 ranges visible and share the original
-//! immutable storage. Each piece retires its bottom inputs; later failure
-//! preserves earlier publications. Other jobs may build output ranges in
-//! parallel and publish together.
-//! No snapshot or size limit refuses a compaction. Only the latest version survives; tombstones survive while
-//! an unselected run could hold an older value.
+//! Bounded views keep only unmerged level-0 ranges visible and share the
+//! original immutable storage. Each piece retires its bottom inputs; later
+//! failure preserves earlier publications. Other jobs may build output ranges
+//! in parallel and publish together. No snapshot or size limit refuses a
+//! compaction. Only the latest version survives; tombstones survive while an
+//! unselected run could hold an older value.
 //!
 //! # Memory
 //!
@@ -99,10 +99,10 @@
 //! # Panics
 //!
 //! A panic under the exclusive state lock poisons the engine; subsequent
-//! operations acquiring that lock panic. Build panics
-//! leave published sources readable. A stopped flush worker is replaced by
-//! synchronous flushing when needed; a stopped compaction worker can likewise
-//! be serviced synchronously. Corrupt runs are reported by reads and maintenance.
+//! operations acquiring that lock panic. Build panics leave published sources
+//! readable. A stopped flush worker is replaced by synchronous flushing when
+//! needed; a stopped compaction worker can likewise be serviced synchronously.
+//! Corrupt runs are reported by reads and maintenance.
 //!
 //! # Reading runs
 //!
@@ -141,8 +141,9 @@
 //! Checkpoints use the normal flush builder, then stream immutable run chunks
 //! and persisted Bloom filters once per stable run ID. Later checkpoints reuse
 //! those files and report written/reused bytes and runs, plus deleted run files.
-//! Levels, bounded views and sequence overrides are restored without compaction. Use
-//! [`Engine::checkpoint_with_metadata`] and [`Engine::recover_with_metadata`]
+//! Levels, bounded views and sequence overrides are restored without
+//! compaction. Use [`Engine::checkpoint_with_metadata`] and
+//! [`Engine::recover_with_metadata`]
 //! to store and recover opaque application metadata (up to 16 MiB).
 //! Run format 6 stores magicless Zstandard frames and prefix-compressed index
 //! keys; checkpoint manifests use version 5. Recovery validates file lengths,
@@ -549,9 +550,9 @@ impl Engine {
     /// [`Snapshot`]s are unaffected and stay readable.
     ///
     /// Closing starts no flush or checkpoint; an in-flight build may finish.
-    /// It writes nothing to disk. The engine's data
-    /// goes with it unless checkpointed first.
-    /// Dropping the engine does the same and discards the result.
+    /// It writes nothing to disk, so the engine's data goes with it unless
+    /// checkpointed first. Dropping the engine does the same and discards the
+    /// result.
     ///
     /// Fails only with [`BackgroundError::Panicked`] if either worker
     /// stopped by panicking, at any time; the engine is shut down all the

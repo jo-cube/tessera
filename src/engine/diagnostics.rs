@@ -110,8 +110,8 @@ pub fn streaming_shape(engine: &Engine) -> StreamingShape {
     let state = engine.core.read_state();
     let levels = state.levels.runs();
     let bottom = levels.last().map_or(&[][..], Vec::as_slice);
-    // Aliases retain their physical file ID; this also works on Part 1,
-    // where only one current view per physical run can remain.
+    // Bounded views keep their physical run's ID, so each physical run
+    // counts once however many views of it are published.
     let mut seen = std::collections::HashSet::new();
     let stored_bytes: usize = state
         .runs

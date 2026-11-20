@@ -168,8 +168,8 @@ impl CompactionJob<'_> {
             }
             split.push((source, aliases));
         }
-        // Metadata-only publication partitions each source exactly once. Every
-        // piece now owns actual directory entries and can finish in any order.
+        // Metadata-only publication partitions each source exactly once, so
+        // every piece owns its own directory entries and can finish in any order.
         {
             let mut state = self.engine.write_state();
             state
