@@ -332,5 +332,30 @@ class Publication(Repository):
                                            'SHA256SUMS': f'{digest}  tessera-0.1.0.crate\n'.encode()})
 
 
+class Pins(unittest.TestCase):
+    """The toolchain and MSRV agree wherever they are written down."""
+
+    def read(self, name):
+        return (REPO / name).read_text()
+
+    def test_toolchain_and_msrv_pins_agree(self):
+        channel = re.search(r'^channel = "(.*)"$', self.read('rust-toolchain.toml'), re.M).group(1)
+        msrv = re.search(r'^rust-version = "(.*)"$', self.read('Cargo.toml'), re.M).group(1)
+        ci = self.read('.github/workflows/ci.yml')
+        toolchains = set(re.findall(r'toolchain: (\S+)', ci))
+        self.assertEqual(toolchains, {channel, msrv + '.0'})
+        self.assertIn(f'FROM rust:{channel}-', self.read('scripts/validate.Dockerfile'))
+        self.assertIn(f'tessera-validate:{channel}', self.read('scripts/validate.sh'))
+
+    def test_every_action_is_pinned_to_a_commit(self):
+        for name in ['ci.yml', 'release.yml']:
+            for use in re.findall(r'uses: (\S+)(.*)', self.read('.github/workflows/' + name)):
+                with self.subTest(workflow=name, action=use[0]):
+                    if use[0].startswith('./'):
+                        continue
+                    self.assertRegex(use[0], r'@[0-9a-f]{40}$')
+                    self.assertRegex(use[1], r'^ # \S')
+
+
 if __name__ == '__main__':
     unittest.main()
