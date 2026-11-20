@@ -5,8 +5,11 @@
 //! long-format CSV rows. See tools/README.md.
 //!
 //! `counters [--variant LABEL] [--settle] [--scale SHIFT] [--copy-audit]
-//! [--c2] [--write-only] [--memtable VALUE_LEN] [--worst]
+//! [--c2] [--write-only] [--memtable VALUE_LEN] [--worst] [--keyspaces N]
 //! [SCENARIO...]`
+//!
+//! With `--keyspaces N`, record `i` goes to keyspace `i % N`, so the same
+//! records spread over N keyspaces; every read is checked in its keyspace.
 use std::time::Instant;
 use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics};
 use tessera::{Engine, Keyspace, Options};
@@ -83,12 +86,24 @@ struct Scenario {
     clustered: bool,
 }
 
-#[derive(Default)]
 struct Flags {
     copy_audit: bool,
     c2: bool,
     write_only: bool,
     worst: bool,
+    keyspaces: usize,
+}
+
+impl Default for Flags {
+    fn default() -> Self {
+        Self {
+            copy_audit: false,
+            c2: false,
+            write_only: false,
+            worst: false,
+            keyspaces: 1,
+        }
+    }
 }
 
 static BOTTOM_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -205,7 +220,15 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         })
         .unwrap(),
     );
-    let ks = &engine.keyspace("data").unwrap();
+    let spaces: Vec<Keyspace> = match flags.keyspaces {
+        1 => vec![engine.keyspace("data").unwrap()],
+        n => (0..n)
+            .map(|j| engine.keyspace(&format!("data{j}")).unwrap())
+            .collect(),
+    };
+    let ks = &spaces[0];
+    let single = spaces.len() == 1;
+    let owner = |i: usize| &spaces[i % spaces.len()];
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     let sampler = memory::Sampler::start(std::sync::Arc::clone(&engine), name, variant);
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -218,7 +241,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     }
     for &i in &order {
         let v = value(i, 0, weak, len);
-        ks.put(&key(i), &v).unwrap();
+        owner(i).put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -233,7 +256,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     }
     for &i in &updates {
         let v = value(i, 1, weak, len);
-        ks.put(&key(i), &v).unwrap();
+        owner(i).put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
         updated[i] = true;
     }
@@ -265,18 +288,24 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     // and a full scan over every record.
     let mut ws = engine.reader();
     for i in (0..records).step_by(61) {
-        assert_eq!(ws.get(ks, &key(i)).unwrap().unwrap(), expect(i));
+        assert_eq!(ws.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
     }
-    for start in (0..records).step_by(128) {
-        let keys: Vec<_> = (start..(start + 128).min(records)).rev().map(key).collect();
-        let last = start + keys.len() - 1;
-        for (at, got) in ws.multi_get(ks, &keys).unwrap().iter().enumerate() {
-            assert_eq!(got.unwrap(), expect(last - at));
+    let n = spaces.len();
+    for start in (0..records).step_by(128 * n) {
+        for (j, space) in spaces.iter().enumerate() {
+            let keys: Vec<usize> = (start..(start + 128 * n).min(records))
+                .filter(|i| i % n == j)
+                .rev()
+                .collect();
+            let bytes: Vec<_> = keys.iter().map(|&i| key(i)).collect();
+            for (at, got) in ws.multi_get(space, &bytes).unwrap().iter().enumerate() {
+                assert_eq!(got.unwrap(), expect(keys[at]));
+            }
         }
     }
-    {
-        let mut scan = ws.range(ks, ..);
-        for i in 0..records {
+    for (j, space) in spaces.iter().enumerate() {
+        let mut scan = ws.range(space, ..);
+        for i in (j..records).step_by(n) {
             let (found, value) = scan.next().unwrap().unwrap();
             assert_eq!(found, key(i));
             assert_eq!(value, expect(i));
@@ -286,14 +315,14 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let mut hits = engine.reader();
     for at in 0..10_000 {
         let i = at * 7919 % records;
-        assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
+        assert_eq!(hits.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
     }
     let mut misses = engine.reader();
     for at in 0..1_000 {
         let i = at * 7919 % (records - 1);
         let mut missing = key(i).to_vec();
         missing.push(0);
-        assert!(misses.get(ks, &missing).unwrap().is_none());
+        assert!(misses.get(owner(i), &missing).unwrap().is_none());
     }
     let stats = engine.engine_stats();
     assert_eq!(stats.build.raw_bytes_ingested, ingested);
@@ -382,7 +411,10 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         background.compactions,
         BOTTOM_JOBS.load(std::sync::atomic::Ordering::Relaxed)
     );
-    probe_reads(&engine, ks, name, variant, "end", records, &expect);
+    // The probes and the worst point read one keyspace's key layout.
+    if single {
+        probe_reads(&engine, ks, name, variant, "end", records, &expect);
+    }
     if settle {
         // A control without timing effects: rewrite everything into the
         // bottom level, where sequences are erased, then measure again.
@@ -392,7 +424,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         let mut hits = engine.reader();
         for at in 0..10_000 {
             let i = at * 7919 % records;
-            assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
+            assert_eq!(hits.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
         }
         let mut scans = engine.reader();
         for _ in 0..100 {
@@ -441,7 +473,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
             ratio(scans.counters().blocks_loaded, 100),
         );
     }
-    if flags.worst {
+    if flags.worst && single {
         worst_point(&engine, ks, s, variant, &updated);
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -539,6 +571,10 @@ fn main() {
             "--c2" => flags.c2 = true,
             "--write-only" => flags.write_only = true,
             "--worst" => flags.worst = true,
+            "--keyspaces" => {
+                flags.keyspaces = args.next().expect("N").parse().expect("positive N");
+                assert!(flags.keyspaces > 0, "--keyspaces needs at least 1");
+            }
             "--memtable" => memtable = Some(args.next().expect("VALUE_LEN").parse().unwrap()),
             _ => names.push(arg),
         }

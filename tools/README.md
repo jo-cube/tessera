@@ -29,7 +29,9 @@ stops after the drain, for profiling. `--worst` also measures reads and
 memory with level 0 at its fullest: new jobs are held off while random updates
 fill it to the writer stop. `--memtable VALUE_LEN` (with
 `tools-memory`) fills one memtable to its budget with random keys and prints
-its live heap per entry beyond key and value.
+its live heap per entry beyond key and value. `--keyspaces N` spreads the
+same records over N keyspaces, record `i` in keyspace `i % N`, and checks
+every read in its keyspace; the probe rows and `--worst` need one keyspace.
 
 The hidden `diagnostics` feature provides the counters. It is not part of the
 stable API. The [basic example](../examples/basic.rs) demonstrates the public
