@@ -3,8 +3,8 @@
 #
 #   scripts/validate.sh image              build the toolchain image (online)
 #   scripts/validate.sh deps               resolve and fetch crates (online)
-#   scripts/validate.sh [check]            fmt, Clippy, tests, docs and a release
-#                                          build (default)
+#   scripts/validate.sh [check]            `just all`, one recipe per step, then a
+#                                          release build (default)
 #   scripts/validate.sh limits             the large-allocation boundary tests
 #   scripts/validate.sh full               check, then limits
 #   scripts/validate.sh msrv-image         add the minimum Rust toolchain (online)
@@ -17,6 +17,9 @@
 # the hypervisor caps at 4 GiB in total, and a 3 GiB cgroup inside it. The
 # cgroup sits below the VM size so an out-of-memory kill lands on the workload
 # instead of on the guest kernel or Docker daemon.
+#
+# The image adds just, the prebuilt 1.59.0 binary checked against its
+# published SHA-256 (see validate.Dockerfile).
 #
 # Anything that can loop or allocate without bound, including tests of
 # deliberately broken code, belongs in this script and not in a host shell.
@@ -145,15 +148,18 @@ fetch_crates() {
   bounded deps 300 cargo fetch
 }
 
+# One justfile recipe per step, so each keeps its own bound. `build-tests`
+# compiles the test binaries first, so `test`'s bound covers running them.
 check() {
-  bounded fmt 60 cargo fmt --check
-  bounded clippy 300 cargo clippy --locked --all-targets --all-features -- -D warnings
+  bounded fmt 60 just fmt
+  bounded clippy 300 just clippy
   bounded build-tests 300 cargo test --locked --no-run
-  bounded test 300 cargo test --locked
-  bounded test-diagnostics 300 cargo test --locked --features diagnostics --test lookup_allocations --test retention
-  bounded doc 120 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-
-  bounded release 300 cargo build --locked --release --lib
+  bounded test 300 just test
+  bounded doc 120 just doc
+  bounded long 300 just long
+  bounded package 300 just package
+  bounded scripts-test 60 just scripts-test
+  bounded release 300 just build
 }
 
 # The minimum Rust version is a compile contract: every target type-checks and
@@ -162,8 +168,7 @@ check() {
 msrv_check() {
   image="$msrv_image"
   require_image
-  bounded msrv-check 300 env CARGO_TARGET_DIR=/cache/msrv cargo "+$msrv" check --locked --all-targets --all-features
-  bounded msrv-clippy 300 env CARGO_TARGET_DIR=/cache/msrv cargo "+$msrv" clippy --locked --all-targets --all-features -- -D warnings
+  bounded msrv 600 env CARGO_TARGET_DIR=/cache/msrv just msrv
 }
 
 limits() {
