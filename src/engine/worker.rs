@@ -17,6 +17,7 @@ use super::{CompactionError, CompactionPolicy, Core};
 
 /// What the background worker has done since the engine was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BackgroundStatus {
     /// Whether the worker thread is running.
     pub running: bool,
@@ -43,6 +44,7 @@ pub struct BackgroundStatus {
 
 /// Why waiting for background compaction did not end in success.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackgroundError {
     /// The worker panicked and has stopped for good, with this message.
     Panicked(String),

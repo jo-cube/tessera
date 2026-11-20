@@ -584,6 +584,7 @@ pub struct CorruptBlock {
 
 /// The kinds of structural corruption detected in a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Corruption {
     /// The bytes end before a required field does.
     Truncated,

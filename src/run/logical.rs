@@ -46,6 +46,7 @@ pub struct LogicalWorkspace {
 
 /// The latest live value of a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LiveValue<'a> {
     /// The deciding version's sequence, or 0 when bottom-level compaction
     /// erased it from settled data. This is not a stable update identifier.
@@ -56,6 +57,7 @@ pub struct LiveValue<'a> {
 
 /// A live key and its latest value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LiveRecord<'a> {
     /// The user key.
     pub key: &'a [u8],
@@ -68,6 +70,7 @@ pub struct LiveRecord<'a> {
 
 /// Why a logical read could not produce a correct result.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReadError {
     /// An input run is damaged.
     Corrupt(CorruptRun),
@@ -77,6 +80,7 @@ pub enum ReadError {
 
 /// Two copies of one internal key that differ in value or kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConflictingCopies {
     /// The user key.
     pub key: Vec<u8>,

@@ -150,6 +150,7 @@ check() {
   bounded clippy 300 cargo clippy --locked --all-targets --all-features -- -D warnings
   bounded build-tests 300 cargo test --locked --no-run
   bounded test 300 cargo test --locked
+  bounded test-diagnostics 300 cargo test --locked --features diagnostics --test lookup_allocations --test retention
   bounded doc 120 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 
   bounded release 300 cargo build --locked --release --lib

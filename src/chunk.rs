@@ -25,6 +25,7 @@ struct Pool {
 
 /// Cumulative work performed by this engine, including abandoned builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BuildCounters {
     /// Settled blocks a merge into the bottom level copied forward without
     /// decoding them.
@@ -39,10 +40,6 @@ pub struct BuildCounters {
     pub raw_bytes_compressed: u64,
     /// Admitted key and value bytes; deletes count their keys.
     pub raw_bytes_ingested: u64,
-    /// Always zero; compaction re-encodes every block.
-    pub forced_undersized_blocks: u64,
-    /// Always zero; compaction re-encodes every block.
-    pub filter_decoded_bytes: u64,
 }
 #[derive(Default, Debug)]
 struct Counters {
@@ -119,8 +116,6 @@ impl Counters {
             bytes_compressed: self.bytes_compressed.load(Ordering::Relaxed),
             raw_bytes_compressed: self.raw_bytes_compressed.load(Ordering::Relaxed),
             raw_bytes_ingested: self.raw_bytes_ingested.load(Ordering::Relaxed),
-            forced_undersized_blocks: 0,
-            filter_decoded_bytes: 0,
         }
     }
 }

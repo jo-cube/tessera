@@ -64,7 +64,7 @@ fn contents(engine: &Engine) -> Model {
 
 /// A RAM-only engine with flushed runs, deletes and a memtable.
 fn varied_engine() -> (Engine, Model) {
-    let engine = Engine::new(EngineOptions { ..options() }).unwrap();
+    let engine = Engine::new(options()).unwrap();
     let mut model = Model::new();
     for i in 0..2_000u32 {
         let (key, value) = (i.to_be_bytes().to_vec(), format!("v{i}").into_bytes());

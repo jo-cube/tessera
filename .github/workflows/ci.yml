@@ -42,6 +42,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
+      - name: Diagnostics-only tests
+        run: cargo test --locked --features diagnostics --test lookup_allocations --test retention
       - name: Long correctness campaigns (x86-64 Linux)
         if: matrix.os == 'ubuntu-24.04'
         timeout-minutes: 5

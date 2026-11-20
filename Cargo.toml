@@ -35,10 +35,12 @@ path = "tests/process.rs"
 [[test]]
 name = "lookup_allocations"
 path = "tests/lookup_allocations.rs"
+required-features = ["diagnostics"]
 
 [[test]]
 name = "retention"
 path = "tests/retention.rs"
+required-features = ["diagnostics"]
 
 [[example]]
 name = "counters"

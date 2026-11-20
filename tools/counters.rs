@@ -9,7 +9,8 @@
 //! [SCENARIO...]`
 use std::time::Instant;
 use tessera::engine::diagnostics;
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
+use tessera::engine::diagnostics::MergeWorkspace;
+use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
 
 mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -207,9 +208,10 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let started = Instant::now();
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let engine = std::sync::Arc::new(
-        Engine::new(EngineOptions {
-            background_threads: threads,
-            ..EngineOptions::default()
+        Engine::new({
+            let mut options = EngineOptions::default();
+            options.background_threads = threads;
+            options
         })
         .unwrap(),
     );
@@ -404,7 +406,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         // A control without timing effects: rewrite everything into the
         // bottom level, where sequences are erased, then measure again.
         let mut merge = MergeWorkspace::new();
-        while engine.compact(&mut merge).unwrap().is_some() {}
+        while diagnostics::compact_step(&engine, &mut merge).unwrap() {}
         engine.wait_for_compaction().unwrap();
         let mut hits = EngineWorkspace::new();
         for at in 0..10_000 {

@@ -192,9 +192,9 @@ pub use worker::{BackgroundError, BackgroundStatus};
 pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use crate::chunk::BuildCounters;
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
+pub(crate) use crate::run::{CompactStats, MergeWorkspace};
 pub use crate::run::{
-    CompactStats, ConflictingCopies, CorruptRun, LiveRecord, LiveValue, MergeWorkspace, ReadError,
-    RunCorruption,
+    ConflictingCopies, CorruptRun, LiveRecord, LiveValue, ReadError, RunCorruption,
 };
 
 use std::collections::HashSet;
@@ -250,6 +250,7 @@ fn published(runs: Vec<Run<Vec<u8>>>) -> impl Iterator<Item = SharedRun> {
 
 /// Engine configuration, fixed at construction. See [Memory](self#memory).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EngineOptions {
     /// Writer admission budget; `None` (the default) is unlimited.
     pub memory_limit: Option<usize>,
@@ -279,6 +280,10 @@ pub struct EngineOptions {
 // Internal scheduling defaults. None is an admission/refusal limit.
 const TARGET_RUN_LEN: usize = crate::memtable::TARGET_RUN_LEN; // 64 MiB logical input per run.
 const LEVEL0_STOP: usize = 12; // Bound read amplification while writers wait.
+const _: () = assert!(
+    LEVEL0_STOP == 12,
+    "EngineStats::level0_flushes documents the stop"
+);
 const BULK_INGEST_DIVISOR: usize = 2; // Sorted ingestion at half a memtable.
 const MAX_FROZEN_MEMTABLES: usize = 2; // Bound the flush backlog.
 const MAX_COMPACTION_INPUTS: usize = 32; // Optional level-0 fan-in.
@@ -436,21 +441,25 @@ impl Compression {
 /// write that only needs room flushes instead; see
 /// [Flushing](self#flushing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteError {
     /// Sorted ingestion requires strictly ascending keys without duplicates.
     BatchNotSorted,
     /// The key exceeds [`MAX_KEY_LEN`].
+    #[non_exhaustive]
     KeyTooLong {
         /// Length of the rejected key.
         len: usize,
     },
     /// The value exceeds [`MAX_VALUE_LEN`].
+    #[non_exhaustive]
     ValueTooLong {
         /// Length of the rejected value.
         len: usize,
     },
     /// The record alone would be charged more than a whole memtable budget
     /// ([`EngineOptions::memtable_budget`]), so no memtable can hold it.
+    #[non_exhaustive]
     RecordExceedsBudget {
         /// What the record would be charged: its key and value and
         /// [`ENTRY_OVERHEAD`].
@@ -485,11 +494,13 @@ impl std::error::Error for WriteError {}
 
 /// A write used no sequence number and changed no reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UpdateError {
     /// The write violates key, value or record-budget limits, or a batch
     /// passed to sorted ingestion is not strictly ordered and unique.
     Rejected(WriteError),
     /// No further memory can currently be reclaimed. The write used no sequence.
+    #[non_exhaustive]
     MemoryLimit {
         /// Accounted memory at admission.
         used: usize,
@@ -516,6 +527,7 @@ impl std::error::Error for UpdateError {}
 
 /// What a flush published.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FlushReport {
     /// Memtables flushed.
     pub tables: usize,
@@ -536,8 +548,9 @@ pub struct FlushReport {
 
 /// A summary of an engine's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EngineStats {
-    /// Cumulative encoding and admitted input, with zero block-reuse counters.
+    /// Cumulative encoding, copy-forward and admitted input.
     pub build: BuildCounters,
     /// Physical chunk capacity held by published runs.
     pub chunk_bytes_held: usize,
@@ -549,7 +562,9 @@ pub struct EngineStats {
     pub index_bytes: usize,
     /// The last sequence number used.
     pub last_seq: u64,
-    /// Total memory charged to writer admission (sum of the components below).
+    /// Total memory charged to writer admission: the sum of `memtable_bytes`,
+    /// `run_bytes`, `held_bytes`, `snapshot_bytes`, `pool_reserve_bytes`,
+    /// `pool_unaccounted_bytes`, `build_output_bytes` and `build_workspace_bytes`.
     pub used: usize,
     /// Configured writer admission budget, or unlimited.
     pub memory_limit: Option<usize>,
@@ -1063,8 +1078,8 @@ impl Engine {
     ///
     /// # Panics
     /// Panics if the state lock is poisoned or a synchronous builder panics.
-    #[doc(hidden)]
-    pub fn compact(
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn compact(
         &self,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
@@ -2050,6 +2065,7 @@ impl CompactionPolicy {
 
 /// Why a compaction stopped. Earlier pieces of a bottom job remain published.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompactionError {
     /// An input run is damaged, or two runs disagree about one update. The
     /// current piece is unchanged; earlier pieces stay published. Retrying
@@ -2061,6 +2077,7 @@ pub enum CompactionError {
     Stale,
     /// A single indivisible range exceeds the job's bounded output allowance.
     /// Earlier pieces remain published and this piece changes nothing.
+    #[non_exhaustive]
     OutputLimit {
         /// Conservative output bytes needed before the next allocation.
         bytes: usize,
@@ -2104,7 +2121,7 @@ impl std::error::Error for CompactionError {}
 /// What kind of step a compaction took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum CompactionKind {
+pub(crate) enum CompactionKind {
     /// Runs of one level merged with the runs of the next that they
     /// overlap, into the next.
     Merge,
@@ -2117,7 +2134,7 @@ pub enum CompactionKind {
 
 /// What a compaction replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompactionReport {
+pub(crate) struct CompactionReport {
     /// What kind of step it was. A move replaces nothing, and every count
     /// below is 0.
     pub kind: CompactionKind,

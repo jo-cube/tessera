@@ -3,7 +3,9 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tessera::engine::{CheckpointOptions, Engine, EngineOptions, EngineWorkspace, WriteBatch};
 
-    let engine = Engine::new(EngineOptions::default())?;
+    let mut options = EngineOptions::default();
+    options.memory_limit = Some(256 << 20);
+    let engine = Engine::new(options)?;
     engine.put(b"user/1", b"ada")?;
     let mut workspace = EngineWorkspace::new();
     assert_eq!(

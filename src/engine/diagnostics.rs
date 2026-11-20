@@ -1,8 +1,9 @@
 //! Repository diagnostics: work and memory by level.
 //! Built only with the `diagnostics` feature; not part of the stable API.
 
-use super::Engine;
+use super::{CompactionError, Engine};
 pub use crate::chunk::Erasure;
+pub use crate::run::MergeWorkspace;
 
 /// Bytes one purpose read and wrote.
 #[derive(Clone, Copy, Debug, Default)]
@@ -292,6 +293,21 @@ pub fn hold_compaction(engine: &Engine) -> std::sync::MutexGuard<'_, ()> {
         .compacting
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Performs one eager compaction step with the caller's workspace, and
+/// returns whether one was eligible. Serializes with other compactions.
+///
+/// # Errors
+/// Returns [`CompactionError`] for a read failure or invalidated selection.
+///
+/// # Panics
+/// Panics if the state lock is poisoned or a synchronous builder panics.
+pub fn compact_step(
+    engine: &Engine,
+    workspace: &mut MergeWorkspace,
+) -> Result<bool, CompactionError> {
+    engine.compact(workspace).map(|report| report.is_some())
 }
 
 #[cfg(test)]

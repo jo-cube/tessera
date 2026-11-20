@@ -17,7 +17,9 @@ use tessera::engine::{
     CheckpointOptions, Engine, EngineOptions, EngineWorkspace, WriteBatch,
 };
 
-let engine = Engine::new(EngineOptions::default())?;
+let mut options = EngineOptions::default();
+options.memory_limit = Some(256 << 20);
+let engine = Engine::new(options)?;
 engine.put(b"user/1", b"ada")?;
 let mut workspace = EngineWorkspace::new();
 assert_eq!(engine.get(b"user/1", &mut workspace)?.unwrap().value, b"ada");
@@ -106,7 +108,8 @@ copying is retried once without copying.
 
 ## Options and memory
 
-`EngineOptions` is fixed when the engine starts:
+`EngineOptions` is fixed when the engine starts. Set fields on its default,
+since new options may be added:
 
 | Option | Default | Trade-off |
 | --- | --- | --- |

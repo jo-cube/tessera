@@ -93,6 +93,7 @@ pub(super) fn new_run_id() -> u128 {
 
 /// Bounds on one checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CheckpointOptions {
     /// Maximum new run-file and manifest bytes written in this attempt.
     /// Reused files, CURRENT and filesystem overhead are excluded. Older
@@ -111,6 +112,7 @@ impl Default for CheckpointOptions {
 
 /// What a committed checkpoint holds and the I/O performed for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CheckpointReport {
     /// Its generation, named by CURRENT.
     pub generation: u64,
@@ -130,8 +132,6 @@ pub struct CheckpointReport {
     pub runs_reused: usize,
     /// Obsolete run files (including interrupted temporary files) deleted.
     pub files_deleted: usize,
-    /// Alias of bytes_written.
-    pub bytes: u64,
     /// Largest referenced run file, including its filter.
     pub largest_run_bytes: usize,
     /// Obsolete generation directories removed.
@@ -145,12 +145,14 @@ pub struct CheckpointReport {
 /// still readable either way; its memtables may have flushed. The preceding
 /// committed generation is retained.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CheckpointError {
     /// Application metadata exceeds the 16 MiB format bound.
     MetadataLimit,
     /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
     /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
+    #[non_exhaustive]
     DiskLimit {
         /// Bytes the checkpoint would have reached.
         bytes: u64,
@@ -158,6 +160,7 @@ pub enum CheckpointError {
         max_bytes: u64,
     },
     /// A filesystem operation failed.
+    #[non_exhaustive]
     Io {
         /// The file or directory.
         path: PathBuf,
@@ -205,10 +208,12 @@ impl std::error::Error for CheckpointError {}
 
 /// How stored checkpoint data failed its checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Damage {
     /// A file the checkpoint needs does not exist.
     Missing,
     /// The file is shorter or longer than its format or the manifest says.
+    #[non_exhaustive]
     Length {
         /// Expected length.
         expected: u64,
@@ -218,6 +223,7 @@ pub enum Damage {
     /// The file does not start with its magic number.
     BadMagic,
     /// A manifest version or flags this build does not read.
+    #[non_exhaustive]
     Unsupported {
         /// The version.
         version: u32,
@@ -229,6 +235,7 @@ pub enum Damage {
     /// A persisted Bloom filter failed its independent checksum.
     FilterChecksum,
     /// The manifest is for another generation than `CURRENT` names.
+    #[non_exhaustive]
     Generation {
         /// Named by `CURRENT`.
         expected: u64,
@@ -240,6 +247,7 @@ pub enum Damage {
     /// Run IDs, levels, flush groups, level ordering or copies of one update disagree.
     Order,
     /// A record has a sequence number above the checkpoint's ceiling.
+    #[non_exhaustive]
     Sequence {
         /// The record's.
         seq: u64,
@@ -247,6 +255,7 @@ pub enum Damage {
         ceiling: u64,
     },
     /// The runs hold a different number of records than the manifest says.
+    #[non_exhaustive]
     Records {
         /// The manifest's count.
         expected: u64,
@@ -261,12 +270,14 @@ pub enum Damage {
 /// substitutes an empty database or a different checkpoint. [`Engine::new`] fails only with [`Self::Config`]
 /// or [`Self::Worker`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OpenError {
     /// The directory or its `CURRENT` file does not exist.
     NoCheckpoint(PathBuf),
     /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
     /// A file could not be read.
+    #[non_exhaustive]
     Io {
         /// The file.
         path: PathBuf,
@@ -274,6 +285,7 @@ pub enum OpenError {
         error: io::Error,
     },
     /// A file failed its checks.
+    #[non_exhaustive]
     Corrupt {
         /// The file.
         path: PathBuf,
@@ -1152,7 +1164,6 @@ impl Engine {
             last_seq: written.manifest.last_seq,
             records: written.manifest.records,
             runs: written.manifest.runs.len(),
-            bytes: written.bytes,
             bytes_written: written.bytes,
             bytes_reused: written.bytes_reused,
             runs_written: written.runs_written,

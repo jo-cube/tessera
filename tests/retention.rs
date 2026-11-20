@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "../src/test_support.rs"]
 mod test_support;
 
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace, MergeWorkspace, Snapshot};
+use tessera::engine::diagnostics::{self, MergeWorkspace};
+use tessera::engine::{Engine, EngineOptions, EngineWorkspace, Snapshot};
 
 fn options() -> EngineOptions {
     EngineOptions::default()
@@ -92,12 +93,9 @@ const OWN: usize = 1 << 10;
 /// An engine whose memtable never fills in these tests, so that only the
 /// history its snapshots pin is retained.
 fn memtable_only() -> Engine {
-    Engine::new(EngineOptions {
-        memtable_budget: 64 << 20,
-
-        ..options()
-    })
-    .unwrap()
+    let mut options = options();
+    options.memtable_budget = 64 << 20;
+    Engine::new(options).unwrap()
 }
 
 /// The active table's pinned bytes cover what only its snapshots hold.
@@ -173,16 +171,14 @@ fn whole_table_replaced() {
 }
 
 fn engine_options() -> EngineOptions {
-    EngineOptions {
-        memtable_budget: 96 << 10,
-
-        ..options()
-    }
+    let mut options = options();
+    options.memtable_budget = 96 << 10;
+    options
 }
 
 fn compact_some(engine: &Engine, rng: &mut Rng, workspace: &mut MergeWorkspace) {
     for _ in 0..rng.below(4) {
-        if engine.compact(workspace).unwrap().is_none() {
+        if !diagnostics::compact_step(engine, workspace).unwrap() {
             break;
         }
     }

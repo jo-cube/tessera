@@ -184,6 +184,7 @@ fn read_u64<const N: usize>(bytes: &[u8; N], at: usize) -> u64 {
 /// Why a run's bytes were rejected as damaged: on loading a checkpoint,
 /// which validates every run in full, or while reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CorruptRun {
     /// Byte offset in the run of the offending structure.
     pub offset: usize,
@@ -193,6 +194,7 @@ pub struct CorruptRun {
 
 /// The kinds of structural corruption detected in a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunCorruption {
     /// The bytes are too short to hold a footer.
     Truncated,

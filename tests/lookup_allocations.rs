@@ -12,7 +12,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tessera::engine::{Compression, Engine, EngineOptions, EngineWorkspace, MergeWorkspace};
+use tessera::engine::diagnostics::{self, MergeWorkspace};
+use tessera::engine::{Compression, Engine, EngineOptions, EngineWorkspace};
 
 fn options() -> EngineOptions {
     EngineOptions::default()
@@ -81,13 +82,10 @@ fn value(index: u32) -> Vec<u8> {
 /// An engine of overlapping flushed runs consolidated by compaction, and the
 /// resulting engine after compactions.
 fn consolidated(compression: Compression) -> Engine {
-    let engine = Engine::new(EngineOptions {
-        target_block_compressed: 4 << 10,
-        compression,
-
-        ..options()
-    })
-    .unwrap();
+    let mut options = options();
+    options.target_block_compressed = 4 << 10;
+    options.compression = compression;
+    let engine = Engine::new(options).unwrap();
     // A fixed permutation, flushed in four parts whose key ranges overlap.
     for j in 0..RECORDS {
         let index = j.wrapping_mul(7_919) % RECORDS;
@@ -97,7 +95,7 @@ fn consolidated(compression: Compression) -> Engine {
         }
     }
     let mut workspace = MergeWorkspace::new();
-    while engine.compact(&mut workspace).unwrap().is_some() {}
+    while diagnostics::compact_step(&engine, &mut workspace).unwrap() {}
     engine.wait_for_compaction().unwrap();
     engine
 }
