@@ -1272,6 +1272,8 @@ impl Core {
         while state.levels.level0_flushes() >= state.level0_stop {
             #[cfg(feature = "diagnostics")]
             let _waiting = self.resources.waiting();
+            #[cfg(feature = "diagnostics")]
+            let _level0 = self.resources.level0_waiting();
             drop(state);
             #[cfg(test)]
             self.level0_waits

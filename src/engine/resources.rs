@@ -14,6 +14,10 @@ pub(super) struct Progress {
     #[cfg(feature = "diagnostics")]
     pub(super) writer_wait_ns: std::sync::atomic::AtomicU64,
     #[cfg(feature = "diagnostics")]
+    pub(super) level0_waits: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    pub(super) level0_wait_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
     pub(super) output_limit: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "diagnostics")]
     pub(super) peak_reserved: std::sync::atomic::AtomicUsize,
@@ -44,7 +48,31 @@ impl Drop for WaitCharge<'_> {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(super) struct Level0Charge<'a> {
+    progress: &'a Progress,
+    started: std::time::Instant,
+}
+#[cfg(feature = "diagnostics")]
+impl Drop for Level0Charge<'_> {
+    fn drop(&mut self) {
+        let nanos = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.progress.level0_waits.fetch_add(1, Ordering::Relaxed);
+        self.progress
+            .level0_wait_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 impl Progress {
+    /// Charges one writer wait at the level-0 stop, counted and timed.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn level0_waiting(&self) -> Level0Charge<'_> {
+        Level0Charge {
+            progress: self,
+            started: std::time::Instant::now(),
+        }
+    }
     #[cfg(feature = "diagnostics")]
     pub(super) fn waiting(&self) -> WaitCharge<'_> {
         WaitCharge {

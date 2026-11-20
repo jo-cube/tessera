@@ -255,6 +255,10 @@ pub struct Maintenance {
     pub piece_retries: usize,
     /// Sum of writer nanoseconds waiting at admission, frozen tables and L0 stop.
     pub writer_wait_ns: u64,
+    /// Writer waits at the level-0 stop (one per loop iteration).
+    pub level0_waits: u64,
+    /// Writer nanoseconds waiting at the level-0 stop.
+    pub level0_wait_ns: u64,
 }
 /// Read counters without acquiring the engine state lock.
 pub fn maintenance(engine: &Engine) -> Maintenance {
@@ -269,7 +273,25 @@ pub fn maintenance(engine: &Engine) -> Maintenance {
         peak_active_pieces: p.peak_active.load(Relaxed),
         piece_retries: p.piece_retries.load(Relaxed),
         writer_wait_ns: p.writer_wait_ns.load(Relaxed),
+        level0_waits: p.level0_waits.load(Relaxed),
+        level0_wait_ns: p.level0_wait_ns.load(Relaxed),
     }
+}
+
+/// Flush groups level 0 holds runs of now.
+pub fn level0_flushes(engine: &Engine) -> usize {
+    engine.core.read_state().levels.level0_flushes()
+}
+
+/// Holds off new compaction jobs until the guard drops, after any job in
+/// progress has begun. Writers still stop at the level-0 stop, so a caller
+/// that writes while holding it must stay below the stop or deadlock.
+pub fn hold_compaction(engine: &Engine) -> std::sync::MutexGuard<'_, ()> {
+    engine
+        .core
+        .compacting
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

@@ -203,6 +203,10 @@ impl Store {
             out.emit(phase, "bottom_mean_stored_bytes", shape.bottom_mean_stored_bytes);
             out.emit(phase, "bounded_views", shape.bounded_views);
             out.emit(phase, "stored_bytes", shape.stored_bytes);
+            let m = tessera::engine::diagnostics::maintenance(engine);
+            out.emit(phase, "writer_wait_total_s", format!("{:.3}", m.writer_wait_ns as f64 / 1e9));
+            out.emit(phase, "level0_wait_total_s", format!("{:.3}", m.level0_wait_ns as f64 / 1e9));
+            out.emit(phase, "level0_waits_total", m.level0_waits);
         }
     }
     /// Stored runs plus held filters/segment metadata, after a drain.
