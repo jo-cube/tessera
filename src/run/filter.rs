@@ -1,9 +1,9 @@
 //! Run-local Bloom filters over user keys.
 //!
 //! Filters accompany checkpoint run bytes with their own checksum. Hashing
-//! is fixed: FNV-1a followed by the MurmurHash3 finalizer. Checkpoint envelope
-//! version 4 fixes the blocked layout and probe sequence below.
-//! Every version and tombstone contributes its key; a negative is exact.
+//! is fixed: FNV-1a followed by the MurmurHash3 finalizer. The checkpoint
+//! format fixes the blocked layout and probe sequence below. Every version
+//! and tombstone contributes its key; a negative is exact.
 
 use std::fmt;
 

@@ -70,15 +70,16 @@ impl MergeWorkspace {
 /// different values. A merge does not compare values or report conflicts. A
 /// user key and sequence number must name one logical record; a caller that
 /// needs one record per user key should read through a
-/// [`LogicalCursor`](super::LogicalCursor), which collapses identical copies and rejects
-/// conflicting ones. A caller writing a merged stream to a new run must
+/// [`LogicalCursor`](super::LogicalCursor), which collapses identical copies
+/// and rejects conflicting ones. A caller writing a merged stream to a new run must
 /// resolve duplicates first, because a run rejects them.
 ///
 /// This is a lending cursor like [`RunCursor`](super::reader::RunCursor).
 /// Each input holds its head, the next record it would yield, decoded in its
-/// own workspace, and the merge compares heads in place. So state is one cursor and at most one decoded block
-/// per input, and values are never copied. Records need no allocation; creating
-/// a cursor makes one, and [`seek`](Self::seek) makes none on a warm workspace.
+/// own workspace, and the merge compares heads in place. Its state is one
+/// cursor and at most one decoded block per input, and values are never
+/// copied. Records need no allocation; creating a cursor makes one, and
+/// [`seek`](Self::seek) makes none on a warm workspace.
 #[derive(Debug)]
 pub struct MergeCursor<'a> {
     cursors: Vec<GroupCursor<'a>>,

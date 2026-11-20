@@ -914,7 +914,8 @@ mod tests {
         assert_eq!(fingerprints(), EXPECTED);
     }
 
-    /// Recorded from the builder before its per-record lengths were shared.
+    /// The length and CRC-32 of each run `fingerprints` builds. Any change
+    /// to the bytes the builder writes shows here.
     const EXPECTED: &[(usize, u32)] = &[
         (241484, 1553911650),
         (45296, 1780263009),

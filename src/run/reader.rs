@@ -31,10 +31,10 @@ use crate::chunk::ChunkPool;
 ///
 /// Holding a `Run` is proof of validity: it comes from
 /// [`RunBuilder::finish`](super::RunBuilder::finish) or from a full check by
-/// [`recover_checkpoint_in`](Self::recover_checkpoint_in). Reads never repeat that check. They still return
-/// errors, because a checksum mismatch in memory is a detectable event and not
-/// a programming error. The storage must keep returning the same bytes from
-/// `as_ref`.
+/// [`recover_checkpoint_in`](Self::recover_checkpoint_in). Reads never repeat
+/// that check. They still return errors, because a checksum mismatch in
+/// memory is a detectable event and not a programming error. The storage must
+/// keep returning the same bytes from `as_ref`.
 ///
 /// A run is immutable and has no interior mutability, so it can be shared
 /// between threads whenever its storage can. Each thread needs its own

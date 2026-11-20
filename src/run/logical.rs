@@ -227,8 +227,8 @@ where
     latest_from(InOrder(runs.into_iter().enumerate()), key, workspace)
 }
 
-/// Finds the latest version over the runs `source` offers, each with its position, which
-/// a conflict reports. The source is told the sequence number of the newest
+/// Finds the latest version over the runs `source` offers, each with its
+/// position, which a conflict reports. The source is told the sequence number of the newest
 /// version found so far, and may stop offering runs once none it has left can
 /// hold a version at or above it; one that does can still be checked for a
 /// conflicting copy.
