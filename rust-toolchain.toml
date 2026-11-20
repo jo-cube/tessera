@@ -1,0 +1,6 @@
+# The toolchain for development and CI. Consumers need only `rust-version`
+# from Cargo.toml (1.89), which `just msrv` and CI's msrv job keep proving.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
