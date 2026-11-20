@@ -9,10 +9,6 @@ struct Piece {
     index: usize,
     inputs: Vec<SharedRun>,
     request: usize,
-    /// Copy settled blocks forward. Copied frames can make the output a
-    /// little larger than rewriting it would, so a piece that exceeds the
-    /// whole allowance is retried once without.
-    copy: bool,
 }
 struct Queue {
     pending: VecDeque<Piece>,
@@ -28,6 +24,10 @@ struct Pipeline {
     queue: Mutex<Queue>,
     changed: Condvar,
     capacity: usize,
+    /// Whether `capacity` is a hard limit that refuses larger pieces, as
+    /// tests force. Otherwise a larger piece runs alone.
+    #[cfg(test)]
+    hard_cap: bool,
 }
 struct Lease<'a> {
     pipeline: &'a Pipeline,
@@ -49,13 +49,24 @@ impl Drop for Lease<'_> {
     }
 }
 impl Pipeline {
+    /// Whether a piece that exceeded its request may retry with more.
+    fn grows(&self, piece: &Piece) -> bool {
+        #[cfg(test)]
+        if self.hard_cap {
+            return piece.request < self.capacity;
+        }
+        let _ = piece;
+        true
+    }
     fn take(&self) -> Option<(Piece, Lease<'_>)> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if queue.stopped || queue.pending.is_empty() {
                 return None;
             }
-            if queue.pending[0].request <= self.capacity - queue.reserved {
+            let request = queue.pending[0].request;
+            // A piece larger than the whole allowance runs alone.
+            if request <= self.capacity - queue.reserved.min(self.capacity) || queue.reserved == 0 {
                 let piece = queue.pending.pop_front().unwrap();
                 queue.reserved += piece.request;
                 queue.running += 1;
@@ -96,14 +107,17 @@ impl CompactionJob<'_> {
             .map(|r| r.run.stored_len())
             .sum();
         let bottom_budget = self.piece_budget();
-        // Tests can force smaller input groups without reducing the actual
-        // unpublished-output allowance to a few bytes.
-        let output_budget = self.estimated_run_bytes.saturating_mul(PIECE_RUNS).max(1);
+        // Each piece's allowance has the same floor as its input group, so
+        // that one group always fits. Tests can force smaller input groups
+        // without reducing the allowance to a few bytes.
+        let output_budget = self
+            .estimated_run_bytes
+            .saturating_mul(PIECE_RUNS)
+            .max(MIN_PIECE_BUDGET);
         #[cfg(test)]
-        let output_budget = match self.engine.piece_output_budget.load(Relaxed) {
-            0 => output_budget,
-            n => n,
-        };
+        let forced = self.engine.piece_output_budget.load(Relaxed);
+        #[cfg(test)]
+        let output_budget = if forced == 0 { output_budget } else { forced };
         let capacity = output_budget.saturating_mul(self.engine.background_threads);
         let sources: Vec<_> = self.inputs.drain(..self.source_count).collect();
         let mut bottom: VecDeque<_> = std::mem::take(&mut self.inputs).into();
@@ -133,7 +147,6 @@ impl CompactionJob<'_> {
                 index,
                 inputs,
                 request: 0,
-                copy: true,
             })
             .collect();
         let mut split = Vec::with_capacity(sources.len());
@@ -179,10 +192,23 @@ impl CompactionJob<'_> {
             let estimate = piece.inputs.iter().fold(0usize, |sum, r| {
                 sum.saturating_add(r.run.range_stored_estimate())
             });
+            // Inputs, an eighth for recompression and copied frames, and
+            // each output run's footer and index minimum. It is not capped by
+            // the allowance: a piece above it waits to run alone.
+            let runs = estimate / self.estimated_run_bytes.max(1) + piece.inputs.len() + 1;
             piece.request = estimate
                 .saturating_add(estimate / 8)
-                .saturating_add(piece.inputs.len() * 512)
-                .clamp(output_budget, capacity);
+                .saturating_add(runs.saturating_mul(1024))
+                .max(output_budget);
+            #[cfg(test)]
+            if forced != 0 {
+                piece.request = piece.request.min(capacity);
+            }
+            #[cfg(test)]
+            match self.engine.piece_request.load(Relaxed) {
+                0 => {}
+                n => piece.request = n,
+            }
         }
         let workers = self.engine.background_threads.min(tasks.len()).max(1);
         let pipeline = Pipeline {
@@ -198,6 +224,8 @@ impl CompactionJob<'_> {
             }),
             changed: Condvar::new(),
             capacity,
+            #[cfg(test)]
+            hard_cap: forced != 0,
         };
         #[cfg(feature = "diagnostics")]
         self.engine
@@ -270,7 +298,6 @@ impl CompactionJob<'_> {
                 1,
                 self.options.max_workspace_bytes / workers,
                 Some(budget.clone()),
-                piece.copy,
             );
             let mut queue = pipeline
                 .queue
@@ -278,18 +305,12 @@ impl CompactionJob<'_> {
                 .unwrap_or_else(PoisonError::into_inner);
             if !queue.stopped {
                 match result {
-                    Err(CompactionError::OutputLimit { .. })
-                        if piece.request < pipeline.capacity =>
-                    {
-                        // Drop failed output, then retry alone with all slots.
-                        // The shared cap is unchanged, and no partial range was exposed.
-                        piece.request = pipeline.capacity;
-                        queue.pending.push_front(piece);
-                        #[cfg(feature = "diagnostics")]
-                        self.engine.resources.piece_retries.fetch_add(1, Relaxed);
-                    }
-                    Err(CompactionError::OutputLimit { .. }) if piece.copy => {
-                        piece.copy = false;
+                    Err(CompactionError::OutputLimit { .. }) if pipeline.grows(&piece) => {
+                        // Drop failed output, then retry with at least the
+                        // whole allowance, so alone, and double the request
+                        // each time. Output is finite, so this ends. The
+                        // shared cap is unchanged, and no partial range was exposed.
+                        piece.request = piece.request.saturating_mul(2).max(pipeline.capacity);
                         queue.pending.push_front(piece);
                         #[cfg(feature = "diagnostics")]
                         self.engine.resources.piece_retries.fetch_add(1, Relaxed);

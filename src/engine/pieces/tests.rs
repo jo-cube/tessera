@@ -518,6 +518,26 @@ fn pieces_publish_out_of_order_and_recover_holes_with_shared_storage() {
 }
 
 #[test]
+fn an_underestimated_concurrent_piece_retries_alone_instead_of_failing() {
+    let engine = fixture_with_threads(4);
+    // Every first request is far below the output, and no allowance is forced.
+    engine.core.piece_request.store(1, Ordering::Relaxed);
+    while engine
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    check(&engine.snapshot(), ones);
+    assert_eq!(engine.stats().build_output_bytes, 0);
+    #[cfg(feature = "diagnostics")]
+    {
+        let m = diagnostics::maintenance(&engine);
+        assert!(m.piece_retries > 0);
+        assert_eq!(m.unpublished_bytes, 0);
+    }
+}
+
+#[test]
 fn concurrent_output_refusal_keeps_every_view_readable_and_checkpointable() {
     let engine = fixture_with_threads(4);
     engine.core.piece_output_budget.store(1, Ordering::Relaxed);

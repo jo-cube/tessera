@@ -96,12 +96,6 @@ fn history(copy: bool, threads: usize, piece_budget: usize, seed: u64) -> (Obser
             .core
             .piece_budget
             .store(piece_budget, Ordering::Relaxed);
-        // With runs this small, a concurrent piece can exceed the default
-        // allowance whether or not it copies.
-        engine
-            .core
-            .piece_output_budget
-            .store(1 << 20, Ordering::Relaxed);
     };
     let mut engine = Engine::new(options(threads)).unwrap();
     set_up(&engine);
@@ -192,5 +186,15 @@ fn copying_forward_reads_like_rewriting() {
             copied > 0,
             "{threads} threads, piece budget {piece_budget}: nothing copied"
         );
+    }
+}
+
+/// Report 38's configuration: runs this small give concurrent pieces whose
+/// bottom group, at its 128 KiB floor, exceeded the default allowance of four
+/// estimated runs. Default budgets must build them, copying or not.
+#[test]
+fn tiny_runs_fit_the_default_concurrent_allowance() {
+    for copy in [false, true] {
+        history(copy, 4, 0, 7);
     }
 }

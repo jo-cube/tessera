@@ -50,8 +50,10 @@
 //! to bottom-run boundaries. Up to `background_threads` pieces build at once
 //! and publish independently, in any order. Output reservations share a bound
 //! of that many piece budgets (at least 128 KiB each for one block and metadata).
-//! A growing piece retries alone with the whole
-//! allowance; a range exceeding it reports [`CompactionError::OutputLimit`].
+//! A piece reserves its inputs' stored bytes plus an eighth and per-run
+//! metadata; one larger than the whole bound runs alone. A piece that outgrows
+//! its reservation retries with at least the whole bound, doubling each time,
+//! so the output allowance never fails a job.
 //! Bounded views keep only unmerged level-0 ranges visible and share the original
 //! immutable storage. Each piece retires its bottom inputs; later failure
 //! preserves earlier publications. Other jobs may build output ranges in
@@ -822,6 +824,9 @@ struct Core {
     before_piece: Mutex<Option<PieceHook>>,
     #[cfg(test)]
     piece_output_budget: std::sync::atomic::AtomicUsize,
+    /// Replaces each concurrent piece's first request, if nonzero.
+    #[cfg(test)]
+    piece_request: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -1184,6 +1189,8 @@ impl Core {
             before_piece: Mutex::new(None),
             #[cfg(test)]
             piece_output_budget: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            piece_request: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
@@ -2255,7 +2262,6 @@ impl<'e> CompactionJob<'e> {
             threads,
             self.options.max_workspace_bytes,
             None,
-            true,
         )?;
         Ok(BuiltCompaction {
             job: self,
@@ -2271,7 +2277,6 @@ impl<'e> CompactionJob<'e> {
         threads: usize,
         workspace_allowance: usize,
         budget: Option<Arc<crate::run::OutputBudget>>,
-        copy: bool,
     ) -> Result<(crate::run::Compacted, resources::BuildCharge<'e>), CompactionError> {
         let estimate = inputs.iter().fold(0usize, |sum, run| {
             sum.saturating_add(run.run.build_estimate())
@@ -2301,7 +2306,7 @@ impl<'e> CompactionJob<'e> {
             codec: self.engine.codec,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
-            copy_forward: copy && self.copy_forward(),
+            copy_forward: self.copy_forward(),
         };
         #[cfg(feature = "diagnostics")]
         crate::run::copy_audit::set_bottom_inputs(
