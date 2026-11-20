@@ -189,9 +189,9 @@ fn copying_forward_reads_like_rewriting() {
     }
 }
 
-/// Report 38's configuration: runs this small give concurrent pieces whose
-/// bottom group, at its 128 KiB floor, exceeded the default allowance of four
-/// estimated runs. Default budgets must build them, copying or not.
+/// Runs this small give concurrent pieces whose bottom group, at its 128 KiB
+/// floor, exceeds an allowance of four estimated runs. Default budgets must
+/// build them, copying or not.
 #[test]
 fn tiny_runs_fit_the_default_concurrent_allowance() {
     for copy in [false, true] {

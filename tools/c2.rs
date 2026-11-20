@@ -1,4 +1,4 @@
-//! Offline spike for early-stop point decoding: recompresses sampled bottom
+//! Offline measurement for early-stop point decoding: recompresses sampled bottom
 //! segments exactly as the run builder does (magicless frames, level 1, the
 //! segment's raw dictionary and block-size hint), with Zstandard's
 //! `targetCBlockSize` and, for comparison, `maxBlockSize`. For each record it
