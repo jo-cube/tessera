@@ -1,0 +1,564 @@
+//! Committing checkpoints: run files, manifests, CURRENT and reclamation.
+
+use super::*;
+
+/// Places where a test can stop a checkpoint as a crash would: returning at
+/// once, removing nothing.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Crash {
+    PartialRun,
+    AfterFirstRun,
+    BeforeManifestSync,
+    BeforeRename,
+    AfterRename,
+    BeforeReclaim,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CRASH_AT: std::cell::Cell<Option<Crash>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a test asked to crash here, which also makes the caller skip all
+/// cleanup.
+#[cfg(test)]
+pub(super) fn crash(at: Crash) -> bool {
+    CRASH_AT.with(|crash| crash.get() == Some(at))
+}
+
+/// Stands for the crash a test asked for.
+#[cfg(test)]
+pub(super) fn crashed(path: &Path) -> CheckpointError {
+    CheckpointError::Io {
+        path: path.to_owned(),
+        error: io::Error::other("crash injected by a test"),
+        after_commit_point: false,
+    }
+}
+
+#[cfg(test)]
+macro_rules! crash_point {
+    ($at:expr, $path:expr) => {
+        if crash($at) {
+            return Err(Failure::Crashed(crashed($path)));
+        }
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! crash_point {
+    ($at:expr, $path:expr) => {};
+}
+
+/// A failure while building the new checkpoint directory.
+enum Failure {
+    /// Clean up and report.
+    Error(CheckpointError),
+    /// A test's crash: report without cleaning up.
+    #[cfg(test)]
+    Crashed(CheckpointError),
+}
+
+impl From<CheckpointError> for Failure {
+    fn from(error: CheckpointError) -> Self {
+        Self::Error(error)
+    }
+}
+
+fn io_error(path: &Path) -> impl FnOnce(io::Error) -> CheckpointError + '_ {
+    move |error| CheckpointError::Io {
+        path: path.to_owned(),
+        error,
+        after_commit_point: false,
+    }
+}
+
+/// Writes `bytes` to a new file at `path` and syncs it.
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(io_error(path))?;
+    file.write_all(bytes).map_err(io_error(path))?;
+    file.sync_all().map_err(io_error(path))
+}
+
+/// Generations of the `ckpt-*` directories present.
+fn generations(dir: &Path) -> Result<Vec<u64>, CheckpointError> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io_error(dir))? {
+        let entry = entry.map_err(io_error(dir))?;
+        let name = entry.file_name();
+        let Some(digits) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
+            continue;
+        };
+        if digits.len() == 20
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(generation) = digits.parse()
+        {
+            found.push(generation);
+        }
+    }
+    Ok(found)
+}
+
+/// GC runs only after the new CURRENT and its parent are durable. The previous
+/// committed manifest is retained even if abandoned attempts lie between it
+/// and the new generation.
+fn reclaim(
+    dir: &Path,
+    found: &[u64],
+    manifest: &Manifest,
+    previous: Option<&Manifest>,
+) -> (usize, usize, usize) {
+    let keep: HashSet<_> = manifest
+        .runs
+        .iter()
+        .chain(previous.into_iter().flat_map(|m| &m.runs))
+        .map(|r| run_name(r.id))
+        .collect();
+    let (mut files, mut directories, mut failed) = (0, 0, 0);
+    if let Ok(entries) = fs::read_dir(dir.join(RUNS)) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                failed += 1;
+                continue;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let digits = name.strip_suffix(".tmp").unwrap_or(name);
+            if digits.len() == 32
+                && digits.bytes().all(|b| b.is_ascii_hexdigit())
+                && !keep.contains(name)
+            {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => files += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+    } else {
+        failed += 1;
+    }
+    for &generation in found {
+        if generation != manifest.generation && generation != manifest.previous {
+            match fs::remove_dir_all(checkpoint_dir(dir, generation)) {
+                Ok(()) => directories += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    (files, directories, failed)
+}
+
+struct Image {
+    runs: Vec<(usize, u64, SharedRun)>,
+    ceiling: u64,
+    depth: usize,
+    _live: Arc<()>,
+}
+
+impl Core {
+    /// Use the normal flush job, keeping precisely the run image at rotation.
+    /// Taking a later snapshot of the state would include runs published by
+    /// concurrent ingestion, or miss pre-ceiling runs replaced by compaction.
+    fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
+        loop {
+            let serial = self.serialize_flush();
+            let mut state = self.write_state();
+            // Respect the ordinary frozen-table bound before rotating active.
+            // This can occur while the background flush is building.
+            if !state.active.is_empty() && state.frozen.len() >= self.max_frozen_memtables {
+                let job = FlushJob {
+                    engine: self,
+                    _serial: serial,
+                    tables: state.frozen.clone(),
+                    cuts: state.flush_cuts(self.target_run_len),
+                };
+                drop(state);
+                job.build().publish();
+                continue;
+            }
+            let mut image = Image {
+                runs: state.levels.checkpoint_runs(),
+                ceiling: state.last_seq,
+                depth: state.levels.depth(),
+                _live: Arc::clone(&self.snapshots),
+            };
+            let flush = state.levels.next_flush();
+            if !state.active.is_empty() {
+                self.freeze_active(&mut state);
+            }
+            if state.frozen.is_empty() {
+                return Ok(image);
+            }
+            let job = FlushJob {
+                engine: self,
+                _serial: serial,
+                tables: state.frozen.clone(),
+                cuts: state.flush_cuts(self.target_run_len),
+            };
+            drop(state);
+            #[cfg(test)]
+            AFTER_ROTATION.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            let (_, runs) = job.build().publish_kept();
+            image
+                .runs
+                .extend(runs.into_iter().map(|run| (0, flush, run)));
+            image.runs.sort_by_key(|(level, _, _)| *level);
+            return Ok(image);
+        }
+    }
+}
+
+/// Visit the exact file bytes without allocating a contiguous serialization.
+pub(super) fn run_parts(
+    run: &Run<Vec<u8>>,
+    mut part: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    for bytes in run.chunks() {
+        part(bytes)?;
+    }
+    let mut filter_sum = Hasher::new();
+    for word in run.filter_words() {
+        filter_sum.update(&word);
+        part(&word)?;
+    }
+    part(&filter_sum.finalize().to_le_bytes())
+}
+
+struct Written {
+    manifest: Manifest,
+    bytes: u64,
+    bytes_reused: u64,
+    runs_written: usize,
+    runs_reused: usize,
+    files_deleted: usize,
+    largest_run_bytes: usize,
+}
+
+fn write_runs(
+    image: &Image,
+    dir: &Path,
+    generation: u64,
+    previous: u64,
+    options: CheckpointOptions,
+    metadata: &[u8],
+) -> Result<Written, Failure> {
+    let runs_dir = dir.join(RUNS);
+    fs::create_dir_all(&runs_dir).map_err(io_error(&runs_dir))?;
+    let mut written = Written {
+        manifest: Manifest {
+            generation,
+            last_seq: image.ceiling,
+            records: {
+                let mut seen = HashSet::new();
+                image
+                    .runs
+                    .iter()
+                    .filter(|(_, _, r)| seen.insert(r.id))
+                    .map(|(_, _, r)| r.run.len() as u64)
+                    .sum()
+            },
+            next_run_id: image
+                .runs
+                .iter()
+                .map(|(_, _, run)| (run.id as u64) + 1)
+                .chain(std::iter::once(
+                    RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner).1,
+                ))
+                .max()
+                .unwrap(),
+            previous,
+            depth: image.depth,
+            metadata: metadata.to_vec(),
+            runs: Vec::with_capacity(image.runs.len()),
+        },
+        bytes: 0,
+        bytes_reused: 0,
+        runs_written: 0,
+        runs_reused: 0,
+        files_deleted: 0,
+        largest_run_bytes: 0,
+    };
+    let mut physical_sums = HashMap::new();
+    for &(level, flush, ref published) in &image.runs {
+        let run = &published.run;
+        let len = (run.stored_len() + run.filter_bytes() + 4) as u64;
+        if let Some(&sum) = physical_sums.get(&published.id) {
+            written.manifest.runs.push(RunEntry {
+                id: published.id,
+                level,
+                flush,
+                seq_override: run.seq_override(),
+                len,
+                run_len: run.stored_len() as u64,
+                sum,
+                bounds: run.slice().map(|(a, b)| (a.to_vec(), b.to_vec())),
+            });
+            continue;
+        }
+        let file = runs_dir.join(run_name(published.id));
+        let exists = match fs::metadata(&file) {
+            Ok(found) if found.len() == len => true,
+            Ok(_) => {
+                return Err(io_error(&file)(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "existing run file has the wrong length",
+                ))
+                .into());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(io_error(&file)(e).into()),
+        };
+        if !exists && written.bytes.saturating_add(len) > options.max_bytes {
+            return Err(CheckpointError::DiskLimit {
+                bytes: written.bytes.saturating_add(len),
+                max_bytes: options.max_bytes,
+            }
+            .into());
+        }
+        let sum = if exists {
+            written.bytes_reused += len;
+            written.runs_reused += 1;
+            *published.checkpoint_crc.get_or_init(|| {
+                let mut sum = Hasher::new();
+                run_parts(run, |bytes| {
+                    sum.update(bytes);
+                    Ok(())
+                })
+                .expect("hashing cannot fail");
+                sum.finalize()
+            })
+        } else {
+            let tmp = runs_dir.join(format!("{}.tmp", run_name(published.id)));
+            // An interrupted temporary file is never a reusable final file.
+            match fs::remove_file(&tmp) {
+                Ok(()) => written.files_deleted += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_error(&tmp)(e).into()),
+            }
+            let mut output = BufWriter::new(File::create_new(&tmp).map_err(io_error(&tmp))?);
+            #[cfg(test)]
+            if crash(Crash::PartialRun) {
+                output
+                    .write_all(&run.chunks().next().unwrap()[..1])
+                    .map_err(io_error(&tmp))?;
+                return Err(Failure::Crashed(crashed(&tmp)));
+            }
+            let mut sum = Hasher::new();
+            run_parts(run, |bytes| {
+                output.write_all(bytes)?;
+                sum.update(bytes);
+                Ok(())
+            })
+            .map_err(io_error(&tmp))?;
+            output.flush().map_err(io_error(&tmp))?;
+            output.get_ref().sync_all().map_err(io_error(&tmp))?;
+            fs::rename(&tmp, &file).map_err(io_error(&file))?;
+            written.bytes += len;
+            written.runs_written += 1;
+            let sum = sum.finalize();
+            let _ = published.checkpoint_crc.set(sum);
+            crash_point!(Crash::AfterFirstRun, &file);
+            sum
+        };
+        physical_sums.insert(published.id, sum);
+        written.largest_run_bytes = written.largest_run_bytes.max(len as usize);
+        written.manifest.runs.push(RunEntry {
+            id: published.id,
+            level,
+            flush,
+            seq_override: run.seq_override(),
+            len,
+            run_len: run.stored_len() as u64,
+            sum,
+            bounds: run.slice().map(|(a, b)| (a.to_vec(), b.to_vec())),
+        });
+    }
+    sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
+    let manifest = written.manifest.encode();
+    let total = written.bytes.saturating_add(manifest.len() as u64);
+    if total > options.max_bytes {
+        return Err(CheckpointError::DiskLimit {
+            bytes: total,
+            max_bytes: options.max_bytes,
+        }
+        .into());
+    }
+    let path = checkpoint_dir(dir, generation);
+    let file = path.join(MANIFEST);
+    write_synced(&file, &manifest)?;
+    written.bytes = total;
+    crash_point!(Crash::BeforeManifestSync, &file);
+    sync_dir(&path).map_err(io_error(&path))?;
+    sync_dir(dir).map_err(io_error(dir))?;
+    Ok(written)
+}
+
+impl Engine {
+    /// Flushes and commits the state at one sequence ceiling. Existing run
+    /// files are reused; file I/O holds no state lock. Keeps one previous
+    /// generation. See [Checkpoints](crate::engine#checkpoints).
+    ///
+    /// # Errors
+    /// Returns [`CheckpointError`] for locking, disk-budget or I/O failures.
+    /// Its I/O variant identifies errors after the commit point.
+    ///
+    /// # Panics
+    /// Panics if the state lock is poisoned or a synchronous flush build panics.
+    pub fn checkpoint(
+        &self,
+        dir: &Path,
+        options: CheckpointOptions,
+    ) -> Result<CheckpointReport, CheckpointError> {
+        self.checkpoint_with_metadata(dir, options, &[])
+    }
+
+    /// Like checkpoint, with an opaque application blob (at most 16 MiB).
+    /// Recover it with [`Self::recover_with_metadata`].
+    ///
+    /// # Errors
+    /// Returns [`CheckpointError::MetadataLimit`] for oversized metadata and
+    /// the same locking, disk-budget and I/O errors as [`Self::checkpoint`].
+    ///
+    /// # Panics
+    /// Panics under the same conditions as [`Self::checkpoint`].
+    pub fn checkpoint_with_metadata(
+        &self,
+        dir: &Path,
+        options: CheckpointOptions,
+        metadata: &[u8],
+    ) -> Result<CheckpointReport, CheckpointError> {
+        let _serial = self
+            .core
+            .checkpointing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        fs::create_dir_all(dir).map_err(io_error(dir))?;
+        let _lock = match lock(dir).map_err(io_error(dir))? {
+            Ok(file) => file,
+            Err(()) => return Err(CheckpointError::Locked(dir.to_owned())),
+        };
+        self.publish_metadata(dir, options, metadata)
+    }
+
+    fn publish_metadata(
+        &self,
+        dir: &Path,
+        options: CheckpointOptions,
+        metadata: &[u8],
+    ) -> Result<CheckpointReport, CheckpointError> {
+        if metadata.len() > MAX_METADATA_BYTES {
+            return Err(CheckpointError::MetadataLimit);
+        }
+        let previous = match committed_manifest(dir) {
+            Ok((_, _, manifest)) => Some(manifest),
+            Err(OpenError::Corrupt {
+                path,
+                damage: Damage::Missing,
+            }) if path == dir.join(CURRENT) => None,
+            Err(error) => return Err(io_error(dir)(io::Error::other(error))),
+        };
+        let found = generations(dir)?;
+        let generation = found
+            .iter()
+            .copied()
+            .chain(previous.iter().map(|m| m.generation))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| io_error(dir)(io::Error::other("checkpoint generations exhausted")))?;
+        let _ = fs::remove_file(dir.join(CURRENT_TMP));
+        let path = checkpoint_dir(dir, generation);
+        fs::create_dir(&path).map_err(io_error(&path))?;
+        let built = self
+            .core
+            .checkpoint_image()
+            .map_err(Failure::Error)
+            .and_then(|image| {
+                #[cfg(test)]
+                AFTER_IMAGE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                write_runs(
+                    &image,
+                    dir,
+                    generation,
+                    previous.as_ref().map_or(0, |m| m.generation),
+                    options,
+                    metadata,
+                )
+            });
+        let written = match built {
+            Ok(written) => written,
+            Err(Failure::Error(error)) => {
+                let _ = fs::remove_dir_all(&path);
+                return Err(error);
+            }
+            #[cfg(test)]
+            Err(Failure::Crashed(error)) => return Err(error),
+        };
+        let tmp = dir.join(CURRENT_TMP);
+        let current = encode_current(generation);
+        #[cfg(test)]
+        if crash(Crash::BeforeRename) {
+            write_synced(&tmp, &current)?;
+            return Err(crashed(&tmp));
+        }
+        let committed = write_synced(&tmp, &current)
+            .and_then(|()| fs::rename(&tmp, dir.join(CURRENT)).map_err(io_error(dir)));
+        if let Err(error) = committed {
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_dir_all(&path);
+            return Err(error);
+        }
+        #[cfg(test)]
+        if crash(Crash::AfterRename) {
+            return Err(crashed(dir));
+        }
+        if let Err(error) = sync_dir(dir) {
+            return Err(CheckpointError::Io {
+                path: dir.to_owned(),
+                error,
+                after_commit_point: true,
+            });
+        }
+        #[cfg(test)]
+        if crash(Crash::BeforeReclaim) {
+            return Err(crashed(dir));
+        }
+        let (files_deleted, reclaimed, unreclaimed) =
+            reclaim(dir, &found, &written.manifest, previous.as_ref());
+        let _ = sync_dir(&dir.join(RUNS));
+        let _ = sync_dir(dir);
+        Ok(CheckpointReport {
+            generation,
+            last_seq: written.manifest.last_seq,
+            records: written.manifest.records,
+            runs: written.manifest.runs.len(),
+            bytes_written: written.bytes,
+            bytes_reused: written.bytes_reused,
+            runs_written: written.runs_written,
+            runs_reused: written.runs_reused,
+            files_deleted: files_deleted + written.files_deleted,
+            largest_run_bytes: written.largest_run_bytes,
+            reclaimed,
+            unreclaimed,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_ROTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_IMAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
