@@ -136,10 +136,12 @@ impl BuiltFlush<'_> {
             state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
         }
         drop(charge);
+        // Requested under the lock, as flushes and admission do, so that a
+        // reader who sees the run also sees the compaction request.
+        job.engine.notify_worker();
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
-        job.engine.notify_worker();
         job.engine.flush_signal.changed();
         job.engine.resources.changed();
         (report, runs)
