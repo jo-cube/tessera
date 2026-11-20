@@ -215,6 +215,12 @@ impl Pool {
             free.push(buffers);
         }
     }
+
+    /// Buffers waiting in the pool.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.free.lock().unwrap().len()
+    }
 }
 
 enum Source<'a> {
@@ -501,6 +507,21 @@ impl<'a> Reader<'a> {
         self.buffers = Buffers::default();
         self.initial = ReaderCounters::default();
         self
+    }
+
+    /// The capacity of the vector multi-get results are collected into.
+    #[cfg(test)]
+    pub(crate) fn result_capacity(&self) -> usize {
+        self.buffers.results.capacity()
+    }
+
+    /// The address of the value buffer, which pooling keeps.
+    #[cfg(test)]
+    pub(crate) fn value_buffer(&self) -> (usize, usize) {
+        (
+            self.buffers.value.as_ptr().addr(),
+            self.buffers.value.capacity(),
+        )
     }
 }
 

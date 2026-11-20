@@ -1835,3 +1835,6 @@ mod api_engine_tests;
 #[cfg(test)]
 #[path = "../tests/snapshot.rs"]
 mod api_snapshot_tests;
+#[cfg(test)]
+#[path = "../tests/api.rs"]
+mod api_tests;
