@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use store::{Reader, Store};
+use store::Store;
 
 const MOUNT: &str = "/Volumes/tessbench";
 /// Process RSS plus RAM-disk bytes beyond which a child aborts.
@@ -437,7 +437,7 @@ fn amplification(out: &Out, case: &str, before: [u64; 3], after: [u64; 3]) {
 
 /// Checks 20k sampled keys and 200 group scans against the oracle.
 fn gate(store: &Store, data: &Data, rng: &mut Rng, out: &Out, case: &str) {
-    let mut r = Reader::new();
+    let mut r = store.reader();
     let mut bad = 0;
     for _ in 0..20_000 {
         let i = rng.n(data.recs.len());
@@ -479,7 +479,7 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     let (keys, want) = read_keys(data, rng);
     let check = |bad: usize, case: &str| out.emit(case, "errors", bad);
     // (a) one thread, get.
-    let mut r = Reader::new();
+    let mut r = store.reader();
     let (mut h, mut bad) = (hist(), 0);
     let span = Span::new();
     for (k, &i) in keys.iter().zip(&want) {
@@ -500,7 +500,7 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
             .zip(want.chunks(q))
             .map(|(ks, ws)| {
                 s.spawn(move || {
-                    let mut r = Reader::new();
+                    let mut r = store.reader();
                     let (mut h, mut bad) = (hist(), 0);
                     for (k, &i) in ks.iter().zip(ws) {
                         let t = Instant::now();
@@ -551,7 +551,7 @@ fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
         .iter()
         .map(|&g| (data.groups[g].0..data.groups[g].1).filter(|&i| data.state[i] != DELETED).count())
         .collect();
-    let mut r = Reader::new();
+    let mut r = store.reader();
     let (mut h, mut bad, mut total) = (hist(), 0, 0);
     let span = Span::new();
     for (&g, &w) in picks.iter().zip(&want) {
@@ -581,7 +581,7 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
             .map(|t| {
                 let (keys, stop) = (&keys, &stop);
                 s.spawn(move || {
-                    let mut r = Reader::new();
+                    let mut r = store.reader();
                     let mut rng = Rng(0x726561646572 + t);
                     let (mut h, mut n) = (hist(), 0u64);
                     while !stop.load(Ordering::Relaxed) {

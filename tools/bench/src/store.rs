@@ -1,6 +1,7 @@
 //! One interface over Tessera and the RocksDB adapter in native.cc.
 use std::ffi::{CStr, CString, c_char, c_void};
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace, WriteBatch};
+use tessera::diagnostics::{EngineDiagnostics, ReaderDiagnostics};
+use tessera::{Engine, Keyspace, Options, WriteBatch};
 
 #[repr(C)]
 struct Rec {
@@ -35,7 +36,7 @@ pub fn rocksdb_version() -> String {
 }
 
 pub enum Store {
-    T(Engine),
+    T(Engine, Keyspace),
     R(*mut c_void),
 }
 // The RocksDB DB object is thread-safe; readers are per thread.
@@ -50,20 +51,20 @@ impl Drop for Store {
     }
 }
 
-pub struct Reader {
-    ws: EngineWorkspace,
+/// A per-thread reader: Tessera's pooled reader of the latest state, or a
+/// RocksDB read context.
+pub struct Reader<'s> {
+    t: Option<tessera::Reader<'s>>,
     r: *mut c_void,
     keys: Vec<u8>,
 }
-impl Reader {
-    pub fn new() -> Self {
-        Self { ws: EngineWorkspace::new(), r: unsafe { tb_reader() }, keys: Vec::new() }
-    }
+impl Reader<'_> {
     pub fn read_counters(&self) -> (u64, u64, u64) {
-        (self.ws.decoded_bytes(), self.ws.blocks_loaded(), self.ws.filter_probes())
+        let c = self.t.as_ref().map(ReaderDiagnostics::counters).unwrap_or_default();
+        (c.decoded_bytes, c.blocks_loaded, c.filter_probes)
     }
 }
-impl Drop for Reader {
+impl Drop for Reader<'_> {
     fn drop(&mut self) {
         unsafe { tb_reader_free(self.r) }
     }
@@ -75,14 +76,16 @@ impl Drop for Reader {
 pub struct Batch {
     rocks: bool,
     t: WriteBatch,
+    ks: Option<Keyspace>,
     r: Vec<Rec>,
 }
 impl Batch {
     pub fn push(&mut self, key: &[u8], value: Option<&[u8]>) {
         if !self.rocks {
+            let ks = self.ks.as_ref().unwrap();
             match value {
-                Some(v) => self.t.put(key, v),
-                None => self.t.delete(key),
+                Some(v) => self.t.put(ks, key, v),
+                None => self.t.delete(ks, key),
             }
             return;
         }
@@ -97,7 +100,7 @@ impl Batch {
 
 impl Store {
     pub fn tessera() -> Self {
-        let mut options = EngineOptions::default();
+        let mut options = Options::default();
         if let Ok(ratio) = std::env::var("TESSERA_BENCH_LEVEL_RATIO") {
             options.level_ratio = ratio.parse().expect("integer level ratio");
         }
@@ -105,30 +108,38 @@ impl Store {
             options.background_threads = threads.parse().expect("integer builder count");
         }
         eprintln!("Tessera: level_ratio={}, background_threads={}", options.level_ratio, options.background_threads);
-        Self::T(Engine::new(options).unwrap())
+        let engine = Engine::in_memory(options).unwrap();
+        let ks = engine.keyspace("bench").unwrap();
+        Self::T(engine, ks)
     }
     pub fn rocks(dir: &str, cache: u64) -> Self {
         let c = CString::new(dir).unwrap();
         Self::R(unsafe { tb_open(c.as_ptr(), cache) })
     }
     pub fn batch(&self) -> Batch {
-        Batch { rocks: matches!(self, Self::R(_)), t: WriteBatch::new(), r: Vec::new() }
+        let ks = if let Self::T(_, ks) = self { Some(ks.clone()) } else { None };
+        Batch { rocks: matches!(self, Self::R(_)), t: WriteBatch::new(), ks, r: Vec::new() }
+    }
+    pub fn reader(&self) -> Reader<'_> {
+        let t = if let Self::T(e, _) = self { Some(e.reader()) } else { None };
+        Reader { t, r: unsafe { tb_reader() }, keys: Vec::new() }
     }
     /// Writes and clears `b`.
     pub fn write(&self, b: &mut Batch) {
         match self {
-            Self::T(e) => {
+            Self::T(e, _) => {
                 e.write(&b.t).unwrap();
             }
             Self::R(p) => unsafe { tb_write(*p, b.r.as_ptr(), b.r.len()) },
         }
         b.clear();
     }
-    /// Ingests sorted unique records, through `file` for RocksDB.
+    /// Ingests sorted unique records, through `file` for RocksDB. Tessera
+    /// builds a large batch of ascending keys into runs directly.
     pub fn ingest(&self, b: &mut Batch, file: &str) {
         match self {
-            Self::T(e) => {
-                e.ingest_sorted(&b.t).unwrap();
+            Self::T(e, _) => {
+                e.write(&b.t).unwrap();
             }
             Self::R(p) => {
                 let f = CString::new(file).unwrap();
@@ -139,7 +150,7 @@ impl Store {
     }
     pub fn get<R>(&self, k: &[u8], r: &mut Reader, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
         match self {
-            Self::T(e) => f(e.get(k, &mut r.ws).unwrap().as_ref().map(|v| v.value)),
+            Self::T(_, ks) => f(r.t.as_mut().unwrap().get(ks, k).unwrap()),
             Self::R(p) => {
                 let (mut v, mut n) = (std::ptr::null(), 0);
                 let found = unsafe { tb_get(*p, r.r, k.as_ptr(), k.len(), &mut v, &mut n) };
@@ -149,7 +160,11 @@ impl Store {
     }
     pub fn multi_get<F: FnMut(usize, Option<&[u8]>)>(&self, keys: &[[u8; 16]], sorted: bool, r: &mut Reader, mut f: F) {
         match self {
-            Self::T(e) => e.multi_get(keys, &mut r.ws, f).unwrap(),
+            Self::T(_, ks) => {
+                for (i, v) in r.t.as_mut().unwrap().multi_get(ks, keys).unwrap().iter().enumerate() {
+                    f(i, *v)
+                }
+            }
             Self::R(p) => {
                 unsafe extern "C" fn cb<F: FnMut(usize, Option<&[u8]>)>(ctx: *mut c_void, i: usize, v: *const u8, n: usize) {
                     let f = unsafe { &mut *(ctx as *mut F) };
@@ -164,11 +179,10 @@ impl Store {
     }
     pub fn scan<F: FnMut(&[u8], &[u8])>(&self, prefix: &[u8], r: &mut Reader, mut f: F) {
         match self {
-            Self::T(e) => {
-                let guard = e.read();
-                let mut scan = guard.scan_prefix(prefix, &mut r.ws);
-                while let Some(x) = scan.next_record().unwrap() {
-                    f(x.key, x.value)
+            Self::T(_, ks) => {
+                let mut scan = r.t.as_mut().unwrap().prefix(ks, prefix);
+                while let Some((k, v)) = scan.next().unwrap() {
+                    f(k, v)
                 }
             }
             Self::R(p) => {
@@ -184,7 +198,7 @@ impl Store {
     /// Flushes and waits until compaction is idle.
     pub fn drain(&self) {
         match self {
-            Self::T(e) => {
+            Self::T(e, _) => {
                 e.flush().unwrap();
                 e.wait_for_compaction().unwrap();
                 let s = e.background_status().unwrap();
@@ -194,8 +208,8 @@ impl Store {
         }
     }
     pub fn emit_shape(&self, phase: &str, out: &super::Out) {
-        if let Self::T(engine) = self {
-            let shape = tessera::engine::diagnostics::streaming_shape(engine);
+        if let Self::T(engine, _) = self {
+            let shape = tessera::diagnostics::streaming_shape(engine);
             out.emit(phase, "runs_per_level", shape.runs_per_level.iter().map(usize::to_string).collect::<Vec<_>>().join(";"));
             out.emit(phase, "max_overlap", shape.max_overlap);
             out.emit(phase, "level0_runs", shape.level0_runs);
@@ -203,7 +217,7 @@ impl Store {
             out.emit(phase, "bottom_mean_stored_bytes", shape.bottom_mean_stored_bytes);
             out.emit(phase, "bounded_views", shape.bounded_views);
             out.emit(phase, "stored_bytes", shape.stored_bytes);
-            let m = tessera::engine::diagnostics::maintenance(engine);
+            let m = tessera::diagnostics::maintenance(engine);
             out.emit(phase, "writer_wait_total_s", format!("{:.3}", m.writer_wait_ns as f64 / 1e9));
             out.emit(phase, "level0_wait_total_s", format!("{:.3}", m.level0_wait_ns as f64 / 1e9));
             out.emit(phase, "level0_waits_total", m.level0_waits);
@@ -212,24 +226,24 @@ impl Store {
     /// Stored runs plus held filters/segment metadata, after a drain.
     pub fn accounted_run_bytes(&self) -> Option<u64> {
         match self {
-            Self::T(e) => {
-                let s = e.stats();
+            Self::T(e, _) => {
+                let s = e.engine_stats();
                 Some((s.run_bytes + s.held_bytes) as u64)
             }
             Self::R(_) => None,
         }
     }
     pub fn pool_stats(&self) -> Option<(usize, usize, usize)> {
-        if let Self::T(e) = self {
-            let s = e.stats();
+        if let Self::T(e, _) = self {
+            let s = e.engine_stats();
             Some((s.pool_reserve_bytes, s.pool_in_use_bytes, s.pool_reserve_limit))
         } else { None }
     }
     /// Flush bytes written, compaction bytes written, stored run/SST bytes.
     pub fn counters(&self) -> [u64; 3] {
         match self {
-            Self::T(e) => {
-                let s = e.stats();
+            Self::T(e, _) => {
+                let s = e.engine_stats();
                 let b = e.background_status().unwrap();
                 [s.flushed_bytes, b.output_bytes, s.run_bytes as u64]
             }

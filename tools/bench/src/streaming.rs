@@ -309,7 +309,7 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         memory.report(&store, &out, phase, live);
         store.emit_shape(phase, &out);
         let mut rng = Rng(0x67617465 ^ ds as u64);
-        let mut reader = Reader::new();
+        let mut reader = store.reader();
         let mut bad = 0;
         for _ in 0..20_000 {
             let i = rng.n(data.n);
@@ -355,7 +355,7 @@ fn point_reads(store: &Store, data: &StreamData, out: &Out) {
                 .chunks(queries.len() / threads)
                 .map(|chunk| {
                     scope.spawn(move || {
-                        let mut reader = Reader::new();
+                        let mut reader = store.reader();
                         let bad = chunk.iter().filter(|(key, expected)| store.get(key, &mut reader, |v| v.map(<[u8]>::len)) != *expected).count();
                         let (decoded, blocks, filters) = reader.read_counters();
                         (bad, decoded, blocks, filters)
@@ -367,7 +367,7 @@ fn point_reads(store: &Store, data: &StreamData, out: &Out) {
         let case = format!("get_{threads}t");
         span.finish(out, &case, queries.len(), 0);
         out.emit(&case, "errors", bad);
-        if matches!(store, Store::T(_)) {
+        if matches!(store, Store::T(..)) {
         out.emit(&case, "decoded_bytes_per_get", format!("{:.2}", decoded as f64 / queries.len() as f64));
         out.emit(&case, "blocks_per_get", format!("{:.6}", blocks as f64 / queries.len() as f64));
         out.emit(&case, "filter_probes_per_get", format!("{:.6}", filters as f64 / queries.len() as f64));
