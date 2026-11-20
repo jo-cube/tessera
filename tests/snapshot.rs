@@ -211,8 +211,8 @@ fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
     wait_until(|| engine.stats().retained_sources == 2);
     let held = engine.stats();
     // The flushed table, charged as the snapshots' view with what it
-    // pinned, and the run it shadowed, since merged away. The run flushed after the snapshots
-    // was freed by the compaction.
+    // pinned, and the run it shadowed, since merged away. The compaction
+    // freed the run flushed after the snapshots.
     assert_eq!(held.retained_sources, 2);
     assert!(held.retained_bytes > pinned);
     assert!(held.retained_run_bytes > 0);

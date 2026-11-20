@@ -1,7 +1,7 @@
 //! Tests that run this binary again as a child process: one holding a
-//! checkpoint directory's `LOCK` until killed, one checking close-on-exec. They live apart from the
-//! other suites and run one at a time,
-//! because spawning forks: a child shares every lock descriptor this process
+//! checkpoint directory's `LOCK` until killed, one checking close-on-exec.
+//! They live apart from the other suites and run one at a time, because
+//! spawning forks: a child shares every lock descriptor this process
 //! has open until it executes, so a test in another thread could briefly
 //! find its own directory locked. Files go to fresh directories under the
 //! system temporary directory, which the bounded runner makes a small tmpfs.

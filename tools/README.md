@@ -25,7 +25,9 @@ merges decoded. `--c2` recompresses evenly spaced bottom segments (at least
 64 MiB raw) as the builder does, with Zstandard `targetCBlockSize` and
 `maxBlockSize` variants, and prints stored bytes, raw bytes an early-stopping
 point read would decode, and relative decompression time. `--write-only`
-stops after the drain, for profiling. `--memtable VALUE_LEN` (with
+stops after the drain, for profiling. `--worst` also measures reads and
+memory with level 0 at its fullest: new jobs are held off while random updates
+fill it to the writer stop. `--memtable VALUE_LEN` (with
 `tools-memory`) fills one memtable to its budget with random keys and prints
 its live heap per entry beyond key and value.
 

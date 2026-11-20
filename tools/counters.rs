@@ -1,5 +1,5 @@
-//! Deterministic work and memory counters by level, using the hidden
-//! `diagnostics` feature. Each scenario loads keys in random order with
+//! Work and memory counters by level over deterministic inputs, using the
+//! hidden `diagnostics` feature. Each scenario loads keys in random order with
 //! automatic flushes, updates half of them at random, waits for background
 //! compaction, checks every read path against a version oracle and prints
 //! long-format CSV rows. See tools/README.md.

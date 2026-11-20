@@ -889,8 +889,8 @@ fn randomized_operations_match_an_independent_model_across_flushes() {
 // Configuration.
 
 /// The defaults are valid, run a worker with the default compaction
-/// options, and keep the overlap within its allowance without any call to
-/// `compact`.
+/// options, and keep the overlap within its allowance with no explicit
+/// compaction step.
 #[test]
 fn the_defaults_compact_in_the_background() {
     let defaults = EngineOptions::default();
