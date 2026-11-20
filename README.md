@@ -63,7 +63,9 @@ std::fs::remove_dir_all(&dir)?;
 ```
 
 Run the same code with `cargo run --example basic`. API contracts are in the
-[engine documentation](src/engine.rs); build local rustdoc with `cargo doc --open`.
+[engine documentation](src/engine.rs); build local rustdoc with
+`cargo doc --open`. [ARCHITECTURE.md](ARCHITECTURE.md) describes the data
+flow, the run format and the design decisions behind them.
 
 ## Operations and consistency
 
@@ -87,12 +89,13 @@ value and 80-byte entry charge must also fit the memtable budget.
   zero after bottom-level compaction, so it is not a stable update identifier.
 
 Compaction keeps disjoint levels below level 0. Large level-0 jobs into the
-bottom run as disjoint key ranges aligned to bottom-run boundaries, with
-about one target run of bottom input per piece. Up to `background_threads`
-pieces build at once within a shared unpublished-output allowance. Each piece publishes atomically
-and releases its bottom inputs. Bounded views of level-0 sources expose only the
-remaining ranges; snapshots and checkpoints preserve the bounds they captured.
-A later piece failure leaves earlier publications intact and stops the job.
+bottom run as disjoint key ranges aligned to bottom-run boundaries, with about
+one target run of bottom input per piece. Up to `background_threads` pieces
+build at once within a shared unpublished-output allowance. Each piece
+publishes atomically and releases its bottom inputs. Bounded views of level-0
+sources expose only the remaining ranges; snapshots and checkpoints preserve
+the bounds they captured. A later piece failure leaves earlier publications
+intact and stops the job.
 
 A level-0 merge into the bottom copies settled bottom blocks forward without
 decoding them. A block is settled when every record has sequence 0 and a value,
@@ -102,9 +105,8 @@ starts a segment that inherits that segment's dictionary. It copies those frames
 after checking each one's CRC, and compresses the touched blocks with the same
 dictionary. Such a segment holds at most twice the usual raw length, and output
 runs end only at its edges. Runs keep a one- or two-byte record count per block
-to mark settled blocks. It is held beside the run, counted in its held bytes and
-rebuilt on recovery. A piece that exceeds the whole output allowance while
-copying is retried once without copying.
+to mark settled blocks. It is held beside the run, counted in its held bytes
+and rebuilt on recovery.
 
 ## Options and memory
 
@@ -143,13 +145,15 @@ frozen tables can charge about 192 MiB at the default memtable budget.
 Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
 finished runs trim their partial final chunk. The free reserve is capped at
 32 MiB. Concurrent bottom compaction bounds unpublished output by the builder
-count times one estimated target stored run.
-A growing piece can use the whole allowance; a range exceeding it stops the job
-with an output-limit error. With one builder, bottom pieces publish consecutively
-using the serial piece budget. A level-0 source is released when its final range
-is merged. Snapshots can keep
-replaced storage alive. Workspaces retain decode buffers and contexts; there is no decoded-block
-cache. Use `Engine::stats()` and workspace counters to inspect memory and work.
+count times one estimated target stored run. A piece reserves its inputs'
+stored bytes plus an eighth; one larger than the whole allowance runs alone.
+A piece that outgrows its reservation retries alone with at least the whole
+allowance, doubling each time, so the allowance never fails a job. With one
+builder, bottom pieces publish consecutively using the serial piece budget. A
+level-0 source is released when its final range is merged. Snapshots can keep
+replaced storage alive. Workspaces retain decode buffers and contexts; there
+is no decoded-block cache. Use `Engine::stats()` and workspace counters to
+inspect memory and work.
 
 On Linux with glibc, freed buffers can remain resident, so RSS may stay above
 `EngineStats::used` after maintenance. Applications can evaluate
@@ -191,9 +195,10 @@ checkpoint are lost on process exit.
 The layout is `CURRENT`, `LOCK`, `runs/<32-hex-digit ID>` and
 `ckpt-<20-digit generation>/MANIFEST`. Run format 6 uses magicless Zstandard
 frames and a prefix-compressed sparse index. Run files append Bloom words and
-their CRC-32. Manifest version 4 records checksums, lengths, levels, flush groups,
-sequence overrides, the ceiling and application metadata. Unsupported versions
-are rejected. CRC-32 detects accidental damage; it does not authenticate files.
+their CRC-32. Manifest version 5 records checksums, lengths, levels, flush
+groups, bounded views, sequence overrides, the ceiling and application
+metadata. Unsupported versions are rejected. CRC-32 detects accidental
+damage; it does not authenticate files.
 
 Runs and the manifest are synced before renaming `CURRENT`, the commit point;
 the parent directory is synced before GC. An error before the rename retains
@@ -216,6 +221,7 @@ create `LOCK`. Rejections return typed `OpenError`s.
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
+cargo test --locked --features diagnostics --test lookup_allocations --test retention
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo +1.89.0 check --locked --all-targets --all-features
 cargo +1.89.0 clippy --locked --all-targets --all-features -- -D warnings
