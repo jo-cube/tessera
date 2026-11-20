@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN, Record, Value, Version};
 use crate::memtable::{
-    ENTRY_OVERHEAD, FlushCuts, FrozenMemtable, MAX_TARGET_RUN_LEN, MemoryUsage, Memtable,
-    TARGET_RUN_LEN, TableError, flush_merged,
+    ENTRY_OVERHEAD, FlushCuts, FlushSpace, FrozenMemtable, Key, MAX_TARGET_RUN_LEN, MemoryUsage,
+    Memtable, TARGET_RUN_LEN, TableError, flush_merged,
 };
 use crate::run::{
     Codec, LogicalWorkspace, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD, ReadWorkspace,
@@ -1199,14 +1199,15 @@ fn a_snapshot_pins_copied_nodes_and_the_partial_arena_chunk() {
 /// Flushes `tables` with `cuts` and returns each run's records, checking
 /// that together they are the merged tables' newest records in order.
 fn split_flush(tables: &[&FrozenMemtable], target: usize, cuts: &FlushCuts) -> Vec<Vec<Entry>> {
-    let runs = flush_merged(
+    let mut spaces = flush_merged(
         tables,
         target,
         Codec::None,
         TARGET_BLOCK_LEN,
-        cuts,
+        &[FlushSpace { prefix: &[], cuts }],
         &crate::chunk::ChunkPool::new(0),
     );
+    let runs = spaces.pop().unwrap().runs;
     let pieces: Vec<Vec<Entry>> = runs.iter().map(run_contents).collect();
     let mut newest: std::collections::BTreeMap<Vec<u8>, Entry> = Default::default();
     for table in tables {
@@ -1346,4 +1347,129 @@ fn arena_overwrites_deletes_and_large_records_survive_the_last_owning_snapshot()
     drop(snapshot);
     assert_eq!(pool.stats().1, 0);
     assert_eq!(pool.stats().0, 2 * CHUNK_BYTES);
+}
+
+/// A flush builds each prefix's records into runs of their own, without
+/// the prefix, counts each space's input over every table, and leaves out
+/// records under no listed prefix.
+#[test]
+fn a_flush_splits_spaces_strips_prefixes_and_leaves_out_the_rest() {
+    let mut older = Memtable::new(1 << 20, None);
+    let mut newer_seq = 0;
+    for (prefix, key) in [
+        (&b"\x01"[..], &b"a"[..]),
+        (b"\x01", b"b"),
+        (b"\x02", b"a"),
+        (b"\x03", b"z"),
+    ] {
+        newer_seq += 1;
+        older
+            .write(Key { prefix, key }, newer_seq, Value::Bytes(b"old"))
+            .unwrap();
+    }
+    let older = older.freeze();
+    let mut newer = Memtable::new(1 << 20, Some(newer_seq));
+    newer
+        .write(
+            Key {
+                prefix: b"\x01",
+                key: b"a",
+            },
+            newer_seq + 1,
+            Value::Bytes(b"new"),
+        )
+        .unwrap();
+    let newer = newer.freeze();
+    let cuts = FlushCuts::default();
+    let spaces = [
+        FlushSpace {
+            prefix: b"\x01",
+            cuts: &cuts,
+        },
+        FlushSpace {
+            prefix: b"\x03",
+            cuts: &cuts,
+        },
+    ];
+    let built = flush_merged(
+        &[&older, &newer],
+        TARGET_RUN_LEN,
+        Codec::None,
+        TARGET_BLOCK_LEN,
+        &spaces,
+        &crate::chunk::ChunkPool::new(0),
+    );
+    let contents: Vec<Vec<Entry>> = built
+        .iter()
+        .map(|space| space.runs.iter().flat_map(run_contents).collect())
+        .collect();
+    assert_eq!(
+        contents[0]
+            .iter()
+            .map(|entry| entry.0.as_slice())
+            .collect::<Vec<_>>(),
+        [b"a", b"b"]
+    );
+    assert_eq!(contents[0][0].2, Some(b"new".to_vec()));
+    assert_eq!(
+        contents[1]
+            .iter()
+            .map(|entry| entry.0.as_slice())
+            .collect::<Vec<_>>(),
+        [b"z"]
+    );
+    assert_eq!(
+        built
+            .iter()
+            .map(|space| space.runs.len())
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    let input = |key: &[u8], value: &[u8]| crate::run::input_len(key, Value::Bytes(value));
+    assert_eq!(
+        built[0].logical,
+        input(b"a", b"old") + input(b"b", b"old") + input(b"a", b"new")
+    );
+    assert_eq!(built[1].logical, input(b"z", b"old"));
+}
+
+/// Prefixed keys order, search and seek as their concatenation, including
+/// prefixes and keys of different lengths that share leading bytes.
+#[test]
+fn prefixed_keys_behave_as_their_concatenation() {
+    let prefixes: [&[u8]; 4] = [b"\x01", b"\x7f", b"\x80\x01", b"\x81\x01"];
+    let keys: [&[u8]; 5] = [b"", b"\x00", b"\x01", b"\x80", b"\x80\x01\xff"];
+    let mut table = Memtable::new(ROOMY, None);
+    let mut model = std::collections::BTreeMap::new();
+    let mut seq = 0u64;
+    for (i, prefix) in prefixes.iter().enumerate() {
+        for key in keys.iter().skip(i % 2) {
+            seq += 1;
+            let value = seq.to_le_bytes();
+            table
+                .write(Key { prefix, key }, seq, Value::Bytes(&value))
+                .unwrap();
+            model.insert([*prefix, *key].concat(), value.to_vec());
+        }
+    }
+    let stored: Vec<Vec<u8>> = table.iter().map(|record| record.key.to_vec()).collect();
+    assert_eq!(stored, model.keys().cloned().collect::<Vec<_>>());
+    for prefix in prefixes {
+        for key in keys {
+            let whole = [prefix, key].concat();
+            let found = table
+                .get_in(Key { prefix, key })
+                .map(|version| match version.value {
+                    Value::Bytes(bytes) => bytes.to_vec(),
+                    Value::Tombstone => unreachable!(),
+                });
+            assert_eq!(found.as_ref(), model.get(&whole));
+            let from: Vec<Vec<u8>> = table
+                .iter_from_in(Key { prefix, key })
+                .map(|record| record.key.to_vec())
+                .collect();
+            let expected: Vec<Vec<u8>> = model.range(whole..).map(|(key, _)| key.clone()).collect();
+            assert_eq!(from, expected);
+        }
+    }
 }

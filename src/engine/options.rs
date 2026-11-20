@@ -78,9 +78,9 @@ impl Options {
         ConfigError::check(
             "Options::memtable_size",
             self.memtable_size as u64,
-            ENTRY_OVERHEAD as u64,
+            (ENTRY_OVERHEAD + MAX_PREFIX_LEN) as u64,
             (usize::MAX / 2) as u64,
-            "it must admit the smallest record, and twice it must not overflow",
+            "it must admit the smallest record in any keyspace, and twice it must not overflow",
         )?;
         ConfigError::check(
             "Options::background_threads",

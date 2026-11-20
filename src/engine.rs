@@ -26,6 +26,7 @@ mod flush_job;
 mod flusher;
 mod handle;
 mod ingest;
+mod keyspaces;
 mod levels;
 mod multi;
 mod options;
@@ -63,7 +64,7 @@ use options::ConfigError;
 pub use options::{Compression, Options};
 use read::View;
 pub use read::{KeyRange, MultiGet, Reader, Scan, Snapshot};
-pub(crate) use stats::{EngineStats, FlushReport};
+pub(crate) use stats::{EngineStats, FlushReport, KeyspaceDetail};
 use worker::BackgroundError;
 #[cfg(test)]
 use worker::BackgroundStatus;
@@ -74,7 +75,7 @@ pub(crate) use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub(crate) use crate::run::{CompactStats, MergeWorkspace};
 use crate::run::{ConflictingCopies, LiveRecord, LiveValue, ReadError};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::sync::{
@@ -83,14 +84,16 @@ use std::sync::{
 
 use crate::block::{Record, Value, Version};
 use crate::chunk::{ChunkPool, RESERVE_BYTES};
-use crate::memtable::{FlushCuts, FrozenMemtable, Memtable, Records, TableError, flush_merged};
+use crate::memtable::{
+    FlushCuts, FlushSpace, FrozenMemtable, Key, Memtable, Records, TableError, flush_merged,
+};
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP,
-    RECORD_INPUT_OVERHEAD, Run, RunView, SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in,
-    latest_from,
+    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP, Run, RunView,
+    SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
 };
 
 use directory::RunDirectory;
+use keyspaces::{Directories, KeyPrefix, KeyspaceState, MAX_PREFIX_LEN};
 use levels::{Dest, Fit, Levels, Plan};
 
 type SharedRun = Arc<Published>;
@@ -141,43 +144,32 @@ const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowanc
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
 const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// The keyspace an engine holds: its name and its ID, which no other
-/// keyspace of the engine ever has.
-#[derive(Clone, Debug)]
-struct Entry {
-    id: u32,
-    name: Arc<str>,
-}
-
 struct State {
     last_seq: u64,
-    /// The live keyspace, if one has been created and not dropped. Changed
-    /// under this lock, so every write, read and snapshot agrees on it.
-    keyspace: Option<Entry>,
+    /// The live keyspaces by ID. Created and dropped under this lock, so
+    /// every write, read and snapshot agrees on them.
+    keyspaces: BTreeMap<u32, KeyspaceState>,
+    /// The live keyspaces' IDs by name.
+    names: BTreeMap<Arc<str>, u32>,
     /// The ID the next keyspace created gets. IDs are never reused.
     next_keyspace: u32,
+    /// Every live keyspace's directory, rebuilt with any of them, so that a
+    /// snapshot takes them all with one reference count.
+    directories: Directories,
     active: Memtable,
     /// Oldest first. Each table's sequence numbers are above the runs' and
     /// those of the tables before it, and below `active`'s. Writers rotate
     /// tables while the flush worker builds.
     frozen: Vec<Arc<FrozenMemtable>>,
-    /// Shared so that a compaction can read its inputs without the lock while
-    /// flushes publish beside them.
-    runs: Vec<SharedRun>,
-    /// The same runs, indexed for reading: grouped into key-disjoint runs,
-    /// newest group first. Rebuilt by [`State::order_runs`] in the same write
-    /// section as every change to `runs`, so readers only ever see the two
-    /// agree; `runs` keeps publication order, which compaction selection uses
-    /// to break ties. Immutable once built, so a lookup, a scan or a snapshot
-    /// shares it with one reference count.
-    directory: Arc<RunDirectory>,
+    /// Stored and held bytes of every keyspace's runs.
     run_bytes: usize,
     held_bytes: usize,
-    /// The same runs as compaction sees them, in levels. Changed in the same
-    /// write section as `runs`, and never read by lookups or scans.
-    levels: Levels,
+    /// The most flushes any keyspace's level 0 holds runs of.
+    level0_flushes: usize,
     /// Level-0 writer stop; deterministic tests may change it.
     level0_stop: usize,
+    /// The keyspace compaction served last, where ties resume after.
+    compaction_cursor: u32,
     /// Whether flushes are split at level 1's boundaries; tests turn it off
     /// to compare.
     #[cfg(test)]
@@ -213,49 +205,6 @@ struct Retained {
 }
 
 impl State {
-    /// Refuses an update to keyspace `id` unless it is the live one.
-    fn check_keyspace(&self, id: u32) -> Result<(), UpdateError> {
-        match &self.keyspace {
-            Some(entry) if entry.id == id => Ok(()),
-            _ => Err(UpdateError::KeyspaceDropped),
-        }
-    }
-
-    /// Rebuilds the directory from `runs`. Publication is rare, so this
-    /// builds a fresh one rather than maintaining one, in O(n log n) for n
-    /// runs, and readers holding the previous directory keep it.
-    fn order_runs(&mut self) {
-        self.directory = Arc::new(RunDirectory::build(&self.runs));
-        if cfg!(any(test, debug_assertions)) {
-            self.levels.check(&self.runs);
-        }
-    }
-
-    fn recount_runs(&mut self) {
-        self.run_bytes = physical_runs(&self.runs).map(|r| r.run.stored_len()).sum();
-        self.held_bytes = physical_runs(&self.runs).map(|r| r.run.held_bytes()).sum();
-    }
-
-    fn retire_runs(&mut self, inputs: &[SharedRun]) {
-        let live: HashSet<_> = self.runs.iter().map(|r| r.run.storage_id()).collect();
-        for input in physical_runs(inputs).filter(|r| !live.contains(&r.run.storage_id())) {
-            self.retire(
-                input.run.retirement(),
-                input.run.stored_len(),
-                Some(input.run.held_bytes()),
-            );
-        }
-    }
-
-    /// Where a flush beginning now splits its runs.
-    fn flush_cuts(&self, target_run_len: usize) -> FlushCuts {
-        #[cfg(test)]
-        if !self.split_flushes {
-            return FlushCuts::default();
-        }
-        self.levels.flush_cuts(target_run_len)
-    }
-
     /// `held_bytes` is `Some` for a run.
     fn retire(&mut self, source: Weak<dyn Send + Sync>, bytes: usize, held_bytes: Option<usize>) {
         self.retired
@@ -408,15 +357,16 @@ impl Core {
             chunks,
             state: RwLock::new(State {
                 last_seq,
-                keyspace: None,
+                keyspaces: BTreeMap::new(),
+                names: BTreeMap::new(),
                 next_keyspace: 0,
+                directories: Arc::new([]),
                 active,
                 frozen: Vec::new(),
-                runs: Vec::new(),
-                directory: Arc::new(RunDirectory::empty()),
                 run_bytes: 0,
                 held_bytes: 0,
-                levels: Levels::new(options.level_ratio),
+                level0_flushes: 0,
+                compaction_cursor: 0,
                 level0_stop: if background.is_some() {
                     LEVEL0_STOP
                 } else {
@@ -476,8 +426,8 @@ impl Core {
         }
     }
 
-    /// Writes to the live keyspace, creating one if there is none: for tests
-    /// of the core alone.
+    /// Writes to keyspace "test", creating it if needed: for tests of the
+    /// core alone.
     #[cfg(test)]
     fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
         self.update(self.test_keyspace(), key, Value::Bytes(value))
@@ -488,29 +438,24 @@ impl Core {
         self.update(self.test_keyspace(), key, Value::Tombstone)
     }
 
-    /// The live keyspace's ID, creating a keyspace if there is none.
+    /// Keyspace "test"'s ID, creating it if needed.
     #[cfg(test)]
     fn test_keyspace(&self) -> u32 {
         let mut state = self.write_state();
-        if state.keyspace.is_none() {
-            let id = state.next_keyspace;
-            state.next_keyspace += 1;
-            state.keyspace = Some(Entry {
-                id,
-                name: Arc::from("test"),
-            });
+        match state.names.get("test") {
+            Some(&id) => id,
+            None => state.create_keyspace("test", self.level_ratio).unwrap(),
         }
-        state.keyspace.as_ref().unwrap().id
     }
 
     /// Applies one update to keyspace `keyspace` and returns its sequence
     /// number.
     fn update(&self, keyspace: u32, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
-        self.validate_record(key, value)?;
+        self.validate_record(KeyPrefix::new(keyspace), key, value)?;
         let mut state = self.admit(self.write_state())?;
         loop {
-            state.check_keyspace(keyspace)?;
-            match self.write(&mut state, key, value) {
+            let prefix = state.keyspace(keyspace)?.prefix;
+            match self.write(&mut state, prefix.key(key), value) {
                 Err(Refusal::Full) => state = self.admit(self.make_room(state))?,
                 written => return written.map_err(Refusal::into_error),
             }
@@ -545,12 +490,7 @@ impl Core {
             drop(state);
             let serial = self.serialize_flush();
             let state = self.write_state();
-            let job = FlushJob {
-                engine: self,
-                _serial: serial,
-                tables: state.frozen.clone(),
-                cuts: state.flush_cuts(self.target_run_len),
-            };
+            let job = FlushJob::new(self, serial, &state);
             drop(state);
             if !job.tables.is_empty() {
                 job.build().publish();
@@ -569,7 +509,7 @@ impl Core {
         &'s self,
         mut state: RwLockWriteGuard<'s, State>,
     ) -> RwLockWriteGuard<'s, State> {
-        while state.levels.level0_flushes() >= state.level0_stop {
+        while state.level0_flushes >= state.level0_stop {
             #[cfg(feature = "diagnostics")]
             let _waiting = self.resources.waiting();
             #[cfg(feature = "diagnostics")]
@@ -582,7 +522,7 @@ impl Core {
             if signal
                 .wait_for(|| {
                     let state = self.read_state();
-                    state.levels.level0_flushes() < state.level0_stop
+                    state.level0_flushes < state.level0_stop
                 })
                 .is_err()
             {
@@ -603,17 +543,16 @@ impl Core {
     }
 
     /// Applies a RAM-only write to the active table.
-    fn write(&self, state: &mut State, key: &[u8], value: Value<'_>) -> Result<u64, Refusal> {
+    fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Result<u64, Refusal> {
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
-        let written = match value {
-            Value::Bytes(bytes) => state.active.put(key, seq, bytes),
-            Value::Tombstone => state.active.delete(key, seq),
-        };
-        written.map_err(|error| self.refusal(error))?;
+        state
+            .active
+            .write(key, seq, value)
+            .map_err(|error| self.refusal(error))?;
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         self.chunks.ingested(
-            key.len()
+            key.key.len()
                 + match value {
                     Value::Bytes(bytes) => bytes.len(),
                     Value::Tombstone => 0,
@@ -657,11 +596,15 @@ impl Core {
         value: &'w mut Vec<u8>,
     ) -> Result<Option<&'w [u8]>> {
         let state = self.read_state();
-        state.check_keyspace(keyspace)?;
-        let in_memory = state
-            .active
-            .get(key)
-            .or_else(|| state.frozen.iter().rev().find_map(|table| table.get(key)));
+        let space = state.keyspace(keyspace)?;
+        let stored = space.prefix.key(key);
+        let in_memory = state.active.get_in(stored).or_else(|| {
+            state
+                .frozen
+                .iter()
+                .rev()
+                .find_map(|table| table.get_in(stored))
+        });
         if let Some(version) = in_memory {
             let Value::Bytes(bytes) = version.value else {
                 return Ok(None);
@@ -673,7 +616,7 @@ impl Core {
         // The runs are immutable and shared, so they are read after the lock
         // is released: the result is the state at the lock, and a writer or
         // publication waits only for the memtable lookup, not for decoding.
-        let directory = Arc::clone(&state.directory);
+        let directory = Arc::clone(&space.directory);
         drop(state);
         let found = latest_from(directory.lookup(), key, logical)?;
         Ok(found.map(|found| {
@@ -704,28 +647,22 @@ impl Core {
         tables.extend(state.frozen.iter().rev().cloned());
         View {
             tables,
-            runs: Arc::clone(&state.directory),
+            directories: Arc::clone(&state.directories),
             last_seq: state.last_seq,
-            keyspace: state.keyspace.as_ref().map(|entry| entry.id),
             next_keyspace: state.next_keyspace,
             _live: Arc::clone(&self.snapshots),
         }
     }
 
-    /// Drops keyspace `name` and every source holding its data, and returns
-    /// whether it was live. Snapshots keep what they hold.
+    /// Drops keyspace `name` and retires its runs, and returns whether it
+    /// was live. Snapshots keep what they hold. Its memtable records stay
+    /// charged until the next flush leaves them out.
     ///
     /// Holding the flush and compaction locks keeps any build from
-    /// publishing the keyspace's records after this; a sorted batch built
-    /// outside the lock checks the keyspace when it publishes.
+    /// publishing the keyspace's runs after this; a batch built outside the
+    /// lock checks its keyspaces when it publishes.
     fn drop_keyspace(&self, name: &str) -> bool {
-        let live = |state: &State| {
-            state
-                .keyspace
-                .as_ref()
-                .is_some_and(|entry| &*entry.name == name)
-        };
-        if !live(&self.read_state()) {
+        if !self.read_state().names.contains_key(name) {
             return false;
         }
         let _flushing = self.serialize_flush();
@@ -734,32 +671,10 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut state = self.write_state();
-        if !live(&state) {
+        if !state.remove_keyspace(name) {
             return false;
         }
-        state.keyspace = None;
-        state.last_view = None;
-        let successor = Memtable::in_pool(self.memtable_budget, Some(state.last_seq), &self.chunks);
-        let active = Arc::new(std::mem::replace(&mut state.active, successor).freeze());
-        let mut tables = std::mem::take(&mut state.frozen);
-        tables.push(active);
-        for table in tables {
-            // As in flush publication: another reference is a snapshot's,
-            // which keeps the whole table; otherwise views may hold history.
-            let bytes = if Arc::strong_count(&table) > 1 {
-                table.memory().charged
-            } else {
-                table.held_by_snapshots()
-            };
-            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
-        }
-        let runs = std::mem::take(&mut state.runs);
-        state.retire_runs(&runs);
-        state.levels = Levels::new(self.level_ratio);
-        state.order_runs();
-        state.recount_runs();
         drop(state);
-        drop(runs);
         self.flush_signal.changed();
         self.resources.changed();
         self.notify_worker();
@@ -808,15 +723,9 @@ impl Core {
         if state.frozen.is_empty() {
             return None;
         }
-        let tables = state.frozen.clone();
-        let cuts = state.flush_cuts(self.target_run_len);
+        let job = FlushJob::new(self, serial, &state);
         drop(state);
-        Some(FlushJob {
-            engine: self,
-            _serial: serial,
-            tables,
-            cuts,
-        })
+        Some(job)
     }
 
     fn compact(
@@ -829,6 +738,41 @@ impl Core {
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
         }
+    }
+
+    /// The keyspace compaction serves next, after adding the levels each
+    /// keyspace's size calls for: the highest [`levels::Score`], or under
+    /// reclaim the most reclaimable bytes among keyspaces with work. Ties go
+    /// to the first keyspace after the one served last, in ID order, so
+    /// that equal keyspaces take turns.
+    fn choose_keyspace(state: &mut State, fit: &Fit, reclaim: bool) -> Option<u32> {
+        let cursor = state.compaction_cursor;
+        // IDs after the cursor first, then the rest: a key that wraps.
+        let mut best: Option<((bool, u32), (levels::Score, usize))> = None;
+        for (&id, space) in &mut state.keyspaces {
+            let turn = (id <= cursor, id);
+            space.levels.insert_levels(fit);
+            let rank = if reclaim {
+                if matches!(space.levels.plan_reclaim(fit), Plan::Idle) {
+                    continue;
+                }
+                (levels::Score::default(), space.levels.reclaimable_bytes())
+            } else {
+                match space.levels.score(fit) {
+                    Some(score) => (score, 0),
+                    None => continue,
+                }
+            };
+            let better = best
+                .as_ref()
+                .is_none_or(|(first, top)| rank > *top || rank == *top && turn < *first);
+            if better {
+                best = Some((turn, rank));
+            }
+        }
+        let ((_, id), _) = best?;
+        state.compaction_cursor = id;
+        Some(id)
     }
 
     /// Chooses the next step from the levels, under the exclusive lock
@@ -853,22 +797,26 @@ impl Core {
         }
         let mut state = self.write_state();
         let fit = options.fit(self.target_run_len, state.level0_stop);
-        state.levels.insert_levels(&fit);
+        let Some(keyspace) = Self::choose_keyspace(&mut state, &fit, options.reclaim) else {
+            return Ok(None);
+        };
+        let space = state.space_mut(keyspace);
         let plan = if options.reclaim {
-            state.levels.plan_reclaim(&fit)
+            space.levels.plan_reclaim(&fit)
         } else {
-            state.levels.plan(&fit)
+            space.levels.plan(&fit)
         };
         let mut source_count = 0;
         let (kind, level, inputs, dest, mut cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Move { level, run } => {
-                if state.levels.move_down(level, &run).is_err() {
+                if space.levels.move_down(level, &run).is_err() {
                     return Err(CompactionError::Stale);
                 }
                 if cfg!(any(test, debug_assertions)) {
-                    state.levels.check(&state.runs);
+                    space.levels.check(&space.runs);
                 }
+                state.levels_changed();
                 self.flush_signal.request();
                 return Ok(Some(Begun::Done(CompactionReport {
                     kind: CompactionKind::Move,
@@ -938,17 +886,19 @@ impl Core {
                 )
             }
         };
-        cuts.omit_filter = matches!(dest, Dest::Level(level) if level == state.levels.depth());
-        let others = Self::others(&state, &inputs);
+        let space = state.space_mut(keyspace);
+        cuts.omit_filter = matches!(dest, Dest::Level(level) if level == space.levels.depth());
+        let others = Self::others(space, &inputs);
         // Output into the bottom level erases the sequences no unselected
         // run can contest; `build` decides record by record. Snapshots and
         // checkpoints keep the directories, and so the runs, they started from.
-        let zero_seq = matches!(dest, Dest::Level(level) if level == state.levels.depth());
-        let estimated_run_bytes = state.levels.segment(&fit);
+        let zero_seq = matches!(dest, Dest::Level(level) if level == space.levels.depth());
+        let estimated_run_bytes = space.levels.segment(&fit);
         drop(state);
         Ok(Some(Begun::Job(CompactionJob {
             engine: self,
             _serial: serial,
+            keyspace,
             inputs,
             others,
             options,
@@ -979,24 +929,24 @@ impl Core {
         }
     }
 
-    /// The runs outside `inputs` that overlap their span, for the
-    /// tombstone rule.
-    fn others(state: &State, inputs: &[SharedRun]) -> Vec<SharedRun> {
+    /// The runs of `space` outside `inputs` that overlap their span, for
+    /// the tombstone rule.
+    fn others(space: &KeyspaceState, inputs: &[SharedRun]) -> Vec<SharedRun> {
         let ranges = inputs
             .iter()
             .map(|run| run.run.key_range().expect(NOT_EMPTY));
         let min = ranges.clone().map(|range| range.min).min();
         let max = ranges.map(|range| range.max).max();
         match (min, max) {
-            (Some(min), Some(max)) => state.levels.others(inputs, min, max),
+            (Some(min), Some(max)) => space.levels.others(inputs, min, max),
             _ => Vec::new(),
         }
     }
 
     /// Begins a compaction of the runs `picks` names, by index into the run
-    /// list, whatever their levels: the tests' arbitrary merges. The output
-    /// goes into the deepest level of the inputs if it fits there, and
-    /// otherwise into level 0 as a new flush.
+    /// list of the one live keyspace, whatever their levels: the tests'
+    /// arbitrary merges. The output goes into the deepest level of the
+    /// inputs if it fits there, and otherwise into level 0 as a flush of its own.
     #[cfg(test)]
     fn begin_picked(
         &self,
@@ -1008,23 +958,26 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let state = self.write_state();
+        let keyspace = state.only_id();
+        let space = state.only();
         let inputs: Vec<SharedRun> = picks
             .iter()
-            .map(|&index| Arc::clone(&state.runs[index]))
+            .map(|&index| Arc::clone(&space.runs[index]))
             .collect();
         let deepest = inputs
             .iter()
-            .filter_map(|run| state.levels.level_of(run))
+            .filter_map(|run| space.levels.level_of(run))
             .max()
             .unwrap_or(0);
-        let others = Self::others(&state, &inputs);
-        let estimated_run_bytes = state
+        let others = Self::others(space, &inputs);
+        let estimated_run_bytes = space
             .levels
             .segment(&options.fit(self.target_run_len, state.level0_stop));
         drop(state);
         Ok(CompactionJob {
             engine: self,
             _serial: serial,
+            keyspace,
             inputs,
             others,
             options,
@@ -1052,14 +1005,17 @@ impl Core {
         let state = self.read_state();
         let retained = state.retained();
         let usage = self.usage(&state);
-        let physical: Vec<_> = physical_runs(&state.runs).collect();
+        let spaces = self.keyspace_stats_in(&state);
+        let sum = |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).sum::<usize>();
+        let most =
+            |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).max().unwrap_or(0);
 
         EngineStats {
             build: self.chunks.counters(),
-            filter_bytes: physical.iter().map(|run| run.run.filter_bytes()).sum(),
-            index_bytes: physical.iter().map(|run| run.run.index_bytes()).sum(),
-            chunk_bytes_held: physical.iter().map(|run| run.run.chunk_capacity()).sum(),
-            block_bytes_live: physical.iter().map(|run| run.run.frame_bytes()).sum(),
+            filter_bytes: sum(|space| space.filter_bytes),
+            index_bytes: sum(|space| space.index_bytes),
+            chunk_bytes_held: sum(|space| space.chunk_bytes_held),
+            block_bytes_live: sum(|space| space.block_bytes_live),
             used: usage.used,
             memory_limit: self.memory_limit,
             memtable_bytes: usage.memtables,
@@ -1084,21 +1040,54 @@ impl Core {
                     budget: sum.budget + table.budget,
                 }),
             frozen_tables: state.frozen.len(),
-            runs: state.runs.len(),
+            runs: sum(|space| space.runs),
             run_bytes: state.run_bytes,
             held_bytes: state.held_bytes,
-            max_overlap: state.directory.group_count(),
+            max_overlap: most(|space| space.max_overlap),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
             retained_bytes: retained.bytes,
             retained_run_bytes: retained.run_bytes,
             retained_held_bytes: retained.held_bytes,
-            level0_flushes: state.levels.level0_flushes(),
-            level0_runs: state.levels.shape()[0].0,
-            levels: state.levels.depth(),
+            level0_flushes: state.level0_flushes,
+            level0_runs: sum(|space| space.level0_runs),
+            levels: most(|space| space.levels),
             flushes: state.flushes,
             flushed_bytes: state.flushed_bytes,
+            keyspaces: spaces.len(),
         }
+    }
+
+    /// Each live keyspace's runs and levels, in name order.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    fn keyspace_stats(&self) -> Vec<KeyspaceDetail> {
+        self.keyspace_stats_in(&self.read_state())
+    }
+
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    fn keyspace_stats_in(&self, state: &State) -> Vec<KeyspaceDetail> {
+        state
+            .names
+            .values()
+            .map(|id| {
+                let space = &state.keyspaces[id];
+                let physical: Vec<_> = physical_runs(&space.runs).collect();
+                KeyspaceDetail {
+                    name: space.name.to_string(),
+                    runs: space.runs.len(),
+                    run_bytes: space.run_bytes,
+                    held_bytes: space.held_bytes,
+                    filter_bytes: physical.iter().map(|run| run.run.filter_bytes()).sum(),
+                    index_bytes: physical.iter().map(|run| run.run.index_bytes()).sum(),
+                    chunk_bytes_held: physical.iter().map(|run| run.run.chunk_capacity()).sum(),
+                    block_bytes_live: physical.iter().map(|run| run.run.frame_bytes()).sum(),
+                    max_overlap: space.directory.group_count(),
+                    level0_flushes: space.levels.level0_flushes(),
+                    level0_runs: space.levels.shape()[0].0,
+                    levels: space.levels.depth(),
+                }
+            })
+            .collect()
     }
 
     fn read_state(&self) -> RwLockReadGuard<'_, State> {
@@ -1507,7 +1496,7 @@ mod tests {
             .unwrap()
             .build(&mut MergeWorkspace::new())
             .unwrap();
-        engine.core.write_state().runs.remove(1);
+        engine.core.write_state().only_mut().runs.remove(1);
         let _ = built.publish();
     }
 
@@ -1552,7 +1541,7 @@ mod tests {
     fn publication_frees_the_inputs_once_nothing_holds_them() {
         let engine = Engine::in_memory(manual()).unwrap();
         overlapping_runs(&engine);
-        let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
+        let inputs: Vec<SharedRun> = engine.core.read_state().only().runs.clone();
         let mut workspace = MergeWorkspace::new();
         while engine
             .core
@@ -1832,6 +1821,9 @@ mod api_compaction_tests;
 #[cfg(test)]
 #[path = "../tests/engine.rs"]
 mod api_engine_tests;
+#[cfg(test)]
+#[path = "../tests/keyspaces.rs"]
+mod api_keyspaces_tests;
 #[cfg(test)]
 #[path = "../tests/snapshot.rs"]
 mod api_snapshot_tests;

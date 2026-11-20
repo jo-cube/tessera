@@ -24,8 +24,8 @@ pub(crate) enum WriteError {
     /// ([`Options::memtable_size`]), so no memtable can hold it.
     #[non_exhaustive]
     RecordExceedsBudget {
-        /// What the record would be charged: its key and value and
-        /// [`ENTRY_OVERHEAD`].
+        /// What the record would be charged: its key behind the keyspace's
+        /// prefix of 1 to 5 bytes, its value and [`ENTRY_OVERHEAD`].
         charge: usize,
         /// The budget.
         budget: usize,
@@ -70,6 +70,9 @@ pub(crate) enum UpdateError {
     },
     /// A keyspace the write names is not live.
     KeyspaceDropped,
+    /// Creating a keyspace would exceed the live keyspace limit, or the IDs are
+    /// used up.
+    Keyspaces,
 }
 
 impl fmt::Display for UpdateError {
@@ -80,6 +83,11 @@ impl fmt::Display for UpdateError {
                 write!(f, "memory use {used} bytes reached the limit of {limit}")
             }
             Self::KeyspaceDropped => f.write_str("the keyspace was dropped"),
+            Self::Keyspaces => write!(
+                f,
+                "an engine holds at most {} live keyspaces and 2^32 over its life",
+                keyspaces::MAX_KEYSPACES
+            ),
         }
     }
 }

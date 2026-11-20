@@ -22,15 +22,36 @@ fn overlaps<'a>(records: impl Iterator<Item = Record<'a>>, keys: &[&[u8]]) -> bo
     false
 }
 
+/// One keyspace's part of an ingested batch: its runs and their input.
+struct Ingested {
+    keyspace: u32,
+    runs: Vec<Run<Vec<u8>>>,
+    logical: usize,
+}
+
 impl Core {
+    /// Builds sorted, unique records into runs of their own keyspace, with
+    /// placeholder sequences.
     fn build_ingestion<'a>(
         &self,
-        records: impl Iterator<Item = (&'a [u8], Value<'a>)>,
-    ) -> Vec<Run<Vec<u8>>> {
-        let mut runs = Vec::new();
+        records: impl Iterator<Item = (u32, &'a [u8], Value<'a>)>,
+    ) -> Vec<Ingested> {
+        let mut built: Vec<Ingested> = Vec::new();
         let mut builder = None::<RunBuilder>;
         let mut bytes = 0;
-        for (key, value) in records {
+        for (keyspace, key, value) in records {
+            if built.last().is_none_or(|last| last.keyspace != keyspace) {
+                if let Some(last) = built.last_mut() {
+                    last.runs.extend(builder.take().map(RunBuilder::finish));
+                }
+                built.push(Ingested {
+                    keyspace,
+                    runs: Vec::new(),
+                    logical: 0,
+                });
+                bytes = 0;
+            }
+            let space = built.last_mut().expect("a keyspace was begun");
             builder
                 .get_or_insert_with(|| {
                     RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.chunks)
@@ -39,47 +60,67 @@ impl Core {
                 .expect("validated unique sorted records");
             bytes += crate::run::input_len(key, value);
             if bytes >= self.target_run_len {
-                runs.push(builder.take().unwrap().finish());
+                space.runs.push(builder.take().unwrap().finish());
                 bytes = 0;
             }
         }
-        runs.extend(builder.map(RunBuilder::finish));
-        runs
+        if let Some(last) = built.last_mut() {
+            last.runs.extend(builder.map(RunBuilder::finish));
+        }
+        built
     }
 
     pub(super) fn ingest_batch(
         &self,
-        keyspace: u32,
         batch: &WriteBatch,
         sorted: bool,
     ) -> Result<u64, UpdateError> {
         let state = self.admit(self.write_state())?;
-        state.check_keyspace(keyspace)?;
+        batch.check_keyspaces(&state)?;
         let input = batch.validate(self.memtable_budget)?;
         let mut charge = self.resources.build(
             input.saturating_mul(3),
             crate::run::workspace_estimate([]).saturating_add(if sorted { 0 } else { input }),
         );
         drop(state);
-        let mut keys: Vec<_> = batch.records().map(|(key, _)| key).collect();
-        let runs = if sorted {
+        // The batch's keys as the memtables store them, for the overlap
+        // checks: one buffer, in batch order.
+        let mut stored = Vec::new();
+        let mut spans = Vec::with_capacity(batch.len());
+        for (keyspace, key, _) in batch.records() {
+            let start = stored.len();
+            stored.extend_from_slice(KeyPrefix::new(keyspace).as_bytes());
+            stored.extend_from_slice(key);
+            spans.push(start..stored.len());
+        }
+        let mut keys: Vec<&[u8]> = spans.iter().map(|span| &stored[span.clone()]).collect();
+        let mut built = if sorted {
             self.build_ingestion(batch.records())
         } else {
             // Local staging sequences choose the last duplicate operation.
             // The final unique records are built with zero placeholders too.
             keys.sort_unstable();
             keys.dedup();
-            let mut table = Memtable::in_pool(input, None, &self.chunks);
-            for (index, (key, value)) in batch.records().enumerate() {
-                let seq = index as u64 + 1;
-                match value {
-                    Value::Bytes(v) => table.put(key, seq, v),
-                    Value::Tombstone => table.delete(key, seq),
-                }
-                .expect("the private table admits the whole batch");
+            let budget = input.saturating_add(batch.len().saturating_mul(8));
+            let mut table = Memtable::in_pool(budget, None, &self.chunks);
+            for (index, (keyspace, key, value)) in batch.records().enumerate() {
+                let prefix = KeyPrefix::new(keyspace);
+                table
+                    .write(prefix.key(key), index as u64 + 1, value)
+                    .expect("the private table admits the whole batch");
             }
-            self.build_ingestion(table.iter().map(|record| (record.key, record.value)))
+            self.build_ingestion(table.iter().map(|record| {
+                let (keyspace, key) = keyspaces::split(record.key);
+                (keyspace, key, record.value)
+            }))
         };
+        let mut logical: BTreeMap<u32, usize> = BTreeMap::new();
+        for (keyspace, key, value) in batch.records() {
+            *logical.entry(keyspace).or_default() += crate::run::input_len(key, value);
+        }
+        for space in &mut built {
+            space.logical = logical.get(&space.keyspace).copied().unwrap_or(0);
+        }
         #[cfg(test)]
         {
             let hook = self.after_ingest_build.lock().unwrap().take();
@@ -87,14 +128,20 @@ impl Core {
                 hook();
             }
         }
-        let bytes: usize = runs.iter().map(|run| run.stored_len()).sum();
-        let held: usize = runs.iter().map(Run::held_bytes).sum();
-        let logical = batch
-            .records()
-            .map(|(key, value)| crate::run::input_len(key, value))
-            .sum();
+        let runs = || built.iter().flat_map(|space| &space.runs);
+        let bytes: usize = runs().map(|run| run.stored_len()).sum();
+        let held: usize = runs().map(Run::held_bytes).sum();
         charge.finished(bytes + held);
-        let mut runs: Vec<_> = published(runs).collect();
+        let mut built: Vec<(u32, usize, Vec<SharedRun>)> = built
+            .into_iter()
+            .map(|space| {
+                (
+                    space.keyspace,
+                    space.logical,
+                    published(space.runs).collect(),
+                )
+            })
+            .collect();
         let (lo, hi) = (keys[0], keys[keys.len() - 1]);
         let mut state = self.write_state();
         // Freeze a potentially large table cheaply, then inspect it unlocked.
@@ -103,7 +150,7 @@ impl Core {
         if state.frozen.len() < self.max_frozen_memtables
             && state
                 .active
-                .iter_from(lo)
+                .iter_from_in(Key::plain(lo))
                 .next()
                 .is_some_and(|record| record.key <= hi)
         {
@@ -126,7 +173,7 @@ impl Core {
                 drop(state);
                 let target = tables
                     .iter()
-                    .filter(|table| overlaps(table.iter_from(lo), &keys))
+                    .filter(|table| overlaps(table.iter_from_in(Key::plain(lo)), &keys))
                     .filter_map(|table| table.last_seq())
                     .max();
                 drop(tables);
@@ -143,31 +190,32 @@ impl Core {
                 // Include tables frozen by writers while state was released.
                 continue;
             }
-            if overlaps(state.active.iter_from(lo), &keys) {
+            if overlaps(state.active.iter_from_in(Key::plain(lo)), &keys) {
                 state = self.make_room(state);
                 continue;
             }
             break;
         }
-        // A keyspace dropped while the runs were built takes them with it.
-        state.check_keyspace(keyspace)?;
+        // A keyspace dropped while the runs were built fails the batch.
+        batch.check_keyspaces(&state)?;
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
-        for run in &mut runs {
-            Arc::get_mut(run)
-                .expect("unpublished run is private")
-                .run
-                .set_seq_override(seq);
+        for (keyspace, logical, runs) in &mut built {
+            for run in runs.iter_mut() {
+                Arc::get_mut(run)
+                    .expect("unpublished run is private")
+                    .run
+                    .set_seq_override(seq);
+            }
+            let space = state.space_mut(*keyspace);
+            space.levels.push_flush(runs, *logical);
+            space.runs.append(runs);
+            state.published(*keyspace);
         }
-        state.levels.push_flush(&runs, logical);
-        state.runs.extend(runs);
-        state.run_bytes += bytes;
-        state.held_bytes += held;
-        state.order_runs();
         state.last_seq = seq;
         self.chunks.ingested(
             batch
                 .records()
-                .map(|(key, value)| {
+                .map(|(_, key, value)| {
                     key.len()
                         + match value {
                             Value::Bytes(bytes) => bytes.len(),
@@ -258,7 +306,7 @@ mod tests {
                 // its later publication sequence must still win.
                 assert_eq!(engine.get_seq(b"a"), Some((0, b"new".to_vec())));
                 // The newer deletion has also been physically discarded.
-                for run in &engine.core.read_state().runs {
+                for run in &engine.core.read_state().only().runs {
                     assert!(
                         run.run
                             .get(b"b", &mut crate::run::ReadWorkspace::new())
@@ -493,6 +541,7 @@ mod tests {
                     engine
                         .core
                         .read_state()
+                        .only()
                         .runs
                         .iter()
                         .filter(|run| run.run.max_seq() == seq)

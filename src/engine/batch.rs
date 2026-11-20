@@ -39,6 +39,8 @@ pub struct WriteBatch {
     engine: Option<u64>,
     /// The name of a keyspace of another engine, if one was appended.
     foreign: Option<Arc<str>>,
+    /// Whether operations name more than one keyspace.
+    mixed: bool,
 }
 
 impl WriteBatch {
@@ -87,6 +89,7 @@ impl WriteBatch {
         self.operations.clear();
         self.engine = None;
         self.foreign = None;
+        self.mixed = false;
     }
 
     fn note(&mut self, keyspace: &Keyspace) {
@@ -94,6 +97,10 @@ impl WriteBatch {
         if engine != keyspace.engine_id() && self.foreign.is_none() {
             self.foreign = Some(keyspace.shared_name());
         }
+        self.mixed |= self
+            .operations
+            .first()
+            .is_some_and(|first| first.keyspace != keyspace.id());
     }
 
     fn append(&mut self, bytes: &[u8]) -> Range<usize> {
@@ -102,9 +109,11 @@ impl WriteBatch {
         start..self.bytes.len()
     }
 
-    pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (&[u8], Value<'_>)> + Clone {
+    /// Each operation's keyspace, key and value, in insertion order.
+    pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], Value<'_>)> + Clone {
         self.operations.iter().map(|op| {
             (
+                op.keyspace,
                 &self.bytes[op.key.clone()],
                 op.value.as_ref().map_or(Value::Tombstone, |range| {
                     Value::Bytes(&self.bytes[range.clone()])
@@ -122,35 +131,44 @@ impl WriteBatch {
         }
     }
 
-    /// The one keyspace every operation names, or `None` for an empty
-    /// batch. Operations naming several keyspaces are refused: an engine
-    /// holds one live keyspace, so one of them was dropped.
-    pub(super) fn keyspace(&self) -> Result<Option<u32>, UpdateError> {
-        let Some(first) = self.operations.first() else {
-            return Ok(None);
+    /// The keyspaces the operations name, ascending and each once.
+    pub(super) fn keyspaces(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = match self.operations.first() {
+            Some(first) if !self.mixed => vec![first.keyspace],
+            _ => self.operations.iter().map(|op| op.keyspace).collect(),
         };
-        if self
-            .operations
-            .iter()
-            .all(|op| op.keyspace == first.keyspace)
-        {
-            Ok(Some(first.keyspace))
-        } else {
-            Err(UpdateError::KeyspaceDropped)
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Refuses the whole batch unless every keyspace it names is live.
+    pub(super) fn check_keyspaces(&self, state: &State) -> Result<(), UpdateError> {
+        match self.operations.first() {
+            None => Ok(()),
+            Some(first) if !self.mixed => state.check_keyspace(first.keyspace),
+            Some(_) => self
+                .keyspaces()
+                .into_iter()
+                .try_for_each(|id| state.check_keyspace(id)),
         }
     }
 }
 
 impl WriteBatch {
+    /// Whether the operations are strictly ascending in the memtables'
+    /// order: by keyspace prefix, then key.
     pub(super) fn is_sorted(&self) -> bool {
-        self.operations
-            .windows(2)
-            .all(|pair| self.bytes[pair[0].key.clone()] < self.bytes[pair[1].key.clone()])
+        self.operations.windows(2).all(|pair| {
+            let [a, b] = [&pair[0], &pair[1]]
+                .map(|op| (KeyPrefix::new(op.keyspace), &self.bytes[op.key.clone()]));
+            (a.0.as_bytes(), a.1) < (b.0.as_bytes(), b.1)
+        })
     }
 
     pub(super) fn validate(&self, budget: usize) -> Result<usize, UpdateError> {
         let mut charge = 0usize;
-        for (key, value) in self.records() {
+        for (keyspace, key, value) in self.records() {
             let len = match value {
                 Value::Bytes(bytes) => bytes.len(),
                 Value::Tombstone => 0,
@@ -163,7 +181,9 @@ impl WriteBatch {
             if len > MAX_VALUE_LEN {
                 return Err(UpdateError::Rejected(WriteError::ValueTooLong { len }));
             }
-            let record = key.len() + len + ENTRY_OVERHEAD;
+            // As the memtable charges it: the key behind its keyspace prefix.
+            let record =
+                KeyPrefix::new(keyspace).as_bytes().len() + key.len() + len + ENTRY_OVERHEAD;
             if record > budget {
                 return Err(UpdateError::Rejected(WriteError::RecordExceedsBudget {
                     charge: record,
@@ -180,34 +200,34 @@ impl Core {
     /// Applies `batch` atomically and returns its last sequence number, or
     /// the current one for an empty batch.
     pub(super) fn write_batch(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
-        let Some(keyspace) = batch.keyspace()? else {
+        if batch.is_empty() {
             return Ok(self.read_state().last_seq);
-        };
+        }
         let charge = batch.validate(self.memtable_budget)?;
         let sorted = batch.is_sorted();
-        if !batch.is_empty()
-            && (sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget)
-        {
-            return self.ingest_batch(keyspace, batch, sorted);
+        if sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget {
+            return self.ingest_batch(batch, sorted);
         }
         if batch.len() == 1 {
-            let (key, value) = batch.records().next().unwrap();
+            let (keyspace, key, value) = batch.records().next().unwrap();
             return self.update(keyspace, key, value);
         }
         let mut state = self.admit(self.write_state())?;
         loop {
-            state.check_keyspace(keyspace)?;
+            batch.check_keyspaces(&state)?;
             let end = state
                 .last_seq
                 .checked_add(batch.len() as u64)
                 .expect(SEQUENCES);
-            let needed = batch.records().fold(0usize, |sum, (key, value)| {
-                sum.saturating_add(state.active.write_charge(key, value))
+            let needed = batch.records().fold(0usize, |sum, (keyspace, key, value)| {
+                let prefix = KeyPrefix::new(keyspace);
+                sum.saturating_add(state.active.write_charge(prefix.key(key), value))
             });
             let memory = state.active.memory();
             if needed <= memory.budget.saturating_sub(memory.charged) {
-                for (key, value) in batch.records() {
-                    self.write(&mut state, key, value)
+                for (keyspace, key, value) in batch.records() {
+                    let prefix = KeyPrefix::new(keyspace);
+                    self.write(&mut state, prefix.key(key), value)
                         .expect("preflight admitted every batch operation");
                 }
                 return Ok(end);

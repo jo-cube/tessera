@@ -216,11 +216,11 @@ of at most 16 MiB in the same commit. All writes since the latest successful
 checkpoint are lost on process exit.
 
 The layout is `CURRENT`, `LOCK`, `runs/<32-hex-digit ID>` and
-`ckpt-<20-digit generation>/MANIFEST`. Run format 6 uses magicless Zstandard
+`ckpt-<20-digit generation>/MANIFEST`. Run format 1 uses magicless Zstandard
 frames and a prefix-compressed sparse index. Run files append Bloom words and
-their CRC-32. Manifest version 5 records checksums, lengths, levels, flush
-groups, bounded views, sequence overrides, the ceiling and application
-metadata. Unsupported versions are rejected. CRC-32 detects accidental
+their CRC-32. Manifest version 1 records the keyspaces, checksums, lengths,
+levels, flush groups, bounded views, sequence overrides, the ceiling and
+application metadata. Unsupported versions are rejected. CRC-32 detects accidental
 damage; it does not authenticate files.
 
 Runs and the manifest are synced before renaming `CURRENT`, the commit point;

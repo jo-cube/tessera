@@ -172,18 +172,18 @@ impl CompactionJob<'_> {
         // every piece owns its own directory entries and can finish in any order.
         {
             let mut state = self.engine.write_state();
-            state
+            let space = state.space_mut(self.keyspace);
+            space
                 .levels
                 .split_sources(&split)
                 .map_err(|_| CompactionError::Stale)?;
-            state
+            space
                 .runs
                 .retain(|r| !split.iter().any(|(old, _)| Arc::ptr_eq(old, r)));
-            state
+            space
                 .runs
                 .extend(split.iter().flat_map(|(_, views)| views.iter().cloned()));
-            state.recount_runs();
-            state.order_runs();
+            state.published(self.keyspace);
         }
         drop(split);
         drop(starts);

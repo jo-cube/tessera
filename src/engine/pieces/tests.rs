@@ -35,14 +35,15 @@ fn fixture_with_threads(background_threads: usize) -> Engine {
             builder.finish()
         })
         .collect();
+    engine.ks();
     {
         let mut state = engine.core.write_state();
-        state.runs = published(runs).collect();
-        let recovered: Vec<_> = state.runs.iter().map(|r| (1, 0, r.clone())).collect();
-        state.levels = Levels::recovered(&recovered, 1, 10);
-        state.run_bytes = state.runs.iter().map(|r| r.run.stored_len()).sum();
-        state.held_bytes = state.runs.iter().map(|r| r.run.held_bytes()).sum();
-        state.order_runs();
+        let id = state.only_id();
+        let space = state.only_mut();
+        space.runs = published(runs).collect();
+        let recovered: Vec<_> = space.runs.iter().map(|r| (1, 0, r.clone())).collect();
+        space.levels = Levels::recovered(&recovered, 1, 10);
+        state.published(id);
         state.split_flushes = false;
     }
     for key in 0..KEYS {
@@ -132,11 +133,14 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
         assert_eq!(middle.get_seq(&0u16.to_be_bytes()).unwrap().0, 0);
         assert_eq!(middle.get_seq(&32u16.to_be_bytes()).unwrap().0, 33);
         let state = engine.core.read_state();
-        assert_eq!(state.directory.group_count(), deepest_overlap(&state.runs));
-        assert_eq!(state.directory.group_count(), 2);
+        assert_eq!(
+            state.only().directory.group_count(),
+            deepest_overlap(&state.only().runs)
+        );
+        assert_eq!(state.only().directory.group_count(), 2);
         drop(state);
         assert!(
-            engine.core.read_state().levels.runs()[0]
+            engine.core.read_state().only().levels.runs()[0]
                 .iter()
                 .any(|r| r.run.slice().is_some())
         );
@@ -147,6 +151,7 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
             recovered
                 .core
                 .read_state()
+                .only()
                 .levels
                 .checkpoint_runs()
                 .iter()
@@ -155,6 +160,7 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
             engine
                 .core
                 .read_state()
+                .only()
                 .levels
                 .checkpoint_runs()
                 .iter()
@@ -190,10 +196,10 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
 #[test]
 fn a_middle_piece_refusal_keeps_published_ranges_and_releases_charges() {
     let engine = fixture();
-    let retired = engine.core.read_state().levels.runs()[1][0]
+    let retired = engine.core.read_state().only().levels.runs()[1][0]
         .run
         .retirement();
-    let original_ids: Vec<_> = engine.core.read_state().levels.runs()[1]
+    let original_ids: Vec<_> = engine.core.read_state().only().levels.runs()[1]
         .iter()
         .map(|r| r.id)
         .collect();
@@ -209,12 +215,12 @@ fn a_middle_piece_refusal_keeps_published_ranges_and_releases_charges() {
     );
     let state = engine.core.read_state();
     assert!(
-        state.levels.runs()[1]
+        state.only().levels.runs()[1]
             .iter()
             .all(|r| !original_ids[..2].contains(&r.id))
     );
     assert!(
-        state.levels.runs()[1]
+        state.only().levels.runs()[1]
             .iter()
             .any(|r| r.id == original_ids[2])
     );
@@ -249,7 +255,7 @@ fn interleaved_skipped_run_contests_erasure_in_every_piece() {
     }
     engine.flush().unwrap();
     let state = engine.core.read_state();
-    let l0 = state.levels.runs()[0].clone();
+    let l0 = state.only().levels.runs()[0].clone();
     drop(state);
     let mut job = engine
         .core
@@ -277,7 +283,7 @@ fn interleaved_skipped_run_contests_erasure_in_every_piece() {
     check(&engine.snapshot(), &engine.ks(), expected);
     check(&before, &engine.ks(), expected);
     let state = engine.core.read_state();
-    for run in &state.levels.runs()[1] {
+    for run in &state.only().levels.runs()[1] {
         let mut ws = crate::run::ReadWorkspace::new();
         let mut cursor = run.run.cursor(&mut ws);
         while let Some(record) = cursor.next_record().unwrap() {
@@ -343,14 +349,16 @@ fn corruption_in_a_middle_piece_preserves_completed_publications() {
     let engine = fixture();
     let (clean, damaged, first) = {
         let state = engine.core.read_state();
-        let clean = state.levels.runs()[1][2].clone();
+        let clean = state.only().levels.runs()[1][2].clone();
         let damaged = published(vec![clean.run.damaged_at(12)]).next().unwrap();
-        let first = state.levels.runs()[1][0].run.retirement();
+        let first = state.only().levels.runs()[1][0].run.retirement();
         (clean, damaged, first)
     };
     let replace = |old: &SharedRun, new: &SharedRun| {
         let mut state = engine.core.write_state();
-        state
+        let id = state.only_id();
+        let space = state.only_mut();
+        space
             .levels
             .replace(
                 std::slice::from_ref(old),
@@ -358,9 +366,9 @@ fn corruption_in_a_middle_piece_preserves_completed_publications() {
                 Dest::Level(1),
             )
             .unwrap();
-        let at = state.runs.iter().position(|r| Arc::ptr_eq(r, old)).unwrap();
-        state.runs[at] = new.clone();
-        state.order_runs();
+        let at = space.runs.iter().position(|r| Arc::ptr_eq(r, old)).unwrap();
+        space.runs[at] = new.clone();
+        state.published(id);
     };
     replace(&clean, &damaged);
     assert!(matches!(
@@ -412,9 +420,12 @@ fn pieces_publish_out_of_order_and_recover_holes_with_shared_storage() {
         let expected_bytes = engine.engine_stats().run_bytes;
         {
             let state = engine.core.read_state();
-            assert_eq!(state.levels.runs()[0].len(), 7);
-            assert_eq!(physical_runs(&state.levels.runs()[0]).count(), 1);
-            assert_eq!(state.directory.group_count(), deepest_overlap(&state.runs));
+            assert_eq!(state.only().levels.runs()[0].len(), 7);
+            assert_eq!(physical_runs(&state.only().levels.runs()[0]).count(), 1);
+            assert_eq!(
+                state.only().directory.group_count(),
+                deepest_overlap(&state.only().runs)
+            );
         }
         engine.checkpoint_to(&scratch.0).unwrap();
         let recovered = Engine::open(&scratch.0, options()).unwrap();
@@ -510,7 +521,7 @@ fn one_builder_publishes_small_bottom_ranges_before_building_the_next() {
     let engine = fixture_with_threads(1);
     // Use the real planner estimate, rather than the forced-piece test mode.
     engine.core.piece_budget.store(0, Ordering::Relaxed);
-    let first = engine.core.read_state().levels.runs()[1][0]
+    let first = engine.core.read_state().only().levels.runs()[1][0]
         .run
         .retirement();
     let builds = Arc::new(AtomicUsize::new(0));

@@ -325,10 +325,8 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn exact_parts(first: &[u8], second: &[u8]) -> Self {
-        let mut bytes = vec![0; first.len() + second.len()].into_boxed_slice();
-        bytes[..first.len()].copy_from_slice(first);
-        bytes[first.len()..].copy_from_slice(second);
+    pub(crate) fn exact_parts(parts: &[&[u8]]) -> Self {
+        let bytes = parts.concat().into_boxed_slice();
         Self {
             bytes,
             pool: Weak::new(),

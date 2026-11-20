@@ -325,7 +325,8 @@ fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
     assert!(full.active.charged <= BUDGET);
     assert_eq!(
         full.active.charged,
-        live + written * 104 + full.active.pinned
+        // Each write: a 1-byte keyspace prefix, a 4-byte key and 100 bytes.
+        live + written * 105 + full.active.pinned
     );
     assert!(full.active.pinned > 0);
     // Every key was overwritten at most once: the leaves and values the
@@ -354,6 +355,8 @@ fn concurrent_snapshots_see_a_prefix_of_the_writes() {
         ..manual()
     })
     .unwrap();
+    // Snapshots taken before the first write read the keyspace too.
+    engine.ks();
     let start = Barrier::new(2);
     thread::scope(|scope| {
         scope.spawn(|| {

@@ -436,17 +436,19 @@ fn compact_reports(engine: &Engine) -> Vec<crate::engine::CompactionReport> {
     reports
 }
 
-/// The manifest's exact v6 payload boundaries, excluding persisted filters.
+/// The manifest's exact run payload boundaries, excluding persisted
+/// filters: the run entries follow the 88-byte header and the keyspace table.
 fn run_payloads(dir: &Path) -> Vec<(PathBuf, usize)> {
     let current = fs::read(dir.join("CURRENT")).unwrap();
     let generation = u64::from_le_bytes(current[8..16].try_into().unwrap());
     let manifest = fs::read(dir.join(format!("ckpt-{generation:020}/MANIFEST"))).unwrap();
-    let count = u32::from_le_bytes(manifest[68..72].try_into().unwrap()) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(manifest[at..at + 4].try_into().unwrap()) as usize;
+    let (table, count) = (u32_at(64), u32_at(68));
     (0..count)
         .map(|i| {
-            let at = 80 + i * 68;
+            let at = 88 + table + i * 72;
             let id = u128::from_le_bytes(manifest[at..at + 16].try_into().unwrap());
-            let len = u64::from_le_bytes(manifest[at + 48..at + 56].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(manifest[at + 52..at + 60].try_into().unwrap()) as usize;
             (dir.join("runs").join(format!("{id:032x}")), len)
         })
         .collect()
@@ -464,7 +466,7 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 
 /// Dictionary runs through the engine: compaction builds them on
 /// structured values and reads equal the model; a checkpoint writes them
-/// (version 6) and they recover under every compression setting, beside
+/// (version 1) and they recover under every compression setting, beside
 /// newer plain runs; a snapshot keeps reading dictionary runs that a later
 /// compaction replaced.
 #[test]
@@ -536,7 +538,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     engine.checkpoint_to(&scratch.0).unwrap();
     let versions = run_versions(&scratch.0);
     assert!(
-        !versions.is_empty() && versions.iter().all(|&v| v == 6),
+        !versions.is_empty() && versions.iter().all(|&v| v == 1),
         "{versions:?}"
     );
 
@@ -880,7 +882,7 @@ fn closing_a_recovered_engine_takes_no_checkpoint() {
 }
 
 #[test]
-fn multi_segment_checkpoint_streams_one_v6_run_and_recovers() {
+fn multi_segment_checkpoint_streams_one_run_and_recovers() {
     for compression in [Compression::Zstd, Compression::Uncompressed] {
         let options = Options {
             compression,
@@ -896,7 +898,7 @@ fn multi_segment_checkpoint_streams_one_v6_run_and_recovers() {
         }
         let report = engine.checkpoint_to(&scratch.0).unwrap();
         assert_eq!((report.runs, report.records), (1, 9_000));
-        assert_eq!(run_versions(&scratch.0), vec![6]);
+        assert_eq!(run_versions(&scratch.0), vec![1]);
         let recovered = Engine::open(&scratch.0, options).unwrap();
         let stats = recovered.engine_stats();
         assert_eq!(stats.runs, 1);
@@ -947,6 +949,7 @@ fn checkpoints_preserve_bottom_runs_without_filters() {
             engine
                 .core
                 .read_state()
+                .only()
                 .runs
                 .iter()
                 .all(|run| run.run.filter().is_none())
@@ -965,6 +968,7 @@ fn checkpoints_preserve_bottom_runs_without_filters() {
             recovered
                 .core
                 .read_state()
+                .only()
                 .runs
                 .iter()
                 .all(|run| run.run.filter().is_none())

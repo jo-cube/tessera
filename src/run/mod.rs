@@ -47,7 +47,7 @@
 //! block length and dictionary always encode to the same bytes. A run
 //! contains no process pointers.
 //!
-//! Version 6 stores independently decodable blocks followed by raw-content
+//! Version 1 stores independently decodable blocks followed by raw-content
 //! segment dictionaries, a segment table, the sparse block index, keys and footer.
 //!
 //! ```text
@@ -163,7 +163,7 @@ pub(crate) fn input_len(key: &[u8], value: crate::block::Value<'_>) -> usize {
 }
 
 const MAGIC: u32 = u32::from_le_bytes(*b"TSRA");
-const FORMAT_VERSION: u32 = 6;
+const FORMAT_VERSION: u32 = 1;
 const TABLE_ENTRY_LEN: usize = 8;
 const SEGMENT_ENTRY_LEN: usize = 16;
 const FOOTER_LEN: usize = 48;

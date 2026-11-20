@@ -54,10 +54,13 @@
 //! `Keyspace` handle is dropped; either joins its background workers and
 //! releases the lock, and writes nothing.
 //!
-//! A [`Keyspace`] is a named, independent key space. Keys and values are
-//! byte strings of at most [`MAX_KEY_LEN`] and [`MAX_VALUE_LEN`] bytes. An
-//! engine holds one live keyspace; [`Engine::drop_keyspace`] removes it and
-//! its data, and the name can be created again.
+//! A [`Keyspace`] is a named, independent key space: the same key in two
+//! keyspaces is two records, and scans never cross from one to another. Keys
+//! and values are byte strings of at most [`MAX_KEY_LEN`] and
+//! [`MAX_VALUE_LEN`] bytes. An engine holds up to 4096 live keyspaces, and a
+//! [`WriteBatch`] or [`Snapshot`] spans all of them.
+//! [`Engine::drop_keyspace`] removes one and its data, and the name can be
+//! created again as an empty keyspace with another ID.
 //!
 //! # Reads
 //!

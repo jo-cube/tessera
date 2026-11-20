@@ -365,7 +365,7 @@ fn assemble_frames_with_min(
     run.extend_from_slice(&dictionaries_offset.to_le_bytes());
     run.extend_from_slice(&u32::from(has_dictionary).to_le_bytes());
     run.extend_from_slice(&0u32.to_le_bytes());
-    run.extend_from_slice(&6u32.to_le_bytes());
+    run.extend_from_slice(&1u32.to_le_bytes());
     run.extend_from_slice(b"TSRA");
     reseal_index(&mut run);
     run
@@ -472,7 +472,7 @@ fn uncompressed_format_is_exactly_the_documented_bytes() {
         &[51, 0, 0, 0, 0, 0, 0, 0],
         &[0; 4],
         &crc32fast::hash(&[&[0,0,0,0,4,0,0,0][..], &[26,0,0,0,7,0,0,0], b"a\0\0a\0\0b"].concat()).to_le_bytes(),
-        &[6, 0, 0, 0],
+        &[1, 0, 0, 0],
         b"TSRA",
     ]
     .concat();
@@ -1189,6 +1189,7 @@ fn malformed_structures_are_rejected() {
     let cases: &[(&str, Mutation, RunCorruption)] = &[
         ("magic", |b, l| b[l.footer + 47] ^= 1, InvalidMagic),
         ("zero version", |b, l| put_u32(b, l.footer + 40, 0), UnsupportedVersion),
+        ("next version", |b, l| put_u32(b, l.footer + 40, 2), UnsupportedVersion),
         ("maximum version", |b, l| put_u32(b, l.footer + 40, u32::MAX), UnsupportedVersion),
         ("index offset past end", |b, l| put_u64(b, l.footer, 1 << 40), InvalidFooter),
         ("index offset overflow", |b, l| put_u64(b, l.footer, u64::MAX), InvalidFooter),

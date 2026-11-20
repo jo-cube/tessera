@@ -171,17 +171,20 @@ impl Workspace {
             .map(|hit| hit.value.as_ref().map(|range| &self.values[range.clone()]))
     }
 
-    /// Looks up `keys` in `view`.
+    /// Looks up `keys` of the keyspace with `prefix` in `tables`, newest
+    /// first, and then `runs`.
     pub(super) fn lookup_view<K: AsRef<[u8]>>(
         &mut self,
         keys: &[K],
-        view: &View,
+        tables: &[Arc<FrozenMemtable>],
+        prefix: KeyPrefix,
+        runs: &RunDirectory,
     ) -> Result<(), ReadError> {
         self.prepare(keys);
-        for table in &view.tables {
-            self.table(keys, |key| table.get(key));
+        for table in tables {
+            self.table(keys, |key| table.get_in(prefix.key(key)));
         }
-        self.runs(keys, &view.runs)
+        self.runs(keys, runs)
     }
 
     /// Releases buffers whose capacity exceeds `bytes`.
@@ -210,12 +213,13 @@ impl Core {
     ) -> Result<()> {
         multi.prepare(keys);
         let state = self.read_state();
-        state.check_keyspace(keyspace)?;
-        multi.table(keys, |key| state.active.get(key));
+        let space = state.keyspace(keyspace)?;
+        let prefix = space.prefix;
+        multi.table(keys, |key| state.active.get_in(prefix.key(key)));
         for table in state.frozen.iter().rev() {
-            multi.table(keys, |key| table.get(key));
+            multi.table(keys, |key| table.get_in(prefix.key(key)));
         }
-        let directory = Arc::clone(&state.directory);
+        let directory = Arc::clone(&space.directory);
         drop(state);
         multi.runs(keys, &directory)?;
         Ok(())

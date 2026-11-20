@@ -296,21 +296,22 @@ fn a_report_describes_what_was_published() {
 
 #[test]
 fn a_write_to_a_full_table_flushes_it_and_lands_in_the_next() {
-    let budget = 1 + 1 + ENTRY_OVERHEAD;
+    // One record: its keyspace prefix, key and value bytes.
+    let budget = 1 + 1 + 3 + ENTRY_OVERHEAD;
     let engine = Engine::in_memory(Options {
         memtable_size: budget,
         ..manual()
     })
     .unwrap();
-    let a = engine.ks().put_seq(b"a", b"v").unwrap();
-    let b = engine.ks().put_seq(b"b", b"v").unwrap();
+    let a = engine.ks().put_seq(b"a", b"vvv").unwrap();
+    let b = engine.ks().put_seq(b"b", b"vvv").unwrap();
     assert_eq!(b, a + 1);
     let stats = engine.engine_stats();
     assert_eq!(stats.runs + stats.frozen_tables, 1);
     assert_eq!(stats.active.charged, budget);
     assert_eq!(
         scanned(&engine, b""),
-        [live(b"a", a, b"v"), live(b"b", b, b"v")]
+        [live(b"a", a, b"vvv"), live(b"b", b, b"vvv")]
     );
 }
 
@@ -876,17 +877,18 @@ fn the_defaults_compact_in_the_background() {
     }
 }
 
-/// The smallest budget admits exactly the smallest record: an empty key
-/// with no value.
+/// The smallest budget admits an empty record behind the longest, 5-byte
+/// keyspace prefix: in a keyspace with a 1-byte prefix, a 4-byte key.
 #[test]
 fn the_smallest_budget_admits_the_smallest_record() {
     let engine = Engine::in_memory(Options {
-        memtable_size: ENTRY_OVERHEAD,
+        memtable_size: ENTRY_OVERHEAD + 5,
         ..manual()
     })
     .unwrap();
     engine.ks().delete(b"").unwrap();
-    let error = engine.ks().put(b"k", b"").unwrap_err();
+    engine.ks().delete(b"kkkk").unwrap();
+    let error = engine.ks().put(b"kkkkk", b"").unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }
 

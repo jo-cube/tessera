@@ -85,6 +85,49 @@ pub(super) enum Dest {
     Anywhere(usize),
 }
 
+/// How much a keyspace's levels need compaction, compared across keyspaces
+/// to choose the one compaction serves: a level 0 at the writer stop first,
+/// then the highest level score, then small neighbours to merge.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Score {
+    class: u8,
+    /// The score as a fraction, compared exactly.
+    numerator: usize,
+    denominator: usize,
+}
+
+impl Score {
+    fn new(class: u8, numerator: usize, denominator: usize) -> Self {
+        Self {
+            class,
+            numerator,
+            denominator,
+        }
+    }
+}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let left = self.numerator as u128 * other.denominator as u128;
+        let right = other.numerator as u128 * self.denominator as u128;
+        self.class.cmp(&other.class).then(left.cmp(&right))
+    }
+}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Score {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Score {}
+
 /// Why levels refused a change: what selection saw has since changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Stale;
@@ -536,6 +579,42 @@ impl Levels {
     /// The next step: the highest-scoring level, then small neighbours, or idle.
     pub(super) fn plan(&self, fit: &Fit) -> Plan {
         let segment = self.segment(fit);
+        if let Some((level, _, _)) = self.due(fit, segment) {
+            return self.plan_level(level, fit);
+        }
+        self.plan_neighbours(fit, segment).unwrap_or(Plan::Idle)
+    }
+
+    /// How much [`Self::plan`] has to do, or `None` if it would be idle.
+    pub(super) fn score(&self, fit: &Fit) -> Option<Score> {
+        if self.level0_flushes() >= fit.level0_stop {
+            return Some(Score::new(2, 1, 1));
+        }
+        let segment = self.segment(fit);
+        if let Some((_, numerator, denominator)) = self.due(fit, segment) {
+            return Some(Score::new(1, numerator, denominator));
+        }
+        self.plan_neighbours(fit, segment)
+            .map(|_| Score::new(0, 1, 1))
+    }
+
+    /// Bytes a reclaiming compaction could free at most: every level above
+    /// the last, whose versions merging may discard, and the runs of the
+    /// last level holding versions or tombstones to discard.
+    pub(super) fn reclaimable_bytes(&self) -> usize {
+        let last = self.levels.len() - 1;
+        let above: usize = self.bytes[..last].iter().sum();
+        let below: usize = self.levels[last]
+            .iter()
+            .filter(|run| run.run.reclaimable())
+            .map(bytes_of)
+            .sum();
+        above + below
+    }
+
+    /// The highest-scoring level over its target, with its score as a
+    /// fraction.
+    fn due(&self, fit: &Fit, segment: usize) -> Option<(usize, usize, usize)> {
         let base = BASE_SEGMENTS.saturating_mul(segment);
         let last = self.levels.len() - 1;
         // Scores as fractions: (numerator, denominator), compared exactly.
@@ -565,10 +644,7 @@ impl Levels {
             let right = b.1 as u128 * a.2 as u128;
             right.cmp(&left).then(a.0.cmp(&b.0))
         });
-        if let Some(&(level, _, _)) = due.first() {
-            return self.plan_level(level, fit);
-        }
-        self.plan_neighbours(fit, segment).unwrap_or(Plan::Idle)
+        due.first().copied()
     }
 
     /// Pressure may reclaim versions below ordinary level targets. Every job

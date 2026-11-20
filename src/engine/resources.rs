@@ -191,7 +191,12 @@ impl Core {
         }
     }
 
-    pub(super) fn validate_record(&self, key: &[u8], value: Value<'_>) -> Result<(), UpdateError> {
+    pub(super) fn validate_record(
+        &self,
+        prefix: KeyPrefix,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> Result<(), UpdateError> {
         let len = match value {
             Value::Bytes(bytes) => bytes.len(),
             Value::Tombstone => 0,
@@ -201,7 +206,7 @@ impl Core {
         } else if len > MAX_VALUE_LEN {
             Some(WriteError::ValueTooLong { len })
         } else {
-            let charge = key.len() + len + ENTRY_OVERHEAD;
+            let charge = prefix.as_bytes().len() + key.len() + len + ENTRY_OVERHEAD;
             (charge > self.memtable_budget).then_some(WriteError::RecordExceedsBudget {
                 charge,
                 budget: self.memtable_budget,
@@ -292,7 +297,11 @@ impl Core {
                 ..self.policy
             };
             let fit = options.fit(self.target_run_len, state.level0_stop);
-            if matches!(state.levels.plan_reclaim(&fit), Plan::Idle) {
+            if state
+                .keyspaces
+                .values()
+                .all(|space| matches!(space.levels.plan_reclaim(&fit), Plan::Idle))
+            {
                 return Err(UpdateError::MemoryLimit {
                     used: usage.used,
                     limit,
@@ -480,7 +489,10 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::MemoryLimit);
         assert_formula(engine.engine_stats());
         let mut logical = crate::run::LogicalWorkspace::default();
-        let found = snapshot.get(b"key", &mut logical).unwrap().unwrap();
+        let found = snapshot
+            .get(snapshot.only().unwrap(), b"key", &mut logical)
+            .unwrap()
+            .unwrap();
         assert_eq!(found.value, [0; 4096]);
         drop(snapshot);
         let released = engine.engine_stats();
@@ -529,7 +541,7 @@ mod tests {
         let cases = [
             (
                 Options {
-                    memtable_size: ENTRY_OVERHEAD - 1,
+                    memtable_size: ENTRY_OVERHEAD + MAX_PREFIX_LEN - 1,
                     ..Options::default()
                 },
                 "Options::memtable_size",
@@ -613,7 +625,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!recovered.core.read_state().runs[0].run.reclaimable());
+        assert!(!recovered.core.read_state().only().runs[0].run.reclaimable());
         let error = recovered.ks().put(b"new", b"value").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MemoryLimit);
         assert_eq!(recovered.background_status().unwrap().compactions, 0);

@@ -327,14 +327,8 @@ fn error_kinds_by_failure() {
         );
     }
     let max_name = "n".repeat(crate::MAX_KEYSPACE_NAME_LEN);
-    let second = engine.keyspace(&max_name).unwrap_err();
-    assert_eq!(second.kind(), ErrorKind::InvalidInput);
-    assert!(
-        second
-            .to_string()
-            .contains("this engine holds one keyspace"),
-        "{second}"
-    );
+    let longest = engine.keyspace(&max_name).unwrap();
+    assert_eq!(longest.name(), max_name);
 
     let long_key = vec![0; MAX_KEY_LEN + 1];
     assert_eq!(kind(ks.put(&long_key, b"")), ErrorKind::InvalidInput);
@@ -455,14 +449,12 @@ fn a_dropped_keyspace_refuses_its_handles_and_its_name_can_be_reused() {
     assert!(before.reader().multi_get(&again, &[b"k"]).unwrap()[0].is_none());
     assert_eq!(dropped(users.put(b"k", b"v")), ErrorKind::KeyspaceDropped);
     assert_eq!(engine.keyspaces(), ["users"]);
-    // After the drop, another name is allowed.
-    assert!(engine.drop_keyspace("users").unwrap());
     engine.keyspace("orders").unwrap();
-    assert_eq!(engine.keyspaces(), ["orders"]);
+    assert_eq!(engine.keyspaces(), ["orders", "users"]);
 }
 
 #[test]
-fn stats_cover_the_live_keyspace() {
+fn stats_cover_each_live_keyspace() {
     let (engine, ks, _) = layered();
     let stats = engine.stats();
     assert_eq!(stats.memory_limit, None);

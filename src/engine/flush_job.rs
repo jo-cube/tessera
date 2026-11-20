@@ -14,13 +14,25 @@ pub(super) struct FlushJob<'e> {
     /// Oldest first: a prefix of the state's frozen tables, since only
     /// flushes, one at a time, add or remove them.
     pub(super) tables: Vec<Arc<FrozenMemtable>>,
-    /// Where to split the runs, from level 1 when the flush began. Level 1
-    /// may change before the flush publishes; level 0 allows any overlap,
-    /// so stale cuts change only how well the runs fit, never a read.
-    pub(super) cuts: FlushCuts,
+    /// The keyspaces live when the flush began, sorted by prefix, and where
+    /// to split each one's runs, from its level 1 then. Level 1 may change
+    /// before the flush publishes; level 0 allows any overlap, so stale cuts
+    /// change only how well the runs fit, never a read. Records of other
+    /// keyspaces, which were dropped, are left out.
+    pub(super) spaces: Vec<(u32, KeyPrefix, FlushCuts)>,
 }
 
 impl<'e> FlushJob<'e> {
+    /// A flush of every frozen table in `state`, holding `serial`.
+    pub(super) fn new(engine: &'e Core, serial: MutexGuard<'e, ()>, state: &State) -> Self {
+        Self {
+            engine,
+            _serial: serial,
+            tables: state.frozen.clone(),
+            spaces: state.flush_spaces(engine.target_run_len),
+        }
+    }
+
     /// Builds the runs, compressing without the state lock. Several tables
     /// are merged as one, keeping each key's newest update.
     pub(super) fn build(self) -> BuiltFlush<'e> {
@@ -33,22 +45,39 @@ impl<'e> FlushJob<'e> {
             .resources
             .build(estimate, crate::run::workspace_estimate([]));
         let tables: Vec<&FrozenMemtable> = self.tables.iter().map(Arc::as_ref).collect();
-        let runs = flush_merged(
+        let spaces: Vec<FlushSpace<'_>> = self
+            .spaces
+            .iter()
+            .map(|(_, prefix, cuts)| FlushSpace {
+                prefix: prefix.as_bytes(),
+                cuts,
+            })
+            .collect();
+        let built = flush_merged(
             &tables,
             self.engine.target_run_len,
             self.engine.codec,
             self.engine.target_block_compressed,
-            &self.cuts,
+            &spaces,
             &self.engine.chunks,
         );
+        let spaces: Vec<(u32, crate::memtable::SpaceRuns)> = self
+            .spaces
+            .iter()
+            .map(|(id, _, _)| *id)
+            .zip(built)
+            .filter(|(_, space)| !space.runs.is_empty())
+            .collect();
         charge.finished(
-            runs.iter()
+            spaces
+                .iter()
+                .flat_map(|(_, space)| &space.runs)
                 .map(|run| run.stored_len() + run.held_bytes())
                 .sum(),
         );
         BuiltFlush {
             job: self,
-            runs,
+            spaces,
             charge,
         }
     }
@@ -72,10 +101,25 @@ impl fmt::Debug for FlushJob<'_> {
 pub(super) struct BuiltFlush<'e> {
     charge: resources::BuildCharge<'e>,
     job: FlushJob<'e>,
-    pub(super) runs: Vec<Run<Vec<u8>>>,
+    /// Each keyspace with records in the tables, and its runs.
+    pub(super) spaces: Vec<(u32, crate::memtable::SpaceRuns)>,
+}
+
+/// One keyspace's runs of a published flush, and the level-0 flush they
+/// were published as.
+pub(super) struct Kept {
+    pub(super) keyspace: u32,
+    pub(super) flush: u64,
+    pub(super) runs: Vec<SharedRun>,
 }
 
 impl BuiltFlush<'_> {
+    /// The runs built, over every keyspace.
+    #[cfg(test)]
+    pub(super) fn runs(&self) -> impl Iterator<Item = &Run<Vec<u8>>> {
+        self.spaces.iter().flat_map(|(_, space)| &space.runs)
+    }
+
     /// Publishes the runs and removes the frozen tables in one step.
     ///
     pub(super) fn publish(self) -> FlushReport {
@@ -83,16 +127,23 @@ impl BuiltFlush<'_> {
     }
 
     /// The checkpoint keeps the exact outputs even if compaction replaces them.
-    pub(super) fn publish_kept(self) -> (FlushReport, Vec<SharedRun>) {
-        let Self { job, runs, charge } = self;
+    pub(super) fn publish_kept(self) -> (FlushReport, Vec<Kept>) {
+        let Self {
+            job,
+            spaces,
+            charge,
+        } = self;
+        let runs = || spaces.iter().flat_map(|(_, space)| &space.runs);
         let report = FlushReport {
             tables: job.tables.len(),
             records: job.records(),
-            runs: runs.len(),
-            run_bytes: runs.iter().map(|run| run.stored_len()).sum(),
-            held_bytes: runs.iter().map(Run::held_bytes).sum(),
-            filter_build_bytes: runs.iter().map(Run::filter_build_bytes).max().unwrap_or(0),
+            runs: runs().count(),
+            run_bytes: runs().map(Run::stored_len).sum(),
+            held_bytes: runs().map(Run::held_bytes).sum(),
+            filter_build_bytes: runs().map(Run::filter_build_bytes).max().unwrap_or(0),
         };
+        #[cfg(feature = "diagnostics")]
+        let raw: usize = runs().map(Run::raw_len).sum();
         let mut state = job.engine.write_state();
         let flushed = job.tables.len();
         assert!(
@@ -102,24 +153,26 @@ impl BuiltFlush<'_> {
                 .all(|(held, flushed)| Arc::ptr_eq(held, flushed)),
             "a flush's tables are the oldest frozen ones"
         );
-        let runs: Vec<SharedRun> = published(runs).collect();
-        let logical = job
-            .tables
-            .iter()
-            .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
-            .sum();
-        state.levels.push_flush(&runs, logical);
+        let mut kept = Vec::with_capacity(spaces.len());
+        for (keyspace, space) in spaces {
+            // Dropping a keyspace waits for flushes, so this holds; a
+            // keyspace dropped before the flush began is not among them.
+            let Some(target) = state.keyspaces.get_mut(&keyspace) else {
+                continue;
+            };
+            let runs: Vec<SharedRun> = published(space.runs).collect();
+            let flush = target.levels.next_flush();
+            target.levels.push_flush(&runs, space.logical);
+            target.runs.extend(runs.iter().cloned());
+            state.published(keyspace);
+            kept.push(Kept {
+                keyspace,
+                flush,
+                runs,
+            });
+        }
         #[cfg(feature = "diagnostics")]
-        job.engine.chunks.work(
-            0,
-            0,
-            runs.iter().map(|run| run.run.raw_len()).sum(),
-            report.run_bytes,
-        );
-        state.runs.extend(runs.iter().cloned());
-        state.order_runs();
-        state.run_bytes += report.run_bytes;
-        state.held_bytes += report.held_bytes;
+        job.engine.chunks.work(0, 0, raw, report.run_bytes);
         state.flushes += 1;
         state.flushed_bytes += report.run_bytes as u64;
         state.flush_totals.add(report);
@@ -144,14 +197,14 @@ impl BuiltFlush<'_> {
         drop(state);
         job.engine.flush_signal.changed();
         job.engine.resources.changed();
-        (report, runs)
+        (report, kept)
     }
 }
 
 impl fmt::Debug for BuiltFlush<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BuiltFlush")
-            .field("runs", &self.runs.len())
+            .field("keyspaces", &self.spaces.len())
             .finish_non_exhaustive()
     }
 }

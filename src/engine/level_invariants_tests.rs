@@ -75,8 +75,9 @@ fn settle(engine: &Engine, steps: &mut Steps) {
 /// Each level's runs by identity, level 0 first.
 fn level_ids(engine: &Engine) -> Vec<Vec<usize>> {
     let state = engine.core.read_state();
-    state.levels.check(&state.runs);
+    state.only().levels.check(&state.only().runs);
     state
+        .only()
         .levels
         .runs()
         .iter()
@@ -242,6 +243,7 @@ fn recovery_preserves_run_ids_and_levels() {
         expected = engine
             .core
             .read_state()
+            .only()
             .levels
             .runs()
             .iter()
@@ -256,6 +258,7 @@ fn recovery_preserves_run_ids_and_levels() {
     let actual: Vec<Vec<_>> = engine
         .core
         .read_state()
+        .only()
         .levels
         .runs()
         .iter()
@@ -494,7 +497,7 @@ fn a_flush_split_at_stale_boundaries_publishes_correctly() {
         put(&engine, index * 59 + 3, 20_000 + index);
     }
     let job = engine.core.begin_flush().unwrap();
-    assert!(!job.cuts.at.is_empty());
+    assert!(!job.spaces[0].2.at.is_empty());
     // ... then compaction rewrites level 1 under it.
     let mut workspace = MergeWorkspace::new();
     let report = engine.core.compact(eager, &mut workspace).unwrap().unwrap();
@@ -663,7 +666,7 @@ fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
 /// The bottom level's records by key, with their stored sequences.
 fn bottom_seqs(engine: &Engine) -> BTreeMap<Vec<u8>, u64> {
     let state = engine.core.read_state();
-    let bottom = state.levels.runs().last().unwrap();
+    let bottom = state.only().levels.runs().last().unwrap();
     let mut out = BTreeMap::new();
     for run in bottom {
         let mut workspace = crate::run::ReadWorkspace::new();
@@ -711,7 +714,15 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     flush(&[b"p", b"q", b"z"].map(|key| (&key[..], 2 * wide)), "r2");
     settle_with(&engine, eager, &mut Steps::default());
     assert_eq!(
-        engine.core.read_state().levels.runs().last().unwrap().len(),
+        engine
+            .core
+            .read_state()
+            .only()
+            .levels
+            .runs()
+            .last()
+            .unwrap()
+            .len(),
         2
     );
     // Level 0, oldest first: the source, a run reaching both bottom runs,
@@ -766,7 +777,7 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
         assert_eq!(scan(&recovered.snapshot()), model, "{name}");
         assert_eq!(bottom_seqs(&recovered), bottom, "{name}");
         let state = recovered.core.read_state();
-        for run in &state.runs {
+        for run in &state.only().runs {
             let records = bottom_seqs_of(&run.run);
             assert_eq!(run.run.min_seq(), records.iter().copied().min().unwrap());
             assert_eq!(run.run.max_seq(), records.iter().copied().max().unwrap());
@@ -775,7 +786,7 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     // Once the skipped run is merged, nothing contests any key.
     settle_with(&engine, eager, &mut Steps::default());
     assert_eq!(scan(&engine.snapshot()), model);
-    assert_eq!(engine.core.read_state().levels.runs()[0].len(), 0);
+    assert_eq!(engine.core.read_state().only().levels.runs()[0].len(), 0);
     assert!(bottom_seqs(&engine).values().all(|&seq| seq == 0));
     std::fs::remove_dir_all(&base).unwrap();
 }

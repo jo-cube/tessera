@@ -168,6 +168,8 @@ pub(crate) struct CompactionReport {
 pub(super) struct CompactionJob<'e> {
     pub(super) engine: &'e Core,
     pub(super) _serial: MutexGuard<'e, ()>,
+    /// The keyspace whose runs it compacts.
+    pub(super) keyspace: u32,
     pub(super) inputs: Vec<SharedRun>,
     /// Unselected runs whose key ranges overlap the inputs' span. They may
     /// hold older versions that the inputs' tombstones hide.
@@ -329,7 +331,10 @@ impl<'e> CompactionJob<'e> {
             (crate::run::copy_audit::enabled() && self.zero_seq && self.source_count > 0).then(
                 || {
                     let state = self.engine.read_state();
-                    let bottom = state.levels.runs().last().expect("a bottom level");
+                    let space = state
+                        .keyspace(self.keyspace)
+                        .expect("a compacting keyspace");
+                    let bottom = space.levels.runs().last().expect("a bottom level");
                     inputs
                         .iter()
                         .map(|run| bottom.iter().any(|b| Arc::ptr_eq(b, run)))
@@ -432,13 +437,15 @@ impl<'e> CompactionJob<'e> {
         diagnostics::observe("job_before_publish", self.engine.stats());
         let is_input = |run: &SharedRun| inputs.iter().any(|input| Arc::ptr_eq(input, run));
         let mut state = self.engine.write_state();
-        if state.runs.iter().filter(|run| is_input(run)).count() != inputs.len() {
+        // Dropping a keyspace waits for compactions, so it is live.
+        let space = state.space_mut(self.keyspace);
+        if space.runs.iter().filter(|run| is_input(run)).count() != inputs.len() {
             drop(state);
             unreachable!("compactions are serialized, so only this one removes runs");
         }
         #[cfg(feature = "diagnostics")]
         let bottom_bytes = if self.zero_seq {
-            let bottom = state.levels.runs().last().unwrap();
+            let bottom = space.levels.runs().last().unwrap();
             if self.source_count > 0 {
                 let (mut blocks, mut raw, mut segments) = (0, 0, 0);
                 for run in bottom.iter().filter(|r| is_input(r)) {
@@ -460,11 +467,11 @@ impl<'e> CompactionJob<'e> {
         #[cfg(feature = "diagnostics")]
         let copied_raw = output.copied.raw as usize;
         let outputs: Vec<SharedRun> = published(output.runs).collect();
-        if state.levels.replace(inputs, &outputs, self.dest).is_err() {
+        if space.levels.replace(inputs, &outputs, self.dest).is_err() {
             return Err(CompactionError::Stale);
         }
         match &self.cursor {
-            Some(Cursor::After(key)) => state.levels.advance(self.level, key),
+            Some(Cursor::After(key)) => space.levels.advance(self.level, key),
             None => {}
         }
         #[cfg(feature = "diagnostics")]
@@ -481,11 +488,11 @@ impl<'e> CompactionJob<'e> {
                 report.output_bytes,
             );
         }
-        state.runs.retain(|run| !is_input(run));
-        state.runs.extend(outputs);
-        state.order_runs();
-        state.recount_runs();
-        state.retire_runs(inputs);
+        let space = state.space_mut(self.keyspace);
+        space.runs.retain(|run| !is_input(run));
+        space.runs.extend(outputs);
+        state.published(self.keyspace);
+        state.retire_runs(self.keyspace, inputs);
         drop(charge);
         drop(state);
         self.engine.resources.changed();

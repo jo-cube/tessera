@@ -191,67 +191,47 @@ impl Engine {
 
     /// Returns the keyspace `name`, creating it if it does not exist. Names
     /// are 1 to [`MAX_KEYSPACE_NAME_LEN`] bytes of ASCII letters, digits,
-    /// `_`, `.` and `-`, compared exactly. A new keyspace is durable from
-    /// the next checkpoint.
-    ///
-    /// An engine holds one live keyspace: while one exists, any other name
-    /// is refused. [`Engine::drop_keyspace`] frees the engine for a new one.
+    /// `_`, `.` and `-`, compared exactly. An engine holds at most 4096 live
+    /// keyspaces. A created keyspace is durable from the next checkpoint.
     ///
     /// # Errors
-    /// [`ErrorKind::InvalidInput`] for a name outside the rules or a second
-    /// keyspace; [`ErrorKind::Stopped`] after [`Engine::close`].
+    /// [`ErrorKind::InvalidInput`] for a name outside the rules, or when
+    /// creating the keyspace would exceed the limit; [`ErrorKind::Stopped`] after
+    /// [`Engine::close`].
     pub fn keyspace(&self, name: &str) -> Result<Keyspace> {
         let _open = self.shared.enter()?;
         if !valid_name(name) {
             return Err(invalid_name(name));
         }
-        let found = |state: &State| match &state.keyspace {
-            Some(entry) if &*entry.name == name => Some(Ok(self.handle(entry))),
-            Some(entry) => Some(Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "this engine holds one keyspace, {:?}; drop it to create {name:?}",
-                    entry.name
-                ),
-            ))),
-            None => None,
+        let found = |state: &State| {
+            state
+                .names
+                .get_key_value(name)
+                .map(|(name, &id)| self.handle(id, name))
         };
         if let Some(found) = found(&self.core.read_state()) {
-            return found;
+            return Ok(found);
         }
         let mut state = self.core.write_state();
         if let Some(found) = found(&state) {
-            return found;
+            return Ok(found);
         }
-        let id = state.next_keyspace;
-        state.next_keyspace = id
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "keyspace IDs are exhausted"))?;
-        let entry = Entry {
-            id,
-            name: Arc::from(name),
-        };
-        let keyspace = self.handle(&entry);
-        state.keyspace = Some(entry);
-        Ok(keyspace)
+        let id = state.create_keyspace(name, self.core.level_ratio)?;
+        Ok(self.handle(id, &state.keyspaces[&id].name))
     }
 
-    fn handle(&self, entry: &Entry) -> Keyspace {
+    fn handle(&self, id: u32, name: &Arc<str>) -> Keyspace {
         Keyspace {
             shared: Arc::clone(&self.shared),
-            id: entry.id,
-            name: Arc::clone(&entry.name),
+            id,
+            name: Arc::clone(name),
         }
     }
 
     /// The names of the live keyspaces, in bytewise order.
     pub fn keyspaces(&self) -> Vec<String> {
         let state = self.core.read_state();
-        state
-            .keyspace
-            .iter()
-            .map(|entry| entry.name.to_string())
-            .collect()
+        state.names.keys().map(|name| name.to_string()).collect()
     }
 
     /// Drops keyspace `name` and its data, and returns whether it existed.
@@ -430,11 +410,11 @@ impl Engine {
             stored_bytes: state.run_bytes,
             snapshot_bytes: usage.snapshots,
             keyspaces: state
-                .keyspace
+                .names
                 .iter()
-                .map(|entry| KeyspaceStats {
-                    name: entry.name.to_string(),
-                    stored_bytes: state.run_bytes,
+                .map(|(name, id)| KeyspaceStats {
+                    name: name.to_string(),
+                    stored_bytes: state.keyspaces[id].run_bytes,
                 })
                 .collect(),
         }
@@ -596,12 +576,12 @@ impl Keyspace {
     pub fn stats(&self) -> Result<KeyspaceStats> {
         let _open = self.shared.enter()?;
         let state = self.shared.core.read_state();
-        state
-            .check_keyspace(self.id)
+        let space = state
+            .keyspace(self.id)
             .map_err(|error| self.named(error.into()))?;
         Ok(KeyspaceStats {
             name: self.name.to_string(),
-            stored_bytes: state.run_bytes,
+            stored_bytes: space.run_bytes,
         })
     }
 }
@@ -678,11 +658,11 @@ impl Engine {
     /// one publication sequence.
     pub(crate) fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
         assert!(batch.is_sorted(), "ingestion needs strictly sorted keys");
-        let Some(keyspace) = batch.keyspace()? else {
+        if batch.is_empty() {
             return Ok(self.core.read_state().last_seq);
-        };
+        }
         batch.validate(self.core.memtable_budget)?;
-        self.core.ingest_batch(keyspace, batch, true)
+        self.core.ingest_batch(batch, true)
     }
 
     /// Opens or creates the keyspace the crate's tests write to.
@@ -726,9 +706,10 @@ impl Engine {
     /// The test keyspace's latest value of `key` and its sequence number.
     pub(crate) fn get_seq(&self, key: &[u8]) -> Option<(u64, Vec<u8>)> {
         let mut logical = LogicalWorkspace::default();
+        let id = self.ks().id();
         self.core
             .snapshot()
-            .get(key, &mut logical)
+            .get(id, key, &mut logical)
             .unwrap()
             .map(|found| (found.seq, found.value.to_vec()))
     }

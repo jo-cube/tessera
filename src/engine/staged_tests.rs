@@ -73,7 +73,7 @@ mod flush {
         assert!(engine.engine_stats().frozen.is_some());
 
         let built = job.build();
-        assert_eq!(built.runs.len(), 1);
+        assert_eq!(built.runs().count(), 1);
         assert_eq!(scanned(&engine, b""), expected);
         assert_eq!(
             engine.engine_stats().runs,
@@ -107,7 +107,8 @@ mod flush {
         built.publish();
         assert_eq!(scanned(&engine, b""), expected);
         assert_eq!(value_of(&engine, b"b"), None);
-        assert_eq!(engine.engine_stats().active.payload, 1 + 6 + 1 + 1 + 6);
+        // Each key carries its keyspace's one-byte prefix.
+        assert_eq!(engine.engine_stats().active.payload, 2 + 6 + 2 + 2 + 6);
     }
 
     #[test]
@@ -118,7 +119,7 @@ mod flush {
         engine.ks().put(b"a", b"during").unwrap();
         assert_eq!(job.tables.iter().map(|table| table.len()).sum::<usize>(), 1);
         let built = job.build();
-        assert_eq!(built.runs[0].len(), 1);
+        assert_eq!(built.runs().next().unwrap().len(), 1);
         built.publish();
         assert_eq!(value_of(&engine, b"a").unwrap().1, b"during");
     }
@@ -180,11 +181,12 @@ mod flush {
         let job = engine.core.begin_flush().unwrap();
         engine.ks().put(b"bb", b"1").unwrap();
         let stats = engine.engine_stats();
-        assert_eq!(stats.frozen.unwrap().payload, 6);
-        assert_eq!(stats.active.payload, 3);
+        // Each key carries its keyspace's one-byte prefix.
+        assert_eq!(stats.frozen.unwrap().payload, 7);
+        assert_eq!(stats.active.payload, 4);
         job.build().publish();
         let stats = engine.engine_stats();
-        assert_eq!(stats.active.payload, 3);
+        assert_eq!(stats.active.payload, 4);
         assert!(stats.run_bytes > 0);
     }
 
@@ -490,6 +492,8 @@ mod compaction {
                 ..manual()
             })
             .unwrap();
+            // Snapshots taken before the first write read the keyspace too.
+            engine.ks();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             let mut stage = Stage::Idle;
             let mut workspace = MergeWorkspace::new();

@@ -5,13 +5,15 @@
 //! structural snapshot at that rotation's sequence ceiling. Later writes and
 //! compactions proceed while files are written, outside the state lock.
 //!
-//! Layout: `runs/<32-hex-digit RunId>` holds the exact v6 run chunks, followed
+//! Layout: `runs/<32-hex-digit RunId>` holds the exact run chunks (run format 1), followed
 //! by little-endian Bloom words and their CRC-32. The manifest records both
 //! lengths and a CRC-32 of the entire file. Filters use the fixed hash defined
 //! in `run/filter.rs`; recovery validates runs and filter membership, then
 //! checks copies across runs, without rebuilding filters.
-//! `ckpt-<20-digit generation>/MANIFEST` records levels, level-0 flush groups,
-//! effective sequence overrides, ceiling, next ID counter and application data.
+//! `ckpt-<20-digit generation>/MANIFEST` (manifest format 1; see [`Manifest`])
+//! records the keyspaces with their IDs, names and level depths, the next
+//! keyspace ID, each run's keyspace, level and level-0 flush group, effective
+//! sequence overrides, ceiling, next run ID counter and application metadata.
 //!
 //! Publication uses the LOCK/CURRENT protocol: sync every new run file,
 //! its directory, the manifest, its directory and the parent; write and sync
@@ -52,10 +54,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
 
+use super::keyspaces::{KeyspaceState, MAX_KEYSPACES};
 use super::levels::Levels;
 use super::{
-    Core, Entry, FlushJob, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Options, Published, SharedRun,
-    directory, physical_runs,
+    Core, FlushJob, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Options, Published, SharedRun,
+    directory,
 };
 
 mod errors;
@@ -79,16 +82,11 @@ const PREFIX: &str = "ckpt-";
 const CURRENT_MAGIC: [u8; 8] = *b"TSRCUR\0\x01";
 const CURRENT_LEN: usize = 20;
 const MANIFEST_MAGIC: [u8; 8] = *b"TSRCKPT\x01";
-// Manifest version 5 persists exact inclusive bounds of shared run views.
-// Run payloads use format version 6.
-const MANIFEST_VERSION: u32 = 5;
-// Magic/version/flags, generation/ceiling/records/next-id/previous,
-// depth, metadata length, run count. Entries include both file and run lengths.
-const MANIFEST_HEADER_LEN: usize = 80;
-const MANIFEST_ENTRY_LEN: usize = 68;
-// The manifest's metadata field holds the keyspace name and the
-// application's metadata; see `encode_catalog`.
-const MAX_METADATA_BYTES: usize = MAX_METADATA_LEN + 2 + MAX_KEYSPACE_NAME_LEN;
+const MANIFEST_VERSION: u32 = 1;
+/// The manifest flag for application metadata, which may be empty.
+const MANIFEST_METADATA: u32 = 1;
+const MANIFEST_HEADER_LEN: usize = 88;
+const MANIFEST_ENTRY_LEN: usize = 72;
 const RUNS: &str = "runs";
 // Keep namespace and counter together, including when recovery advances the
 // counter to the end of its range. Rollover starts a fresh namespace.
@@ -106,76 +104,6 @@ pub(super) fn new_run_id() -> u128 {
     let number = ids.1;
     ids.1 += 1;
     (u128::from(namespace) << 64) | u128::from(number)
-}
-
-const CATALOG_KEYSPACE: u8 = 1;
-const CATALOG_METADATA: u8 = 2;
-
-/// Encodes the live keyspace's name and the application's metadata into the
-/// manifest's metadata field: nothing for neither; otherwise a flags byte
-/// (1: a keyspace, 2: metadata), then the name's length byte and the name if
-/// there is a keyspace, then the metadata.
-fn encode_catalog(keyspace: Option<&str>, metadata: Option<&[u8]>) -> Vec<u8> {
-    if keyspace.is_none() && metadata.is_none() {
-        return Vec::new();
-    }
-    let mut bytes =
-        Vec::with_capacity(2 + keyspace.map_or(0, str::len) + metadata.map_or(0, <[u8]>::len));
-    bytes.push(
-        if keyspace.is_some() {
-            CATALOG_KEYSPACE
-        } else {
-            0
-        } | if metadata.is_some() {
-            CATALOG_METADATA
-        } else {
-            0
-        },
-    );
-    if let Some(name) = keyspace {
-        bytes.push(name.len() as u8);
-        bytes.extend_from_slice(name.as_bytes());
-    }
-    bytes.extend_from_slice(metadata.unwrap_or_default());
-    bytes
-}
-
-/// What [`encode_catalog`] wrote.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Catalog {
-    pub(super) keyspace: Option<String>,
-    pub(super) metadata: Option<Vec<u8>>,
-}
-
-fn decode_catalog(bytes: &[u8]) -> Result<Catalog, Damage> {
-    let Some((&flags, rest)) = bytes.split_first() else {
-        return Ok(Catalog::default());
-    };
-    if flags & !(CATALOG_KEYSPACE | CATALOG_METADATA) != 0 || flags == 0 {
-        return Err(Damage::Catalog);
-    }
-    let (keyspace, rest) = if flags & CATALOG_KEYSPACE != 0 {
-        let (&len, rest) = rest.split_first().ok_or(Damage::Catalog)?;
-        let name = rest.get(..usize::from(len)).ok_or(Damage::Catalog)?;
-        let name = std::str::from_utf8(name).map_err(|_| Damage::Catalog)?;
-        if !super::handle::valid_name(name) {
-            return Err(Damage::Catalog);
-        }
-        (Some(name.to_owned()), &rest[usize::from(len)..])
-    } else {
-        (None, rest)
-    };
-    let metadata = if flags & CATALOG_METADATA != 0 {
-        if rest.len() > MAX_METADATA_LEN {
-            return Err(Damage::Catalog);
-        }
-        Some(rest.to_vec())
-    } else if rest.is_empty() {
-        None
-    } else {
-        return Err(Damage::Catalog);
-    };
-    Ok(Catalog { keyspace, metadata })
 }
 
 /// What a committed checkpoint holds and the I/O performed for it.
@@ -465,11 +393,24 @@ mod tests {
             records: 12,
             next_run_id: 3,
             previous: 4,
-            depth: 2,
-            metadata: b"offsets\0\xff".to_vec(),
+            next_keyspace: 9,
+            keyspaces: vec![
+                KeyspaceEntry {
+                    id: 3,
+                    name: "users".into(),
+                    depth: 2,
+                },
+                KeyspaceEntry {
+                    id: 8,
+                    name: "orders".into(),
+                    depth: 1,
+                },
+            ],
+            metadata: Some(b"offsets\0\xff".to_vec()),
             runs: vec![
                 RunEntry {
                     id: 1,
+                    keyspace: 3,
                     level: 0,
                     flush: 0,
                     seq_override: Some(7),
@@ -480,7 +421,8 @@ mod tests {
                 },
                 RunEntry {
                     id: 2,
-                    level: 2,
+                    keyspace: 8,
+                    level: 1,
                     flush: 0,
                     seq_override: None,
                     len: 100,
@@ -516,11 +458,17 @@ mod tests {
             records: 2,
             next_run_id: 3,
             previous: 1,
-            depth: 1,
-            metadata: Vec::new(),
+            next_keyspace: 1,
+            keyspaces: vec![KeyspaceEntry {
+                id: 0,
+                name: "test".into(),
+                depth: 1,
+            }],
+            metadata: None,
             runs: vec![
                 RunEntry {
                     id: 1,
+                    keyspace: 0,
                     level: 0,
                     flush: 0,
                     seq_override: None,
@@ -531,6 +479,7 @@ mod tests {
                 },
                 RunEntry {
                     id: 2,
+                    keyspace: 0,
                     level: 0,
                     flush: 1,
                     seq_override: None,
@@ -550,13 +499,17 @@ mod tests {
             let sum = crc(&[&bytes[..end]]);
             bytes[end..].copy_from_slice(&sum.to_le_bytes());
         };
+        // The run entries follow the header and the keyspace table, whose
+        // one entry is 9 bytes and the name.
+        let entries = MANIFEST_HEADER_LEN + 9 + "test".len();
         for (at, replacement) in [
-            (40, 0u64),                           // exhausted/invalid next counter
-            (48, 2),                              // previous is not older
-            (60, u64::MAX),                       // unbounded metadata length
-            (MANIFEST_HEADER_LEN + 40, 3),        // file cannot hold its checksum
-            (MANIFEST_HEADER_LEN + 48, u64::MAX), // run payload exceeds file
-            (MANIFEST_HEADER_LEN + 32, u64::MAX), // flush counter cannot advance
+            (40, 0u64),               // exhausted/invalid next counter
+            (48, 2),                  // previous is not older
+            (80, u64::MAX),           // unbounded metadata length
+            (72, u64::MAX),           // unbounded bounds length
+            (entries + 44, 3),        // file cannot hold its checksum
+            (entries + 52, u64::MAX), // run payload exceeds file
+            (entries + 36, u64::MAX), // flush counter cannot advance
         ] {
             let mut damaged = bytes.clone();
             damaged[at..at + 8].copy_from_slice(&replacement.to_le_bytes());
@@ -564,8 +517,7 @@ mod tests {
             assert!(Manifest::decode(&damaged).is_err(), "offset {at}");
         }
         let mut duplicate = bytes.clone();
-        duplicate[MANIFEST_HEADER_LEN + MANIFEST_ENTRY_LEN
-            ..MANIFEST_HEADER_LEN + MANIFEST_ENTRY_LEN + 16]
+        duplicate[entries + MANIFEST_ENTRY_LEN..entries + MANIFEST_ENTRY_LEN + 16]
             .copy_from_slice(&1u128.to_le_bytes());
         seal(&mut duplicate);
         assert_eq!(Manifest::decode(&duplicate), Err(Damage::Order));
@@ -723,6 +675,7 @@ mod tests {
         let expected: Vec<_> = engine
             .core
             .read_state()
+            .only()
             .runs
             .iter()
             .map(|r| {
@@ -811,6 +764,7 @@ mod tests {
             recovered
                 .core
                 .read_state()
+                .only()
                 .runs
                 .iter()
                 .all(|r| r.run.filter_build_bytes() == 0)
@@ -920,6 +874,7 @@ mod tests {
         let before = engine
             .core
             .read_state()
+            .only()
             .runs
             .iter()
             .map(|r| r.id)
@@ -928,6 +883,7 @@ mod tests {
         let after = engine
             .core
             .read_state()
+            .only()
             .runs
             .iter()
             .map(|r| r.id)

@@ -24,7 +24,7 @@ pub(in crate::engine) fn recover(
         }
     }
     let mut loaded = load(dir)?;
-    let metadata = loaded.catalog.metadata.take();
+    let metadata = loaded.metadata.take();
     Ok(Some((loaded.into_core(options), metadata)))
 }
 
@@ -41,16 +41,22 @@ fn read_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
     }
 }
 
+/// One recovered keyspace.
+struct LoadedKeyspace {
+    id: u32,
+    name: String,
+    depth: usize,
+    runs: Vec<(usize, u64, SharedRun)>,
+}
+
 /// A committed checkpoint, checked in full before starting any worker.
 pub(super) struct Loaded {
     pub(super) ceiling: u64,
-    catalog: Catalog,
+    metadata: Option<Vec<u8>>,
     next_run_id: u64,
-    depth: usize,
-    runs: Vec<(usize, u64, SharedRun)>,
+    next_keyspace: u32,
+    keyspaces: Vec<LoadedKeyspace>,
     pool: ChunkPool,
-    run_bytes: usize,
-    held_bytes: usize,
 }
 
 impl Loaded {
@@ -63,27 +69,27 @@ impl Loaded {
         {
             let mut state = core.write_state();
             state.last_seq = self.ceiling;
-            if let Some(name) = self.catalog.keyspace {
-                state.keyspace = Some(Entry {
-                    id: 0,
-                    name: Arc::from(name),
-                });
-                state.next_keyspace = 1;
-            }
+            state.next_keyspace = self.next_keyspace;
             state.active = crate::memtable::Memtable::in_pool(
                 options.memtable_size,
                 Some(self.ceiling),
                 &core.chunks,
             );
-            state.runs = self
-                .runs
-                .iter()
-                .map(|(_, _, run)| Arc::clone(run))
-                .collect();
-            state.levels = Levels::recovered(&self.runs, self.depth, options.level_ratio);
-            state.order_runs();
-            state.run_bytes = self.run_bytes;
-            state.held_bytes = self.held_bytes;
+            for keyspace in self.keyspaces {
+                let name: Arc<str> = Arc::from(keyspace.name);
+                let mut space =
+                    KeyspaceState::new(keyspace.id, Arc::clone(&name), options.level_ratio);
+                space.runs = keyspace
+                    .runs
+                    .iter()
+                    .map(|(_, _, run)| Arc::clone(run))
+                    .collect();
+                space.levels =
+                    Levels::recovered(&keyspace.runs, keyspace.depth, options.level_ratio);
+                state.names.insert(name, keyspace.id);
+                state.keyspaces.insert(keyspace.id, space);
+                state.published(keyspace.id);
+            }
         }
         core
     }
@@ -132,7 +138,15 @@ pub(super) fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manife
     let manifest_path = path.join(MANIFEST);
     let mut file = File::open(&manifest_path).map_err(read_error(&manifest_path))?;
     let found = file.metadata().map_err(read_error(&manifest_path))?.len();
+    // The version is checked first, so that a manifest of another version
+    // reports its version rather than its length.
     let mut header = [0u8; MANIFEST_HEADER_LEN];
+    let head = found.min(MANIFEST_HEADER_LEN as u64) as usize;
+    file.read_exact(&mut header[..head])
+        .map_err(read_error(&manifest_path))?;
+    if head >= 16 {
+        check_version(&header).map_err(|damage| corrupt(&manifest_path, damage))?;
+    }
     if found < (MANIFEST_HEADER_LEN + 4) as u64 {
         return Err(corrupt(
             &manifest_path,
@@ -142,18 +156,10 @@ pub(super) fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manife
             },
         ));
     }
-    file.read_exact(&mut header)
-        .map_err(read_error(&manifest_path))?;
-    let count = u32::from_le_bytes(header[68..72].try_into().unwrap()) as u64;
-    let metadata = u64::from_le_bytes(header[60..68].try_into().unwrap());
-    let bounds = u64::from_le_bytes(header[72..80].try_into().unwrap());
-    let max_bounds = count * 2 * crate::block::MAX_KEY_LEN as u64;
-    let expected = MANIFEST_HEADER_LEN as u64
-        + count * MANIFEST_ENTRY_LEN as u64
-        + metadata.min(MAX_METADATA_BYTES as u64)
-        + bounds.min(max_bounds)
-        + 4;
-    if found != expected || metadata > MAX_METADATA_BYTES as u64 || bounds > max_bounds {
+    let expected = Lengths::of(&header)
+        .file_len()
+        .map_err(|damage| corrupt(&manifest_path, damage))?;
+    if found != expected {
         return Err(corrupt(&manifest_path, Damage::Length { expected, found }));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(expected).map_err(|_| {
@@ -185,17 +191,31 @@ pub(super) fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manife
 /// Reads and checks exactly CURRENT's generation under LOCK.
 pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
     let (_, manifest_path, manifest) = committed_manifest(dir)?;
-    let catalog =
-        decode_catalog(&manifest.metadata).map_err(|damage| corrupt(&manifest_path, damage))?;
-    if catalog.keyspace.is_none() && !manifest.runs.is_empty() {
-        return Err(corrupt(&manifest_path, Damage::Catalog));
-    }
     let pool = ChunkPool::new(RESERVE_BYTES);
-    let mut runs: Vec<(usize, u64, SharedRun)> = Vec::with_capacity(manifest.runs.len());
+    let mut keyspaces: Vec<LoadedKeyspace> = manifest
+        .keyspaces
+        .iter()
+        .map(|keyspace| LoadedKeyspace {
+            id: keyspace.id,
+            name: keyspace.name.clone(),
+            depth: keyspace.depth,
+            runs: Vec::new(),
+        })
+        .collect();
     let mut records = 0u64;
     let mut backings: HashMap<u128, Run<Vec<u8>>> = HashMap::new();
     for entry in &manifest.runs {
         let file = dir.join(RUNS).join(run_name(entry.id));
+        // Decoding checked that the keyspace is listed.
+        let at = keyspaces
+            .binary_search_by_key(&entry.keyspace, |keyspace| keyspace.id)
+            .map_err(|_| {
+                corrupt(
+                    &manifest_path,
+                    Damage::UnknownKeyspace { id: entry.keyspace },
+                )
+            })?;
+        let runs = &mut keyspaces[at].runs;
         let (mut run, max_seq) = if let Some(backing) = backings.get(&entry.id) {
             (backing.clone(), backing.max_seq())
         } else {
@@ -281,11 +301,15 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         ));
     }
     // Per-run checks cannot detect disagreeing copies in different runs. Check
-    // the grouped merge before exposing an engine, including older versions
-    // that compaction will eventually visit.
+    // each keyspace's grouped merge before exposing an engine, including
+    // older versions that compaction will eventually visit.
     // This holds one decoded block per overlapping group, with no value copies.
-    {
-        let published: Vec<_> = runs.iter().map(|(_, _, run)| Arc::clone(run)).collect();
+    for keyspace in &keyspaces {
+        let published: Vec<_> = keyspace
+            .runs
+            .iter()
+            .map(|(_, _, run)| Arc::clone(run))
+            .collect();
         let directory = super::directory::RunDirectory::build(&published);
         let mut workspace = crate::run::MergeWorkspace::new();
         let mut cursor =
@@ -304,21 +328,12 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
             })?;
         }
     }
-    let published: Vec<_> = runs.iter().map(|(_, _, r)| r.clone()).collect();
-    let run_bytes: usize = super::physical_runs(&published)
-        .map(|r| r.run.stored_len())
-        .sum();
-    let held_bytes: usize = super::physical_runs(&published)
-        .map(|r| r.run.held_bytes())
-        .sum();
     Ok(Loaded {
         ceiling: manifest.last_seq,
-        catalog,
+        metadata: manifest.metadata,
         next_run_id: manifest.next_run_id,
-        depth: manifest.depth,
+        next_keyspace: manifest.next_keyspace,
+        keyspaces,
         pool,
-        runs,
-        run_bytes,
-        held_bytes,
     })
 }

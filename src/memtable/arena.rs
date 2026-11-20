@@ -53,8 +53,8 @@ impl Arena {
     }
 
     /// Returns the location and the used bytes actually copied for snapshots.
-    pub fn append(&mut self, key: &[u8], value: &[u8]) -> (Location, usize) {
-        let len = key.len() + value.len();
+    pub fn append(&mut self, parts: &[&[u8]]) -> (Location, usize) {
+        let len = parts.iter().map(|part| part.len()).sum();
         if len == 0 {
             return (
                 Location {
@@ -68,7 +68,7 @@ impl Arena {
         let (allocation, offset, copied) = if len > CHUNK_BYTES {
             let allocation = self.pages.len();
             self.pages.push(Arc::new(Page {
-                chunk: Chunk::exact_parts(key, value),
+                chunk: Chunk::exact_parts(parts),
                 used: len,
             }));
             (allocation, 0, 0)
@@ -88,8 +88,11 @@ impl Arena {
             let copied = self.copy_charge(len);
             let page = Arc::make_mut(&mut self.pages[at]);
             let offset = page.used;
-            page.chunk.bytes_mut()[offset..offset + key.len()].copy_from_slice(key);
-            page.chunk.bytes_mut()[offset + key.len()..offset + len].copy_from_slice(value);
+            let mut end = offset;
+            for part in parts {
+                page.chunk.bytes_mut()[end..end + part.len()].copy_from_slice(part);
+                end += part.len();
+            }
             page.used += len;
             page.chunk.set_used(page.used);
             (at, offset, copied)
@@ -122,9 +125,9 @@ mod tests {
     fn records_are_whole_and_accounting_is_used_bytes_including_garbage() {
         let pool = ChunkPool::new(2 * CHUNK_BYTES);
         let mut arena = Arena::new(&pool);
-        let (first, _) = arena.append(b"a", &vec![1; CHUNK_BYTES - 10]);
-        let (second, _) = arena.append(b"b", &[2; 32]);
-        let (large, _) = arena.append(b"c", &vec![3; CHUNK_BYTES + 1]);
+        let (first, _) = arena.append(&[b"a", &vec![1; CHUNK_BYTES - 10]]);
+        let (second, _) = arena.append(&[b"b", &[2; 32]]);
+        let (large, _) = arena.append(&[b"c", &vec![3; CHUNK_BYTES + 1]]);
         assert_ne!(first.allocation, second.allocation);
         assert_eq!(
             arena.pages[large.allocation].chunk.bytes().len(),
@@ -143,10 +146,10 @@ mod tests {
     fn a_snapshot_copies_only_the_partial_chunk_and_keeps_its_bytes_alive() {
         let pool = ChunkPool::new(3 * CHUNK_BYTES);
         let mut arena = Arena::new(&pool);
-        let (first, _) = arena.append(b"key", b"old");
+        let (first, _) = arena.append(&[b"key", b"old"]);
         let snapshot = arena.clone();
         assert_eq!(arena.copy_charge(6), 6);
-        let (_, copied) = arena.append(b"key", b"new");
+        let (_, copied) = arena.append(&[b"key", b"new"]);
         assert_eq!(copied, 6);
         assert_eq!(arena.used(), 12);
         assert_eq!(arena.get(first), b"keyold");

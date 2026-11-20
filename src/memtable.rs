@@ -49,6 +49,7 @@
 //! the bounded free reserve are reported by the engine's pool counters.
 //! Records larger than a chunk have exact allocations outside the pool.
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Weak};
@@ -98,6 +99,36 @@ const BRANCH_BYTES: usize = ARC_HEADER
     + size_of::<Node>()
     + (NODE_CAPACITY + 1) * (size_of::<Arc<[u8]>>() + size_of::<Arc<Node>>());
 
+/// A key as a table stores it: a prefix, such as a keyspace's, followed
+/// by the caller's key. Comparisons treat it as the two concatenated,
+/// without building that.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Key<'a> {
+    pub(crate) prefix: &'a [u8],
+    pub(crate) key: &'a [u8],
+}
+
+impl<'a> Key<'a> {
+    /// `key` with no prefix.
+    pub(crate) fn plain(key: &'a [u8]) -> Self {
+        Self { prefix: &[], key }
+    }
+
+    fn len(&self) -> usize {
+        self.prefix.len() + self.key.len()
+    }
+
+    /// How a stored key compares with this one.
+    fn order(&self, stored: &[u8]) -> Ordering {
+        let shared = self.prefix.len().min(stored.len());
+        match stored[..shared].cmp(&self.prefix[..shared]) {
+            Ordering::Equal if stored.len() < self.prefix.len() => Ordering::Less,
+            Ordering::Equal => stored[shared..].cmp(self.key),
+            order => order,
+        }
+    }
+}
+
 /// The latest update of one key in one tree. The arena also keeps overwritten
 /// payloads until its last table or snapshot is dropped.
 #[derive(Clone)]
@@ -109,8 +140,8 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(key: &[u8], seq: u64, value: Option<&[u8]>, arena: &mut Arena) -> (Self, usize) {
-        let (data, copied) = arena.append(key, value.unwrap_or_default());
+    fn new(key: Key<'_>, seq: u64, value: Option<&[u8]>, arena: &mut Arena) -> (Self, usize) {
+        let (data, copied) = arena.append(&[key.prefix, key.key, value.unwrap_or_default()]);
         (
             Self {
                 seq,
@@ -186,8 +217,9 @@ impl Node {
 }
 
 impl Leaf {
-    fn search(&self, key: &[u8], arena: &Arena) -> Result<usize, usize> {
-        self.slots.binary_search_by(|slot| slot.key(arena).cmp(key))
+    fn search(&self, key: Key<'_>, arena: &Arena) -> Result<usize, usize> {
+        self.slots
+            .binary_search_by(|slot| key.order(slot.key(arena)))
     }
 
     /// Splits an overfull leaf. Appending at the right edge leaves the left
@@ -211,9 +243,9 @@ impl Leaf {
 
 impl Branch {
     /// The child whose range holds `key`.
-    fn route(&self, key: &[u8]) -> usize {
+    fn route(&self, key: Key<'_>) -> usize {
         self.separators
-            .partition_point(|separator| **separator <= *key)
+            .partition_point(|separator| key.order(separator) != Ordering::Greater)
     }
 
     /// Splits an overfull branch, like [`Leaf::split`].
@@ -387,7 +419,7 @@ impl Table {
     /// would detach: every node from the first shared one down.
     /// Others can only drop references, so the write itself detaches no more
     /// than this.
-    fn plan(&self, key: &[u8]) -> (Path, Option<&Slot>, usize) {
+    fn plan(&self, key: Key<'_>) -> (Path, Option<&Slot>, usize) {
         let mut routes = [0; MAX_DEPTH];
         let (mut node, mut level, mut shared, mut detach) = (&self.root, 0, false, 0);
         loop {
@@ -414,13 +446,13 @@ impl Table {
         }
     }
 
-    fn write(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), TableError> {
+    fn write(&mut self, key: Key<'_>, seq: u64, value: Value<'_>) -> Result<(), TableError> {
         let admitted = self.admit(key, seq, value)?;
         self.insert(key, seq, admitted);
         Ok(())
     }
 
-    fn insert(&mut self, key: &[u8], seq: u64, admitted: Admitted<'_>) {
+    fn insert(&mut self, key: Key<'_>, seq: u64, admitted: Admitted<'_>) {
         let Admitted {
             path,
             new,
@@ -456,7 +488,7 @@ impl Table {
     /// snapshots.
     fn admit<'v>(
         &mut self,
-        key: &[u8],
+        key: Key<'_>,
         seq: u64,
         value: Value<'v>,
     ) -> Result<Admitted<'v>, TableError> {
@@ -465,8 +497,9 @@ impl Table {
             Value::Tombstone => None,
         };
         let value_len = bytes.map_or(0, <[u8]>::len);
-        if key.len() > MAX_KEY_LEN {
-            return Err(TableError::KeyTooLong { len: key.len() });
+        // The prefix is the table user's, so the limit is on the caller's key.
+        if key.key.len() > MAX_KEY_LEN {
+            return Err(TableError::KeyTooLong { len: key.key.len() });
         }
         if value_len > MAX_VALUE_LEN {
             return Err(TableError::ValueTooLong { len: value_len });
@@ -509,7 +542,7 @@ impl Table {
         })
     }
 
-    fn get(&self, key: &[u8]) -> Option<Version<'_>> {
+    fn get(&self, key: Key<'_>) -> Option<Version<'_>> {
         let mut node = &*self.root;
         loop {
             match node {
@@ -525,7 +558,7 @@ impl Table {
         }
     }
 
-    fn iter_from(&self, start: &[u8]) -> Records<'_> {
+    fn iter_from(&self, start: Key<'_>) -> Records<'_> {
         let mut path = [None; MAX_DEPTH];
         let mut depth = 0;
         let mut node = &*self.root;
@@ -540,7 +573,7 @@ impl Table {
                 Node::Leaf(leaf) => {
                     let at = leaf
                         .slots
-                        .partition_point(|slot| slot.key(&self.arena) < start);
+                        .partition_point(|slot| start.order(slot.key(&self.arena)).is_lt());
                     return Records {
                         arena: &self.arena,
                         path,
@@ -704,30 +737,49 @@ impl Memtable {
     ///
     /// Key and value limits are checked first, then the sequence number, then
     /// the budget. A rejected update changes nothing.
+    #[cfg(test)]
     pub fn put(&mut self, key: &[u8], seq: u64, value: &[u8]) -> Result<(), TableError> {
-        self.0.write(key, seq, Value::Bytes(value))
+        self.write(Key::plain(key), seq, Value::Bytes(value))
     }
 
     /// Stores a tombstone for `key` at sequence number `seq`, under the same
     /// rules as [`put`](Self::put).
+    #[cfg(test)]
     pub fn delete(&mut self, key: &[u8], seq: u64) -> Result<(), TableError> {
-        self.0.write(key, seq, Value::Tombstone)
+        self.write(Key::plain(key), seq, Value::Tombstone)
+    }
+
+    /// Sets `key` to `value`, or stores a tombstone for it, at sequence
+    /// number `seq`, as [`put`](Self::put) and [`delete`](Self::delete) do.
+    /// The limit on key length applies to `key.key` alone.
+    pub(crate) fn write(
+        &mut self,
+        key: Key<'_>,
+        seq: u64,
+        value: Value<'_>,
+    ) -> Result<(), TableError> {
+        self.0.write(key, seq, value)
     }
 
     /// Returns the latest update of `key`, which may be a tombstone, or `None`
     /// if the table holds nothing for it.
+    #[cfg(test)]
     pub fn get(&self, key: &[u8]) -> Option<Version<'_>> {
+        self.0.get(Key::plain(key))
+    }
+
+    /// [`get`](Self::get) for a prefixed key.
+    pub(crate) fn get_in(&self, key: Key<'_>) -> Option<Version<'_>> {
         self.0.get(key)
     }
 
     /// Returns each key's latest update, in ascending key order.
     pub fn iter(&self) -> Records<'_> {
-        self.0.iter_from(&[])
+        self.0.iter_from(Key::plain(&[]))
     }
 
-    /// Returns each update whose key is at or above `start`, in ascending key
-    /// order.
-    pub fn iter_from(&self, start: &[u8]) -> Records<'_> {
+    /// [`iter_from`](Self::iter_from) for a prefixed key.
+    pub(crate) fn iter_from_in(&self, start: Key<'_>) -> Records<'_> {
         self.0.iter_from(start)
     }
 
@@ -755,7 +807,7 @@ impl Memtable {
 
     /// A conservative upper bound on the charge of one additional update,
     /// including nodes and records a live snapshot could pin.
-    pub(crate) fn write_charge(&self, key: &[u8], value: Value<'_>) -> usize {
+    pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> usize {
         let bytes = match value {
             Value::Bytes(bytes) => bytes.len(),
             Value::Tombstone => 0,
@@ -806,18 +858,30 @@ pub struct FrozenMemtable {
 impl FrozenMemtable {
     /// Returns the latest update of `key`, which may be a tombstone, or `None`
     /// if the table holds nothing for it.
+    #[cfg(test)]
     pub fn get(&self, key: &[u8]) -> Option<Version<'_>> {
+        self.table.get(Key::plain(key))
+    }
+
+    /// [`get`](Self::get) for a prefixed key.
+    pub(crate) fn get_in(&self, key: Key<'_>) -> Option<Version<'_>> {
         self.table.get(key)
     }
 
     /// Returns each key's latest update, in ascending key order.
     pub fn iter(&self) -> Records<'_> {
-        self.table.iter_from(&[])
+        self.table.iter_from(Key::plain(&[]))
     }
 
     /// Returns each update whose key is at or above `start`, in ascending key
     /// order.
+    #[cfg(test)]
     pub fn iter_from(&self, start: &[u8]) -> Records<'_> {
+        self.table.iter_from(Key::plain(start))
+    }
+
+    /// [`iter_from`](Self::iter_from) for a prefixed key.
+    pub(crate) fn iter_from_in(&self, start: Key<'_>) -> Records<'_> {
         self.table.iter_from(start)
     }
 
@@ -874,6 +938,7 @@ impl FrozenMemtable {
     /// The table is only borrowed. A caller that cannot use a run can drop the
     /// iterator and flush again, which produces identical runs. The table and
     /// the runs built so far coexist until the caller drops the table.
+    #[cfg(test)]
     pub fn flush_with(
         &self,
         target_run_len: usize,
@@ -904,35 +969,95 @@ pub(crate) struct FlushCuts {
     pub(crate) max_pieces: usize,
 }
 
-/// Builds runs from several frozen tables as if they were one, splitting
-/// them as [`FrozenMemtable::flush_with`] does and at `cuts`. `tables` is
-/// ordered oldest first, and where tables share a key the newest update is
-/// the one written.
+/// One key space of a flush: the keys that start with `prefix`, built into
+/// runs of their own, without the prefix, and split at `cuts`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlushSpace<'a> {
+    pub(crate) prefix: &'a [u8],
+    pub(crate) cuts: &'a FlushCuts,
+}
+
+/// What a flush built for one [`FlushSpace`].
+#[derive(Debug, Default)]
+pub(crate) struct SpaceRuns {
+    /// In key order.
+    pub(crate) runs: Vec<Run<Vec<u8>>>,
+    /// The input of the space's records in every table, counting a key once
+    /// per table that holds it, as run lengths count input.
+    pub(crate) logical: usize,
+}
+
+/// The space `key` belongs to and the key without its prefix. `spaces` are
+/// sorted by prefix, and no prefix starts another, so the only candidate is
+/// the last prefix at or below `key`. `current` remembers the last space
+/// found, which ascending keys mostly stay in.
+fn locate<'k>(
+    spaces: &[FlushSpace<'_>],
+    current: &mut Option<usize>,
+    key: &'k [u8],
+) -> Option<(usize, &'k [u8])> {
+    if let Some(at) = *current
+        && let Some(rest) = key.strip_prefix(spaces[at].prefix)
+    {
+        return Some((at, rest));
+    }
+    let at = spaces
+        .partition_point(|space| space.prefix <= key)
+        .checked_sub(1)?;
+    let rest = key.strip_prefix(spaces[at].prefix)?;
+    *current = Some(at);
+    Some((at, rest))
+}
+
+/// Builds runs from several frozen tables as if they were one, a separate
+/// set for each of `spaces`, splitting them as [`FrozenMemtable::flush_with`]
+/// does and at each space's cuts. `tables` is ordered oldest first, and
+/// where tables share a key the newest update is the one written. Records
+/// in no space are left out. The result is in the order of `spaces`, which
+/// are sorted by prefix, with prefixes of which none starts another.
 pub(crate) fn flush_merged(
     tables: &[&FrozenMemtable],
     target_run_len: usize,
     codec: Codec,
     target_block_compressed: usize,
-    cuts: &FlushCuts,
+    spaces: &[FlushSpace<'_>],
     pool: &ChunkPool,
-) -> Vec<Run<Vec<u8>>> {
-    if let ([table], []) = (tables, cuts.at.as_slice()) {
-        let mut flush = table.flush_with(target_run_len, codec, target_block_compressed);
-        flush.pool = pool.clone();
-        return flush.collect();
-    }
+) -> Vec<SpaceRuns> {
     let target = target_run_len.min(MAX_TARGET_RUN_LEN);
-    // Input still to come, for the rule that a cut leaves a piece after it:
-    // exact for one table, an overestimate where tables share keys.
-    let mut rest: usize = tables
-        .iter()
-        .map(|table| table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
-        .sum();
-    let mut next_cut = cuts.at.iter().peekable();
-    // Input in the run being built, and runs begun in this target length.
-    let (mut piece, mut pieces) = (0, 1);
+    let mut out: Vec<SpaceRuns> = spaces.iter().map(|_| SpaceRuns::default()).collect();
+    // Input still to come in each space, for the rule that a cut leaves a
+    // piece after it: exact for one table, an overestimate where tables
+    // share keys.
+    let rests: Vec<usize> = if let [space] = spaces {
+        vec![
+            tables
+                .iter()
+                .map(|table| {
+                    (table.memory().payload + table.len() * RECORD_INPUT_OVERHEAD)
+                        .saturating_sub(table.len() * space.prefix.len())
+                })
+                .sum(),
+        ]
+    } else {
+        let mut rests = vec![0; spaces.len()];
+        for table in tables {
+            let mut current = None;
+            for record in table.iter() {
+                if let Some((at, key)) = locate(spaces, &mut current, record.key) {
+                    rests[at] += crate::run::input_len(key, record.value);
+                }
+            }
+        }
+        rests
+    };
     let mut heads: Vec<_> = tables.iter().map(|table| table.iter().peekable()).collect();
-    let (mut runs, mut builder, mut input) = (Vec::new(), None::<RunBuilder>, 0);
+    let mut current = None;
+    // The space being built, its next cut, the input in the run being
+    // built, in the piece being built and still to come, and the runs
+    // begun in this target length.
+    let mut space = None::<usize>;
+    let (mut next_cut, mut input, mut piece, mut rest, mut pieces) = (0, 0, 0, 0, 1);
+    let mut builder = None::<RunBuilder>;
     loop {
         // The smallest key, and among tables holding it the newest.
         let mut newest: Option<(usize, &[u8])> = None;
@@ -943,15 +1068,36 @@ pub(crate) fn flush_merged(
                 newest = Some((at, record.key));
             }
         }
-        let Some((winner, key)) = newest else {
+        let Some((winner, stored)) = newest else {
             break;
         };
         let record = heads[winner].next().expect("the winner has a head");
+        let located = locate(spaces, &mut current, stored);
         for head in &mut heads {
-            head.next_if(|other| other.key == key);
+            if let Some(older) = head.next_if(|other| other.key == stored)
+                && let Some((at, key)) = located
+            {
+                out[at].logical += crate::run::input_len(key, older.value);
+            }
         }
+        let Some((at, key)) = located else {
+            continue;
+        };
+        let len = crate::run::input_len(key, record.value);
+        out[at].logical += len;
+        if space != Some(at) {
+            if let Some(done) = space {
+                out[done]
+                    .runs
+                    .extend(builder.take().map(RunBuilder::finish));
+            }
+            space = Some(at);
+            (next_cut, input, piece, rest, pieces) = (0, 0, 0, rests[at], 1);
+        }
+        let cuts = spaces[at].cuts;
         let mut cut = false;
-        while next_cut.next_if(|at| at.as_slice() <= key).is_some() {
+        while cuts.at.get(next_cut).is_some_and(|at| at.as_slice() <= key) {
+            next_cut += 1;
             cut = true;
         }
         if cut
@@ -960,7 +1106,7 @@ pub(crate) fn flush_merged(
             && rest >= cuts.min_piece
             && pieces < cuts.max_pieces
         {
-            runs.extend(builder.take().map(RunBuilder::finish));
+            out[at].runs.extend(builder.take().map(RunBuilder::finish));
             piece = 0;
             pieces += 1;
         }
@@ -968,16 +1114,17 @@ pub(crate) fn flush_merged(
             .get_or_insert_with(|| RunBuilder::in_pool(codec, target_block_compressed, pool))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
-        let len = crate::run::input_len(record.key, record.value);
         (input, piece, rest) = (input + len, piece + len, rest.saturating_sub(len));
         if input >= target {
             // A full run starts the next target length with its own pieces.
-            runs.extend(builder.take().map(RunBuilder::finish));
+            out[at].runs.extend(builder.take().map(RunBuilder::finish));
             (input, piece, pieces) = (0, 0, 1);
         }
     }
-    runs.extend(builder.map(RunBuilder::finish));
-    runs
+    if let Some(done) = space {
+        out[done].runs.extend(builder.map(RunBuilder::finish));
+    }
+    out
 }
 
 /// Iterates a table's latest updates in ascending key order. Holds the path
@@ -1035,6 +1182,7 @@ impl fmt::Debug for Records<'_> {
 }
 
 /// The runs of a [`FrozenMemtable`], built as they are requested.
+#[cfg(test)]
 pub struct Flush<'a> {
     pool: ChunkPool,
     records: Records<'a>,
@@ -1043,6 +1191,7 @@ pub struct Flush<'a> {
     target_block_compressed: usize,
 }
 
+#[cfg(test)]
 impl Iterator for Flush<'_> {
     type Item = Run<Vec<u8>>;
 
@@ -1067,6 +1216,7 @@ impl Iterator for Flush<'_> {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for Flush<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Flush")

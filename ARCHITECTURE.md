@@ -186,3 +186,13 @@ gives the output a segment that inherits its dictionary.
 **An embedded library with a synchronous API.**
 - A Redis-style single-threaded front end: an extra handoff hop and a
   throughput ceiling, and no fit for an embedded library.
+
+**Keyspaces share the memtables; each has its own runs and levels.**
+- One memtable per keyspace: each would need its own budget and flushes, and
+  a batch across keyspaces would have to commit to several tables at once.
+- Runs holding several keyspaces behind their prefixes: a keyspace's scans
+  and compactions would read and rewrite the others' data, and a drop could
+  not release its runs at once.
+- A snapshot holding one reference per keyspace: taking it would cost one
+  reference count per keyspace; the engine keeps one shared list of the
+  keyspaces' directories instead.

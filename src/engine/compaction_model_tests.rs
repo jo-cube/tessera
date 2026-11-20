@@ -84,7 +84,7 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
         engine.ks().put(&key(index), &value(index)).unwrap();
     }
     engine.flush().unwrap();
-    let disjoint = engine.core.read_state().runs.len();
+    let disjoint = engine.core.read_state().only().runs.len();
     assert!(disjoint >= 5, "{disjoint} runs");
     let snapshot = engine.snapshot();
     for index in 1_500..1_520 {
@@ -99,21 +99,23 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
             let range = run.run.key_range().unwrap();
             (range.min.to_vec(), range.max.to_vec())
         };
-        let newest = (0..state.runs.len())
-            .max_by_key(|&at| state.runs[at].run.max_seq())
+        let newest = (0..state.only().runs.len())
+            .max_by_key(|&at| state.only().runs[at].run.max_seq())
             .unwrap();
-        let (low, high) = range(&state.runs[newest]);
-        let mut older: Vec<usize> = (0..state.runs.len()).filter(|&at| at != newest).collect();
-        older.sort_by_key(|&at| range(&state.runs[at]).0);
-        let first = older.partition_point(|&at| range(&state.runs[at]).1 < low);
+        let (low, high) = range(&state.only().runs[newest]);
+        let mut older: Vec<usize> = (0..state.only().runs.len())
+            .filter(|&at| at != newest)
+            .collect();
+        older.sort_by_key(|&at| range(&state.only().runs[at]).0);
+        let first = older.partition_point(|&at| range(&state.only().runs[at]).1 < low);
         let mut picks = vec![newest];
         picks.extend(
             older[first..]
                 .iter()
-                .take_while(|&&at| range(&state.runs[at]).0 <= high),
+                .take_while(|&&at| range(&state.only().runs[at]).0 <= high),
         );
-        let update_bytes = state.runs[newest].run.as_bytes().len();
-        (picks, state.runs.clone(), update_bytes)
+        let update_bytes = state.only().runs[newest].run.as_bytes().len();
+        (picks, state.only().runs.clone(), update_bytes)
     };
     assert!(
         picks.len() < before.len() - 1,
@@ -129,7 +131,7 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
             &mut MergeWorkspace::new(),
         )
         .unwrap();
-    let after = engine.core.read_state().runs.clone();
+    let after = engine.core.read_state().only().runs.clone();
     for (at, run) in before.iter().enumerate() {
         let kept = after.iter().any(|other| Arc::ptr_eq(other, run));
         assert_eq!(kept, !picks.contains(&at), "run {at}");
@@ -230,10 +232,10 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
             .all(|pair| range(&pair[0]).1 < range(&pair[1]).0)
     };
     // The fixture is settled before checkpointing: all runs are disjoint.
-    let mut recovered = engine.core.read_state().runs.clone();
+    let mut recovered = engine.core.read_state().only().runs.clone();
     recovered.sort_by_key(|run| range(run).0);
     assert!(recovered.len() > 4 && disjoint(&recovered));
-    assert_eq!(engine.core.read_state().directory.group_count(), 1);
+    assert_eq!(engine.core.read_state().only().directory.group_count(), 1);
     // Start the independent schedule model with all settled runs in level 2.
     // Recovery restores the recorded levels.
     let mut levels: Vec<Vec<SharedRun>> = vec![Vec::new(), Vec::new(), recovered];
@@ -249,6 +251,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         engine
             .core
             .read_state()
+            .only()
             .runs
             .iter()
             .position(|other| Arc::ptr_eq(other, run))
@@ -276,7 +279,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
                 .iter()
                 .map(|other| position(engine, other)),
         );
-        let before = engine.core.read_state().runs.clone();
+        let before = engine.core.read_state().only().runs.clone();
         let report = engine
             .compact_picked(
                 CompactionPolicy::default(),
@@ -293,7 +296,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
             let (largest, per_run) = cell.get();
             cell.set((largest.max(growth), per_run.max(per_output)));
         });
-        let after = engine.core.read_state().runs.clone();
+        let after = engine.core.read_state().only().runs.clone();
         for (at, old) in before.iter().enumerate() {
             let kept = after.iter().any(|new| Arc::ptr_eq(new, old));
             assert_eq!(
@@ -316,10 +319,10 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
             from + 1
         );
         let state = engine.core.read_state();
-        assert_eq!(state.directory.len(), state.runs.len());
+        assert_eq!(state.only().directory.len(), state.only().runs.len());
         assert_eq!(
             levels.iter().map(Vec::len).sum::<usize>(),
-            state.runs.len(),
+            state.only().runs.len(),
             "every run in exactly one level"
         );
     };
@@ -346,6 +349,7 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         let mut flushed: Vec<SharedRun> = engine
             .core
             .read_state()
+            .only()
             .runs
             .iter()
             .filter(|run| !known.iter().any(|other| Arc::ptr_eq(run, other)))

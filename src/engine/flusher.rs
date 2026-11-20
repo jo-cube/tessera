@@ -85,12 +85,7 @@ fn run(core: &Core) {
         if state.frozen.is_empty() {
             continue;
         }
-        let job = FlushJob {
-            engine: core,
-            _serial: serial,
-            tables: state.frozen.clone(),
-            cuts: state.flush_cuts(core.target_run_len),
-        };
+        let job = FlushJob::new(core, serial, &state);
         drop(state);
         #[cfg(test)]
         if let Some(hook) = core.before_flush_build.lock().unwrap().take() {
@@ -136,7 +131,8 @@ mod tests {
     #[test]
     fn writers_continue_during_build_until_the_frozen_limit() {
         let engine = Engine::in_memory(Options {
-            memtable_size: ENTRY_OVERHEAD + 2,
+            // One record per table: a 1-byte prefix, key and 3-byte value.
+            memtable_size: ENTRY_OVERHEAD + 5,
             background_compaction: None,
             ..Options::default()
         })
@@ -148,16 +144,16 @@ mod tests {
             a.wait();
             b.wait();
         }));
-        engine.ks().put(b"a", b"v").unwrap();
-        engine.ks().put(b"b", b"v").unwrap();
+        engine.ks().put(b"a", b"vvv").unwrap();
+        engine.ks().put(b"b", b"vvv").unwrap();
         started.wait();
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
             let writer = scope.spawn(move || {
-                engine.ks().put(b"c", b"v").unwrap();
+                engine.ks().put(b"c", b"vvv").unwrap();
                 tx.send(()).unwrap();
-                engine.ks().put(b"d", b"v").unwrap();
+                engine.ks().put(b"d", b"vvv").unwrap();
                 tx.send(()).unwrap();
             });
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -173,7 +169,8 @@ mod tests {
     #[test]
     fn a_failed_background_build_is_readable_and_writers_flush_synchronously() {
         let engine = Engine::in_memory(Options {
-            memtable_size: ENTRY_OVERHEAD + 2,
+            // One record per table: a 1-byte prefix, key and 3-byte value.
+            memtable_size: ENTRY_OVERHEAD + 5,
             max_frozen_memtables: 1,
             background_compaction: None,
             ..Options::default()
@@ -181,12 +178,12 @@ mod tests {
         .unwrap();
         *engine.core.before_flush_build.lock().unwrap() =
             Some(Arc::new(|| panic!("injected flush failure")));
-        engine.ks().put(b"a", b"v").unwrap();
-        engine.ks().put(b"b", b"v").unwrap();
-        engine.ks().put(b"c", b"v").unwrap();
+        engine.ks().put(b"a", b"vvv").unwrap();
+        engine.ks().put(b"b", b"vvv").unwrap();
+        engine.ks().put(b"c", b"vvv").unwrap();
         assert!(matches!(engine.flush(), Err(BackgroundError::Panicked(_))));
-        assert_eq!(engine.ks().get(b"a").unwrap().unwrap(), b"v");
-        assert_eq!(engine.ks().get(b"b").unwrap().unwrap(), b"v");
+        assert_eq!(engine.ks().get(b"a").unwrap().unwrap(), b"vvv");
+        assert_eq!(engine.ks().get(b"b").unwrap().unwrap(), b"vvv");
         assert!(engine.close().is_err());
     }
 }

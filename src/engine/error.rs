@@ -183,6 +183,7 @@ impl From<UpdateError> for Error {
             UpdateError::Rejected(_) => ErrorKind::InvalidInput,
             UpdateError::MemoryLimit { .. } => ErrorKind::MemoryLimit,
             UpdateError::KeyspaceDropped => ErrorKind::KeyspaceDropped,
+            UpdateError::Keyspaces => ErrorKind::InvalidInput,
         };
         Self::new(kind, error.to_string())
     }

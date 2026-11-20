@@ -13,44 +13,65 @@ use std::sync::LazyLock;
 pub(super) struct View {
     /// Newest first.
     pub(super) tables: Vec<Arc<FrozenMemtable>>,
-    pub(super) runs: Arc<RunDirectory>,
+    /// The directory of every keyspace live at that moment.
+    pub(super) directories: Directories,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) last_seq: u64,
-    /// The keyspace live at that moment.
-    pub(super) keyspace: Option<u32>,
     /// The ID the next keyspace created after that moment gets.
     pub(super) next_keyspace: u32,
     pub(super) _live: Arc<()>,
 }
 
 /// How a view sees a keyspace.
-enum Visible {
-    Live,
+enum Visible<'v> {
+    Live(&'v RunDirectory),
     /// Created after the view: empty.
     Later,
     Dropped,
 }
 
 impl View {
-    fn visible(&self, keyspace: u32) -> Visible {
-        if self.keyspace == Some(keyspace) {
-            Visible::Live
-        } else if keyspace >= self.next_keyspace {
-            Visible::Later
-        } else {
-            Visible::Dropped
+    fn visible(&self, keyspace: u32) -> Visible<'_> {
+        match keyspaces::directory_of(&self.directories, keyspace) {
+            Some(directory) => Visible::Live(directory),
+            None if keyspace >= self.next_keyspace => Visible::Later,
+            None => Visible::Dropped,
         }
     }
 
-    /// The value `key` had, or `None` if it was absent or deleted, without
-    /// copying it.
+    /// The value `key` had in live keyspace `keyspace`, or `None` if it was
+    /// absent or deleted, without copying it.
+    #[cfg(test)]
     pub(super) fn get<'r>(
         &'r self,
+        keyspace: u32,
         key: &[u8],
         logical: &'r mut LogicalWorkspace,
     ) -> Result<Option<LiveValue<'r>>, ReadError> {
-        let in_memory = self.tables.iter().find_map(|table| table.get(key));
-        resolve(in_memory, &self.runs, key, logical)
+        let Visible::Live(runs) = self.visible(keyspace) else {
+            return Ok(None);
+        };
+        self.get_in(KeyPrefix::new(keyspace), runs, key, logical)
+    }
+
+    fn get_in<'r>(
+        &'r self,
+        prefix: KeyPrefix,
+        runs: &'r RunDirectory,
+        key: &[u8],
+        logical: &'r mut LogicalWorkspace,
+    ) -> Result<Option<LiveValue<'r>>, ReadError> {
+        let stored = prefix.key(key);
+        let in_memory = self.tables.iter().find_map(|table| table.get_in(stored));
+        resolve(in_memory, runs, key, logical)
+    }
+
+    /// The one keyspace live in the view, for tests of one keyspace, or
+    /// `None` if the view was taken before it was created.
+    #[cfg(test)]
+    pub(super) fn only(&self) -> Option<u32> {
+        assert!(self.directories.len() <= 1, "at most one live keyspace");
+        self.directories.first().map(|(id, _)| *id)
     }
 }
 
@@ -109,19 +130,19 @@ impl Snapshot {
     }
 
     /// The live records with `prefix`, with their sequence numbers, in
-    /// whatever keyspace is live in the snapshot.
+    /// the one keyspace live in the snapshot.
     #[cfg(test)]
     pub(crate) fn records(&self, prefix: &[u8]) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
         let (mut lower, mut upper) = (Vec::new(), Vec::new());
         let (mut logical, mut spare) = (LogicalWorkspace::default(), Vec::new());
-        let limit = Bounds::Prefix(prefix).copy_into(&mut lower, &mut upper);
-        let mut scan = Scan::new(
-            &self.view.tables,
-            &self.view.runs,
-            limit,
-            &mut logical,
-            &mut spare,
-        );
+        let Some(id) = self.view.only() else {
+            return Vec::new();
+        };
+        let limit = Bounds::Prefix(prefix).copy_into(KeyPrefix::new(id), &mut lower, &mut upper);
+        let Visible::Live(runs) = self.view.visible(id) else {
+            unreachable!("the keyspace is live in the view")
+        };
+        let mut scan = Scan::new(&self.view.tables, runs, limit, &mut logical, &mut spare);
         let mut out = Vec::new();
         while let Some(record) = scan.next_record().unwrap() {
             out.push((record.key.to_vec(), record.seq, record.value.to_vec()));
@@ -129,19 +150,19 @@ impl Snapshot {
         out
     }
 
-    /// The value of `key` in whatever keyspace is live in the snapshot.
+    /// The value of `key` in the one keyspace live in the snapshot.
     #[cfg(test)]
     pub(crate) fn value(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.get_seq(key).map(|(_, value)| value)
     }
 
-    /// The value of `key` and its sequence number, in whatever keyspace is
-    /// live in the snapshot.
+    /// The value of `key` and its sequence number, in the one keyspace live
+    /// in the snapshot.
     #[cfg(test)]
     pub(crate) fn get_seq(&self, key: &[u8]) -> Option<(u64, Vec<u8>)> {
         let mut logical = LogicalWorkspace::default();
         self.view
-            .get(key, &mut logical)
+            .get(self.view.only()?, key, &mut logical)
             .unwrap()
             .map(|found| (found.seq, found.value.to_vec()))
     }
@@ -151,7 +172,15 @@ impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
             .field("tables", &self.view.tables.len())
-            .field("runs", &self.view.runs.len())
+            .field(
+                "runs",
+                &self
+                    .view
+                    .directories
+                    .iter()
+                    .map(|(_, directory)| directory.len())
+                    .sum::<usize>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -332,7 +361,10 @@ impl<'a> Reader<'a> {
             Source::Snapshot(snapshot) => {
                 own(snapshot.engine, keyspace)?;
                 match snapshot.view.visible(keyspace.id()) {
-                    Visible::Live => Ok(snapshot.view.get(key, logical)?.map(|found| found.value)),
+                    Visible::Live(runs) => Ok(snapshot
+                        .view
+                        .get_in(KeyPrefix::new(keyspace.id()), runs, key, logical)?
+                        .map(|found| found.value)),
                     Visible::Later => Ok(None),
                     Visible::Dropped => Err(Error::keyspace_dropped(keyspace.name())),
                 }
@@ -371,7 +403,12 @@ impl<'a> Reader<'a> {
             Source::Snapshot(snapshot) => {
                 own(snapshot.engine, keyspace)?;
                 match snapshot.view.visible(keyspace.id()) {
-                    Visible::Live => multi.lookup_view(keys, &snapshot.view)?,
+                    Visible::Live(runs) => multi.lookup_view(
+                        keys,
+                        &snapshot.view.tables,
+                        KeyPrefix::new(keyspace.id()),
+                        runs,
+                    )?,
                     Visible::Later => multi.prepare(keys),
                     Visible::Dropped => return Err(Error::keyspace_dropped(keyspace.name())),
                 }
@@ -437,26 +474,26 @@ impl<'a> Reader<'a> {
             upper,
             ..
         } = buffers;
-        let limit = bounds.copy_into(lower, upper);
+        let limit = bounds.copy_into(KeyPrefix::new(keyspace.id()), lower, upper);
         let view = match *source {
             Source::Latest(shared) => shared.enter().and_then(|_open| {
                 own(shared.id, keyspace)?;
                 let view = pinned.insert(shared.core.snapshot());
                 match view.visible(keyspace.id()) {
-                    Visible::Live => Ok(Some(&*view)),
+                    Visible::Live(runs) => Ok(Some((&*view, runs))),
                     _ => Err(Error::keyspace_dropped(keyspace.name())),
                 }
             }),
             Source::Snapshot(snapshot) => own(snapshot.engine, keyspace).and_then(|()| {
                 match snapshot.view.visible(keyspace.id()) {
-                    Visible::Live => Ok(Some(&*snapshot.view)),
+                    Visible::Live(runs) => Ok(Some((&*snapshot.view, runs))),
                     Visible::Later => Ok(None),
                     Visible::Dropped => Err(Error::keyspace_dropped(keyspace.name())),
                 }
             }),
         };
         match view {
-            Ok(Some(view)) => Scan::new(&view.tables, &view.runs, limit, logical, scan_tables),
+            Ok(Some((view, runs))) => Scan::new(&view.tables, runs, limit, logical, scan_tables),
             Ok(None) => Scan::new(&[], &EMPTY, limit, logical, scan_tables),
             Err(error) => {
                 let mut scan = Scan::new(&[], &EMPTY, limit, logical, scan_tables);
@@ -696,13 +733,19 @@ impl Bounds<'_> {
     /// Copies the bounds into the reader's buffers, for the scan to borrow.
     /// An upper bound longer than any key is cut to [`MAX_KEY_LEN`] bytes,
     /// inclusive, which admits the same keys.
-    fn copy_into<'r>(&self, lower: &'r mut Vec<u8>, upper: &'r mut Vec<u8>) -> Limit<'r> {
+    fn copy_into<'r>(
+        &self,
+        keyspace: KeyPrefix,
+        lower: &'r mut Vec<u8>,
+        upper: &'r mut Vec<u8>,
+    ) -> Limit<'r> {
         lower.clear();
         upper.clear();
         match *self {
             Bounds::Prefix(prefix) => {
                 lower.extend_from_slice(prefix);
                 Limit {
+                    prefix: keyspace,
                     start: lower,
                     after: false,
                     end: End::Prefix,
@@ -730,6 +773,7 @@ impl Bounds<'_> {
                     }
                 };
                 Limit {
+                    prefix: keyspace,
                     start: lower,
                     after,
                     end,
@@ -755,6 +799,8 @@ enum End {
 /// A scan's bounds, borrowed from the reader's buffers.
 #[derive(Clone, Copy)]
 struct Limit<'r> {
+    /// The keyspace's prefix of the memtables' keys.
+    prefix: KeyPrefix,
     /// The first key, or the prefix.
     start: &'r [u8],
     /// Whether `start` itself is excluded.
@@ -777,8 +823,11 @@ impl Limit<'_> {
 /// A directory with no runs, for scans that read nothing.
 static EMPTY: LazyLock<RunDirectory> = LazyLock::new(RunDirectory::empty);
 
+/// The next memtable record in `limit`, with the keyspace prefix removed.
 fn next_within<'a>(records: &mut Records<'a>, limit: &Limit<'_>) -> Option<Record<'a>> {
-    records.next().filter(|record| limit.admits(record.key))
+    let record = records.next()?;
+    let key = record.key.strip_prefix(limit.prefix.as_bytes())?;
+    limit.admits(key).then_some(Record { key, ..record })
 }
 
 type TableCursor<'a> = (Records<'a>, Option<Record<'a>>);
@@ -834,7 +883,7 @@ impl<'r> Scan<'r> {
         let skip = limit.after.then_some(limit.start);
         let mut cursors: Vec<TableCursor<'r>> = std::mem::take(spare_tables);
         cursors.extend(tables.iter().map(|table| {
-            let mut records = table.iter_from(limit.start);
+            let mut records = table.iter_from_in(limit.prefix.key(limit.start));
             let mut head = next_within(&mut records, &limit);
             if head.is_some_and(|record| Some(record.key) == skip) {
                 head = next_within(&mut records, &limit);

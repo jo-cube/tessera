@@ -92,8 +92,25 @@ pub(crate) enum Damage {
     Run(CorruptRun),
     /// Run IDs, levels, flush groups, level ordering or copies of one update disagree.
     Order,
-    /// The keyspace and application metadata in the manifest are malformed.
-    Catalog,
+    /// The manifest's keyspace table is malformed: a bad name, depth or
+    /// length, IDs out of order, or more than the live keyspace limit.
+    Keyspaces,
+    /// Two keyspaces of the manifest share a name or an ID.
+    DuplicateKeyspace,
+    /// A keyspace ID is not below the manifest's next keyspace ID.
+    #[non_exhaustive]
+    KeyspaceId {
+        /// The keyspace's ID.
+        id: u32,
+        /// The next ID.
+        next: u32,
+    },
+    /// A run belongs to a keyspace the manifest does not list.
+    #[non_exhaustive]
+    UnknownKeyspace {
+        /// The run's keyspace ID.
+        id: u32,
+    },
     /// A record has a sequence number above the checkpoint's ceiling.
     #[non_exhaustive]
     Sequence {
@@ -110,6 +127,51 @@ pub(crate) enum Damage {
         /// The runs'.
         found: u64,
     },
+}
+
+impl fmt::Display for Damage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("the file is missing"),
+            Self::Length { expected, found } => {
+                write!(f, "length {found} bytes where {expected} are expected")
+            }
+            Self::BadMagic => f.write_str("the file does not start with its magic number"),
+            Self::Unsupported { version, .. } if *version != MANIFEST_VERSION => {
+                write!(f, "unsupported manifest version {version}")
+            }
+            Self::Unsupported { flags, .. } => {
+                write!(f, "unsupported manifest flags {flags:#x}")
+            }
+            Self::Checksum => f.write_str("checksum mismatch"),
+            Self::FilterChecksum => f.write_str("key filter checksum mismatch"),
+            Self::Generation { expected, found } => write!(
+                f,
+                "the manifest is of generation {found}, CURRENT names {expected}"
+            ),
+            Self::Run(error) => write!(f, "invalid run: {error}"),
+            Self::Order => f.write_str(
+                "run IDs, levels, flush groups, level order or copies of one update disagree",
+            ),
+            Self::Keyspaces => f.write_str("malformed keyspace table"),
+            Self::DuplicateKeyspace => f.write_str("two keyspaces share a name or an ID"),
+            Self::KeyspaceId { id, next } => write!(
+                f,
+                "keyspace ID {id} is not below the next keyspace ID {next}"
+            ),
+            Self::UnknownKeyspace { id } => {
+                write!(f, "a run belongs to keyspace ID {id}, which is not listed")
+            }
+            Self::Sequence { seq, ceiling } => write!(
+                f,
+                "sequence number {seq} is above the checkpoint's ceiling {ceiling}"
+            ),
+            Self::Records { expected, found } => write!(
+                f,
+                "the runs hold {found} records where the manifest says {expected}"
+            ),
+        }
+    }
 }
 
 /// Why an engine did not open. Nothing is exposed, no worker is left
@@ -152,11 +214,7 @@ impl fmt::Display for OpenError {
             ),
             Self::Io { path, error } => write!(f, "cannot read {}: {error}", path.display()),
             Self::Corrupt { path, damage } => {
-                write!(
-                    f,
-                    "checkpoint file {} is damaged: {damage:?}",
-                    path.display()
-                )
+                write!(f, "checkpoint file {} is damaged: {damage}", path.display())
             }
             Self::Worker(error) => {
                 write!(f, "cannot start the background compaction worker: {error}")

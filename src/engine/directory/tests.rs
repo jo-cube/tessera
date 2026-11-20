@@ -570,7 +570,7 @@ fn key(index: u64) -> Vec<u8> {
 /// The directory holds exactly the state's runs.
 fn assert_published(engine: &Engine) {
     let state = engine.core.read_state();
-    check_invariants(&state.runs, &state.directory);
+    check_invariants(&state.only().runs, &state.only().directory);
 }
 
 /// Flushes, compactions and recovery each publish a directory of exactly the
@@ -591,8 +591,11 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
         assert_published(&engine);
     }
     let snapshot = engine.snapshot();
-    let pinned = Arc::clone(&snapshot.view.runs);
-    assert!(Arc::ptr_eq(&pinned, &engine.core.read_state().directory));
+    let pinned = Arc::clone(&snapshot.view.directories[0].1);
+    assert!(Arc::ptr_eq(
+        &pinned,
+        &engine.core.read_state().only().directory
+    ));
     let ks = engine.ks();
     let keys = |snapshot: &Snapshot| {
         let mut reader = snapshot.reader();
@@ -614,9 +617,12 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
     engine.ks().delete(&key(1)).unwrap();
     engine.flush().unwrap();
     assert_published(&engine);
-    assert!(!Arc::ptr_eq(&pinned, &engine.core.read_state().directory));
+    assert!(!Arc::ptr_eq(
+        &pinned,
+        &engine.core.read_state().only().directory
+    ));
     // The snapshot still reads the runs it was taken with.
-    assert!(Arc::ptr_eq(&pinned, &snapshot.view.runs));
+    assert!(Arc::ptr_eq(&pinned, &snapshot.view.directories[0].1));
     assert_eq!(keys(&snapshot), before);
     drop(snapshot);
     drop(pinned);

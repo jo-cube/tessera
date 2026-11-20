@@ -207,7 +207,8 @@ impl<'e> BuiltCompaction<'e> {
         diagnostics::observe("piece_before_publish", job.engine.stats());
         let outputs: Vec<_> = published(output.runs).collect();
         let mut state = job.engine.write_state();
-        state
+        let space = state.space_mut(job.keyspace);
+        space
             .levels
             .replace_piece(sources, bottom, &outputs, job.dest)
             .map_err(|_| CompactionError::Stale)?;
@@ -215,19 +216,18 @@ impl<'e> BuiltCompaction<'e> {
             bottom.iter().any(|r| Arc::ptr_eq(r, run))
                 || sources.iter().any(|(r, _)| Arc::ptr_eq(r, run))
         };
-        state.runs.retain(|r| !is_removed(r));
-        state
+        space.runs.retain(|r| !is_removed(r));
+        space
             .runs
             .extend(sources.iter().filter_map(|(_, r)| r.clone()));
-        state.runs.extend(outputs.iter().cloned());
-        state.recount_runs();
-        state.order_runs();
+        space.runs.extend(outputs.iter().cloned());
+        state.published(job.keyspace);
         let removed: Vec<_> = bottom
             .iter()
             .chain(sources.iter().map(|(r, _)| r))
             .cloned()
             .collect();
-        state.retire_runs(&removed);
+        state.retire_runs(job.keyspace, &removed);
         #[cfg(feature = "diagnostics")]
         #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
         if let Dest::Level(level) = job.dest {

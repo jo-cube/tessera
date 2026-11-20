@@ -202,18 +202,27 @@ fn mutations(iterations: usize) {
                 (40, 8),
                 (48, 8),
                 (56, 4),
-                (60, 8),
+                (60, 4),
+                (64, 4),
                 (68, 4),
+                (72, 8),
+                (80, 8),
+                (MANIFEST_HEADER_LEN, 4),
+                (MANIFEST_HEADER_LEN + 4, 4),
+                (MANIFEST_HEADER_LEN + 8, 1),
             ];
+            // One keyspace, "test": a 9-byte entry and its name.
+            let entries = MANIFEST_HEADER_LEN + 9 + "test".len();
             for index in 0..manifest.runs.len() {
-                let at = MANIFEST_HEADER_LEN + index * MANIFEST_ENTRY_LEN;
+                let at = entries + index * MANIFEST_ENTRY_LEN;
                 manifest_fields.extend([
                     (at + 16, 4),
                     (at + 20, 4),
-                    (at + 24, 8),
-                    (at + 32, 8),
-                    (at + 40, 8),
-                    (at + 48, 8),
+                    (at + 24, 4),
+                    (at + 28, 8),
+                    (at + 36, 8),
+                    (at + 44, 8),
+                    (at + 52, 8),
                 ]);
             }
             for iteration in 0..iterations {
@@ -309,4 +318,158 @@ fn bounded_checkpoint_mutations() {
 #[ignore = "long deterministic checkpoint mutation campaign"]
 fn long_checkpoint_mutations() {
     mutations(10_000);
+}
+
+/// A checkpoint of keyspaces "a", "b" and "c", where "b" was dropped and
+/// created again so that its ID is 3 and the next ID is 4.
+fn keyspace_checkpoint(scratch: &Scratch) -> Manifest {
+    let options = Options {
+        background_compaction: None,
+        ..Options::default()
+    };
+    let engine = Engine::in_memory(options).unwrap();
+    for name in ["a", "b", "c"] {
+        engine
+            .keyspace(name)
+            .unwrap()
+            .put(b"k", name.as_bytes())
+            .unwrap();
+    }
+    engine.drop_keyspace("b").unwrap();
+    engine.keyspace("b").unwrap().put(b"k", b"b2").unwrap();
+    engine.checkpoint_to(&scratch.0).unwrap();
+    engine.close().unwrap();
+    let (_, _, manifest) = committed_manifest(&scratch.0).unwrap();
+    let ids: Vec<_> = manifest
+        .keyspaces
+        .iter()
+        .map(|keyspace| (keyspace.id, keyspace.name.as_str()))
+        .collect();
+    assert_eq!(ids, [(0, "a"), (2, "c"), (3, "b")]);
+    assert_eq!(manifest.next_keyspace, 4);
+    manifest
+}
+
+/// Writes `manifest` over the committed one, as encoded, and opens the
+/// directory, expecting corruption with a message containing `message`.
+fn rejected(scratch: &Scratch, bytes: &[u8], message: &str) {
+    let (_, path, _) = committed_manifest(&scratch.0).unwrap();
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, bytes).unwrap();
+    let error = Engine::open(&scratch.0, Options::default()).unwrap_err();
+    fs::write(&path, original).unwrap();
+    assert_eq!(error.kind(), ErrorKind::Corruption, "{error}");
+    assert!(error.to_string().contains(message), "{error}");
+}
+
+#[test]
+fn recovery_rejects_each_damaged_keyspace_table() {
+    let scratch = Scratch::new("keyspace-table");
+    let manifest = keyspace_checkpoint(&scratch);
+    let damaged = |change: &dyn Fn(&mut Manifest)| {
+        let mut copy = Manifest {
+            keyspaces: manifest.keyspaces.clone(),
+            runs: manifest.runs.clone(),
+            metadata: manifest.metadata.clone(),
+            ..manifest
+        };
+        change(&mut copy);
+        copy.encode()
+    };
+    // A run whose keyspace is not listed.
+    rejected(
+        &scratch,
+        &damaged(&|m| m.keyspaces.retain(|k| k.name != "c")),
+        "a run belongs to keyspace ID 2, which is not listed",
+    );
+    // Two keyspaces with one name, and two with one ID.
+    rejected(
+        &scratch,
+        &damaged(&|m| m.keyspaces[1].name = "a".into()),
+        "two keyspaces share a name or an ID",
+    );
+    rejected(
+        &scratch,
+        &damaged(&|m| {
+            m.keyspaces[1].id = 0;
+            m.runs.retain(|run| run.keyspace == 0 || run.keyspace == 3);
+        }),
+        "two keyspaces share a name or an ID",
+    );
+    // An ID at or above the next ID.
+    rejected(
+        &scratch,
+        &damaged(&|m| m.next_keyspace = 3),
+        "keyspace ID 3 is not below the next keyspace ID 3",
+    );
+    // A malformed table: an invalid name, a zero depth, IDs out of order.
+    rejected(
+        &scratch,
+        &damaged(&|m| m.keyspaces[0].name = "a b".into()),
+        "malformed keyspace table",
+    );
+    rejected(
+        &scratch,
+        &damaged(&|m| m.keyspaces[0].depth = 0),
+        "malformed keyspace table",
+    );
+    rejected(
+        &scratch,
+        &damaged(&|m| m.keyspaces.swap(0, 1)),
+        "malformed keyspace table",
+    );
+    // A table length that disagrees with its entries, resealed.
+    let mut bytes = manifest.encode();
+    let table = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+    bytes[64..68].copy_from_slice(&(table - 1).to_le_bytes());
+    let mut shorter = bytes[..MANIFEST_HEADER_LEN + table as usize - 1].to_vec();
+    shorter.extend_from_slice(&bytes[MANIFEST_HEADER_LEN + table as usize..]);
+    reseal(&mut shorter);
+    rejected(&scratch, &shorter, "malformed keyspace table");
+    // More keyspaces than the limit.
+    let mut bytes = manifest.encode();
+    bytes[60..64].copy_from_slice(&(MAX_KEYSPACES as u32 + 1).to_le_bytes());
+    reseal(&mut bytes);
+    rejected(&scratch, &bytes, "malformed keyspace table");
+    // Runs of one keyspace out of table order.
+    rejected(
+        &scratch,
+        &damaged(&|m| m.runs.reverse()),
+        "run IDs, levels, flush groups, level order or copies of one update disagree",
+    );
+    // The undamaged checkpoint still opens, with every keyspace.
+    let engine = Engine::open(&scratch.0, Options::default()).unwrap();
+    assert_eq!(engine.keyspaces(), ["a", "b", "c"]);
+    assert_eq!(
+        engine.keyspace("b").unwrap().get(b"k").unwrap().unwrap(),
+        b"b2"
+    );
+    engine.close().unwrap();
+}
+
+#[test]
+fn recovery_names_an_unsupported_manifest_version() {
+    let scratch = Scratch::new("manifest-version");
+    let manifest = keyspace_checkpoint(&scratch);
+    for version in [0, 2, 5, u32::MAX] {
+        let mut bytes = manifest.encode();
+        bytes[8..12].copy_from_slice(&version.to_le_bytes());
+        reseal(&mut bytes);
+        rejected(
+            &scratch,
+            &bytes,
+            &format!("unsupported manifest version {version}"),
+        );
+        // A manifest of another version is reported by its version, whatever
+        // its length.
+        rejected(
+            &scratch,
+            &bytes[..MANIFEST_HEADER_LEN / 2],
+            &format!("unsupported manifest version {version}"),
+        );
+    }
+    let mut bytes = manifest.encode();
+    bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+    reseal(&mut bytes);
+    rejected(&scratch, &bytes, "unsupported manifest flags 0x2");
 }

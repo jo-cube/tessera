@@ -110,4 +110,40 @@ pub struct EngineStats {
     pub flushes: u64,
     /// Stored bytes those flushes published.
     pub flushed_bytes: u64,
+    /// Live keyspaces. The run, byte and level figures above are totals,
+    /// or for `max_overlap`, `level0_flushes` and `levels` the most, over
+    /// them; [`KeyspaceDetail`] gives each one's.
+    pub keyspaces: usize,
+}
+
+/// One keyspace's runs and levels.
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyspaceDetail {
+    /// Its name.
+    pub name: String,
+    /// Published runs.
+    pub runs: usize,
+    /// Stored bytes of its runs.
+    pub run_bytes: usize,
+    /// Key filters, restart heads and physical segment metadata beside
+    /// `run_bytes`.
+    pub held_bytes: usize,
+    /// Bloom filter payload bytes of its runs.
+    pub filter_bytes: usize,
+    /// Block index bytes of its runs.
+    pub index_bytes: usize,
+    /// Physical chunk capacity held by its runs.
+    pub chunk_bytes_held: usize,
+    /// Frame bytes referenced by its runs.
+    pub block_bytes_live: usize,
+    /// The most of its runs whose key ranges share one key.
+    pub max_overlap: usize,
+    /// Flushes whose runs its level 0 holds.
+    pub level0_flushes: usize,
+    /// Runs in its level 0.
+    pub level0_runs: usize,
+    /// Its levels below level 0.
+    pub levels: usize,
 }

@@ -29,7 +29,7 @@ Versions follow [semantic versioning](https://semver.org). Before 1.0:
   minimum Rust version, and its changelog says which;
 - a patch version (0.1.0 → 0.1.1) keeps all three.
 
-The checkpoint format is run format 6 with manifest version 5. Recovery
+The checkpoint format is run format 1 with manifest version 1. Recovery
 rejects versions it does not support, and there is no converter: to cross a
 format change, an application recovers with the old version and writes its
 data into an engine of the new one. The `diagnostics` and `tools-memory`

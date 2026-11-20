@@ -4,7 +4,7 @@
 
 pub use super::checkpoint::CheckpointReport;
 pub use super::read::ReaderCounters;
-pub use super::stats::{EngineStats, FlushReport};
+pub use super::stats::{EngineStats, FlushReport, KeyspaceDetail};
 pub use super::worker::BackgroundStatus;
 use super::{CheckpointReport as Report, Engine, Reader};
 pub use crate::chunk::{BuildCounters, Erasure};
@@ -13,8 +13,10 @@ pub use crate::run::MergeWorkspace;
 
 /// Engine operations for tools and tests.
 pub trait EngineDiagnostics {
-    /// Detailed statistics.
+    /// Detailed statistics, totalled over keyspaces.
     fn engine_stats(&self) -> EngineStats;
+    /// Each live keyspace's runs and levels, in name order.
+    fn keyspace_stats(&self) -> Vec<KeyspaceDetail>;
     /// Waits until everything written before the call is in runs, and
     /// reports what the flushes it waited for published.
     ///
@@ -36,6 +38,10 @@ pub trait EngineDiagnostics {
 impl EngineDiagnostics for Engine {
     fn engine_stats(&self) -> EngineStats {
         self.core.stats()
+    }
+
+    fn keyspace_stats(&self) -> Vec<KeyspaceDetail> {
+        self.core.keyspace_stats()
     }
 
     fn flush(&self) -> crate::Result<FlushReport> {
@@ -131,12 +137,36 @@ pub struct LevelMemory {
     pub physical: usize,
 }
 
-/// Memory of each level, level 0 first.
+/// Every keyspace's runs by level, level 0 first and the bottom level
+/// last: a keyspace with fewer levels adds its levels below level 0 to the
+/// deepest ones, so that every keyspace's bottom level is the last.
+fn aligned_levels(state: &super::State) -> Vec<Vec<super::SharedRun>> {
+    let depth = state
+        .keyspaces
+        .values()
+        .map(|space| space.levels.runs().len())
+        .max()
+        .unwrap_or(2);
+    let mut levels = vec![Vec::new(); depth];
+    for space in state.keyspaces.values() {
+        let own = space.levels.runs();
+        for (level, runs) in own.iter().enumerate() {
+            let at = if level == 0 {
+                0
+            } else {
+                depth - (own.len() - level)
+            };
+            levels[at].extend(runs.iter().cloned());
+        }
+    }
+    levels
+}
+
+/// Memory of each level over every keyspace, level 0 first and the bottom
+/// level last, as [`streaming_shape`] aligns them.
 pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
     let state = engine.core.read_state();
-    state
-        .levels
-        .runs()
+    aligned_levels(&state)
         .iter()
         .map(|runs| {
             let mut level = LevelMemory {
@@ -179,17 +209,19 @@ pub struct StreamingShape {
     pub stored_bytes: usize,
 }
 
-/// Summarizes the currently published shape after the caller drains the engine.
+/// Summarizes the currently published shape after the caller drains the
+/// engine, over every keyspace: levels align at the bottom, as in
+/// [`levels`], and `max_overlap` is the most of any keyspace.
 pub fn streaming_shape(engine: &Engine) -> StreamingShape {
     let state = engine.core.read_state();
-    let levels = state.levels.runs();
+    let levels = aligned_levels(&state);
     let bottom = levels.last().map_or(&[][..], Vec::as_slice);
     // Bounded views keep their physical run's ID, so each physical run
     // counts once however many views of it are published.
     let mut seen = std::collections::HashSet::new();
-    let stored_bytes: usize = state
-        .runs
+    let stored_bytes: usize = levels
         .iter()
+        .flatten()
         .filter(|run| seen.insert(run.id))
         .map(|run| run.run.stored_len())
         .sum();
@@ -199,7 +231,12 @@ pub fn streaming_shape(engine: &Engine) -> StreamingShape {
     let bottom_bytes: usize = physical_bottom.iter().map(|run| run.run.stored_len()).sum();
     StreamingShape {
         runs_per_level: levels.iter().map(Vec::len).collect(),
-        max_overlap: state.directory.group_count(),
+        max_overlap: state
+            .keyspaces
+            .values()
+            .map(|space| space.directory.group_count())
+            .max()
+            .unwrap_or(0),
         level0_runs: levels.first().map_or(0, Vec::len),
         bottom_runs,
         bottom_mean_stored_bytes: bottom_bytes.checked_div(bottom_runs).unwrap_or(0),
@@ -240,11 +277,12 @@ pub fn take_copy_audit() -> (Vec<SegmentCopy>, u64) {
     crate::run::copy_audit::take()
 }
 
-/// Every `every`-th Zstandard segment of the bottom level's physical runs,
-/// decoded, with its dictionary and the builder's block-size hint.
+/// Every `every`-th Zstandard segment of every keyspace's bottom-level
+/// physical runs, decoded, with its dictionary and the builder's
+/// block-size hint.
 pub fn bottom_segments(engine: &Engine, every: usize) -> Vec<SegmentSample> {
     let state = engine.core.read_state();
-    let levels = state.levels.runs();
+    let levels = aligned_levels(&state);
     let bottom = levels.last().map_or(&[][..], Vec::as_slice);
     let mut out = Vec::new();
     let mut ordinal = 0usize;
@@ -258,10 +296,10 @@ pub fn bottom_segments(engine: &Engine, every: usize) -> Vec<SegmentSample> {
     out
 }
 
-/// Raw block bytes of the bottom level's physical runs.
+/// Raw block bytes of every keyspace's bottom-level physical runs.
 pub fn bottom_raw(engine: &Engine) -> usize {
     let state = engine.core.read_state();
-    let levels = state.levels.runs();
+    let levels = aligned_levels(&state);
     let bottom = levels.last().map_or(&[][..], Vec::as_slice);
     super::physical_runs(bottom)
         .map(|run| run.run.raw_len())
@@ -352,9 +390,9 @@ pub fn maintenance(engine: &Engine) -> Maintenance {
     }
 }
 
-/// Flush groups level 0 holds runs of now.
+/// Flush groups the deepest keyspace's level 0 holds runs of now.
 pub fn level0_flushes(engine: &Engine) -> usize {
-    engine.core.read_state().levels.level0_flushes()
+    engine.core.read_state().level0_flushes
 }
 
 /// Holds off new compaction jobs until the guard drops, after any job in

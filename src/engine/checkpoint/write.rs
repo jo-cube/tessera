@@ -153,12 +153,19 @@ fn reclaim(
     (files, directories, failed)
 }
 
-struct Image {
-    runs: Vec<(usize, u64, SharedRun)>,
-    ceiling: u64,
+/// One keyspace of a checkpoint image.
+struct ImageKeyspace {
+    id: u32,
+    name: Arc<str>,
     depth: usize,
-    /// The live keyspace's name at the ceiling.
-    keyspace: Option<Arc<str>>,
+    runs: Vec<(usize, u64, SharedRun)>,
+}
+
+struct Image {
+    /// The keyspaces live at the ceiling, by ID.
+    keyspaces: Vec<ImageKeyspace>,
+    next_keyspace: u32,
+    ceiling: u64,
     _live: Arc<()>,
 }
 
@@ -173,36 +180,33 @@ impl Core {
             // Respect the ordinary frozen-table bound before rotating active.
             // This can occur while the background flush is building.
             if !state.active.is_empty() && state.frozen.len() >= self.max_frozen_memtables {
-                let job = FlushJob {
-                    engine: self,
-                    _serial: serial,
-                    tables: state.frozen.clone(),
-                    cuts: state.flush_cuts(self.target_run_len),
-                };
+                let job = FlushJob::new(self, serial, &state);
                 drop(state);
                 job.build().publish();
                 continue;
             }
             let mut image = Image {
-                runs: state.levels.checkpoint_runs(),
+                keyspaces: state
+                    .keyspaces
+                    .iter()
+                    .map(|(&id, space)| ImageKeyspace {
+                        id,
+                        name: Arc::clone(&space.name),
+                        depth: space.levels.depth(),
+                        runs: space.levels.checkpoint_runs(),
+                    })
+                    .collect(),
+                next_keyspace: state.next_keyspace,
                 ceiling: state.last_seq,
-                depth: state.levels.depth(),
-                keyspace: state.keyspace.as_ref().map(|entry| Arc::clone(&entry.name)),
                 _live: Arc::clone(&self.snapshots),
             };
-            let flush = state.levels.next_flush();
             if !state.active.is_empty() {
                 self.freeze_active(&mut state);
             }
             if state.frozen.is_empty() {
                 return Ok(image);
             }
-            let job = FlushJob {
-                engine: self,
-                _serial: serial,
-                tables: state.frozen.clone(),
-                cuts: state.flush_cuts(self.target_run_len),
-            };
+            let job = FlushJob::new(self, serial, &state);
             drop(state);
             #[cfg(test)]
             AFTER_ROTATION.with(|hook| {
@@ -210,11 +214,20 @@ impl Core {
                     hook();
                 }
             });
-            let (_, runs) = job.build().publish_kept();
-            image
-                .runs
-                .extend(runs.into_iter().map(|run| (0, flush, run)));
-            image.runs.sort_by_key(|(level, _, _)| *level);
+            let (_, kept) = job.build().publish_kept();
+            for kept in kept {
+                // The flush began in the section the image was taken in, so
+                // its keyspaces are the image's.
+                let at = image
+                    .keyspaces
+                    .binary_search_by_key(&kept.keyspace, |space| space.id)
+                    .expect("a flushed keyspace is in the image");
+                let space = &mut image.keyspaces[at];
+                space
+                    .runs
+                    .extend(kept.runs.into_iter().map(|run| (0, kept.flush, run)));
+                space.runs.sort_by_key(|(level, _, _)| *level);
+            }
             return Ok(image);
         }
     }
@@ -255,32 +268,45 @@ fn write_runs(
 ) -> Result<Written, Failure> {
     let runs_dir = dir.join(RUNS);
     fs::create_dir_all(&runs_dir).map_err(io_error(&runs_dir))?;
+    let image_runs = || {
+        image.keyspaces.iter().flat_map(|space| {
+            space
+                .runs
+                .iter()
+                .map(move |(level, flush, run)| (space.id, *level, *flush, run))
+        })
+    };
     let mut written = Written {
         manifest: Manifest {
             generation,
             last_seq: image.ceiling,
             records: {
                 let mut seen = HashSet::new();
-                image
-                    .runs
-                    .iter()
-                    .filter(|(_, _, r)| seen.insert(r.id))
-                    .map(|(_, _, r)| r.run.len() as u64)
+                image_runs()
+                    .filter(|(_, _, _, r)| seen.insert(r.id))
+                    .map(|(_, _, _, r)| r.run.len() as u64)
                     .sum()
             },
-            next_run_id: image
-                .runs
-                .iter()
-                .map(|(_, _, run)| (run.id as u64) + 1)
+            next_run_id: image_runs()
+                .map(|(_, _, _, run)| (run.id as u64) + 1)
                 .chain(std::iter::once(
                     RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner).1,
                 ))
                 .max()
                 .unwrap(),
             previous,
-            depth: image.depth,
-            metadata: encode_catalog(image.keyspace.as_deref(), metadata),
-            runs: Vec::with_capacity(image.runs.len()),
+            next_keyspace: image.next_keyspace,
+            keyspaces: image
+                .keyspaces
+                .iter()
+                .map(|space| KeyspaceEntry {
+                    id: space.id,
+                    name: space.name.to_string(),
+                    depth: space.depth,
+                })
+                .collect(),
+            metadata: metadata.map(<[u8]>::to_vec),
+            runs: Vec::with_capacity(image_runs().count()),
         },
         bytes: 0,
         bytes_reused: 0,
@@ -290,12 +316,13 @@ fn write_runs(
         largest_run_bytes: 0,
     };
     let mut physical_sums = HashMap::new();
-    for &(level, flush, ref published) in &image.runs {
+    for (keyspace, level, flush, published) in image_runs() {
         let run = &published.run;
         let len = (run.stored_len() + run.filter_bytes() + 4) as u64;
         if let Some(&sum) = physical_sums.get(&published.id) {
             written.manifest.runs.push(RunEntry {
                 id: published.id,
+                keyspace,
                 level,
                 flush,
                 seq_override: run.seq_override(),
@@ -368,6 +395,7 @@ fn write_runs(
         written.largest_run_bytes = written.largest_run_bytes.max(len as usize);
         written.manifest.runs.push(RunEntry {
             id: published.id,
+            keyspace,
             level,
             flush,
             seq_override: run.seq_override(),
