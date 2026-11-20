@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "../src/test_support.rs"]
 mod test_support;
 
-use tessera::engine::diagnostics::{self, MergeWorkspace};
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace, Snapshot};
+use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace};
+use tessera::{Engine, Keyspace, Options, Snapshot};
 
-fn options() -> EngineOptions {
-    EngineOptions::default()
+fn options() -> Options {
+    Options::default()
 }
 
 struct Counting;
@@ -92,24 +92,26 @@ const OWN: usize = 1 << 10;
 
 /// An engine whose memtable never fills in these tests, so that only the
 /// history its snapshots pin is retained.
-fn memtable_only() -> Engine {
+fn memtable_only() -> (Engine, Keyspace) {
     let mut options = options();
-    options.memtable_budget = 64 << 20;
-    Engine::new(options).unwrap()
+    options.memtable_size = 64 << 20;
+    let engine = Engine::in_memory(options).unwrap();
+    let ks = engine.keyspace("data").unwrap();
+    (engine, ks)
 }
 
 /// The active table's pinned bytes cover what only its snapshots hold.
 fn memtable_checkpoints(seed: u64) -> usize {
     let mut rng = Rng(seed);
-    let engine = memtable_only();
+    let (engine, ks) = memtable_only();
     let mut held: Vec<Snapshot> = Vec::with_capacity(64);
     let mut checked = 0;
     for step in 0..12_000 {
         let key = key(&mut rng, 1_500);
         if rng.chance(15) {
-            engine.delete(&key).unwrap();
+            ks.delete(&key).unwrap();
         } else {
-            engine.put(&key, &value(&mut rng)).unwrap();
+            ks.put(&key, &value(&mut rng)).unwrap();
         }
         if rng.chance(2) && held.len() < 60 {
             held.push(engine.snapshot());
@@ -118,7 +120,7 @@ fn memtable_checkpoints(seed: u64) -> usize {
             drop_one(&mut rng, &mut held);
         }
         if step % 1_500 == 1_499 {
-            let stats = engine.stats();
+            let stats = engine.engine_stats();
             assert_eq!(stats.runs, 0);
             let (pinned, count) = (stats.active.pinned, held.len());
             assert_eq!(stats.retained_bytes, pinned);
@@ -128,7 +130,7 @@ fn memtable_checkpoints(seed: u64) -> usize {
                 "seed {seed} step {step}: dropping {count} snapshots freed {freed} bytes, \
                  {pinned} were pinned"
             );
-            assert_eq!(engine.stats().active.pinned, 0);
+            assert_eq!(engine.engine_stats().active.pinned, 0);
             checked += 1;
         }
     }
@@ -139,22 +141,22 @@ fn memtable_checkpoints(seed: u64) -> usize {
 /// once. Dropping it frees the detached nodes and returns the copied partial
 /// chunk to the pool. Used arena bytes and chunk capacity are accounted separately.
 fn whole_table_replaced() {
-    let engine = memtable_only();
+    let (engine, ks) = memtable_only();
     let keys: Vec<Vec<u8>> = (0..20_000u32)
         .map(|i| format!("key{i:06}").into_bytes())
         .collect();
     for key in &keys {
-        engine.put(key, b"12345678").unwrap();
+        ks.put(key, b"12345678").unwrap();
     }
-    let arena_used = engine.stats().active.arena_bytes;
+    let arena_used = engine.engine_stats().active.arena_bytes;
     let snapshot = engine.snapshot();
     for key in &keys {
-        engine.put(key, b"abcdefgh").unwrap();
+        ks.put(key, b"abcdefgh").unwrap();
     }
-    let before = engine.stats();
+    let before = engine.engine_stats();
     let pinned = before.active.pinned;
     let freed = freed_by(|| drop(snapshot));
-    let after = engine.stats();
+    let after = engine.engine_stats();
     assert_eq!(before.pool_in_use_bytes - after.pool_in_use_bytes, 1 << 20);
     assert_eq!(
         after.pool_reserve_bytes - before.pool_reserve_bytes,
@@ -170,9 +172,9 @@ fn whole_table_replaced() {
     );
 }
 
-fn engine_options() -> EngineOptions {
+fn engine_options() -> Options {
     let mut options = options();
-    options.memtable_budget = 96 << 10;
+    options.memtable_size = 96 << 10;
     options
 }
 
@@ -188,21 +190,21 @@ fn compact_some(engine: &Engine, rng: &mut Rng, workspace: &mut MergeWorkspace) 
 /// memtable history and released tables and runs.
 fn engine_checkpoints(seed: u64) -> usize {
     let mut rng = Rng(seed);
-    let engine = Engine::new(engine_options()).unwrap();
+    let engine = Engine::in_memory(engine_options()).unwrap();
+    let ks = engine.keyspace("data").unwrap();
     let mut held: Vec<Snapshot> = Vec::with_capacity(64);
     let mut merge = MergeWorkspace::new();
-    let mut workspace = EngineWorkspace::new();
     let mut checked = 0;
     for step in 0..8_000 {
         let key = key(&mut rng, 2_000);
-        let flushes = engine.stats().flushes;
+        let flushes = engine.engine_stats().flushes;
         if rng.chance(10) {
-            engine.delete(&key).unwrap();
+            ks.delete(&key).unwrap();
         } else {
-            engine.put(&key, &value(&mut rng)).unwrap();
+            ks.put(&key, &value(&mut rng)).unwrap();
         }
         // The write flushed a full table.
-        if engine.stats().flushes != flushes {
+        if engine.engine_stats().flushes != flushes {
             compact_some(&engine, &mut rng, &mut merge);
         }
         if rng.chance(3) && held.len() < 48 {
@@ -218,11 +220,12 @@ fn engine_checkpoints(seed: u64) -> usize {
             compact_some(&engine, &mut rng, &mut merge);
         }
         if step % 1_000 == 999 {
-            // Fill the workspace now, so that the checkpoint frees none of it.
+            // Fill the pooled reader buffers now, so that the check frees
+            // none of them.
             for snapshot in &held {
-                let _ = snapshot.get(&key, &mut workspace).unwrap();
+                let _ = snapshot.reader().get(&ks, &key).unwrap();
             }
-            let stats = engine.stats();
+            let stats = engine.engine_stats();
             let sources: usize = stats.runs + stats.frozen_tables + 1;
             let allowance = held.len() * (OWN + 8 * sources);
             let freed = freed_by(|| held.clear());
@@ -233,10 +236,10 @@ fn engine_checkpoints(seed: u64) -> usize {
                 stats.retained_bytes
             );
             test_support::wait_until(|| {
-                let stats = engine.stats();
+                let stats = engine.engine_stats();
                 (stats.retained_bytes, stats.retained_sources) == (0, 0)
             });
-            let after = engine.stats();
+            let after = engine.engine_stats();
             assert_eq!((after.retained_bytes, after.retained_sources), (0, 0));
             checked += 1;
         }

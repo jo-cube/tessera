@@ -36,7 +36,7 @@ pub struct BackgroundStatus {
     pub failures: u64,
     /// The failure that ended the most recent pass, if it failed. A
     /// read failure is not terminal: the next request starts another pass.
-    pub last_failure: Option<CompactionError>,
+    pub(crate) last_failure: Option<CompactionError>,
     /// The message of the panic that stopped the worker, if it panicked. A
     /// stopped worker is not restarted; the engine works on without it.
     pub panic: Option<String>,
@@ -45,7 +45,7 @@ pub struct BackgroundStatus {
 /// Why waiting for background compaction did not end in success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BackgroundError {
+pub(crate) enum BackgroundError {
     /// The worker panicked and has stopped for good, with this message.
     Panicked(String),
     /// The pass waited for ended on this failure. Nothing is retried until
@@ -171,6 +171,7 @@ impl Signal {
 
     /// Requests a pass and waits until one started after the request has
     /// finished, or the worker has stopped.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn wait(&self) -> Result<(), BackgroundError> {
         let target = self.request();
         let mut progress = self.lock();

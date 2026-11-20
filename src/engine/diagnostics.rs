@@ -1,9 +1,83 @@
-//! Repository diagnostics: work and memory by level.
+//! Repository diagnostics: work and memory by level, detailed statistics,
+//! explicit flushes and compactions, and reader counters.
 //! Built only with the `diagnostics` feature; not part of the stable API.
 
-use super::{CompactionError, Engine};
-pub use crate::chunk::Erasure;
+pub use super::checkpoint::CheckpointReport;
+pub use super::read::ReaderCounters;
+pub use super::stats::{EngineStats, FlushReport};
+pub use super::worker::BackgroundStatus;
+use super::{CheckpointReport as Report, Engine, Reader};
+pub use crate::chunk::{BuildCounters, Erasure};
+pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub use crate::run::MergeWorkspace;
+
+/// Engine operations for tools and tests.
+pub trait EngineDiagnostics {
+    /// Detailed statistics.
+    fn engine_stats(&self) -> EngineStats;
+    /// Waits until everything written before the call is in runs, and
+    /// reports what the flushes it waited for published.
+    ///
+    /// # Errors
+    /// [`ErrorKind::Background`](crate::ErrorKind::Background) if the flush
+    /// worker panicked.
+    fn flush(&self) -> crate::Result<FlushReport>;
+    /// Requests a complete compaction pass and waits for it.
+    ///
+    /// # Errors
+    /// A worker panic or the failure that ended the pass.
+    fn wait_for_compaction(&self) -> crate::Result<()>;
+    /// What the compaction worker has done.
+    fn background_status(&self) -> Option<BackgroundStatus>;
+    /// The report of the latest checkpoint this engine committed.
+    fn last_checkpoint(&self) -> Option<CheckpointReport>;
+}
+
+impl EngineDiagnostics for Engine {
+    fn engine_stats(&self) -> EngineStats {
+        self.core.stats()
+    }
+
+    fn flush(&self) -> crate::Result<FlushReport> {
+        let _open = self.shared.enter()?;
+        Ok(self.core.flush()?)
+    }
+
+    fn wait_for_compaction(&self) -> crate::Result<()> {
+        let _open = self.shared.enter()?;
+        match &self.core.background {
+            Some(signal) => Ok(signal.wait()?),
+            None => Ok(()),
+        }
+    }
+
+    fn background_status(&self) -> Option<BackgroundStatus> {
+        self.core
+            .background
+            .as_ref()
+            .map(super::worker::Signal::status)
+    }
+
+    fn last_checkpoint(&self) -> Option<Report> {
+        *self
+            .shared
+            .last_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Reader counters for tools and tests.
+pub trait ReaderDiagnostics {
+    /// Work this reader has done, and memory its buffers hold.
+    fn counters(&self) -> ReaderCounters;
+}
+
+impl ReaderDiagnostics for Reader<'_> {
+    fn counters(&self) -> ReaderCounters {
+        self.reader_counters()
+    }
+}
 
 /// Bytes one purpose read and wrote.
 #[derive(Clone, Copy, Debug, Default)]
@@ -194,14 +268,13 @@ pub fn bottom_raw(engine: &Engine) -> usize {
         .sum()
 }
 
-static MEMORY_OBSERVER: std::sync::OnceLock<fn(&str, super::EngineStats)> =
-    std::sync::OnceLock::new();
+static MEMORY_OBSERVER: std::sync::OnceLock<fn(&str, EngineStats)> = std::sync::OnceLock::new();
 
 /// Install a process-wide maintenance boundary sampler for repository tools.
-pub fn set_memory_observer(observer: fn(&str, super::EngineStats)) {
+pub fn set_memory_observer(observer: fn(&str, EngineStats)) {
     assert!(MEMORY_OBSERVER.set(observer).is_ok());
 }
-pub(super) fn observe(reason: &str, stats: super::EngineStats) {
+pub(super) fn observe(reason: &str, stats: EngineStats) {
     if let Some(observer) = MEMORY_OBSERVER.get() {
         observer(reason, stats);
     }
@@ -299,47 +372,46 @@ pub fn hold_compaction(engine: &Engine) -> std::sync::MutexGuard<'_, ()> {
 /// returns whether one was eligible. Serializes with other compactions.
 ///
 /// # Errors
-/// Returns [`CompactionError`] for a read failure or invalidated selection.
+/// [`ErrorKind::Corruption`](crate::ErrorKind::Corruption) for a read
+/// failure.
 ///
 /// # Panics
 /// Panics if the state lock is poisoned or a synchronous builder panics.
-pub fn compact_step(
-    engine: &Engine,
-    workspace: &mut MergeWorkspace,
-) -> Result<bool, CompactionError> {
-    engine.compact(workspace).map(|report| report.is_some())
+pub fn compact_step(engine: &Engine, workspace: &mut MergeWorkspace) -> crate::Result<bool> {
+    Ok(engine.core.compact_step(workspace)?.is_some())
 }
 
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use crate::engine::{EngineOptions, EngineWorkspace};
+    use crate::engine::Options;
 
     #[test]
     fn point_filter_probes_exclude_range_and_sequence_pruning() {
-        let engine = Engine::new(EngineOptions {
+        let engine = Engine::in_memory(Options {
             background_compaction: None,
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
+        let ks = engine.test_keyspace();
         for value in [b"old", b"new"] {
-            engine.put(b"a", value).unwrap();
-            engine.put(b"z", value).unwrap();
+            ks.put(b"a", value).unwrap();
+            ks.put(b"z", value).unwrap();
             engine.flush().unwrap();
         }
-        let mut ws = EngineWorkspace::new();
-        assert!(engine.get(b"b", &mut ws).unwrap().is_none());
-        assert_eq!(ws.filter_probes(), 2);
-        assert_eq!(engine.get(b"a", &mut ws).unwrap().unwrap().value, b"new");
-        assert_eq!(ws.filter_probes(), 3);
-        assert!(engine.get(b"0", &mut ws).unwrap().is_none());
-        assert_eq!(ws.filter_probes(), 3);
+        let mut reader = engine.reader();
+        assert!(reader.get(&ks, b"b").unwrap().is_none());
+        assert_eq!(reader.counters().filter_probes, 2);
+        assert_eq!(reader.get(&ks, b"a").unwrap(), Some(&b"new"[..]));
+        assert_eq!(reader.counters().filter_probes, 3);
+        assert!(reader.get(&ks, b"0").unwrap().is_none());
+        assert_eq!(reader.counters().filter_probes, 3);
         let shape = streaming_shape(&engine);
         assert_eq!(
             shape.runs_per_level.iter().sum::<usize>(),
-            engine.stats().runs
+            engine.engine_stats().runs
         );
-        assert_eq!(shape.stored_bytes, engine.stats().run_bytes);
+        assert_eq!(shape.stored_bytes, engine.engine_stats().run_bytes);
         assert_eq!(shape.bounded_views, 0);
     }
 }

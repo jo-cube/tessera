@@ -118,9 +118,8 @@ pub(crate) use filter::MAX_FILTER_BYTES;
 pub(crate) use group::RunList;
 #[cfg(test)]
 pub(crate) use logical::latest_in;
-pub use logical::{
-    ConflictingCopies, LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace, ReadError,
-};
+pub(crate) use logical::{ConflictingCopies, ReadError};
+pub use logical::{LiveRecord, LiveValue, LogicalCursor, LogicalWorkspace};
 pub(crate) use logical::{LookupSource, latest_from};
 pub use merge::{MergeCursor, MergeWorkspace};
 pub(crate) use output_budget::{OutputBudget, OutputCounters};
@@ -185,7 +184,7 @@ fn read_u64<const N: usize>(bytes: &[u8; N], at: usize) -> u64 {
 /// which validates every run in full, or while reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct CorruptRun {
+pub(crate) struct CorruptRun {
     /// Byte offset in the run of the offending structure.
     pub offset: usize,
     /// The invariant that was violated.
@@ -195,7 +194,7 @@ pub struct CorruptRun {
 /// The kinds of structural corruption detected in a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum RunCorruption {
+pub(crate) enum RunCorruption {
     /// The bytes are too short to hold a footer.
     Truncated,
     /// The footer does not end with the run magic number.

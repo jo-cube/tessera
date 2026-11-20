@@ -8,9 +8,8 @@
 //! [--c2] [--write-only] [--memtable VALUE_LEN] [--worst]
 //! [SCENARIO...]`
 use std::time::Instant;
-use tessera::engine::diagnostics;
-use tessera::engine::diagnostics::MergeWorkspace;
-use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
+use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics};
+use tessera::{Engine, Keyspace, Options};
 
 mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -98,6 +97,7 @@ static BOTTOM_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// short scans from spread 7-byte prefixes (one seek, then 100 records).
 fn probe_reads(
     engine: &Engine,
+    ks: &Keyspace,
     name: &str,
     variant: &str,
     point: &str,
@@ -106,47 +106,37 @@ fn probe_reads(
 ) {
     const GETS: usize = 10_000;
     const SEEKS: usize = 200;
-    let mut hits = EngineWorkspace::new();
+    let mut hits = engine.reader();
     for at in 0..GETS {
         let i = at * 7919 % records;
-        assert_eq!(
-            engine.get(&key(i), &mut hits).unwrap().unwrap().value,
-            expect(i)
-        );
+        assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
     }
-    let mut misses = EngineWorkspace::new();
+    let mut misses = engine.reader();
     for at in 0..GETS {
         let i = at * 7919 % (records - 1);
         let mut missing = key(i).to_vec();
         missing.push(0);
-        assert!(engine.get(&missing, &mut misses).unwrap().is_none());
+        assert!(misses.get(ks, &missing).unwrap().is_none());
     }
     let (mut seek_blocks, mut scan_blocks) = (0, 0);
-    let mut ws = EngineWorkspace::new();
+    let mut ws = engine.reader();
     for at in 0..SEEKS {
         // Prefixes of 256 entities (16,384 keys); start well before the end.
         let i = (at * 104_729) % (records - 20_000);
         let prefix = &key(i)[..7];
-        let guard = engine.read();
         // One seek alone, then a fresh scan of 100 records from it.
-        let before = ws.blocks_loaded();
-        assert!(
-            guard
-                .scan_prefix(prefix, &mut ws)
-                .next_record()
-                .unwrap()
-                .is_some()
-        );
-        seek_blocks += ws.blocks_loaded() - before;
-        let before = ws.blocks_loaded();
-        let mut scan = guard.scan_prefix(prefix, &mut ws);
+        let before = ws.counters().blocks_loaded;
+        assert!(ws.prefix(ks, prefix).next().unwrap().is_some());
+        seek_blocks += ws.counters().blocks_loaded - before;
+        let before = ws.counters().blocks_loaded;
+        let mut scan = ws.prefix(ks, prefix);
         for _ in 0..100 {
-            assert!(scan.next_record().unwrap().is_some());
+            assert!(scan.next().unwrap().is_some());
         }
         drop(scan);
-        scan_blocks += ws.blocks_loaded() - before;
+        scan_blocks += ws.counters().blocks_loaded - before;
     }
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     let levels = diagnostics::levels(engine);
     let stored_records: usize = levels.iter().map(|m| m.records).sum();
     let l0 = levels[0];
@@ -160,12 +150,12 @@ fn probe_reads(
     let per = |n: u64, d: usize| n as f64 / d as f64;
     println!(
         "probe,{name},{variant},{point},{:.3},{:.3},{:.1},{:.3},{:.3},{:.1},{},{:.3},{:.3},{},{},{},{},{},{:.4}",
-        per(hits.filter_probes(), GETS),
-        per(hits.blocks_loaded(), GETS),
-        per(hits.decoded_bytes(), GETS),
-        per(misses.filter_probes(), GETS),
-        per(misses.blocks_loaded(), GETS),
-        per(misses.decoded_bytes(), GETS),
+        per(hits.counters().filter_probes, GETS),
+        per(hits.counters().blocks_loaded, GETS),
+        per(hits.counters().decoded_bytes, GETS),
+        per(misses.counters().filter_probes, GETS),
+        per(misses.counters().blocks_loaded, GETS),
+        per(misses.counters().decoded_bytes, GETS),
         stats.max_overlap + stats.frozen_tables + 1,
         per(seek_blocks, SEEKS),
         per(scan_blocks, SEEKS),
@@ -208,13 +198,14 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let started = Instant::now();
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let engine = std::sync::Arc::new(
-        Engine::new({
-            let mut options = EngineOptions::default();
+        Engine::in_memory({
+            let mut options = Options::default();
             options.background_threads = threads;
             options
         })
         .unwrap(),
     );
+    let ks = &engine.keyspace("data").unwrap();
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     let sampler = memory::Sampler::start(std::sync::Arc::clone(&engine), name, variant);
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -227,7 +218,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     }
     for &i in &order {
         let v = value(i, 0, weak, len);
-        engine.put(&key(i), &v).unwrap();
+        ks.put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -242,7 +233,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     }
     for &i in &updates {
         let v = value(i, 1, weak, len);
-        engine.put(&key(i), &v).unwrap();
+        ks.put(&key(i), &v).unwrap();
         ingested += (16 + v.len()) as u64;
         updated[i] = true;
     }
@@ -263,58 +254,48 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     }
 
     let expect = |i: usize| value(i, u8::from(updated[i]), weak, len);
-    let mut scans = EngineWorkspace::new();
+    let mut scans = engine.reader();
     for _ in 0..100 {
-        let guard = engine.read();
-        let mut scan = guard.scan(&mut scans);
+        let mut scan = scans.range(ks, ..);
         for _ in 0..100 {
-            assert!(scan.next_record().unwrap().is_some());
+            assert!(scan.next().unwrap().is_some());
         }
     }
     // Every reader path against the oracle: sampled gets, then multi-get
     // and a full scan over every record.
-    let mut ws = EngineWorkspace::new();
+    let mut ws = engine.reader();
     for i in (0..records).step_by(61) {
-        assert_eq!(
-            engine.get(&key(i), &mut ws).unwrap().unwrap().value,
-            expect(i)
-        );
+        assert_eq!(ws.get(ks, &key(i)).unwrap().unwrap(), expect(i));
     }
     for start in (0..records).step_by(128) {
         let keys: Vec<_> = (start..(start + 128).min(records)).rev().map(key).collect();
         let last = start + keys.len() - 1;
-        engine
-            .multi_get(&keys, &mut ws, |at, got| {
-                assert_eq!(got.unwrap(), expect(last - at));
-            })
-            .unwrap();
+        for (at, got) in ws.multi_get(ks, &keys).unwrap().iter().enumerate() {
+            assert_eq!(got.unwrap(), expect(last - at));
+        }
     }
     {
-        let guard = engine.read();
-        let mut scan = guard.scan(&mut ws);
+        let mut scan = ws.range(ks, ..);
         for i in 0..records {
-            let rec = scan.next_record().unwrap().unwrap();
-            assert_eq!(rec.key, key(i));
-            assert_eq!(rec.value, expect(i));
+            let (found, value) = scan.next().unwrap().unwrap();
+            assert_eq!(found, key(i));
+            assert_eq!(value, expect(i));
         }
-        assert!(scan.next_record().unwrap().is_none());
+        assert!(scan.next().unwrap().is_none());
     }
-    let mut hits = EngineWorkspace::new();
+    let mut hits = engine.reader();
     for at in 0..10_000 {
         let i = at * 7919 % records;
-        assert_eq!(
-            engine.get(&key(i), &mut hits).unwrap().unwrap().value,
-            expect(i)
-        );
+        assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
     }
-    let mut misses = EngineWorkspace::new();
+    let mut misses = engine.reader();
     for at in 0..1_000 {
         let i = at * 7919 % (records - 1);
         let mut missing = key(i).to_vec();
         missing.push(0);
-        assert!(engine.get(&missing, &mut misses).unwrap().is_none());
+        assert!(misses.get(ks, &missing).unwrap().is_none());
     }
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     assert_eq!(stats.build.raw_bytes_ingested, ingested);
     let background = engine.background_status().unwrap();
     assert_eq!(background.failures, 0);
@@ -383,9 +364,9 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         "reads,{name},{variant},{},{},{:.1},{:.1},{:.3},{:.3},{:.3},{},{},{depth},{load_seconds:.1},{:.1}",
         stats.run_bytes,
         stats.held_bytes,
-        ratio(hits.decoded_bytes(), 10_000),
-        ratio(misses.decoded_bytes(), 1_000),
-        ratio(scans.blocks_loaded(), 100),
+        ratio(hits.counters().decoded_bytes, 10_000),
+        ratio(misses.counters().decoded_bytes, 1_000),
+        ratio(scans.counters().blocks_loaded, 100),
         ratio(stored, work[0].stored),
         ratio(raw, flush_raw),
         stats.flushes,
@@ -401,27 +382,23 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         background.compactions,
         BOTTOM_JOBS.load(std::sync::atomic::Ordering::Relaxed)
     );
-    probe_reads(&engine, name, variant, "end", records, &expect);
+    probe_reads(&engine, ks, name, variant, "end", records, &expect);
     if settle {
         // A control without timing effects: rewrite everything into the
         // bottom level, where sequences are erased, then measure again.
         let mut merge = MergeWorkspace::new();
         while diagnostics::compact_step(&engine, &mut merge).unwrap() {}
         engine.wait_for_compaction().unwrap();
-        let mut hits = EngineWorkspace::new();
+        let mut hits = engine.reader();
         for at in 0..10_000 {
             let i = at * 7919 % records;
-            assert_eq!(
-                engine.get(&key(i), &mut hits).unwrap().unwrap().value,
-                expect(i)
-            );
+            assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
         }
-        let mut scans = EngineWorkspace::new();
+        let mut scans = engine.reader();
         for _ in 0..100 {
-            let guard = engine.read();
-            let mut scan = guard.scan(&mut scans);
+            let mut scan = scans.range(ks, ..);
             for _ in 0..100 {
-                assert!(scan.next_record().unwrap().is_some());
+                assert!(scan.next().unwrap().is_some());
             }
         }
         let levels = diagnostics::levels(&engine);
@@ -458,28 +435,32 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         }
         println!(
             "settled,{name},{variant},{},{},{:.1},{:.3}",
-            engine.stats().run_bytes,
-            engine.stats().held_bytes,
-            ratio(hits.decoded_bytes(), 10_000),
-            ratio(scans.blocks_loaded(), 100),
+            engine.engine_stats().run_bytes,
+            engine.engine_stats().held_bytes,
+            ratio(hits.counters().decoded_bytes, 10_000),
+            ratio(scans.counters().blocks_loaded, 100),
         );
     }
     if flags.worst {
-        worst_point(&engine, s, variant, &updated);
+        worst_point(&engine, ks, s, variant, &updated);
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     {
         println!(
             "reader_memory,{name},{variant},{},{}",
-            scans.capacity() + ws.capacity() + hits.capacity() + misses.capacity(),
-            scans.context_bytes()
-                + ws.context_bytes()
-                + hits.context_bytes()
-                + misses.context_bytes()
+            scans.counters().capacity
+                + ws.counters().capacity
+                + hits.counters().capacity
+                + misses.counters().capacity,
+            scans.counters().context_bytes
+                + ws.counters().context_bytes
+                + hits.counters().context_bytes
+                + misses.counters().context_bytes
         );
         sampler.stop();
-        memory::sample_stats("final", engine.stats());
+        memory::sample_stats("final", engine.engine_stats());
     }
+    drop((scans, ws, hits, misses));
     std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
 }
 
@@ -490,7 +471,7 @@ const LEVEL0_STOP: usize = 12;
 /// random keys until level 0 holds `LEVEL0_STOP` flush groups, staying below
 /// the stop (a writer at the stop would wait for the held compaction), then
 /// measure reads and memory.
-fn worst_point(engine: &Engine, s: &Scenario, variant: &str, updated: &[bool]) {
+fn worst_point(engine: &Engine, ks: &Keyspace, s: &Scenario, variant: &str, updated: &[bool]) {
     let stop = LEVEL0_STOP;
     let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
     let mut version: Vec<u8> = updated.iter().map(|&u| u8::from(u)).collect();
@@ -498,7 +479,7 @@ fn worst_point(engine: &Engine, s: &Scenario, variant: &str, updated: &[bool]) {
     let mut rng = Rng(0xfeed_face_cafe_f00d);
     let mut written = 0usize;
     loop {
-        let frozen = engine.stats().frozen_tables;
+        let frozen = engine.engine_stats().frozen_tables;
         let flushes = diagnostics::level0_flushes(engine);
         if flushes >= stop {
             break;
@@ -511,16 +492,16 @@ fn worst_point(engine: &Engine, s: &Scenario, variant: &str, updated: &[bool]) {
         // At most one rotation between checks: a memtable holds far more.
         for _ in 0..256 {
             let i = rng.next() as usize % records;
-            engine.put(&key(i), &value(i, 2, weak, len)).unwrap();
+            ks.put(&key(i), &value(i, 2, weak, len)).unwrap();
             version[i] = 2;
             written += 1;
         }
     }
     let expect = |i: usize| value(i, version[i], weak, len);
-    probe_reads(engine, name, variant, "worst", records, &expect);
+    probe_reads(engine, ks, name, variant, "worst", records, &expect);
     eprintln!("worst,{name},{variant},written={written}");
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
-    memory::sample_stats("worst", engine.stats());
+    memory::sample_stats("worst", engine.engine_stats());
     drop(held);
 }
 
@@ -548,7 +529,7 @@ fn main() {
             "--threads" => {
                 let value = args.next().expect("COUNT or default");
                 threads = if value == "default" {
-                    EngineOptions::default().background_threads
+                    Options::default().background_threads
                 } else {
                     value.parse().expect("positive thread count")
                 };
@@ -646,21 +627,22 @@ fn main() {
 fn memtable_overhead(value_len: usize) {
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     {
-        let budget = EngineOptions::default().memtable_budget;
-        let charge = 16 + value_len + tessera::engine::ENTRY_OVERHEAD;
+        let budget = Options::default().memtable_size;
+        let charge = 16 + value_len + diagnostics::ENTRY_OVERHEAD;
         // Stay just inside one table: a full table rotates before flushing.
         let entries = budget / charge - 64;
         let mut order: Vec<_> = (0..entries).collect();
         Rng(0x123456789abcdef).shuffle(&mut order);
-        let engine = Engine::new(EngineOptions::default()).unwrap();
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let ks = engine.keyspace("data").unwrap();
         let mut v = vec![0u8; value_len];
         let before = memory::live();
         for &i in &order {
             v[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            engine.put(&key(i * 7 + 3), &v).unwrap();
+            ks.put(&key(i * 7 + 3), &v).unwrap();
         }
         let after = memory::live();
-        let stats = engine.stats();
+        let stats = engine.engine_stats();
         assert_eq!(stats.flushes, 0);
         assert_eq!(stats.frozen_tables, 0);
         let payload = entries * (16 + value_len);
@@ -674,7 +656,7 @@ fn memtable_overhead(value_len: usize) {
             stats.chunk_bytes_held,
             stats.active.charged,
             (heap - payload) as f64 / entries as f64,
-            tessera::engine::ENTRY_OVERHEAD,
+            diagnostics::ENTRY_OVERHEAD,
         );
     }
     #[cfg(not(all(feature = "tools-memory", target_os = "linux")))]

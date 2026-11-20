@@ -10,17 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use tessera::engine::{
-    CheckpointError, CheckpointOptions, CompactionPolicy, Compression, Damage, Engine,
-    EngineOptions, EngineWorkspace, MergeWorkspace, OpenError,
-};
+use crate::engine::checkpoint::{Damage, OpenError, recover};
+use crate::engine::{CompactionPolicy, Compression, Engine, ErrorKind, MergeWorkspace, Options};
 
 /// The defaults without the background worker: these tests flush and
 /// compact by hand and count what each step leaves.
-fn manual() -> EngineOptions {
-    EngineOptions {
+fn manual() -> Options {
+    Options {
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
@@ -43,22 +41,37 @@ impl Drop for Scratch {
 }
 
 fn contents(engine: &Engine, prefix: &[u8]) -> Model {
-    let mut workspace = EngineWorkspace::new();
-    let guard = engine.read();
-    let mut scan = guard.scan_prefix(prefix, &mut workspace);
+    snapshot_contents(&engine.snapshot(), &engine.ks(), prefix)
+}
+
+fn snapshot_contents(snapshot: &crate::Snapshot, ks: &crate::Keyspace, prefix: &[u8]) -> Model {
+    let mut reader = snapshot.reader();
+    let mut scan = reader.prefix(ks, prefix);
     let mut out = Model::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        out.insert(record.key.to_vec(), record.value.to_vec());
+    while let Some((key, value)) = scan.next().unwrap() {
+        out.insert(key.to_vec(), value.to_vec());
     }
     out
 }
 
 fn get(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
-    let mut workspace = EngineWorkspace::new();
-    engine
-        .get(key, &mut workspace)
-        .unwrap()
-        .map(|found| found.value.to_vec())
+    engine.ks().get(key).unwrap()
+}
+
+/// The damage recovery finds in `dir`, which [`Engine::open`] refuses as
+/// corrupt at `path`.
+fn damage_at(dir: &Path, path: &Path) -> Damage {
+    let error = Engine::open(dir, manual()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Corruption, "{error}");
+    assert_eq!(error.path(), Some(path), "{error}");
+    match recover(dir, &manual()) {
+        Err(OpenError::Corrupt { path: at, damage }) => {
+            assert_eq!(at, path);
+            damage
+        }
+        Err(error) => panic!("{error:?}"),
+        Ok(_) => panic!("damage at {} was accepted", path.display()),
+    }
 }
 
 fn checkpoint_dirs(dir: &Path) -> Vec<String> {
@@ -89,14 +102,14 @@ fn compact_all(engine: &Engine) {
 /// active table, with binary and empty keys, a large value, and deletes that
 /// hide older values in runs.
 fn varied_engine() -> (Engine, Model) {
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         target_run_len: 4096,
         ..manual()
     })
     .unwrap();
     let mut model = Model::new();
     let mut put = |key: Vec<u8>, value: Vec<u8>| {
-        engine.put(&key, &value).unwrap();
+        engine.ks().put(&key, &value).unwrap();
         model.insert(key, value);
     };
     for i in 0..2_000u32 {
@@ -107,16 +120,16 @@ fn varied_engine() -> (Engine, Model) {
     put(vec![0], Vec::new());
     engine.flush().unwrap();
     for i in (0..2_000u32).step_by(3) {
-        engine.delete(&i.to_be_bytes()).unwrap();
+        engine.ks().delete(&i.to_be_bytes()).unwrap();
         model.remove(&i.to_be_bytes()[..]);
     }
     engine.flush().unwrap();
     for i in (1..2_000u32).step_by(7) {
         let (key, value) = (i.to_be_bytes().to_vec(), b"newer".to_vec());
-        engine.put(&key, &value).unwrap();
+        engine.ks().put(&key, &value).unwrap();
         model.insert(key, value);
     }
-    engine.delete(&[0xFF; 40]).unwrap();
+    engine.ks().delete(&[0xFF; 40]).unwrap();
     model.remove(&[0xFF; 40][..]);
     (engine, model)
 }
@@ -125,10 +138,8 @@ fn varied_engine() -> (Engine, Model) {
 fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
     let scratch = Scratch::new("round-trip");
     let (engine, model) = varied_engine();
-    let report = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-    assert_eq!(report.last_seq, engine.stats().last_seq);
+    let report = engine.checkpoint_to(&scratch.0).unwrap();
+    assert_eq!(report.last_seq, engine.engine_stats().last_seq);
     assert!(report.records as usize >= model.len());
     assert!(report.runs > 1, "split at the target run length");
     assert_eq!(
@@ -136,7 +147,7 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         ["CURRENT", "ckpt-00000000000000000001", "runs"]
     );
 
-    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
+    let recovered = Engine::open(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
     assert_eq!(
         contents(&recovered, &[0, 0, 3]),
@@ -152,30 +163,33 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
         assert_eq!(get(&recovered, key), model.get(key).cloned(), "{key:?}");
     }
     let keys: Vec<_> = (0..2_100u32).map(|i| i.to_be_bytes().to_vec()).collect();
-    let mut actual = Vec::new();
-    recovered
-        .multi_get(&keys, &mut EngineWorkspace::new(), |_, value| {
-            actual.push(value.map(<[u8]>::to_vec));
-        })
-        .unwrap();
+    let mut reader = recovered.reader();
+    let actual: Vec<_> = reader
+        .multi_get(&recovered.ks(), &keys)
+        .unwrap()
+        .iter()
+        .map(|value| value.map(<[u8]>::to_vec))
+        .collect();
+    drop(reader);
     assert_eq!(
         actual,
         keys.iter()
             .map(|key| model.get(key).cloned())
             .collect::<Vec<_>>()
     );
-    let stats = recovered.stats();
+    let stats = recovered.engine_stats();
     assert_eq!(stats.last_seq, report.last_seq);
     assert!(stats.held_bytes > 0, "filters are restored");
-    assert_eq!(recovered.put(b"next", b"1").unwrap(), report.last_seq + 1);
+    assert_eq!(
+        recovered.ks().put_seq(b"next", b"1").unwrap(),
+        report.last_seq + 1
+    );
 
     // The recovered engine flushes, compacts and checkpoints like any other.
-    recovered.delete(&4u32.to_be_bytes()).unwrap();
+    recovered.ks().delete(&4u32.to_be_bytes()).unwrap();
     recovered.flush().unwrap();
     compact_all(&recovered);
-    let second = recovered
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    let second = recovered.checkpoint_to(&scratch.0).unwrap();
     assert_eq!((second.generation, second.reclaimed), (2, 0));
     assert_eq!(
         checkpoint_dirs(&scratch.0),
@@ -186,8 +200,10 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
             "runs"
         ]
     );
-    let again = Engine::recover(&scratch.0, manual()).unwrap();
-    assert_eq!(contents(&again, b""), contents(&recovered, b""));
+    let expected = contents(&recovered, b"");
+    drop(recovered);
+    let again = Engine::open(&scratch.0, manual()).unwrap();
+    assert_eq!(contents(&again, b""), expected);
     assert_eq!(get(&again, &4u32.to_be_bytes()), None);
 }
 
@@ -197,7 +213,7 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
 #[test]
 fn checkpoints_recover_under_any_compression() {
     const ALL: [Compression; 2] = [Compression::Zstd, Compression::Uncompressed];
-    let with = |compression| EngineOptions {
+    let with = |compression| Options {
         target_run_len: 1 << 20,
         compression,
         ..manual()
@@ -205,27 +221,25 @@ fn checkpoints_recover_under_any_compression() {
     let mut run_bytes = Vec::new();
     for written in ALL {
         let scratch = Scratch::new(&format!("compression-{written:?}"));
-        let engine = Engine::new(with(written)).unwrap();
+        let engine = Engine::in_memory(with(written)).unwrap();
         let mut model = Model::new();
         for i in 0..3_000u32 {
             let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
-            engine.put(&key, value.as_bytes()).unwrap();
+            engine.ks().put(&key, value.as_bytes()).unwrap();
             model.insert(key, value.into_bytes());
         }
         engine.flush().unwrap();
         for i in (0..3_000u32).step_by(3) {
-            engine.delete(&i.to_be_bytes()).unwrap();
+            engine.ks().delete(&i.to_be_bytes()).unwrap();
             model.remove(&i.to_be_bytes()[..]);
         }
         engine.flush().unwrap();
         assert_eq!(contents(&engine, b""), model);
-        run_bytes.push(engine.stats().run_bytes);
-        engine
-            .checkpoint(&scratch.0, CheckpointOptions::default())
-            .unwrap();
+        run_bytes.push(engine.engine_stats().run_bytes);
+        engine.checkpoint_to(&scratch.0).unwrap();
 
         for read in ALL {
-            let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
+            let recovered = Engine::open(&scratch.0, with(read)).unwrap();
             assert_eq!(contents(&recovered, b""), model, "{written:?} as {read:?}");
             assert_eq!(
                 get(&recovered, &4u32.to_be_bytes()),
@@ -237,35 +251,31 @@ fn checkpoints_recover_under_any_compression() {
             let mut newer = model.clone();
             for i in [1u32, 3, 4, 2_999] {
                 let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
-                recovered.put(&key, value.as_bytes()).unwrap();
+                recovered.ks().put(&key, value.as_bytes()).unwrap();
                 newer.insert(key, value.into_bytes());
             }
-            recovered.delete(&2u32.to_be_bytes()).unwrap();
+            recovered.ks().delete(&2u32.to_be_bytes()).unwrap();
             newer.remove(&2u32.to_be_bytes()[..]);
             recovered.flush().unwrap();
-            assert!(recovered.stats().runs > 1);
+            assert!(recovered.engine_stats().runs > 1);
             // The newer run decides overwritten and deleted keys alone: the
             // recovered run holding the older version is not decoded.
             for (key, expected) in [(4u32, newer.get(&4u32.to_be_bytes()[..])), (2, None)] {
-                let mut workspace = EngineWorkspace::new();
-                let found = recovered
-                    .get(&key.to_be_bytes(), &mut workspace)
-                    .unwrap()
-                    .map(|found| found.value.to_vec());
-                assert_eq!(found.as_ref(), expected, "{written:?} as {read:?}");
-                assert_eq!(workspace.blocks_loaded(), 1, "key {key}");
+                let mut reader = recovered.reader();
+                let found = reader.get(&recovered.ks(), &key.to_be_bytes()).unwrap();
+                assert_eq!(
+                    found.map(<[u8]>::to_vec).as_ref(),
+                    expected,
+                    "{written:?} as {read:?}"
+                );
+                assert_eq!(reader.counters().blocks_loaded, 1, "key {key}");
             }
             let snapshot = recovered.snapshot();
             // Compaction writes the merged runs with the configured codec;
             // the snapshot keeps reading the runs it replaced.
             compact_all(&recovered);
             assert_eq!(contents(&recovered, b""), newer, "{written:?} as {read:?}");
-            let mut workspace = EngineWorkspace::new();
-            let mut scan = snapshot.scan_prefix(b"", &mut workspace);
-            let mut seen = Model::new();
-            while let Some(record) = scan.next_record().unwrap() {
-                seen.insert(record.key.to_vec(), record.value.to_vec());
-            }
+            let seen = snapshot_contents(&snapshot, &recovered.ks(), b"");
             assert_eq!(seen, newer, "snapshot, {written:?} as {read:?}");
         }
     }
@@ -279,28 +289,28 @@ fn checkpoints_recover_under_any_compression() {
 #[test]
 fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
     const LENGTHS: [usize; 3] = [16 << 10, 2 << 10, 256];
-    let with = |target_block_compressed| EngineOptions {
+    let with = |block_size| Options {
         target_run_len: 1 << 20,
-        target_block_compressed,
+        block_size,
         ..manual()
     };
-    // The decoded block one lookup leaves in a fresh workspace.
+    // The decoded block one lookup leaves in a fresh reader.
     let block_of = |engine: &Engine, key: u32| {
-        let mut workspace = EngineWorkspace::new();
-        engine.get(&key.to_be_bytes(), &mut workspace).unwrap();
-        assert_eq!(workspace.blocks_loaded(), 1);
-        workspace.capacity()
+        let mut reader = engine.reader().unpooled();
+        reader.get(&engine.ks(), &key.to_be_bytes()).unwrap();
+        assert_eq!(reader.counters().blocks_loaded, 1);
+        reader.counters().capacity
     };
     // Adaptive compressed targets may reach the raw cap on repetitive records.
     let within = |block: usize, _target: usize| block <= 64 << 10;
     let mut blocks = Vec::new();
     for written in LENGTHS {
         let scratch = Scratch::new(&format!("block-length-{written}"));
-        let engine = Engine::new(with(written)).unwrap();
+        let engine = Engine::in_memory(with(written)).unwrap();
         let mut model = Model::new();
         for i in 0..3_000u32 {
             let (key, value) = (i.to_be_bytes().to_vec(), format!("value {} of {i}", i % 10));
-            engine.put(&key, value.as_bytes()).unwrap();
+            engine.ks().put(&key, value.as_bytes()).unwrap();
             model.insert(key, value.into_bytes());
         }
         engine.flush().unwrap();
@@ -308,12 +318,10 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
         let block = block_of(&engine, 4);
         assert!(within(block, written), "{block} for {written}");
         blocks.push(block);
-        engine
-            .checkpoint(&scratch.0, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&scratch.0).unwrap();
 
         for read in LENGTHS {
-            let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
+            let recovered = Engine::open(&scratch.0, with(read)).unwrap();
             assert_eq!(contents(&recovered, b""), model, "{written} as {read}");
             // Recovered runs keep their blocks.
             assert_eq!(block_of(&recovered, 4), block, "{written} as {read}");
@@ -322,15 +330,15 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
             let mut newer = model.clone();
             for i in (0..3_000u32).step_by(7) {
                 let (key, value) = (i.to_be_bytes().to_vec(), format!("newer {i}"));
-                recovered.put(&key, value.as_bytes()).unwrap();
+                recovered.ks().put(&key, value.as_bytes()).unwrap();
                 newer.insert(key, value.into_bytes());
             }
             for i in (1..3_000u32).step_by(11) {
-                recovered.delete(&i.to_be_bytes()).unwrap();
+                recovered.ks().delete(&i.to_be_bytes()).unwrap();
                 newer.remove(&i.to_be_bytes()[..]);
             }
             recovered.flush().unwrap();
-            assert!(recovered.stats().max_overlap > 1);
+            assert!(recovered.engine_stats().max_overlap > 1);
             assert_eq!(contents(&recovered, b""), newer, "{written} as {read}");
             assert_eq!(
                 get(&recovered, &7u32.to_be_bytes()),
@@ -342,10 +350,8 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
             // A checkpoint preserves all existing block lengths, including the
             // older run under the newer runs.
             let again = Scratch::new(&format!("block-length-{written}-{read}"));
-            recovered
-                .checkpoint(&again.0, CheckpointOptions::default())
-                .unwrap();
-            let reopened = Engine::recover(&again.0, with(written)).unwrap();
+            recovered.checkpoint_to(&again.0).unwrap();
+            let reopened = Engine::open(&again.0, with(written)).unwrap();
             assert_eq!(contents(&reopened, b""), newer, "{written} as {read}");
             assert!(within(block_of(&reopened, 4), read), "{written} as {read}");
 
@@ -353,15 +359,10 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
             // a snapshot keeps reading the runs it replaced.
             let snapshot = recovered.snapshot();
             compact_all(&recovered);
-            assert_eq!(recovered.stats().max_overlap, 1);
+            assert_eq!(recovered.engine_stats().max_overlap, 1);
             assert_eq!(contents(&recovered, b""), newer, "{written} as {read}");
             assert!(within(block_of(&recovered, 4), read), "{written} as {read}");
-            let mut workspace = EngineWorkspace::new();
-            let mut scan = snapshot.scan_prefix(b"", &mut workspace);
-            let mut seen = Model::new();
-            while let Some(record) = scan.next_record().unwrap() {
-                seen.insert(record.key.to_vec(), record.value.to_vec());
-            }
+            let seen = snapshot_contents(&snapshot, &recovered.ks(), b"");
             assert_eq!(seen, newer, "snapshot, {written} as {read}");
         }
     }
@@ -369,17 +370,18 @@ fn runs_of_any_block_length_recover_mix_and_are_rewritten() {
 
     // Lengths above the largest the engine builds are refused, not
     // adjusted; the largest target still caps ordinary raw blocks at 64 KiB.
-    let Err(OpenError::Config(refused)) = Engine::new(with((64 << 10) + 1)).map(drop) else {
-        panic!("an oversized block length was accepted");
-    };
-    assert_eq!(
-        (refused.setting, refused.max),
-        ("EngineOptions::target_block_compressed", 64 << 10)
+    let refused = Engine::in_memory(with((64 << 10) + 1)).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::Config);
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Options::block_size is 65537 but must be from 1 to 65536"),
+        "{refused}"
     );
-    let engine = Engine::new(with(64 << 10)).unwrap();
+    let engine = Engine::in_memory(with(64 << 10)).unwrap();
     for i in 0..3_000u32 {
         let value = format!("value {} of {i}", i % 10);
-        engine.put(&i.to_be_bytes(), value.as_bytes()).unwrap();
+        engine.ks().put(&i.to_be_bytes(), value.as_bytes()).unwrap();
     }
     engine.flush().unwrap();
     let block = block_of(&engine, 2_999);
@@ -419,7 +421,7 @@ fn profile(index: u32, version: u32) -> Vec<u8> {
 
 /// Compacts until one run covers each key, returning the report of every
 /// job that rewrote runs (moves rewrite nothing and are left out).
-fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
+fn compact_reports(engine: &Engine) -> Vec<crate::engine::CompactionReport> {
     let options = CompactionPolicy {
         max_overlap: 1,
         ..CompactionPolicy::default()
@@ -427,7 +429,7 @@ fn compact_reports(engine: &Engine) -> Vec<tessera::engine::CompactionReport> {
     let mut workspace = MergeWorkspace::new();
     let mut reports = Vec::new();
     while let Some(report) = engine.core.compact(options, &mut workspace).unwrap() {
-        if report.kind != tessera::engine::CompactionKind::Move {
+        if report.kind != crate::engine::CompactionKind::Move {
             reports.push(report);
         }
     }
@@ -467,16 +469,16 @@ fn run_versions(dir: &Path) -> Vec<u32> {
 /// compaction replaced.
 #[test]
 fn dictionary_runs_recover_mix_and_are_rewritten() {
-    let with = |compression| EngineOptions {
-        target_block_compressed: 4 << 10,
+    let with = |compression| Options {
+        block_size: 4 << 10,
         compression,
         ..manual()
     };
-    let engine = Engine::new(with(Compression::Zstd)).unwrap();
+    let engine = Engine::in_memory(with(Compression::Zstd)).unwrap();
     let mut model = Model::new();
     let put = |engine: &Engine, model: &mut Model, i: u32, version: u32| {
         let (key, value) = (format!("user/{i:06}").into_bytes(), profile(i, version));
-        engine.put(&key, &value).unwrap();
+        engine.ks().put(&key, &value).unwrap();
         model.insert(key, value);
     };
     for i in 0..14_000 {
@@ -489,17 +491,17 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     }
     for i in (1..14_000).step_by(29) {
         let key = format!("user/{i:06}").into_bytes();
-        engine.delete(&key).unwrap();
+        engine.ks().delete(&key).unwrap();
         model.remove(&key);
     }
     engine.flush().unwrap();
-    let plain_stats = engine.stats();
+    let plain_stats = engine.engine_stats();
     let reports = compact_reports(&engine);
     assert_eq!(reports.len(), 1);
     assert_eq!(contents(&engine, b""), model);
     assert_eq!(get(&engine, b"user/000003"), Some(profile(3, 1)));
     assert_eq!(get(&engine, b"user/000001"), None);
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     // Filters and physical segment metadata are held beside stored bytes.
     assert!(stats.held_bytes > reports[0].output_held_bytes / 2);
     assert_eq!(stats.held_bytes, reports[0].output_held_bytes);
@@ -510,7 +512,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
         put(&engine, &mut model, i, 2);
     }
     let large = vec![b'x'; 768 << 10];
-    engine.put(b"user/large", &large).unwrap();
+    engine.ks().put(b"user/large", &large).unwrap();
     model.insert(b"user/large".to_vec(), large);
     engine.flush().unwrap();
     compact_reports(&engine);
@@ -524,23 +526,14 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     }
     engine.flush().unwrap();
     let _reports = compact_reports(&engine);
-    assert!(engine.stats().retained_held_bytes > 0);
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = snapshot.scan_prefix(b"", &mut workspace);
-    let mut seen = Model::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        seen.insert(record.key.to_vec(), record.value.to_vec());
-    }
-    drop(scan);
-    assert_eq!(seen, held);
+    assert!(engine.engine_stats().retained_held_bytes > 0);
+    assert_eq!(snapshot_contents(&snapshot, &engine.ks(), b""), held);
     drop(snapshot);
     assert_eq!(contents(&engine, b""), model);
 
     // A checkpoint writes the existing version-6 runs unchanged.
     let scratch = Scratch::new("dictionary-runs");
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&scratch.0).unwrap();
     let versions = run_versions(&scratch.0);
     assert!(
         !versions.is_empty() && versions.iter().all(|&v| v == 6),
@@ -548,19 +541,19 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     );
 
     for read in [Compression::Zstd, Compression::Uncompressed] {
-        let recovered = Engine::recover(&scratch.0, with(read)).unwrap();
+        let recovered = Engine::open(&scratch.0, with(read)).unwrap();
         assert_eq!(contents(&recovered, b""), model, "{read:?}");
-        assert!(recovered.stats().held_bytes > 0);
+        assert!(recovered.engine_stats().held_bytes > 0);
         // Newer plain runs beside the recovered dictionary runs, including
         // keys whose newest version is only in the older run.
         let mut newer = model.clone();
         for i in (0..14_000).step_by(11) {
             put(&recovered, &mut newer, i, 4);
         }
-        recovered.delete(b"user/000002").unwrap();
+        recovered.ks().delete(b"user/000002").unwrap();
         newer.remove(&b"user/000002"[..]);
         recovered.flush().unwrap();
-        assert!(recovered.stats().max_overlap > 1);
+        assert!(recovered.engine_stats().max_overlap > 1);
         assert_eq!(contents(&recovered, b""), newer, "{read:?}");
         assert_eq!(get(&recovered, b"user/000011"), Some(profile(11, 4)));
         assert_eq!(
@@ -577,8 +570,8 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
 /// Small repetitive sensor records also use segment dictionaries correctly.
 #[test]
 fn segment_dictionaries_round_trip_sensor_records() {
-    let engine = Engine::new(EngineOptions {
-        target_block_compressed: 4 << 10,
+    let engine = Engine::in_memory(Options {
+        block_size: 4 << 10,
         compression: Compression::Zstd,
         ..manual()
     })
@@ -598,39 +591,44 @@ fn segment_dictionaries_round_trip_sensor_records() {
     };
     for version in 0..2 {
         for i in 0..160_000u32 {
-            engine.put(&i.to_be_bytes(), &reading(i, version)).unwrap();
+            engine
+                .ks()
+                .put(&i.to_be_bytes(), &reading(i, version))
+                .unwrap();
         }
         engine.flush().unwrap();
     }
     let reports = compact_reports(&engine);
-    assert_eq!(engine.stats().held_bytes, reports[0].output_held_bytes);
+    assert_eq!(
+        engine.engine_stats().held_bytes,
+        reports[0].output_held_bytes
+    );
     assert_eq!(get(&engine, &7u32.to_be_bytes()), Some(reading(7, 1)));
 }
 
 #[test]
-fn an_empty_engine_checkpoints_and_recovers_empty_but_nothing_is_not_a_checkpoint() {
+fn opening_a_directory_without_a_checkpoint_starts_empty_and_an_empty_engine_recovers() {
     let scratch = Scratch::new("empty");
-    assert!(matches!(
-        Engine::recover(&scratch.0, manual()),
-        Err(OpenError::NoCheckpoint(_))
-    ));
-    fs::create_dir_all(&scratch.0).unwrap();
-    assert!(matches!(
-        Engine::recover(&scratch.0, manual()),
-        Err(OpenError::NoCheckpoint(_))
-    ));
-    let engine = Engine::new(EngineOptions {
+    // A missing directory is created; nothing is written until a checkpoint.
+    let engine = Engine::open(&scratch.0, manual()).unwrap();
+    assert!(engine.keyspaces().is_empty());
+    assert_eq!(engine.metadata(), None);
+    engine.ks().put(b"a", b"1").unwrap();
+    engine.close().unwrap();
+    assert_eq!(checkpoint_dirs(&scratch.0), Vec::<String>::new());
+    let engine = Engine::open(&scratch.0, manual()).unwrap();
+    assert!(engine.keyspaces().is_empty());
+    engine.close().unwrap();
+    let engine = Engine::in_memory(Options {
         last_seq: 41,
         ..manual()
     })
     .unwrap();
-    let report = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    let report = engine.checkpoint_to(&scratch.0).unwrap();
     assert_eq!((report.records, report.runs, report.last_seq), (0, 0, 41));
-    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
-    assert!(contents(&recovered, b"").is_empty());
-    assert_eq!(recovered.put(b"a", b"1").unwrap(), 42);
+    let recovered = Engine::open(&scratch.0, manual()).unwrap();
+    assert!(recovered.keyspaces().is_empty());
+    assert_eq!(recovered.ks().put_seq(b"a", b"1").unwrap(), 42);
 }
 
 /// Publishes all pending memtables.
@@ -643,8 +641,8 @@ fn flush(engine: &Engine) {
 #[test]
 fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
     let scratch = Scratch::new("concurrent");
-    let engine = Engine::new(EngineOptions {
-        memtable_budget: 256 << 10,
+    let engine = Engine::in_memory(Options {
+        memtable_size: 256 << 10,
         target_run_len: 64 << 10,
         background_compaction: Some(CompactionPolicy::default()),
         ..manual()
@@ -660,11 +658,14 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
             while !done.load(Ordering::Relaxed) || i < 50_000 {
                 let key = (i.wrapping_mul(0x9E37_79B9) % 5_000).to_be_bytes().to_vec();
                 let seq = if i % 5 == 4 {
-                    let seq = engine.delete(&key);
+                    let seq = engine.ks().delete_seq(&key);
                     seq.map(|seq| (seq, None))
                 } else {
                     let value = i.to_le_bytes().to_vec();
-                    engine.put(&key, &value).map(|seq| (seq, Some(value)))
+                    engine
+                        .ks()
+                        .put_seq(&key, &value)
+                        .map(|seq| (seq, Some(value)))
                 };
                 match seq {
                     Ok((seq, value)) => log.push((seq, key, value)),
@@ -681,11 +682,7 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
             log
         });
         for _ in 0..3 {
-            reports.push(
-                engine
-                    .checkpoint(&scratch.0, CheckpointOptions::default())
-                    .unwrap(),
-            );
+            reports.push(engine.checkpoint_to(&scratch.0).unwrap());
         }
         done.store(true, Ordering::Relaxed);
         log = writer.join().unwrap();
@@ -701,9 +698,9 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
             None => model.remove(key),
         };
     }
-    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
+    let recovered = Engine::open(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
-    assert_eq!(recovered.stats().last_seq, last.last_seq);
+    assert_eq!(recovered.engine_stats().last_seq, last.last_seq);
     assert!(
         reports
             .windows(2)
@@ -716,9 +713,7 @@ fn a_checkpoint_beside_writes_flushes_and_compactions_holds_one_state() {
 fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine() {
     let scratch = Scratch::new("damage");
     let (engine, _) = varied_engine();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&scratch.0).unwrap();
     let ckpt = scratch.0.join("ckpt-00000000000000000001");
     let pristine: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&ckpt)
         .unwrap()
@@ -741,13 +736,7 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
             fs::write(path, bytes).unwrap();
         }
     };
-    let damage = |path: &Path| match Engine::recover(&scratch.0, manual()) {
-        Err(OpenError::Corrupt { path: at, damage }) => {
-            assert_eq!(at, path);
-            damage
-        }
-        other => panic!("{:?}", other.map(|_| ())),
-    };
+    let damage = |path: &Path| damage_at(&scratch.0, path);
     let run = run_payloads(&scratch.0)[1].0.clone();
     let manifest = ckpt.join("MANIFEST");
     let current = scratch.0.join("CURRENT");
@@ -795,40 +784,39 @@ fn damaged_or_missing_files_are_rejected_and_never_replaced_by_an_empty_engine()
     restore();
 
     // Recovery changed nothing, and the restored checkpoint recovers.
-    Engine::recover(&scratch.0, manual()).unwrap();
+    Engine::open(&scratch.0, manual()).unwrap();
 }
 
 #[test]
-fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint() {
-    let scratch = Scratch::new("refused");
+fn a_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint() {
+    let scratch = Scratch::new("failed");
     let (engine, model) = varied_engine();
-    let first = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-    engine.put(b"later", b"x").unwrap();
-    let before = engine.stats();
+    let first = engine.checkpoint_to(&scratch.0).unwrap();
+    engine.ks().put(b"later", b"x").unwrap();
+    let before = engine.engine_stats();
 
-    let error = engine
-        .checkpoint(&scratch.0, CheckpointOptions { max_bytes: 1 })
-        .unwrap_err();
-    assert!(matches!(error, CheckpointError::DiskLimit { bytes, max_bytes: 1 } if bytes > 1));
-    assert_eq!(engine.stats().last_seq, before.last_seq);
+    // A file where the run directory belongs fails the next checkpoint.
+    let runs = scratch.0.join("runs");
+    let aside = scratch.0.join("runs-aside");
+    fs::rename(&runs, &aside).unwrap();
+    fs::write(&runs, b"not a directory").unwrap();
+    let error = engine.checkpoint_to(&scratch.0).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io, "{error}");
+    assert!(!error.checkpoint_committed());
+    fs::remove_file(&runs).unwrap();
+    fs::rename(&aside, &runs).unwrap();
+    assert_eq!(engine.engine_stats().last_seq, before.last_seq);
     assert_eq!(get(&engine, b"later"), Some(b"x".to_vec()));
-    assert_eq!(
-        checkpoint_dirs(&scratch.0),
-        ["CURRENT", "ckpt-00000000000000000001", "runs"]
-    );
-    let recovered = Engine::recover(&scratch.0, manual()).unwrap();
+    let recovered = Engine::open(&scratch.0, manual()).unwrap();
     assert_eq!(contents(&recovered, b""), model);
-    assert_eq!(recovered.stats().last_seq, first.last_seq);
+    assert_eq!(recovered.engine_stats().last_seq, first.last_seq);
+    drop(recovered);
 
     // The next checkpoint takes a new generation and succeeds.
-    let next = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    let next = engine.checkpoint_to(&scratch.0).unwrap();
     assert!(next.generation > first.generation);
     assert_eq!(
-        get(&Engine::recover(&scratch.0, manual()).unwrap(), b"later"),
+        get(&Engine::open(&scratch.0, manual()).unwrap(), b"later"),
         Some(b"x".to_vec())
     );
 }
@@ -840,9 +828,7 @@ fn a_refused_or_failed_checkpoint_leaves_the_engine_and_the_previous_checkpoint(
 fn oversized_files_are_refused_before_they_are_read() {
     let scratch = Scratch::new("oversized");
     let (engine, _) = varied_engine();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&scratch.0).unwrap();
     let generation = scratch.0.join(format!("ckpt-{:020}", 1));
     for path in [
         scratch.0.join("CURRENT"),
@@ -856,24 +842,21 @@ fn oversized_files_are_refused_before_they_are_read() {
             .unwrap()
             .set_len(64 << 30)
             .unwrap();
-        let error = Engine::recover(&scratch.0, manual());
+        let damage = damage_at(&scratch.0, &path);
         assert!(
             matches!(
-                error,
-                Err(OpenError::Corrupt {
-                    damage: Damage::Length {
-                        found: 68_719_476_736,
-                        ..
-                    },
+                damage,
+                Damage::Length {
+                    found: 68_719_476_736,
                     ..
-                })
+                }
             ),
-            "{}: {error:?}",
+            "{}: {damage:?}",
             path.display()
         );
         fs::write(&path, original).unwrap();
     }
-    Engine::recover(&scratch.0, manual()).unwrap();
+    Engine::open(&scratch.0, manual()).unwrap();
 }
 
 /// Closing an engine recovered from a checkpoint writes no new one: what
@@ -882,60 +865,57 @@ fn oversized_files_are_refused_before_they_are_read() {
 #[test]
 fn closing_a_recovered_engine_takes_no_checkpoint() {
     let scratch = Scratch::new("close-recovered");
-    let engine = Engine::new(EngineOptions::default()).unwrap();
-    engine.put(b"kept", b"1").unwrap();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    let engine = Engine::in_memory(Options::default()).unwrap();
+    engine.ks().put(b"kept", b"1").unwrap();
+    engine.checkpoint_to(&scratch.0).unwrap();
     engine.close().unwrap();
 
-    let engine = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
-    engine.put(b"lost", b"2").unwrap();
-    assert_eq!(engine.close(), Ok(()));
-    let engine = Engine::recover(&scratch.0, EngineOptions::default()).unwrap();
-    let mut workspace = EngineWorkspace::new();
-    assert!(engine.get(b"kept", &mut workspace).unwrap().is_some());
-    assert!(engine.get(b"lost", &mut workspace).unwrap().is_none());
+    let engine = Engine::open(&scratch.0, Options::default()).unwrap();
+    engine.ks().put(b"lost", b"2").unwrap();
+    engine.close().unwrap();
+    let engine = Engine::open(&scratch.0, Options::default()).unwrap();
+    assert!(engine.ks().get(b"kept").unwrap().is_some());
+    assert!(engine.ks().get(b"lost").unwrap().is_none());
     engine.close().unwrap();
 }
 
 #[test]
 fn multi_segment_checkpoint_streams_one_v6_run_and_recovers() {
     for compression in [Compression::Zstd, Compression::Uncompressed] {
-        let options = EngineOptions {
+        let options = Options {
             compression,
             ..manual()
         };
         let scratch = Scratch::new(&format!("multi-segment-{compression:?}"));
-        let engine = Engine::new(options).unwrap();
+        let engine = Engine::in_memory(options).unwrap();
         for i in 0..9_000u32 {
             engine
+                .ks()
                 .put(&i.to_be_bytes(), &vec![(i % 19) as u8; 1024])
                 .unwrap();
         }
-        let report = engine
-            .checkpoint(&scratch.0, CheckpointOptions::default())
-            .unwrap();
+        let report = engine.checkpoint_to(&scratch.0).unwrap();
         assert_eq!((report.runs, report.records), (1, 9_000));
         assert_eq!(run_versions(&scratch.0), vec![6]);
-        let recovered = Engine::recover(&scratch.0, options).unwrap();
-        let stats = recovered.stats();
+        let recovered = Engine::open(&scratch.0, options).unwrap();
+        let stats = recovered.engine_stats();
         assert_eq!(stats.runs, 1);
         if compression == Compression::Uncompressed {
             assert!(stats.pool_in_use_bytes >= 1 << 20);
         }
         assert!(stats.pool_reserve_bytes <= stats.pool_reserve_limit);
         assert_eq!(stats.pool_reserve_limit, 32 << 20);
-        let mut workspace = EngineWorkspace::new();
-        let guard = recovered.read();
-        let mut scan = guard.scan(&mut workspace);
+        let mut reader = recovered.reader();
+        let ks = recovered.ks();
+        let mut scan = reader.range(&ks, ..);
         for i in 0..9_000u32 {
-            let record = scan.next_record().unwrap().unwrap();
-            assert_eq!(record.key, i.to_be_bytes());
-            assert_eq!(record.value, vec![(i % 19) as u8; 1024]);
+            let (key, value) = scan.next().unwrap().unwrap();
+            assert_eq!(key, i.to_be_bytes());
+            assert_eq!(value, vec![(i % 19) as u8; 1024]);
         }
-        assert!(scan.next_record().unwrap().is_none());
+        assert!(scan.next().unwrap().is_none());
         drop(scan);
+        drop(reader);
         for i in [0u32, 4_100, 8_999] {
             assert_eq!(
                 get(&recovered, &i.to_be_bytes()),
@@ -949,20 +929,20 @@ fn multi_segment_checkpoint_streams_one_v6_run_and_recovers() {
 fn checkpoints_preserve_bottom_runs_without_filters() {
     for compression in [Compression::Uncompressed, Compression::Zstd] {
         let dir = Scratch::new(&format!("bottom-no-filter-{compression:?}"));
-        let options = EngineOptions {
+        let options = Options {
             compression,
             ..manual()
         };
-        let engine = Engine::new(options).unwrap();
+        let engine = Engine::in_memory(options).unwrap();
         for version in [b"old", b"new"] {
             for key in [b"a", b"c", b"e"] {
-                engine.put(key, version).unwrap();
+                engine.ks().put(key, version).unwrap();
             }
             engine.flush().unwrap();
         }
-        assert!(engine.stats().filter_bytes > 0);
+        assert!(engine.engine_stats().filter_bytes > 0);
         compact_all(&engine);
-        assert_eq!(engine.stats().filter_bytes, 0);
+        assert_eq!(engine.engine_stats().filter_bytes, 0);
         assert!(
             engine
                 .core
@@ -971,16 +951,16 @@ fn checkpoints_preserve_bottom_runs_without_filters() {
                 .iter()
                 .all(|run| run.run.filter().is_none())
         );
-        let mut ws = EngineWorkspace::new();
-        assert_eq!(engine.get(b"c", &mut ws).unwrap().unwrap().value, b"new");
-        assert!(engine.get(b"b", &mut ws).unwrap().is_none());
-        assert_eq!(ws.blocks_loaded(), 2);
-        assert!(ws.decoded_bytes() > 0);
-        engine
-            .checkpoint(&dir.0, CheckpointOptions::default())
-            .unwrap();
-        let recovered = Engine::recover(&dir.0, options).unwrap();
-        assert_eq!(recovered.stats().filter_bytes, 0);
+        let ks = engine.ks();
+        let mut reader = engine.reader();
+        assert_eq!(reader.get(&ks, b"c").unwrap().unwrap(), b"new");
+        assert!(reader.get(&ks, b"b").unwrap().is_none());
+        assert_eq!(reader.counters().blocks_loaded, 2);
+        assert!(reader.counters().decoded_bytes > 0);
+        drop(reader);
+        engine.checkpoint_to(&dir.0).unwrap();
+        let recovered = Engine::open(&dir.0, options).unwrap();
+        assert_eq!(recovered.engine_stats().filter_bytes, 0);
         assert!(
             recovered
                 .core
@@ -992,8 +972,8 @@ fn checkpoints_preserve_bottom_runs_without_filters() {
         assert_eq!(get(&recovered, b"c").unwrap(), b"new");
         assert_eq!(get(&recovered, b"b"), None);
         // A new level-0 flush still receives a filter beside an unfiltered bottom.
-        recovered.put(b"c", b"latest").unwrap();
+        recovered.ks().put(b"c", b"latest").unwrap();
         recovered.flush().unwrap();
-        assert!(recovered.stats().filter_bytes > 0);
+        assert!(recovered.engine_stats().filter_bytes > 0);
     }
 }

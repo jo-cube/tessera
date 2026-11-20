@@ -31,25 +31,25 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
         .into_iter()
         .flat_map(|at| [256 << 10, 4 << 20].map(|target| (at, target)))
     {
-        let engine = Engine::new(EngineOptions {
+        let engine = Engine::in_memory(Options {
             background_threads: 4,
             background_compaction: None,
             compression: Compression::Uncompressed,
-            memtable_budget: 8 << 20,
+            memtable_size: 8 << 20,
             target_run_len,
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
         for at in 0..6000u64 {
-            engine.put(&at.to_be_bytes(), &[1; 128]).unwrap();
+            engine.ks().put(&at.to_be_bytes(), &[1; 128]).unwrap();
         }
         engine.flush().unwrap();
         let early = (snapshot_at == 1).then(|| engine.snapshot());
         for at in 0..6000u64 {
             if at % 5 == 0 {
-                engine.delete(&at.to_be_bytes()).unwrap();
+                engine.ks().delete(&at.to_be_bytes()).unwrap();
             } else {
-                engine.put(&at.to_be_bytes(), &[2; 128]).unwrap();
+                engine.ks().put(&at.to_be_bytes(), &[2; 128]).unwrap();
             }
         }
         engine.flush().unwrap();
@@ -96,25 +96,19 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
             assert!(built.output.workspace_bytes > serial.workspace_bytes);
         }
         built.publish().unwrap();
-        let mut workspace = EngineWorkspace::new();
+        let ks = engine.ks();
+        let early_reader = early.as_ref().map(Snapshot::reader);
+        let late_reader = late.as_ref().map(Snapshot::reader);
+        let (mut early_reader, mut late_reader) = (early_reader, late_reader);
         for at in 0..6000u64 {
             let key = at.to_be_bytes();
             let expected = (at % 5 != 0).then_some([2; 128].as_slice());
-            assert_eq!(
-                engine.get(&key, &mut workspace).unwrap().map(|v| v.value),
-                expected
-            );
-            if let Some(snapshot) = &early {
-                assert_eq!(
-                    snapshot.get(&key, &mut workspace).unwrap().unwrap().value,
-                    &[1; 128]
-                );
+            assert_eq!(ks.get(&key).unwrap().as_deref(), expected);
+            if let Some(reader) = &mut early_reader {
+                assert_eq!(reader.get(&ks, &key).unwrap().unwrap(), &[1; 128]);
             }
-            if let Some(snapshot) = &late {
-                assert_eq!(
-                    snapshot.get(&key, &mut workspace).unwrap().map(|v| v.value),
-                    expected
-                );
+            if let Some(reader) = &mut late_reader {
+                assert_eq!(reader.get(&ks, &key).unwrap(), expected);
             }
         }
     }
@@ -122,70 +116,60 @@ fn parallel_jobs_match_serial_and_preserve_snapshots_and_settled_sequences() {
 
 #[test]
 fn background_thread_option_accepts_one_and_rejects_zero() {
-    let options = EngineOptions {
+    let options = Options {
         background_threads: 1,
-        ..EngineOptions::default()
+        ..Options::default()
     };
-    let engine = Engine::new(options).unwrap();
-    engine.put(b"key", b"value").unwrap();
+    let engine = Engine::in_memory(options).unwrap();
+    engine.ks().put(b"key", b"value").unwrap();
     engine.flush().unwrap();
     engine.wait_for_compaction().unwrap();
     assert_eq!(engine.core.background_threads, 1);
     assert!(matches!(
-        Engine::new(EngineOptions {
+        Engine::in_memory(Options {
             background_threads: 0,
             ..options
         }),
-        Err(OpenError::Config(ConfigError {
-            setting: "EngineOptions::background_threads",
-            ..
-        }))
+        Err(error) if error.kind() == ErrorKind::Config && error.to_string().contains("Options::background_threads")
     ));
 }
 
 #[test]
 fn non_default_ratios_preserve_updates_and_deletes() {
     for ratio in [2, 10, usize::MAX] {
-        let engine = Engine::new(EngineOptions {
+        let engine = Engine::in_memory(Options {
             level_ratio: ratio,
             background_threads: 1,
             target_run_len: 4096,
-            memtable_budget: 16 << 10,
-            ..EngineOptions::default()
+            memtable_size: 16 << 10,
+            ..Options::default()
         })
         .unwrap();
         for round in 0..4u8 {
             for at in 0..600u64 {
                 if round == 3 && at % 3 == 0 {
-                    engine.delete(&at.to_be_bytes()).unwrap();
+                    engine.ks().delete(&at.to_be_bytes()).unwrap();
                 } else {
-                    engine.put(&at.to_be_bytes(), &[round; 80]).unwrap();
+                    engine.ks().put(&at.to_be_bytes(), &[round; 80]).unwrap();
                 }
             }
             engine.flush().unwrap();
             engine.wait_for_compaction().unwrap();
         }
-        let mut workspace = EngineWorkspace::new();
         for at in 0..600u64 {
             assert_eq!(
-                engine
-                    .get(&at.to_be_bytes(), &mut workspace)
-                    .unwrap()
-                    .map(|v| v.value),
+                engine.ks().get(&at.to_be_bytes()).unwrap().as_deref(),
                 (at % 3 != 0).then_some([3; 80].as_slice())
             );
         }
     }
     for ratio in [0, 1] {
         assert!(matches!(
-            Engine::new(EngineOptions {
+            Engine::in_memory(Options {
                 level_ratio: ratio,
-                ..EngineOptions::default()
+                ..Options::default()
             }),
-            Err(OpenError::Config(ConfigError {
-                setting: "EngineOptions::level_ratio",
-                ..
-            }))
+            Err(error) if error.kind() == ErrorKind::Config && error.to_string().contains("Options::level_ratio")
         ));
     }
 }

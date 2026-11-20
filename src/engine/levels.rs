@@ -216,6 +216,7 @@ impl Levels {
     }
 
     /// Each level's runs and bytes, level 0 first.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn shape(&self) -> Vec<(usize, usize)> {
         self.levels
             .iter()

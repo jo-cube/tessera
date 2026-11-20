@@ -163,6 +163,7 @@ impl<B: AsRef<[u8]>> RunData<B> {
             Self::Segmented(data) => data.frames_len + data.dictionaries_len + data.tail.len(),
         }
     }
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn chunk_capacity(&self) -> usize {
         match self {
             Self::Contiguous(bytes) => bytes.as_ref().len(),

@@ -71,7 +71,7 @@ pub struct LiveRecord<'a> {
 /// Why a logical read could not produce a correct result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ReadError {
+pub(crate) enum ReadError {
     /// An input run is damaged.
     Corrupt(CorruptRun),
     /// Two runs disagree about one logical update.
@@ -81,7 +81,7 @@ pub enum ReadError {
 /// Two copies of one internal key that differ in value or kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ConflictingCopies {
+pub(crate) struct ConflictingCopies {
     /// The user key.
     pub key: Vec<u8>,
     /// The sequence number both copies carry.
@@ -129,17 +129,20 @@ impl LogicalWorkspace {
     }
 
     /// Returns the decoded-block bytes retained across all inputs.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn capacity(&self) -> usize {
         self.merge.capacity() + self.lookup.capacity()
     }
 
     /// Returns the bytes held by decompression contexts, which Zstandard
     /// allocates outside the Rust heap.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn context_bytes(&self) -> usize {
         self.merge.context_bytes() + self.lookup.context_bytes()
     }
 
     /// Returns how many blocks reads through this workspace have loaded.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn blocks_loaded(&self) -> u64 {
         self.merge.blocks_loaded() + self.lookup.blocks_loaded()
     }
@@ -150,6 +153,7 @@ impl LogicalWorkspace {
     }
 
     /// Raw bytes in blocks loaded through this workspace.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn decoded_bytes(&self) -> u64 {
         self.merge.decoded_bytes() + self.lookup.decoded_bytes()
     }
@@ -430,6 +434,16 @@ impl<'r> LogicalCursor<'r> {
     #[cfg(test)]
     pub fn seek(&mut self, target: &[u8]) -> Result<(), ReadError> {
         self.reposition(|merge| merge.seek(target))
+    }
+
+    /// Moves before the first live key at or above `target` and iterates
+    /// only while keys are within `end`.
+    pub fn seek_range(
+        &mut self,
+        target: &[u8],
+        end: std::ops::Bound<&[u8]>,
+    ) -> Result<(), ReadError> {
+        self.reposition(|merge| merge.seek_range(target, end))
     }
 
     /// Moves before the first live key starting with `prefix` and iterates

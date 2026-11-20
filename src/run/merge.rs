@@ -28,22 +28,26 @@ impl MergeWorkspace {
     }
 
     /// Returns the decoded-block bytes retained across all inputs.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn capacity(&self) -> usize {
         self.runs.iter().map(ReadWorkspace::capacity).sum()
     }
 
     /// Returns how many blocks reads through this workspace have loaded.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn blocks_loaded(&self) -> u64 {
         self.runs.iter().map(ReadWorkspace::blocks_loaded).sum()
     }
 
     /// Raw bytes in blocks loaded through this workspace.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn decoded_bytes(&self) -> u64 {
         self.runs.iter().map(ReadWorkspace::decoded_bytes).sum()
     }
 
     /// Returns the bytes held by decompression contexts, which Zstandard
     /// allocates outside the Rust heap.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn context_bytes(&self) -> usize {
         self.runs.iter().map(ReadWorkspace::context_bytes).sum()
     }
@@ -309,6 +313,18 @@ impl<'a> MergeCursor<'a> {
     /// applied to every input.
     pub fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
         self.reposition(|cursor| cursor.seek_prefix(prefix))
+    }
+
+    /// Moves every input before its first record at or above `target` and
+    /// iterates only while keys are within `end`, with the behavior of
+    /// [`RunCursor::seek_range`](super::reader::RunCursor::seek_range)
+    /// applied to every input.
+    pub fn seek_range(
+        &mut self,
+        target: &[u8],
+        end: std::ops::Bound<&[u8]>,
+    ) -> Result<(), CorruptRun> {
+        self.reposition(|cursor| cursor.seek_range(target, end))
     }
 
     fn reposition(

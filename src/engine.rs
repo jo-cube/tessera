@@ -1,164 +1,17 @@
-//! A RAM-first key-value engine with explicit checkpoints and recovery.
-//!
-//! ```
-//! use tessera::engine::{Engine, EngineOptions, EngineWorkspace};
-//! let engine = Engine::new(EngineOptions::default())?;
-//! engine.put(b"apple", b"red")?;
-//! let snapshot = engine.snapshot();
-//! engine.put(b"apple", b"green")?;
-//! let mut workspace = EngineWorkspace::new();
-//! assert_eq!(snapshot.get(b"apple", &mut workspace)?.unwrap().value, b"red");
-//! engine.close()?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! # Consistency
+//! The engine: memtables, runs in levels, flushes, compaction, checkpoints
+//! and the public handles over them.
 //!
 //! Writes and publication use one exclusive state lock; sequence order is
 //! visibility order. A read takes immutable run references under the shared
-//! lock and decodes after releasing it. A [`ReadGuard`] holds the shared lock
-//! for several consistent reads. Drop it before calling an engine method:
-//! writers and publication must acquire that lock. Writers have priority over
-//! new readers. Caller-owned read workspaces are outside engine accounting.
-//!
-//! # Snapshots
-//!
-//! [`Engine::snapshot`] is infallible and holds no lock after acquisition.
-//! It shares the copy-on-write memtable and immutable run directory. Later
-//! writes copy only shared nodes and partial arena chunks. Snapshots retain
-//! their sources through flushes, compactions, and engine closure; maintenance
-//! keeps only the newest version because older readers own their own sources.
-//!
-//! # Flushing
+//! lock and decodes after releasing it. Writers have priority over new
+//! readers.
 //!
 //! Writers rotate full memtables and a dedicated worker builds runs outside
-//! the state lock. At most two frozen tables await flush. [`Engine::flush`]
-//! waits for everything written before the call. Flushes always publish;
-//! readers see either the tables or their replacement runs atomically.
-//! Outputs end at the target run length and selected level-1 boundaries.
-//!
-//! # Compaction
-//!
-//! Background compaction is always enabled. Level 0 holds overlapping flushes;
-//! deeper levels have disjoint key ranges. Dynamic level targets use
-//! [`EngineOptions::level_ratio`]. Selection takes the most overfull level,
-//! then level 0 at four flushes, then small neighbours. Outputs are cut at the
-//! target run length and the overlap bound. Nonoverlapping runs move without
-//! rewriting. Optional level-0 inputs fit an internal transient allowance;
-//! the first source and its overlaps always proceed. Large level-0 jobs into
-//! the bottom build disjoint pieces of about one target stored run, aligned
-//! to bottom-run boundaries. Up to `background_threads` pieces build at once
-//! and publish independently, in any order. Output reservations share a bound
-//! of that many piece budgets (at least 128 KiB each for one block and metadata).
-//! A piece reserves its inputs' stored bytes plus an eighth and per-run
-//! metadata; one larger than the whole bound runs alone. A piece that outgrows
-//! its reservation retries with at least the whole bound, doubling each time,
-//! so the output allowance never fails a job.
-//! Bounded views keep only unmerged level-0 ranges visible and share the
-//! original immutable storage. Each piece retires its bottom inputs; later
-//! failure preserves earlier publications. Other jobs may build output ranges
-//! in parallel and publish together. No snapshot or size limit refuses a
-//! compaction. Only the latest version survives; tombstones survive while an
-//! unselected run could hold an older value.
-//!
-//! # Memory
-//!
-//! [`EngineOptions::memory_limit`] defaults to unlimited. [`EngineStats::used`]
-//! sums charged memtables, stored runs and their held metadata, pool reserve
-//! and unused checked-out capacity, retired sources, and estimates of build
-//! output and workspace. Pinned history is charged once in memtables, then in
-//! retired sources after publication. Shared sources are counted once.
-//! Estimates and allocator overhead mean this is an admission budget, not an
-//! operating-system RSS cap. An admitted record or maintenance build can
-//! temporarily cross it; flushes and compactions must still finish.
-//!
-//! Below 90% writers proceed. Above that they wait briefly on publication;
-//! at 100% they flush and request reclamation while it can make progress.
-//! Reclamation drains overlapping versions and isolated tombstones even when
-//! ordinary level targets are satisfied. Live data and held snapshots that
-//! cannot shrink cause [`UpdateError::MemoryLimit`] without waiting for their
-//! owners. Writers also wait at the internal level-0 stop (12 flushes).
-//! Reads, snapshots, checkpoints and maintenance never wait on the budget.
-//!
-//! # Background compaction
-//!
-//! Publication wakes the compaction worker. [`Engine::wait_for_compaction`]
-//! requests a complete pass; [`Engine::background_status`] reports progress,
-//! read failures and a worker panic. A failed pass sleeps until requested
-//! again. Closing joins both workers and reports a panic; it writes nothing.
-//! Snapshots remain usable after closure.
-//!
-//! # Thread safety
-//!
-//! [`Engine`] and [`Snapshot`] are `Send + Sync`: share them across threads and
-//! use a separate [`EngineWorkspace`] for each concurrent read. A workspace is
-//! mutably borrowed for an operation and its returned values. A [`ReadGuard`]
-//! is not `Send`; it holds its shared lock until dropped. Scans borrow their
-//! view and workspace, and return records valid until the next cursor step.
-//!
-//! # Panics
-//!
-//! A panic under the exclusive state lock poisons the engine; subsequent
-//! operations acquiring that lock panic. Build panics leave published sources
-//! readable. A stopped flush worker is replaced by synchronous flushing when
-//! needed; a stopped compaction worker can likewise be serviced synchronously.
-//! Corrupt runs are reported by reads and maintenance.
-//!
-//! # Reading runs
-//!
-//! Every publication of runs, by a flush, a compaction or recovery, also
-//! publishes a directory of them in the same step under the exclusive lock.
-//! It partitions the runs into the fewest groups whose key ranges are
-//! strictly disjoint, which is as many groups as the most runs whose
-//! inclusive ranges share a key ([`EngineStats::max_overlap`]). The directory
-//! is immutable: a lookup or scan reads one directory from start to finish,
-//! and a snapshot keeps the one published when it was taken.
-//!
-//! A point lookup not decided by the memtables visits the groups in
-//! descending order of the largest sequence number any of their runs holds.
-//! In each it binary-searches for the one run whose range could hold the key,
-//! and skips it without decoding anything if the key is outside its range,
-//! its Bloom filter rules the key out, or it holds only versions older than
-//! one already found. It stops once no group left holds a version as new.
-//! When runs overlap heavily, groups are single runs and this is the order
-//! of the runs' own sequence bounds.
-//!
-//! A scan merges one input per group: each reads its runs in key order
-//! through one decoded block and one decompression context, after a binary
-//! search for where to start. The memory a scan holds therefore grows with
-//! the overlap, not with the number of runs.
-//!
-//! # Checkpoints
-//!
-//! [`Engine::checkpoint`] writes the state at one snapshot, its **ceiling**,
-//! to a directory while writes continue, and [`Engine::recover`] restores the
-//! committed checkpoint into a new RAM-only engine. A checkpoint holds every
-//! key live at the ceiling with its newest value and nothing written after
-//! it. A RAM-only engine therefore loses every write since its latest
-//! checkpoint when it is closed or dropped or its process ends. No
-//! checkpoint is ever taken automatically.
-//!
-//! Checkpoints use the normal flush builder, then stream immutable run chunks
-//! and persisted Bloom filters once per stable run ID. Later checkpoints reuse
-//! those files and report written/reused bytes and runs, plus deleted run files.
-//! Levels, bounded views and sequence overrides are restored without
-//! compaction. Use [`Engine::checkpoint_with_metadata`] and
-//! [`Engine::recover_with_metadata`]
-//! to store and recover opaque application metadata (up to 16 MiB).
-//! Run format 6 stores magicless Zstandard frames and prefix-compressed index
-//! keys; checkpoint manifests use version 5. Recovery validates file lengths,
-//! checksums, all records, filter membership and cross-run copies before
-//! starting workers. CRC-32 detects damage but does not authenticate files.
-//!
-//! A checkpoint is committed when the directory's `CURRENT` file is renamed
-//! to name it, after its runs and manifest are synced. The previous generation
-//! stays readable; GC keeps files referenced by either generation. A failed or
-//! interrupted checkpoint leaves the previous one intact. Recovery checks
-//! every file of exactly the committed checkpoint, with no fallback to an
-//! older one, before it returns an engine. One engine or process uses a
-//! directory at a time, through an advisory lock on its `LOCK` file, which
-//! the kernel releases if the process dies.
-//! Recovery leaves checkpoint data unchanged and may create the lock file.
+//! the state lock; at most two frozen tables await flush. Level 0 holds
+//! overlapping flushes; deeper levels have disjoint key ranges, with dynamic
+//! targets from [`Options::level_ratio`]. Every publication of runs also
+//! publishes a directory that groups them into the fewest key-disjoint
+//! groups, which point lookups and scans read.
 
 mod batch;
 mod checkpoint;
@@ -167,9 +20,11 @@ mod compaction;
 #[doc(hidden)]
 pub mod diagnostics;
 mod directory;
+mod error;
 mod errors;
 mod flush_job;
 mod flusher;
+mod handle;
 mod ingest;
 mod levels;
 mod multi;
@@ -193,29 +48,35 @@ mod staged_tests;
 mod stress_tests;
 
 pub use batch::WriteBatch;
-pub use checkpoint::{CheckpointError, CheckpointOptions, CheckpointReport, Damage, OpenError};
-pub use compaction::CompactionError;
-use compaction::{Begun, BuiltCompaction, CompactionJob, Cursor};
+#[cfg(feature = "diagnostics")]
+use checkpoint::CheckpointReport;
+use checkpoint::{CheckpointError, OpenError};
+use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob, Cursor};
 pub(crate) use compaction::{CompactionKind, CompactionPolicy, CompactionReport};
-pub use errors::{UpdateError, WriteError};
+pub use error::{Error, ErrorKind, Result};
+use errors::{UpdateError, WriteError};
 #[cfg(test)]
 use flush_job::BuiltFlush;
 use flush_job::FlushJob;
-pub use options::{Compression, ConfigError, EngineOptions};
-pub use read::{EngineWorkspace, ReadGuard, Scan, Snapshot};
-pub use stats::{EngineStats, FlushReport};
-pub use worker::{BackgroundError, BackgroundStatus};
+pub use handle::{Engine, Keyspace, KeyspaceStats, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Stats};
+use options::ConfigError;
+pub use options::{Compression, Options};
+use read::View;
+pub use read::{KeyRange, MultiGet, Reader, Scan, Snapshot};
+pub(crate) use stats::{EngineStats, FlushReport};
+use worker::BackgroundError;
+#[cfg(test)]
+use worker::BackgroundStatus;
 
-pub use crate::block::{Corruption as BlockCorruption, MAX_KEY_LEN, MAX_VALUE_LEN};
-pub use crate::chunk::BuildCounters;
-pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
+pub use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
+pub(crate) use crate::chunk::BuildCounters;
+pub(crate) use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
 pub(crate) use crate::run::{CompactStats, MergeWorkspace};
-pub use crate::run::{
-    ConflictingCopies, CorruptRun, LiveRecord, LiveValue, ReadError, RunCorruption,
-};
+use crate::run::{ConflictingCopies, LiveRecord, LiveValue, ReadError};
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
@@ -280,8 +141,21 @@ const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowanc
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
 const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// The keyspace an engine holds: its name and its ID, which no other
+/// keyspace of the engine ever has.
+#[derive(Clone, Debug)]
+struct Entry {
+    id: u32,
+    name: Arc<str>,
+}
+
 struct State {
     last_seq: u64,
+    /// The live keyspace, if one has been created and not dropped. Changed
+    /// under this lock, so every write, read and snapshot agrees on it.
+    keyspace: Option<Entry>,
+    /// The ID the next keyspace created gets. IDs are never reused.
+    next_keyspace: u32,
     active: Memtable,
     /// Oldest first. Each table's sequence numbers are above the runs' and
     /// those of the tables before it, and below `active`'s. Writers rotate
@@ -339,6 +213,14 @@ struct Retained {
 }
 
 impl State {
+    /// Refuses an update to keyspace `id` unless it is the live one.
+    fn check_keyspace(&self, id: u32) -> Result<(), UpdateError> {
+        match &self.keyspace {
+            Some(entry) if entry.id == id => Ok(()),
+            _ => Err(UpdateError::KeyspaceDropped),
+        }
+    }
+
     /// Rebuilds the directory from `runs`. Publication is rare, so this
     /// builds a fresh one rather than maintaining one, in O(n log n) for n
     /// runs, and readers holding the previous directory keep it.
@@ -495,280 +377,12 @@ struct Core {
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-/// A key-value engine. See the [module documentation](self) for its
-/// consistency, flushing, compaction and persistence rules.
-/// It is `Send + Sync`; use one workspace per concurrent reader.
-/// Methods that acquire the state lock panic if it is poisoned; see
-/// [Panics](self#panics). Drop any [`ReadGuard`] before calling those methods.
-pub struct Engine {
-    core: Arc<Core>,
-    /// Joined when the engine is dropped.
-    worker: Option<std::thread::JoinHandle<()>>,
-    flush_worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Engine {
-    /// Creates an empty engine and starts flush and compaction workers.
-    /// Invalid options return [`OpenError::Config`]; thread creation failures
-    /// return [`OpenError::Worker`].
-    pub fn new(options: EngineOptions) -> Result<Self, OpenError> {
-        options.validate().map_err(OpenError::Config)?;
-        Self::start(Arc::new(Core::new(&options)), &options)
-    }
-
-    /// Wraps `core`, starting its worker if `options` ask for one. On failure
-    /// the core is dropped with nothing running.
-    fn start(core: Arc<Core>, options: &EngineOptions) -> Result<Self, OpenError> {
-        #[cfg(test)]
-        let enabled = options.background_compaction.is_some();
-        #[cfg(not(test))]
-        let enabled = {
-            let _ = options;
-            true
-        };
-        let worker = enabled
-            .then(|| worker::start(Arc::clone(&core)))
-            .transpose()
-            .map_err(OpenError::Worker)?;
-        let mut engine = Self {
-            core,
-            worker,
-            flush_worker: None,
-        };
-        engine.flush_worker =
-            Some(flusher::start(Arc::clone(&engine.core)).map_err(OpenError::Worker)?);
-        Ok(engine)
-    }
-
-    /// Shuts the engine down, joins its flush and compaction workers and
-    /// releases its memory. In-flight builds may publish before workers stop.
-    /// No new compaction starts once this begins.
-    ///
-    /// It consumes the engine, so no read, write, [`ReadGuard`] or other
-    /// call can be in progress or follow; an engine shared through an `Arc`
-    /// is closed once it is the last reference ([`Arc::into_inner`]).
-    /// [`Snapshot`]s are unaffected and stay readable.
-    ///
-    /// Closing starts no flush or checkpoint; an in-flight build may finish.
-    /// It writes nothing to disk, so the engine's data goes with it unless
-    /// checkpointed first. Dropping the engine does the same and discards the
-    /// result.
-    ///
-    /// Fails only with [`BackgroundError::Panicked`] if either worker
-    /// stopped by panicking, at any time; the engine is shut down all the
-    /// same. A compaction read failure is reported by [`Engine::background_status`].
-    ///
-    /// Nothing can use the engine after it is closed, or close it while a
-    /// [`ReadGuard`] is held:
-    ///
-    /// ```compile_fail,E0382
-    /// # use tessera::engine::{Engine, EngineOptions};
-    /// let engine = Engine::new(EngineOptions::default()).unwrap();
-    /// engine.close().unwrap();
-    /// engine.put(b"k", b"v").unwrap();
-    /// ```
-    ///
-    /// ```compile_fail,E0505
-    /// # use tessera::engine::{Engine, EngineOptions};
-    /// let engine = Engine::new(EngineOptions::default()).unwrap();
-    /// let guard = engine.read();
-    /// engine.close().unwrap();
-    /// drop(guard);
-    /// ```
-    pub fn close(mut self) -> Result<(), BackgroundError> {
-        self.stop_worker()
-    }
-
-    fn stop_worker(&mut self) -> Result<(), BackgroundError> {
-        self.core.flush_signal.stop();
-        if let Some(handle) = self.flush_worker.take() {
-            let _ = handle.join();
-        }
-        let flush_error = self.core.flush_signal.failure();
-        let Some(handle) = self.worker.take() else {
-            return flush_error.map_or(Ok(()), Err);
-        };
-        let signal = self.core.background.as_ref().expect(WORKER);
-        signal.stop();
-        // The thread catches its own panics, so joining cannot fail.
-        let _ = handle.join();
-        match signal.status().panic {
-            Some(message) => Err(BackgroundError::Panicked(message)),
-            None => flush_error.map_or(Ok(()), Err),
-        }
-    }
-
-    /// Sets `key` to `value` and returns the update's sequence number.
-    ///
-    /// # Errors
-    /// Returns [`UpdateError`] for an invalid record, memory admission failure
-    /// or exhausted sequence space, without publishing the write.
-    ///
-    /// # Panics
-    /// Panics if the state lock is poisoned or a synchronous flush build panics.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
-        self.core.put(key, value)
-    }
-
-    /// Deletes `key` and returns the update's sequence number.
-    /// A missing key still receives a tombstone and a sequence.
-    ///
-    /// # Errors
-    /// Returns [`UpdateError`] for an invalid key or record charge, memory
-    /// admission failure or exhausted sequences. Rejection publishes nothing.
-    ///
-    /// # Panics
-    /// Panics if the state lock is poisoned or a synchronous flush build panics.
-    pub fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
-        self.core.delete(key)
-    }
-
-    /// Applies every operation atomically and returns the last sequence number.
-    /// Later operations on the same key win. An empty batch returns the current
-    /// sequence number without changing state. Batches built directly into runs
-    /// take one publication sequence; memtable batches take one per operation.
-    ///
-    /// # Errors
-    /// Returns [`UpdateError`] if any record is invalid, admission fails or
-    /// sequences are exhausted. Rejection publishes none of the batch.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned or a synchronous build panics.
-    pub fn write(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
-        self.core.write_batch(batch)
-    }
-
-    /// Builds a strictly key-sorted, duplicate-free batch directly into runs
-    /// outside the state lock and publishes it atomically. Returns the single
-    /// publication sequence of the whole batch; an empty batch returns the
-    /// current ceiling. Rejects unsorted or repeated keys without changes.
-    /// Tables sharing an actual batch key are flushed before publication.
-    /// Runs are built once; concurrent writes to other keys cause no retries.
-    /// Writes completed before publication are older than the ingested data.
-    ///
-    /// # Errors
-    /// Returns [`UpdateError::Rejected`] for unsorted, duplicate or invalid
-    /// records, or another [`UpdateError`] for admission or sequence exhaustion.
-    /// Rejection publishes nothing.
-    ///
-    /// # Panics
-    /// Panics if the state lock is poisoned or the private run build panics;
-    /// a build panic leaves the published sources readable.
-    pub fn ingest_sorted(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
-        if !batch.is_sorted() {
-            return Err(UpdateError::Rejected(WriteError::BatchNotSorted));
-        }
-        batch.validate(self.memtable_budget())?;
-        self.core.ingest_batch(batch, true)
-    }
-
-    fn memtable_budget(&self) -> usize {
-        self.core.memtable_budget
-    }
-
-    /// Returns the latest value of `key`, or `None` if it is absent or
-    /// deleted. The value is copied into `workspace`, once per call.
-    ///
-    /// # Errors
-    /// Returns [`ReadError`] for touched corrupt runs or conflicting copies.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned.
-    pub fn get<'w>(
-        &self,
-        key: &[u8],
-        workspace: &'w mut EngineWorkspace,
-    ) -> Result<Option<LiveValue<'w>>, ReadError> {
-        self.core.get(key, workspace)
-    }
-
-    /// Takes the shared lock and returns a stable view of the engine, for a
-    /// few reads that must agree.
-    ///
-    /// Writers and flush publication wait until it is dropped, so use a
-    /// [`Snapshot`] for a long scan. See the [module documentation](self) for
-    /// what must not be done while holding it.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned.
-    pub fn read(&self) -> ReadGuard<'_> {
-        self.core.read()
-    }
-
-    /// Takes a consistent copy-on-write view without retaining a lock.
-    /// Snapshots keep their own immutable sources through maintenance and closure.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned.
-    pub fn snapshot(&self) -> Snapshot {
-        self.core.snapshot()
-    }
-
-    /// Waits for everything written before this call to appear in runs.
-    /// Publication is unconditional. A stopped flush worker reports its panic;
-    /// its tables stay readable and writers can flush them synchronously.
-    ///
-    /// # Errors
-    /// Returns [`BackgroundError::Panicked`] if the flush worker has failed.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned.
-    pub fn flush(&self) -> Result<FlushReport, BackgroundError> {
-        self.core.flush()
-    }
-
-    /// Performs one eager compaction step, or returns `None` if none is eligible.
-    /// Uses the caller's workspace and serializes with other compactions.
-    ///
-    /// # Errors
-    /// Returns [`CompactionError`] for a read failure or invalidated selection.
-    ///
-    /// # Panics
-    /// Panics if the state lock is poisoned or a synchronous builder panics.
-    #[cfg(any(test, feature = "diagnostics"))]
-    pub(crate) fn compact(
-        &self,
-        workspace: &mut MergeWorkspace,
-    ) -> Result<Option<CompactionReport>, CompactionError> {
-        self.core.compact(
-            CompactionPolicy {
-                max_overlap: 1,
-                ..self.core.policy
-            },
-            workspace,
-        )
-    }
-
-    /// Returns a summary of the current state.
-    ///
-    /// # Panics
-    /// Panics if the engine state lock is poisoned.
-    pub fn stats(&self) -> EngineStats {
-        self.core.stats()
-    }
-
-    /// Requests a complete compaction pass and waits for it, or reports a
-    /// read failure or worker panic. Do not hold a [`ReadGuard`] while waiting.
-    pub fn wait_for_compaction(&self) -> Result<(), BackgroundError> {
-        match &self.core.background {
-            Some(signal) => signal.wait(),
-            None => Ok(()),
-        }
-    }
-
-    /// Returns what the background worker has done, or `None` if the engine
-    /// has none.
-    pub fn background_status(&self) -> Option<BackgroundStatus> {
-        self.core.background.as_ref().map(worker::Signal::status)
-    }
-}
-
 impl Core {
-    fn new(options: &EngineOptions) -> Self {
+    fn new(options: &Options) -> Self {
         Self::with_pool(options, ChunkPool::new(RESERVE_BYTES))
     }
 
-    fn with_pool(options: &EngineOptions, chunks: ChunkPool) -> Self {
+    fn with_pool(options: &Options, chunks: ChunkPool) -> Self {
         #[cfg(test)]
         let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
             options.last_seq,
@@ -776,7 +390,7 @@ impl Core {
             options.max_frozen_memtables,
             options
                 .bulk_ingest_min
-                .unwrap_or(options.memtable_budget / BULK_INGEST_DIVISOR),
+                .unwrap_or(options.memtable_size / BULK_INGEST_DIVISOR),
             options.background_compaction.unwrap_or_default(),
             options.background_compaction.map(|_| worker::Signal::new()),
         );
@@ -785,15 +399,17 @@ impl Core {
             0,
             TARGET_RUN_LEN,
             MAX_FROZEN_MEMTABLES,
-            options.memtable_budget / BULK_INGEST_DIVISOR,
+            options.memtable_size / BULK_INGEST_DIVISOR,
             CompactionPolicy::for_memory(options.memory_limit),
             Some(worker::Signal::new()),
         );
-        let active = Memtable::in_pool(options.memtable_budget, Some(last_seq), &chunks);
+        let active = Memtable::in_pool(options.memtable_size, Some(last_seq), &chunks);
         Self {
             chunks,
             state: RwLock::new(State {
                 last_seq,
+                keyspace: None,
+                next_keyspace: 0,
                 active,
                 frozen: Vec::new(),
                 runs: Vec::new(),
@@ -820,13 +436,13 @@ impl Core {
             background_threads: options.background_threads,
             level_ratio: options.level_ratio,
             checkpointing: Mutex::new(()),
-            memtable_budget: options.memtable_budget,
+            memtable_budget: options.memtable_size,
             max_frozen_memtables,
             flush_signal: flusher::Signal::new(),
             bulk_ingest_min,
             target_run_len,
             codec: options.compression.codec(),
-            target_block_compressed: options.target_block_compressed,
+            target_block_compressed: options.block_size,
             snapshots: Arc::new(()),
             background,
             memory_limit: options.memory_limit,
@@ -860,18 +476,40 @@ impl Core {
         }
     }
 
+    /// Writes to the live keyspace, creating one if there is none: for tests
+    /// of the core alone.
+    #[cfg(test)]
     fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, UpdateError> {
-        self.update(key, Value::Bytes(value))
+        self.update(self.test_keyspace(), key, Value::Bytes(value))
     }
 
+    #[cfg(test)]
     fn delete(&self, key: &[u8]) -> Result<u64, UpdateError> {
-        self.update(key, Value::Tombstone)
+        self.update(self.test_keyspace(), key, Value::Tombstone)
     }
 
-    fn update(&self, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
+    /// The live keyspace's ID, creating a keyspace if there is none.
+    #[cfg(test)]
+    fn test_keyspace(&self) -> u32 {
+        let mut state = self.write_state();
+        if state.keyspace.is_none() {
+            let id = state.next_keyspace;
+            state.next_keyspace += 1;
+            state.keyspace = Some(Entry {
+                id,
+                name: Arc::from("test"),
+            });
+        }
+        state.keyspace.as_ref().unwrap().id
+    }
+
+    /// Applies one update to keyspace `keyspace` and returns its sequence
+    /// number.
+    fn update(&self, keyspace: u32, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
         self.validate_record(key, value)?;
         let mut state = self.admit(self.write_state())?;
         loop {
+            state.check_keyspace(keyspace)?;
             match self.write(&mut state, key, value) {
                 Err(Refusal::Full) => state = self.admit(self.make_room(state))?,
                 written => return written.map_err(Refusal::into_error),
@@ -966,10 +604,7 @@ impl Core {
 
     /// Applies a RAM-only write to the active table.
     fn write(&self, state: &mut State, key: &[u8], value: Value<'_>) -> Result<u64, Refusal> {
-        let seq = state
-            .last_seq
-            .checked_add(1)
-            .ok_or(UpdateError::SequencesExhausted)?;
+        let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
         let written = match value {
             Value::Bytes(bytes) => state.active.put(key, seq, bytes),
             Value::Tombstone => state.active.delete(key, seq),
@@ -1013,13 +648,16 @@ impl Core {
         state.frozen.push(Arc::new(table));
     }
 
+    /// The latest value of `key` in keyspace `keyspace`, copied into `value`.
     fn get<'w>(
         &self,
+        keyspace: u32,
         key: &[u8],
-        workspace: &'w mut EngineWorkspace,
-    ) -> Result<Option<LiveValue<'w>>, ReadError> {
-        let EngineWorkspace { logical, value, .. } = workspace;
+        logical: &'w mut LogicalWorkspace,
+        value: &'w mut Vec<u8>,
+    ) -> Result<Option<&'w [u8]>> {
         let state = self.read_state();
+        state.check_keyspace(keyspace)?;
         let in_memory = state
             .active
             .get(key)
@@ -1030,10 +668,7 @@ impl Core {
             };
             value.clear();
             value.extend_from_slice(bytes);
-            return Ok(Some(LiveValue {
-                seq: version.seq,
-                value,
-            }));
+            return Ok(Some(value));
         }
         // The runs are immutable and shared, so they are read after the lock
         // is released: the result is the state at the lock, and a writer or
@@ -1044,18 +679,12 @@ impl Core {
         Ok(found.map(|found| {
             value.clear();
             value.extend_from_slice(found.value);
-            LiveValue {
-                seq: found.seq,
-                value,
-            }
+            &value[..]
         }))
     }
 
-    fn read(&self) -> ReadGuard<'_> {
-        ReadGuard(self.read_state())
-    }
-
-    fn snapshot(&self) -> Snapshot {
+    /// A consistent view of the state now, sharing every source.
+    fn snapshot(&self) -> View {
         let mut state = self.write_state();
         let mut tables =
             Vec::with_capacity(state.frozen.len() + usize::from(!state.active.is_empty()));
@@ -1073,14 +702,71 @@ impl Core {
             tables.push(view);
         }
         tables.extend(state.frozen.iter().rev().cloned());
-        Snapshot {
+        View {
             tables,
             runs: Arc::clone(&state.directory),
             last_seq: state.last_seq,
+            keyspace: state.keyspace.as_ref().map(|entry| entry.id),
+            next_keyspace: state.next_keyspace,
             _live: Arc::clone(&self.snapshots),
         }
     }
 
+    /// Drops keyspace `name` and every source holding its data, and returns
+    /// whether it was live. Snapshots keep what they hold.
+    ///
+    /// Holding the flush and compaction locks keeps any build from
+    /// publishing the keyspace's records after this; a sorted batch built
+    /// outside the lock checks the keyspace when it publishes.
+    fn drop_keyspace(&self, name: &str) -> bool {
+        let live = |state: &State| {
+            state
+                .keyspace
+                .as_ref()
+                .is_some_and(|entry| &*entry.name == name)
+        };
+        if !live(&self.read_state()) {
+            return false;
+        }
+        let _flushing = self.serialize_flush();
+        let _compacting = self
+            .compacting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.write_state();
+        if !live(&state) {
+            return false;
+        }
+        state.keyspace = None;
+        state.last_view = None;
+        let successor = Memtable::in_pool(self.memtable_budget, Some(state.last_seq), &self.chunks);
+        let active = Arc::new(std::mem::replace(&mut state.active, successor).freeze());
+        let mut tables = std::mem::take(&mut state.frozen);
+        tables.push(active);
+        for table in tables {
+            // As in flush publication: another reference is a snapshot's,
+            // which keeps the whole table; otherwise views may hold history.
+            let bytes = if Arc::strong_count(&table) > 1 {
+                table.memory().charged
+            } else {
+                table.held_by_snapshots()
+            };
+            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
+        }
+        let runs = std::mem::take(&mut state.runs);
+        state.retire_runs(&runs);
+        state.levels = Levels::new(self.level_ratio);
+        state.order_runs();
+        state.recount_runs();
+        drop(state);
+        drop(runs);
+        self.flush_signal.changed();
+        self.resources.changed();
+        self.notify_worker();
+        true
+    }
+
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     fn flush(&self) -> Result<FlushReport, BackgroundError> {
         let mut state = self.write_state();
         let before = state.flush_totals;
@@ -1361,6 +1047,7 @@ impl Core {
         }
     }
 
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     fn stats(&self) -> EngineStats {
         let state = self.read_state();
         let retained = state.retained();
@@ -1482,31 +1169,44 @@ fn deepest_overlap(runs: &[SharedRun]) -> usize {
 }
 
 const LOCK: &str = "a write section holding the state lock panicked";
+/// At one update per nanosecond, 2^64 sequence numbers last 584 years.
+const SEQUENCES: &str = "sequence numbers are exhausted";
 /// Flushes publish only non-empty tables, and compaction builds a run only
 /// once it has a record.
 const NOT_EMPTY: &str = "published runs are not empty";
 
-impl Drop for Engine {
-    /// As [`Engine::close`], discarding its result.
-    fn drop(&mut self) {
-        let _ = self.stop_worker();
-    }
-}
-
 const WORKER: &str = "an engine with a worker has its signal";
-
-impl fmt::Debug for Engine {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Engine")
-            .field("stats", &self.stats())
-            .finish_non_exhaustive()
-    }
-}
 
 /// Helpers for compaction correctness tests. Picks are indices into the
 /// published runs, valid while nothing else changes them.
+#[cfg(any(test, feature = "diagnostics"))]
+impl Core {
+    /// Performs one eager compaction step with the caller's workspace, or
+    /// returns `None` if none is eligible.
+    fn compact_step(
+        &self,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        self.compact(
+            CompactionPolicy {
+                max_overlap: 1,
+                ..self.policy
+            },
+            workspace,
+        )
+    }
+}
+
 #[cfg(test)]
 impl Engine {
+    /// As [`Core::compact_step`].
+    pub(crate) fn compact(
+        &self,
+        workspace: &mut MergeWorkspace,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        self.core.compact_step(workspace)
+    }
+
     /// Compacts `picks` through the engine job: the same tombstone
     /// rule, build and publication, with the output placed as
     /// [`Core::begin_picked`] says.
@@ -1543,13 +1243,9 @@ mod tests {
     #[test]
     fn closing_with_a_poisoned_state_lock_still_releases_the_core() {
         for worker in [false, true] {
-            let options = if worker {
-                EngineOptions::default()
-            } else {
-                manual()
-            };
-            let engine = Engine::new(options).unwrap();
-            engine.put(b"k", b"v").unwrap();
+            let options = if worker { Options::default() } else { manual() };
+            let engine = Engine::in_memory(options).unwrap();
+            engine.ks().put(b"k", b"v").unwrap();
             std::thread::scope(|scope| {
                 let poisoned = scope.spawn(|| {
                     let _state = engine.core.write_state();
@@ -1567,9 +1263,11 @@ mod tests {
                     panic!("{error:?}");
                 };
                 assert!(message.starts_with(crate::engine::LOCK), "{message}");
-                assert_eq!(engine.close(), Err(error));
+                let closed = engine.close().unwrap_err();
+                assert_eq!(closed.kind(), ErrorKind::Background);
+                assert!(closed.to_string().contains(message.as_str()), "{closed}");
             } else {
-                assert_eq!(engine.close(), Ok(()));
+                engine.close().unwrap();
             }
             assert_eq!(Arc::strong_count(&core), 1);
             drop(core);
@@ -1578,10 +1276,10 @@ mod tests {
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
-    fn manual() -> EngineOptions {
-        EngineOptions {
+    fn manual() -> Options {
+        Options {
             background_compaction: None,
-            ..EngineOptions::default()
+            ..Options::default()
         }
     }
 
@@ -1592,54 +1290,54 @@ mod tests {
     }
 
     #[test]
-    fn scans_reuse_workspace_cursor_capacity_after_early_drop_and_source_release() {
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"a", b"old").unwrap();
-        engine.put(b"b", b"deleted").unwrap();
+    fn scans_reuse_reader_cursor_capacity_after_early_drop_and_source_release() {
+        let engine = Engine::in_memory(manual()).unwrap();
+        let ks = engine.ks();
+        ks.put(b"a", b"old").unwrap();
+        ks.put(b"b", b"deleted").unwrap();
         let job = engine.core.begin_flush().unwrap();
-        engine.put(b"a", b"new").unwrap();
-        engine.delete(b"b").unwrap();
-        engine.put(b"c", b"live").unwrap();
+        ks.put(b"a", b"new").unwrap();
+        ks.delete(b"b").unwrap();
+        ks.put(b"c", b"live").unwrap();
         let snapshot = engine.snapshot();
-        let mut ws = EngineWorkspace::new();
-        let mut scan = snapshot.scan(&mut ws);
+        let mut reader = snapshot.reader();
+        let mut scan = reader.range(&ks, ..);
         assert_eq!(scan.tables.len(), 2);
         let allocation = scan.tables.as_ptr().addr();
         let capacity = scan.tables.capacity();
-        assert_eq!(scan.next_record().unwrap().unwrap().value, b"new");
+        assert_eq!(scan.next().unwrap().unwrap().1, b"new");
         drop(scan); // Leave another live key unread.
-        assert!(ws.scan_tables.is_empty());
-        assert_eq!(ws.scan_tables.as_ptr().addr(), allocation);
+        assert!(reader.buffers.scan_tables.is_empty());
+        assert_eq!(reader.buffers.scan_tables.as_ptr().addr(), allocation);
         for _ in 0..3 {
-            let mut scan = snapshot.scan_prefix(b"c", &mut ws);
+            let mut scan = reader.prefix(&ks, b"c");
             assert_eq!(scan.tables.as_ptr().addr(), allocation);
-            assert_eq!(scan.next_record().unwrap().unwrap().value, b"live");
-            assert!(scan.next_record().unwrap().is_none());
+            assert_eq!(scan.next().unwrap().unwrap().1, b"live");
+            assert!(scan.next().unwrap().is_none());
         }
+        drop(reader);
         drop(snapshot);
         job.build().publish();
         engine.flush().unwrap();
-        engine.close().unwrap();
-        // No cursor or borrowed source survives in the workspace.
-        let empty = Engine::new(manual()).unwrap();
-        let guard = empty.read();
-        let mut scan = guard.scan(&mut ws);
+        // No cursor or borrowed source survives in the pooled buffers.
+        let mut reader = engine.reader();
+        let mut scan = reader.range(&ks, ..);
         assert_eq!(scan.tables.as_ptr().addr(), allocation);
-        assert!(scan.next_record().unwrap().is_none());
+        assert!(scan.next().unwrap().is_some());
         drop(scan);
-        assert_eq!(ws.scan_tables.capacity(), capacity);
+        assert_eq!(reader.buffers.scan_tables.capacity(), capacity);
     }
 
     /// The writer-priority rule: from the moment a writer waits for the state
     /// lock until it has it, the gate every reader must pass is closed.
     #[test]
     fn a_waiting_writer_holds_the_gate_until_it_has_the_lock() {
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"k", b"old").unwrap();
-        let held = engine.read();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"k", b"old").unwrap();
+        let held = engine.core.read_state();
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| engine.put(b"k", b"new").unwrap());
-            // The guard keeps the writer waiting, so once it has the gate it
+            let writer = scope.spawn(|| engine.ks().put(b"k", b"new").unwrap());
+            // The read lock keeps the writer waiting, so once it has the gate it
             // keeps it until the guard is dropped.
             while engine.core.gate.try_lock().is_ok() {
                 std::thread::yield_now();
@@ -1653,17 +1351,13 @@ mod tests {
             writer.join().unwrap();
         });
         assert!(engine.core.gate.try_lock().is_ok());
-        let mut workspace = EngineWorkspace::new();
-        assert_eq!(
-            engine.get(b"k", &mut workspace).unwrap().unwrap().value,
-            b"new"
-        );
+        assert_eq!(engine.ks().get(b"k").unwrap().unwrap(), b"new");
     }
 
     #[test]
     fn publication_releases_every_engine_reference_to_the_frozen_table() {
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"k", b"v").unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"k", b"v").unwrap();
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         assert_eq!(Arc::strong_count(&held), 3);
@@ -1673,8 +1367,8 @@ mod tests {
 
     #[test]
     fn an_abandoned_flush_releases_only_its_own_reference() {
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"k", b"v").unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"k", b"v").unwrap();
         let job = engine.core.begin_flush().unwrap();
         let held = frozen_handle(&engine);
         drop(job);
@@ -1692,8 +1386,8 @@ mod tests {
 
     fn overlapping_runs(engine: &Engine) {
         for value in [&b"1"[..], b"2", b"3"] {
-            engine.put(b"a", value).unwrap();
-            engine.put(b"z", value).unwrap();
+            engine.ks().put(b"a", value).unwrap();
+            engine.ks().put(b"z", value).unwrap();
             engine.flush().unwrap();
         }
     }
@@ -1701,29 +1395,24 @@ mod tests {
     /// A lookup's value and the run blocks it decoded, through each read
     /// path that reaches the runs.
     fn read_counting(engine: &Engine, key: &[u8]) -> [(Option<Vec<u8>>, u64); 2] {
-        let mut workspace = EngineWorkspace::new();
-        let got = engine
-            .get(key, &mut workspace)
-            .unwrap()
-            .map(|v| v.value.to_vec());
-        let direct = (got, workspace.blocks_loaded());
-        let mut workspace = EngineWorkspace::new();
-        let guard = engine.read();
-        let got = guard
-            .get(key, &mut workspace)
-            .unwrap()
-            .map(|v| v.value.to_vec());
-        [direct, (got, workspace.blocks_loaded())]
+        let ks = engine.ks();
+        let mut reader = engine.reader();
+        let got = reader.get(&ks, key).unwrap().map(<[u8]>::to_vec);
+        let latest = (got, reader.counters().blocks_loaded);
+        let snapshot = engine.snapshot();
+        let mut reader = snapshot.reader();
+        let got = reader.get(&ks, key).unwrap().map(<[u8]>::to_vec);
+        [latest, (got, reader.counters().blocks_loaded)]
     }
 
     #[test]
     fn a_lookup_decodes_only_the_newest_run_holding_the_key() {
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         overlapping_runs(&engine);
-        engine.put(b"m", b"live").unwrap();
-        engine.delete(b"z").unwrap();
+        engine.ks().put(b"m", b"live").unwrap();
+        engine.ks().delete(b"z").unwrap();
         engine.flush().unwrap();
-        assert_eq!(engine.stats().max_overlap, 4);
+        assert_eq!(engine.engine_stats().max_overlap, 4);
         // "a" is in three runs, the newest decides; "z" is deleted in a
         // fourth; "m" is in one.
         for (key, expected) in [
@@ -1738,16 +1427,11 @@ mod tests {
         }
         // A snapshot keeps the runs it saw, and still reads one block.
         let snapshot = engine.snapshot();
-        engine.put(b"a", b"4").unwrap();
+        engine.ks().put(b"a", b"4").unwrap();
         engine.flush().unwrap();
-        let mut workspace = EngineWorkspace::new();
-        let seen = snapshot
-            .get(b"a", &mut workspace)
-            .unwrap()
-            .unwrap()
-            .value
-            .to_vec();
-        assert_eq!((seen, workspace.blocks_loaded()), (b"3".to_vec(), 1));
+        let mut reader = snapshot.reader();
+        let seen = reader.get(&engine.ks(), b"a").unwrap().unwrap().to_vec();
+        assert_eq!((seen, reader.counters().blocks_loaded), (b"3".to_vec(), 1));
         assert_eq!(value(&engine, b"a").as_deref(), Some(&b"4"[..]));
     }
 
@@ -1756,17 +1440,20 @@ mod tests {
     /// run left out holds the newest "k", and reads decide by sequence.
     #[test]
     fn a_partial_compaction_leaves_interleaved_runs_that_read_correctly() {
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"j", b"j1").unwrap();
-        engine.put(b"k", b"k1").unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"j", b"j1").unwrap();
+        engine.ks().put(b"k", b"k1").unwrap();
         engine.flush().unwrap();
-        engine.put(b"j", b"j2").unwrap();
-        engine.put(b"k", b"k2").unwrap();
+        engine.ks().put(b"j", b"j2").unwrap();
+        engine.ks().put(b"k", b"k2").unwrap();
         for i in 0..200u32 {
-            engine.put(format!("x{i:04}").as_bytes(), &[7; 64]).unwrap();
+            engine
+                .ks()
+                .put(format!("x{i:04}").as_bytes(), &[7; 64])
+                .unwrap();
         }
         engine.flush().unwrap();
-        engine.put(b"k", b"k3").unwrap();
+        engine.ks().put(b"k", b"k3").unwrap();
         engine.flush().unwrap();
         let before = engine.snapshot();
 
@@ -1791,7 +1478,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.kind, CompactionKind::Merge);
         assert_eq!((report.inputs, report.outputs), (2, 1));
-        assert_eq!(engine.stats().runs, 2);
+        assert_eq!(engine.engine_stats().runs, 2);
         // "k": the newer run decides, before the output's older version.
         // "j": only the output's range holds it.
         for (value, blocks) in read_counting(&engine, b"k") {
@@ -1800,15 +1487,8 @@ mod tests {
         for (value, blocks) in read_counting(&engine, b"j") {
             assert_eq!((value.as_deref(), blocks), (Some(&b"j2"[..]), 1));
         }
-        let mut workspace = EngineWorkspace::new();
         for (key, expected) in [(&b"j"[..], &b"j2"[..]), (b"k", b"k3")] {
-            let seen = before
-                .get(key, &mut workspace)
-                .unwrap()
-                .unwrap()
-                .value
-                .to_vec();
-            assert_eq!(seen, expected);
+            assert_eq!(before.value(key).unwrap(), expected);
         }
     }
 
@@ -1818,7 +1498,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "compactions are serialized")]
     fn publication_checks_that_its_inputs_are_published() {
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         overlapping_runs(&engine);
         let built = engine
             .core
@@ -1837,7 +1517,7 @@ mod tests {
     /// validation timeout stops.
     #[test]
     fn building_a_compaction_takes_no_lock() {
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         overlapping_runs(&engine);
         let job = engine
             .core
@@ -1847,13 +1527,13 @@ mod tests {
         let (held, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
-                let guard = engine.read();
+                let guard = engine.core.read_state();
                 held.wait();
                 release.wait();
                 drop(guard);
             });
             held.wait();
-            let writer = scope.spawn(|| engine.put(b"m", b"new").unwrap());
+            let writer = scope.spawn(|| engine.ks().put(b"m", b"new").unwrap());
             while engine.core.gate.try_lock().is_ok() {
                 std::thread::yield_now();
             }
@@ -1865,12 +1545,12 @@ mod tests {
             let report = built.publish().unwrap();
             assert_eq!((report.inputs, report.outputs), (3, 1));
         });
-        assert_eq!(engine.stats().runs, 1);
+        assert_eq!(engine.engine_stats().runs, 1);
     }
 
     #[test]
     fn publication_frees_the_inputs_once_nothing_holds_them() {
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         overlapping_runs(&engine);
         let inputs: Vec<SharedRun> = engine.core.read_state().runs.clone();
         let mut workspace = MergeWorkspace::new();
@@ -1880,7 +1560,7 @@ mod tests {
             .unwrap()
             .is_some()
         {}
-        assert_eq!(engine.stats().runs, 1);
+        assert_eq!(engine.engine_stats().runs, 1);
         crate::test_support::wait_until(|| inputs.iter().all(|run| Arc::strong_count(run) == 1));
         assert!(inputs.iter().all(|run| Arc::strong_count(run) == 1));
     }
@@ -1890,8 +1570,8 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::Ordering;
 
-    fn background(max_overlap: usize) -> EngineOptions {
-        EngineOptions {
+    fn background(max_overlap: usize) -> Options {
+        Options {
             background_compaction: Some(CompactionPolicy {
                 max_overlap,
                 ..CompactionPolicy::default()
@@ -1901,11 +1581,7 @@ mod tests {
     }
 
     fn value(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
-        let mut workspace = EngineWorkspace::new();
-        engine
-            .get(key, &mut workspace)
-            .unwrap()
-            .map(|found| found.value.to_vec())
+        engine.ks().get(key).unwrap()
     }
 
     /// Pauses the next compaction build after merging, until released.
@@ -1925,7 +1601,7 @@ mod tests {
 
     #[test]
     fn a_flush_wakes_the_worker_which_compacts_and_goes_idle() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         assert_eq!(engine.background_status().unwrap().passes, 0);
         overlapping_runs(&engine);
         engine.wait_for_compaction().unwrap();
@@ -1933,8 +1609,8 @@ mod tests {
         assert!(status.running && !status.busy);
         assert!(status.compactions >= 1);
         assert!(status.passes <= 4, "{status:?}");
-        assert_eq!(engine.stats().runs, 1);
-        assert_eq!(engine.stats().max_overlap, 1);
+        assert_eq!(engine.engine_stats().runs, 1);
+        assert_eq!(engine.engine_stats().max_overlap, 1);
         assert_eq!(value(&engine, b"a").unwrap(), b"3");
         // With nothing requested, nothing runs.
         for _ in 0..1000 {
@@ -1946,11 +1622,11 @@ mod tests {
     /// Requests made while the worker cannot run count as one more pass.
     #[test]
     fn requests_coalesce_while_the_worker_is_busy() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         let slot = engine.core.compacting.lock().unwrap();
         for round in 0..10 {
-            engine.put(b"a", &[round]).unwrap();
-            engine.put(b"z", &[round]).unwrap();
+            engine.ks().put(b"a", &[round]).unwrap();
+            engine.ks().put(b"z", &[round]).unwrap();
             engine.flush().unwrap();
         }
         drop(slot);
@@ -1960,23 +1636,23 @@ mod tests {
         // flushes after it started, and one for the wait. A worker that wakes
         // late serves them all in one.
         assert!((1..=3).contains(&status.passes), "{status:?}");
-        assert_eq!(engine.stats().runs, 1);
+        assert_eq!(engine.engine_stats().runs, 1);
     }
 
     /// While the worker holds a built compaction, reads see the inputs and a
     /// flush publishes beside them; publication keeps the flushed run.
     #[test]
     fn reads_and_flushes_proceed_while_the_worker_compacts() {
-        let engine = Engine::new(background(2)).unwrap();
+        let engine = Engine::in_memory(background(2)).unwrap();
         let (built, release) = pause_after_build(&engine);
         overlapping_runs(&engine);
         built.wait();
-        assert_eq!(engine.stats().runs, 3);
+        assert_eq!(engine.engine_stats().runs, 3);
         assert_eq!(value(&engine, b"z").unwrap(), b"3");
-        engine.delete(b"a").unwrap();
-        engine.put(b"m", b"new").unwrap();
+        engine.ks().delete(b"a").unwrap();
+        engine.ks().put(b"m", b"new").unwrap();
         engine.flush().unwrap();
-        assert_eq!(engine.stats().runs, 4);
+        assert_eq!(engine.engine_stats().runs, 4);
         *engine.core.after_build.lock().unwrap() = None;
         release.wait();
         engine.wait_for_compaction().unwrap();
@@ -1984,16 +1660,17 @@ mod tests {
         assert_eq!(value(&engine, b"a"), None);
         assert_eq!(value(&engine, b"m").unwrap(), b"new");
         assert_eq!(value(&engine, b"z").unwrap(), b"3");
-        assert!(engine.stats().max_overlap <= 2);
+        assert!(engine.engine_stats().max_overlap <= 2);
     }
 
     #[test]
     fn dropping_an_idle_engine_joins_the_worker_and_frees_the_core() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         overlapping_runs(&engine);
         engine.wait_for_compaction().unwrap();
+        // The engine, its shared state, both workers and this test.
         let core = Arc::clone(&engine.core);
-        assert_eq!(Arc::strong_count(&core), 4);
+        assert_eq!(Arc::strong_count(&core), 5);
         drop(engine);
         assert_eq!(Arc::strong_count(&core), 1);
         let status = core.background.as_ref().unwrap().status();
@@ -2004,7 +1681,7 @@ mod tests {
     /// published, and starts no other.
     #[test]
     fn dropping_during_a_compaction_publishes_it_and_then_stops() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         let (built, release) = pause_after_build(&engine);
         // Held while the runs are flushed, so that one compaction takes all.
         let slot = engine.core.compacting.lock().unwrap();
@@ -2032,7 +1709,7 @@ mod tests {
     /// taken before stays readable.
     #[test]
     fn closing_during_a_compaction_publishes_it_and_succeeds() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         let (built, release) = pause_after_build(&engine);
         let slot = engine.core.compacting.lock().unwrap();
         overlapping_runs(&engine);
@@ -2047,16 +1724,14 @@ mod tests {
             }
             assert!(!closer.is_finished());
             release.wait();
-            assert_eq!(closer.join().unwrap(), Ok(()));
+            closer.join().unwrap().unwrap();
         });
         assert_eq!(Arc::strong_count(&core), 1);
         let status = core.background.as_ref().unwrap().status();
         // The oldest run's move, then the merge that was held.
         assert_eq!((status.running, status.compactions), (false, 2));
         assert_eq!(core.stats().runs, 1);
-        let mut workspace = EngineWorkspace::new();
-        let found = snapshot.get(b"a", &mut workspace).unwrap().unwrap();
-        assert_eq!(found.value, b"3");
+        assert_eq!(snapshot.value(b"a").unwrap(), b"3");
     }
 
     /// A worker that panicked is reported by `close` with its message, and
@@ -2064,14 +1739,19 @@ mod tests {
     #[test]
     fn closing_after_a_worker_panic_reports_it_and_releases_the_engine() {
         for close in [true, false] {
-            let engine = Engine::new(background(1)).unwrap();
+            let engine = Engine::in_memory(background(1)).unwrap();
             engine.core.panic_worker.store(true, Ordering::Relaxed);
             overlapping_runs(&engine);
             let panicked = Err(BackgroundError::Panicked("injected worker failure".into()));
             assert_eq!(engine.wait_for_compaction(), panicked);
             let core = Arc::clone(&engine.core);
             if close {
-                assert_eq!(engine.close(), panicked);
+                let error = engine.close().unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Background);
+                assert!(
+                    error.to_string().contains("injected worker failure"),
+                    "{error}"
+                );
             } else {
                 drop(engine);
             }
@@ -2085,28 +1765,30 @@ mod tests {
     #[test]
     fn a_worker_that_cannot_start_fails_construction() {
         worker::tests::FAIL_SPAWN.with(|fail| fail.set(true));
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         assert_eq!(engine.background_status(), None);
         drop(engine);
-        let refused = Engine::new(EngineOptions::default()).map(drop);
-        let Err(OpenError::Worker(error)) = refused else {
+        let refused = Engine::in_memory(Options::default()).map(drop);
+        let Err(error) = refused else {
             panic!("{refused:?}");
         };
+        assert_eq!(error.kind(), ErrorKind::Io);
+        let source = std::error::Error::source(&error).unwrap();
         assert!(
-            error.to_string().contains("injected spawn failure"),
-            "{error}"
+            source.to_string().contains("injected spawn failure"),
+            "{error}: {source}"
         );
         // The failure was injected once; the next engine starts its worker.
-        let engine = Engine::new(EngineOptions::default()).unwrap();
+        let engine = Engine::in_memory(Options::default()).unwrap();
         assert!(engine.background_status().unwrap().running);
-        assert_eq!(engine.close(), Ok(()));
+        engine.close().unwrap();
     }
 
     /// A panic stops the worker for good and is reported; the engine keeps
     /// working without it and is still dropped cleanly.
     #[test]
     fn a_panicked_worker_is_reported_and_the_engine_stays_usable() {
-        let engine = Engine::new(background(1)).unwrap();
+        let engine = Engine::in_memory(background(1)).unwrap();
         engine.core.panic_worker.store(true, Ordering::Relaxed);
         overlapping_runs(&engine);
         assert_eq!(
@@ -2117,7 +1799,7 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.panic.as_deref(), Some("injected worker failure"));
 
-        engine.put(b"k", b"v").unwrap();
+        engine.ks().put(b"k", b"v").unwrap();
         engine.flush().unwrap();
         assert_eq!(
             engine.wait_for_compaction(),

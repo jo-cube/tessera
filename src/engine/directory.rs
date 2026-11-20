@@ -148,6 +148,7 @@ impl RunDirectory {
 
     /// The number of groups: the largest number of runs whose key ranges
     /// share a key.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn group_count(&self) -> usize {
         self.groups.len()
     }

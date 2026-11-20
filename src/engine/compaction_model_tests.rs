@@ -7,13 +7,13 @@ use std::collections::BTreeMap;
 
 const RUN_LEN: usize = 64 << 10;
 
-fn engine_options() -> EngineOptions {
-    EngineOptions {
-        memtable_budget: RUN_LEN,
+fn engine_options() -> Options {
+    Options {
+        memtable_size: RUN_LEN,
         target_run_len: RUN_LEN,
 
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
@@ -79,17 +79,16 @@ impl Rng {
 /// runs are retained only while it lives.
 #[test]
 fn a_range_local_replacement_leaves_other_runs_shared() {
-    let engine = Engine::new(engine_options()).unwrap();
-    let mut workspace = EngineWorkspace::new();
+    let engine = Engine::in_memory(engine_options()).unwrap();
     for index in 0..3_000 {
-        engine.put(&key(index), &value(index)).unwrap();
+        engine.ks().put(&key(index), &value(index)).unwrap();
     }
     engine.flush().unwrap();
     let disjoint = engine.core.read_state().runs.len();
     assert!(disjoint >= 5, "{disjoint} runs");
     let snapshot = engine.snapshot();
     for index in 1_500..1_520 {
-        engine.put(&key(index), b"updated").unwrap();
+        engine.ks().put(&key(index), b"updated").unwrap();
     }
     engine.flush().unwrap();
 
@@ -137,30 +136,26 @@ fn a_range_local_replacement_leaves_other_runs_shared() {
     }
     assert_eq!(after.len(), before.len() - picks.len() + report.outputs);
 
-    let read = |found: Option<LiveValue<'_>>| found.map(|live| live.value.to_vec());
     assert_eq!(
-        read(engine.get(&key(1_510), &mut workspace).unwrap()),
+        engine.ks().get(&key(1_510)).unwrap(),
         Some(b"updated".to_vec())
     );
-    assert_eq!(
-        read(snapshot.get(&key(1_510), &mut workspace).unwrap()),
-        Some(value(1_510))
-    );
-    assert!(engine.stats().retained_run_bytes >= report.input_bytes);
+    assert_eq!(snapshot.value(&key(1_510)), Some(value(1_510)));
+    assert!(engine.engine_stats().retained_run_bytes >= report.input_bytes);
     // The test's own references to the replaced runs count as a reader's.
     // Without them, the snapshot holds the older inputs; the update's run
     // was flushed after it, from a memtable it holds instead.
     drop((before, after));
     crate::test_support::wait_until(|| {
-        engine.stats().retained_run_bytes == report.input_bytes - update_bytes
+        engine.engine_stats().retained_run_bytes == report.input_bytes - update_bytes
     });
     assert_eq!(
-        engine.stats().retained_run_bytes,
+        engine.engine_stats().retained_run_bytes,
         report.input_bytes - update_bytes
     );
     drop(snapshot);
-    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
-    assert_eq!(engine.stats().retained_run_bytes, 0);
+    crate::test_support::wait_until(|| engine.engine_stats().retained_run_bytes == 0);
+    assert_eq!(engine.engine_stats().retained_run_bytes, 0);
 }
 
 fn engine_key(index: u64) -> Vec<u8> {
@@ -187,27 +182,27 @@ fn json(index: u64) -> Vec<u8> {
 fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
     let dir = std::env::temp_dir().join(format!("tessera-leveling-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let options = EngineOptions {
-        memtable_budget: 16 << 10,
+    let options = Options {
+        memtable_size: 16 << 10,
         target_run_len: 4 << 10,
 
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     };
     let mut rng = Rng(21);
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     {
-        let engine = Engine::new(options).unwrap();
+        let engine = Engine::in_memory(options).unwrap();
         for _ in 0..3_000 {
             let key = engine_key(rng.below(2_000));
             let value = json(rng.below(1 << 30));
-            engine.put(&key, &value).unwrap();
+            engine.ks().put(&key, &value).unwrap();
             model.insert(key, value);
         }
         engine.flush().unwrap();
         // Consolidate all versions once to seed the independent schedule
         // with disjoint runs, which checkpoints preserve as-is.
-        let count = engine.stats().runs;
+        let count = engine.engine_stats().runs;
         engine
             .compact_picked(
                 CompactionPolicy {
@@ -219,12 +214,10 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
                 &mut MergeWorkspace::new(),
             )
             .unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
     }
-    let engine = Engine::recover(&dir, options).unwrap();
+    let engine = Engine::open(&dir, options).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
     let range = |run: &SharedRun| {
@@ -246,13 +239,9 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
     let mut levels: Vec<Vec<SharedRun>> = vec![Vec::new(), Vec::new(), recovered];
 
     let check_reads = |engine: &Engine, model: &BTreeMap<Vec<u8>, Vec<u8>>| {
-        let mut workspace = EngineWorkspace::new();
         for index in 0..2_100 {
             let key = engine_key(index);
-            let found = engine
-                .get(&key, &mut workspace)
-                .unwrap()
-                .map(|live| live.value.to_vec());
+            let found = engine.ks().get(&key).unwrap();
             assert_eq!(found.as_ref(), model.get(&key), "key {index}");
         }
     };
@@ -344,11 +333,11 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         for _ in 0..400 {
             let key = engine_key(rng.below(2_100));
             if rng.below(5) == 0 {
-                engine.delete(&key).unwrap();
+                engine.ks().delete(&key).unwrap();
                 model.remove(&key);
             } else {
                 let value = json(rng.below(1 << 30));
-                engine.put(&key, &value).unwrap();
+                engine.ks().put(&key, &value).unwrap();
                 model.insert(key, value);
             }
         }
@@ -386,20 +375,16 @@ fn a_leveled_schedule_over_recovered_runs_keeps_levels_valid() {
         }
         check_reads(&engine, &model);
         if let Some((snapshot, seen)) = &snapshot {
-            let mut workspace = EngineWorkspace::new();
             for (key, value) in seen.iter().take(200) {
-                let found = snapshot
-                    .get(key, &mut workspace)
-                    .unwrap()
-                    .map(|live| live.value.to_vec());
+                let found = snapshot.value(key);
                 assert_eq!(found.as_ref(), Some(value));
             }
-            assert!(engine.stats().retained_run_bytes > 0);
+            assert!(engine.engine_stats().retained_run_bytes > 0);
         }
     }
     drop(snapshot);
-    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
-    assert_eq!(engine.stats().retained_run_bytes, 0);
+    crate::test_support::wait_until(|| engine.engine_stats().retained_run_bytes == 0);
+    assert_eq!(engine.engine_stats().retained_run_bytes, 0);
     for level in &levels[1..] {
         assert!(disjoint(level));
     }

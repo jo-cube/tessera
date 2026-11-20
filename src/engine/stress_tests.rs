@@ -82,18 +82,14 @@ impl Oracle {
     }
 }
 
-fn check(snapshot: &Snapshot, oracle: &Oracle) {
+fn check(snapshot: &Snapshot, ks: &Keyspace, oracle: &Oracle) {
     let expected = oracle.at(snapshot.last_seq());
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = snapshot.scan(&mut workspace);
+    let mut reader = snapshot.reader();
+    let mut scan = reader.range(ks, ..);
     let mut actual = Model::new();
-    while let Some(record) = scan.next_record().unwrap() {
+    while let Some((key, value)) = scan.next().unwrap() {
         assert!(actual.len() < 128);
-        assert!(
-            actual
-                .insert(record.key.to_vec(), record.value.to_vec())
-                .is_none()
-        );
+        assert!(actual.insert(key.to_vec(), value.to_vec()).is_none());
     }
     assert_eq!(actual, expected, "snapshot ceiling {}", snapshot.last_seq());
     drop(scan);
@@ -103,28 +99,22 @@ fn check(snapshot: &Snapshot, oracle: &Oracle) {
     keys.reverse();
     for key in &keys {
         assert_eq!(
-            snapshot.get(key, &mut workspace).unwrap().map(|v| v.value),
+            reader.get(ks, key).unwrap(),
             expected.get(key).map(Vec::as_slice)
         );
     }
-    let mut calls = 0;
-    snapshot
-        .multi_get(&keys, &mut workspace, |i, value| {
-            assert_eq!(i, calls);
-            assert_eq!(value, expected.get(&keys[i]).map(Vec::as_slice));
-            calls += 1;
-        })
-        .unwrap();
-    assert_eq!(calls, keys.len());
+    let values = reader.multi_get(ks, &keys).unwrap();
+    assert_eq!(values.len(), keys.len());
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(*value, expected.get(&keys[i]).map(Vec::as_slice));
+    }
+    drop(values);
     for prefix in [&b"p/"[..], b"b/", b"i/", b"absent", &[255]] {
-        let mut scan = snapshot.scan_prefix(prefix, &mut workspace);
+        let mut scan = reader.prefix(ks, prefix);
         let mut expected = expected.iter().filter(|(key, _)| key.starts_with(prefix));
-        while let Some(record) = scan.next_record().unwrap() {
+        while let Some(record) = scan.next().unwrap() {
             let (key, value) = expected.next().unwrap();
-            assert_eq!(
-                (record.key, record.value),
-                (key.as_slice(), value.as_slice())
-            );
+            assert_eq!(record, (key.as_slice(), value.as_slice()));
         }
         assert!(expected.next().is_none());
     }
@@ -141,16 +131,16 @@ fn check(snapshot: &Snapshot, oracle: &Oracle) {
 fn workload(iterations: usize) {
     let started = Instant::now();
     let scratch = Scratch::new("concurrent");
-    let options = EngineOptions {
-        memtable_budget: 4096,
+    let options = Options {
+        memtable_size: 4096,
         memory_limit: Some(8 << 20),
         target_run_len: 2048,
         level_ratio: 2,
         background_threads: 2,
-        target_block_compressed: 128,
-        ..EngineOptions::default()
+        block_size: 128,
+        ..Options::default()
     };
-    let engine = Engine::new(options).unwrap();
+    let engine = Engine::in_memory(options).unwrap();
     let oracle = Oracle::default();
     let barrier = Barrier::new(6);
     let writers = AtomicUsize::new(3);
@@ -182,17 +172,18 @@ fn workload(iterations: usize) {
                             .collect(),
                     };
                     let mut batch = WriteBatch::new();
+                    let ks = engine.ks();
                     for (key, value) in &operations {
                         if let Some(value) = value {
-                            batch.put(key, value);
+                            batch.put(&ks, key, value);
                         } else {
-                            batch.delete(key);
+                            batch.delete(&ks, key);
                         }
                     }
                     let result = match kind {
-                        0 => engine.put(&operations[0].0, operations[0].1.as_ref().unwrap()),
-                        1 => engine.delete(&operations[0].0),
-                        2 => engine.write(&batch),
+                        0 => ks.put_seq(&operations[0].0, operations[0].1.as_ref().unwrap()),
+                        1 => ks.delete_seq(&operations[0].0),
+                        2 => engine.write_seq(&batch),
                         _ => engine.ingest_sorted(&batch),
                     };
                     match result {
@@ -226,7 +217,7 @@ fn workload(iterations: usize) {
                 while writers.load(Ordering::SeqCst) != 0 || count < 40 {
                     let snapshot = engine.snapshot();
                     std::thread::yield_now();
-                    check(&snapshot, oracle);
+                    check(&snapshot, &engine.ks(), oracle);
                     count += 1;
                 }
                 reads.fetch_add(count, Ordering::Relaxed);
@@ -237,13 +228,11 @@ fn workload(iterations: usize) {
             let mut count = 0;
             while writers.load(Ordering::SeqCst) != 0 || count < 4 {
                 engine.flush().unwrap();
-                let report = engine
-                    .checkpoint(&scratch.0, CheckpointOptions::default())
-                    .unwrap();
-                let recovered = Engine::recover(&scratch.0, options).unwrap();
+                let report = engine.checkpoint_to(&scratch.0).unwrap();
+                let recovered = Engine::open(&scratch.0, options).unwrap();
                 let snapshot = recovered.snapshot();
                 assert_eq!(snapshot.last_seq(), report.last_seq);
-                check(&snapshot, &oracle);
+                check(&snapshot, &recovered.ks(), &oracle);
                 recovered.close().unwrap();
                 count += 1;
             }
@@ -252,7 +241,7 @@ fn workload(iterations: usize) {
     });
     engine.flush().unwrap();
     engine.wait_for_compaction().unwrap();
-    check(&engine.snapshot(), &oracle);
+    check(&engine.snapshot(), &engine.ks(), &oracle);
     for count in &admitted {
         assert!(count.load(Ordering::Relaxed) > 0);
     }

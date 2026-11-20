@@ -1,5 +1,5 @@
-//! Tests that run this binary again as a child process: one holding a
-//! checkpoint directory's `LOCK` until killed, one checking close-on-exec.
+//! Tests that run this binary again as a child process: one holding an
+//! engine directory's `LOCK` until killed, one checking close-on-exec.
 //! They live apart from the other suites and run one at a time, because
 //! spawning forks: a child shares every lock descriptor this process
 //! has open until it executes, so a test in another thread could briefly
@@ -14,12 +14,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 
-use tessera::engine::{
-    CheckpointError, CheckpointOptions, Engine, EngineOptions, EngineWorkspace, OpenError,
-};
+use tessera::{Engine, ErrorKind, Options};
 
-fn options() -> EngineOptions {
-    EngineOptions::default()
+fn options() -> Options {
+    Options::default()
 }
 
 /// Held by each parent test, so that one test never forks while the other
@@ -52,31 +50,33 @@ impl Drop for Scratch {
 }
 
 fn contents(engine: &Engine) -> Model {
-    let mut workspace = EngineWorkspace::new();
-    let guard = engine.read();
-    let mut scan = guard.scan(&mut workspace);
+    let ks = engine.keyspace("test").unwrap();
+    let mut reader = engine.reader();
+    let mut scan = reader.range(&ks, ..);
     let mut out = Model::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        out.insert(record.key.to_vec(), record.value.to_vec());
+    while let Some((key, value)) = scan.next().unwrap() {
+        out.insert(key.to_vec(), value.to_vec());
     }
     out
 }
 
-/// A RAM-only engine with flushed runs, deletes and a memtable.
-fn varied_engine() -> (Engine, Model) {
-    let engine = Engine::new(options()).unwrap();
+/// Opens `dir`, writes puts and deletes, checkpoints and closes it.
+fn checkpointed(dir: &Path) -> Model {
+    let engine = Engine::open(dir, options()).unwrap();
+    let ks = engine.keyspace("test").unwrap();
     let mut model = Model::new();
     for i in 0..2_000u32 {
         let (key, value) = (i.to_be_bytes().to_vec(), format!("v{i}").into_bytes());
-        engine.put(&key, &value).unwrap();
+        ks.put(&key, &value).unwrap();
         model.insert(key, value);
     }
-    engine.flush().unwrap();
     for i in (0..2_000u32).step_by(3) {
-        engine.delete(&i.to_be_bytes()).unwrap();
+        ks.delete(&i.to_be_bytes()).unwrap();
         model.remove(&i.to_be_bytes()[..]);
     }
-    (engine, model)
+    engine.checkpoint().unwrap();
+    engine.close().unwrap();
+    model
 }
 
 /// Run as a child by the test below: holds `LOCK` in `dir` as another
@@ -100,10 +100,7 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
     }
     let _serial = one_at_a_time();
     let scratch = Scratch::new("cross-process");
-    let (engine, model) = varied_engine();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
+    let model = checkpointed(&scratch.0);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -121,31 +118,23 @@ fn another_process_holding_the_lock_excludes_us_until_it_dies() {
         "the child did not take the lock"
     );
 
-    assert!(matches!(
-        engine.checkpoint(&scratch.0, CheckpointOptions::default()),
-        Err(CheckpointError::Locked(_))
-    ));
-    assert!(matches!(
-        Engine::recover(&scratch.0, options()),
-        Err(OpenError::Locked(_))
-    ));
+    let error = Engine::open(&scratch.0, options()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Locked, "{error}");
+    assert_eq!(error.path(), Some(scratch.0.as_path()));
 
     // SIGKILL: no destructor runs in the child, and the kernel releases the
     // lock with its open files.
     child.kill().unwrap();
     child.wait().unwrap();
-    let report = engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-    assert_eq!(report.generation, 2);
-    let recovered = Engine::recover(&scratch.0, options()).unwrap();
+    let recovered = Engine::open(&scratch.0, options()).unwrap();
     assert_eq!(contents(&recovered), model);
+    recovered.checkpoint().unwrap();
 }
 
-/// A child spawned while a checkpoint directory is locked does not keep it once
-/// it executes its program: every descriptor is close-on-exec, and
-/// `Command::spawn` returns only after the child has executed. So the
-/// directory recovers while the child still runs.
+/// A child spawned while an engine holds its directory does not keep the
+/// lock once it executes its program: every descriptor is close-on-exec,
+/// and `Command::spawn` returns only after the child has executed. So the
+/// directory opens again while the child still runs.
 #[test]
 fn a_child_that_executes_another_program_does_not_keep_the_lock() {
     if std::env::var("TESSERA_SLEEP_CHILD").is_ok() {
@@ -154,16 +143,9 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
     }
     let _serial = one_at_a_time();
     let scratch = Scratch::new("exec");
-    let engine = Engine::new(options()).unwrap();
-    engine.put(b"k", b"v").unwrap();
-    engine
-        .checkpoint(&scratch.0, CheckpointOptions::default())
-        .unwrap();
-    let lock = fs::OpenOptions::new()
-        .write(true)
-        .open(scratch.0.join("LOCK"))
-        .unwrap();
-    lock.try_lock().unwrap();
+    let engine = Engine::open(&scratch.0, options()).unwrap();
+    engine.keyspace("test").unwrap().put(b"k", b"v").unwrap();
+    engine.checkpoint().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -174,11 +156,13 @@ fn a_child_that_executes_another_program_does_not_keep_the_lock() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    drop(lock);
-    let reopened = Engine::recover(&scratch.0, options());
+    engine.close().unwrap();
+    let reopened = Engine::open(&scratch.0, options());
     child.kill().unwrap();
     child.wait().unwrap();
     let engine = reopened.unwrap();
-    assert_eq!(engine.stats().last_seq, 1);
-    assert_eq!(contents(&engine).get(&b"k"[..]), Some(&b"v".to_vec()));
+    assert_eq!(
+        contents(&engine),
+        Model::from([(b"k".to_vec(), b"v".to_vec())])
+    );
 }

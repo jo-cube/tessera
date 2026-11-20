@@ -24,6 +24,7 @@ struct Pool {
 }
 
 /// Cumulative work performed by this engine, including abandoned builds.
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BuildCounters {
@@ -108,6 +109,7 @@ pub(crate) fn work_slot(level: Option<usize>, bottom: bool) -> usize {
     level.map_or(0, |n| n.min(7) + if bottom { 8 } else { 0 })
 }
 impl Counters {
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     fn snapshot(&self) -> BuildCounters {
         BuildCounters {
             blocks_reused: self.blocks_reused.load(Ordering::Relaxed),
@@ -134,6 +136,7 @@ impl ChunkPool {
         }))
     }
 
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn counters(&self) -> BuildCounters {
         self.0.counters.snapshot()
     }

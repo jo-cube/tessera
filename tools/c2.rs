@@ -5,7 +5,7 @@
 //! finds the end of the Zstandard block holding the record's last byte by
 //! streaming decompression, which bounds what an early-stopping reader decodes.
 use std::time::Instant;
-use tessera::engine::diagnostics::SegmentSample;
+use tessera::diagnostics::SegmentSample;
 use zstd_safe::{
     CCtx, CParameter, DCtx, DParameter, FrameFormat, InBuffer, OutBuffer, ResetDirective,
 };

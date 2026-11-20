@@ -11,16 +11,14 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use tessera::engine::{
-    CompactionKind, CompactionPolicy, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
-};
+use crate::engine::{CompactionKind, CompactionPolicy, Engine, MergeWorkspace, Options};
 
 /// The defaults without the background worker: these tests flush and
 /// compact by hand and count what each step leaves.
-fn manual() -> EngineOptions {
-    EngineOptions {
+fn manual() -> Options {
+    Options {
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
@@ -34,20 +32,15 @@ fn options(max_inputs: usize) -> CompactionPolicy {
 }
 
 fn get(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
-    let mut workspace = EngineWorkspace::new();
-    engine
-        .get(key, &mut workspace)
-        .unwrap()
-        .map(|found| found.value.to_vec())
+    engine.ks().get(key).unwrap()
 }
 
 fn everything(engine: &Engine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let guard = engine.read();
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = guard.scan(&mut workspace);
+    let mut reader = engine.reader();
+    let mut scan = reader.range(&engine.ks(), ..);
     let mut out = Vec::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        out.push((record.key.to_vec(), record.value.to_vec()));
+    while let Some((key, value)) = scan.next().unwrap() {
+        out.push((key.to_vec(), value.to_vec()));
     }
     out
 }
@@ -75,16 +68,19 @@ fn compact_fully(engine: &Engine) {
 /// left outside the merge.
 #[test]
 fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
-    let engine = Engine::new(manual()).unwrap();
+    let engine = Engine::in_memory(manual()).unwrap();
     for i in 0..500 {
-        engine.put(format!("k{i:03}").as_bytes(), b"old").unwrap();
+        engine
+            .ks()
+            .put(format!("k{i:03}").as_bytes(), b"old")
+            .unwrap();
     }
     engine.flush().unwrap();
-    engine.delete(b"k100").unwrap();
-    engine.put(b"k150", b"new").unwrap();
+    engine.ks().delete(b"k100").unwrap();
+    engine.ks().put(b"k150", b"new").unwrap();
     engine.flush().unwrap();
-    engine.put(b"k099", b"new").unwrap();
-    engine.put(b"k151", b"new").unwrap();
+    engine.ks().put(b"k099", b"new").unwrap();
+    engine.ks().put(b"k151", b"new").unwrap();
     engine.flush().unwrap();
 
     // The large run moves to level 1, writing nothing. With two inputs a
@@ -110,7 +106,7 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert!(!report.complete);
     assert_eq!(report.stats.tombstones_dropped, 0);
     assert_eq!(get(&engine, b"k100"), None);
-    assert_eq!(engine.stats().runs, 2);
+    assert_eq!(engine.engine_stats().runs, 2);
 
     let report = engine
         .core
@@ -123,7 +119,7 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
     assert_eq!(get(&engine, b"k150").unwrap(), b"new");
     assert_eq!(get(&engine, b"k151").unwrap(), b"new");
     assert_eq!(everything(&engine).len(), 499);
-    assert_eq!(engine.stats().runs, 1);
+    assert_eq!(engine.engine_stats().runs, 1);
     assert!(
         engine
             .core
@@ -138,9 +134,12 @@ fn a_tombstone_hiding_an_unselected_run_survives_until_that_run_is_merged() {
 /// together, so the large run is rewritten once for all of them.
 #[test]
 fn level_0_is_compacted_at_its_trigger_in_one_job() {
-    let engine = Engine::new(manual()).unwrap();
+    let engine = Engine::in_memory(manual()).unwrap();
     for i in 0..2_000 {
-        engine.put(format!("k{i:04}").as_bytes(), b"base").unwrap();
+        engine
+            .ks()
+            .put(format!("k{i:04}").as_bytes(), b"base")
+            .unwrap();
     }
     engine.flush().unwrap();
     let mut workspace = MergeWorkspace::new();
@@ -153,13 +152,19 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
             .unwrap()
             .is_none()
     );
-    let base = engine.stats().run_bytes;
+    let base = engine.engine_stats().run_bytes;
     for round in 0..3 {
-        engine.put(b"k0000", format!("{round}").as_bytes()).unwrap();
-        engine.put(b"k1999", format!("{round}").as_bytes()).unwrap();
+        engine
+            .ks()
+            .put(b"k0000", format!("{round}").as_bytes())
+            .unwrap();
+        engine
+            .ks()
+            .put(b"k1999", format!("{round}").as_bytes())
+            .unwrap();
         engine.flush().unwrap();
     }
-    assert_eq!(engine.stats().max_overlap, 4);
+    assert_eq!(engine.engine_stats().max_overlap, 4);
     let report = engine
         .core
         .compact(options, &mut workspace)
@@ -174,8 +179,8 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
             .unwrap()
             .is_none()
     );
-    engine.put(b"k0000", b"3").unwrap();
-    engine.put(b"k1999", b"3").unwrap();
+    engine.ks().put(b"k0000", b"3").unwrap();
+    engine.ks().put(b"k1999", b"3").unwrap();
     engine.flush().unwrap();
     let report = engine
         .core
@@ -192,7 +197,7 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
             .unwrap()
             .is_none()
     );
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     assert_eq!(
         (stats.runs, stats.max_overlap, stats.level0_flushes),
         (1, 1, 0)
@@ -208,7 +213,7 @@ fn level_0_is_compacted_at_its_trigger_in_one_job() {
 /// bytes, charged to snapshots that hold replaced runs, and released with them.
 #[test]
 fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         target_run_len: 4_096,
 
         ..manual()
@@ -217,7 +222,7 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     let key = |i: u32| format!("key{i:04}").into_bytes();
     let mut model = Model::new();
     for i in 0..1_000 {
-        engine.put(&key(i), b"old").unwrap();
+        engine.ks().put(&key(i), b"old").unwrap();
         model.insert(key(i), b"old".to_vec());
     }
     let flushed = engine.flush().unwrap();
@@ -225,15 +230,15 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     assert!(flushed.held_bytes > 0 && flushed.filter_build_bytes > 0);
     // Newer tombstones and values over the same range.
     for i in (0..1_000).step_by(3) {
-        engine.delete(&key(i)).unwrap();
+        engine.ks().delete(&key(i)).unwrap();
         model.remove(&key(i));
     }
     for i in (1..1_000).step_by(7) {
-        engine.put(&key(i), b"new").unwrap();
+        engine.ks().put(&key(i), b"new").unwrap();
         model.insert(key(i), b"new".to_vec());
     }
     let second = engine.flush().unwrap();
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     assert_eq!(stats.held_bytes, flushed.held_bytes + second.held_bytes);
 
     let snapshot = engine.snapshot();
@@ -250,7 +255,7 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
         inputs.0 += report.input_bytes;
         inputs.1 += report.input_held_bytes;
     }
-    let compacted = engine.stats();
+    let compacted = engine.engine_stats();
     assert!(compacted.runs > 1, "the output was split");
     assert!(compacted.held_bytes > 0 && inputs.1 > 0);
     // Every run published when the snapshot was taken overlapped another, so
@@ -263,15 +268,13 @@ fn filters_follow_runs_through_flushes_splits_compactions_and_snapshots() {
     assert!(inputs.1 > stats.held_bytes);
     // Every key, deleted ones included, reads as the model says, from the
     // compacted runs and from the snapshot's replaced ones.
-    let mut read = EngineWorkspace::new();
     for i in 0..1_000 {
         let expected = model.get(&key(i)).cloned();
         assert_eq!(get(&engine, &key(i)), expected);
-        let held = snapshot.get(&key(i), &mut read).unwrap();
-        assert_eq!(held.map(|found| found.value.to_vec()), expected);
+        assert_eq!(snapshot.value(&key(i)), expected);
     }
     drop(snapshot);
-    let released = engine.stats();
+    let released = engine.engine_stats();
     assert_eq!(
         (released.retained_run_bytes, released.retained_held_bytes),
         (0, 0)
@@ -292,7 +295,7 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
     const KEYS: usize = 48;
     const ROUNDS: u64 = 400;
 
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         target_run_len: 4 << 10,
 
         background_compaction: Some(CompactionPolicy {
@@ -316,9 +319,12 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
                     for round in 1..=ROUNDS {
                         for i in 0..KEYS {
                             if round == ROUNDS && i % 2 == 1 {
-                                engine.delete(&key(writer, i)).unwrap();
+                                engine.ks().delete(&key(writer, i)).unwrap();
                             } else {
-                                engine.put(&key(writer, i), &round.to_be_bytes()).unwrap();
+                                engine
+                                    .ks()
+                                    .put(&key(writer, i), &round.to_be_bytes())
+                                    .unwrap();
                             }
                         }
                         // Overlapping runs accumulate while writing goes on.
@@ -353,15 +359,16 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
             barrier.wait();
             // Per key: the last round seen, and whether it was deleted.
             let mut seen: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
-            let mut workspace = EngineWorkspace::new();
+            let ks = engine.ks();
+            let mut reader = engine.reader();
             while writing.load(Ordering::Acquire) {
-                let guard = engine.read();
-                let mut scan = guard.scan(&mut workspace);
+                let mut scan = reader.range(&ks, ..);
                 let mut present = Vec::new();
-                while let Some(record) = scan.next_record().unwrap() {
-                    let round = u64::from_be_bytes(record.value.try_into().unwrap());
-                    present.push((record.key.to_vec(), round));
+                while let Some((key, value)) = scan.next().unwrap() {
+                    let round = u64::from_be_bytes(value.try_into().unwrap());
+                    present.push((key.to_vec(), round));
                 }
+                drop(scan);
                 for (key, round) in &present {
                     let (last, deleted) = seen.entry(key.clone()).or_insert((0, false));
                     assert!(!*deleted, "{key:?} returned after its delete");
@@ -388,11 +395,11 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
     // Give the worker work after the manual compactor has stopped, so its
     // participation does not depend on winning their mutex race.
     for _ in 0..3 {
-        engine.put(&key(0, 0), &ROUNDS.to_be_bytes()).unwrap();
+        engine.ks().put(&key(0, 0), &ROUNDS.to_be_bytes()).unwrap();
         flush_waiting(&engine);
     }
     engine.wait_for_compaction().unwrap();
-    assert!(engine.stats().max_overlap <= 2);
+    assert!(engine.engine_stats().max_overlap <= 2);
     assert!(engine.background_status().unwrap().compactions > 0);
     compact_fully(&engine);
     let expected: Vec<_> = (0..WRITERS)
@@ -402,7 +409,7 @@ fn concurrent_compaction_loses_and_resurrects_nothing() {
         .into_iter()
         .collect();
     assert_eq!(everything(&engine), expected);
-    assert_eq!(engine.stats().runs, 1);
+    assert_eq!(engine.engine_stats().runs, 1);
     // The compactor is not guaranteed a turn; record whether it had one.
     eprintln!(
         "manual compactions during writing: {}; background: {:?}",

@@ -7,16 +7,38 @@ use std::ops::Range;
 
 #[derive(Clone, Debug)]
 struct Operation {
+    keyspace: u32,
     key: Range<usize>,
     value: Option<Range<usize>>,
 }
 
-/// A reusable list of puts and deletes, applied in insertion order.
-/// Key and value bytes are copied into one reusable buffer.
+/// A reusable list of puts and deletes in the keyspaces of one engine,
+/// applied atomically and in insertion order by [`Engine::write`]: later
+/// operations on a key win. Key and value bytes are copied into one
+/// reusable buffer when appended; limits are checked when it is written.
+///
+/// ```
+/// use tessera::{Engine, Options, WriteBatch};
+///
+/// let engine = Engine::in_memory(Options::default())?;
+/// let users = engine.keyspace("users")?;
+/// let mut batch = WriteBatch::new();
+/// batch.put(&users, b"user/1", b"ada");
+/// batch.put(&users, b"user/2", b"grace");
+/// batch.delete(&users, b"user/1");
+/// engine.write(&batch)?;
+/// assert_eq!(users.get(b"user/1")?, None);
+/// assert_eq!(users.get(b"user/2")?.as_deref(), Some(&b"grace"[..]));
+/// # Ok::<(), tessera::Error>(())
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct WriteBatch {
     bytes: Vec<u8>,
     operations: Vec<Operation>,
+    /// The engine of the first keyspace appended.
+    engine: Option<u64>,
+    /// The name of a keyspace of another engine, if one was appended.
+    foreign: Option<Arc<str>>,
 }
 
 impl WriteBatch {
@@ -25,17 +47,28 @@ impl WriteBatch {
         Self::default()
     }
 
-    /// Appends a put, copying the key and value.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+    /// Appends a put of `key` in `keyspace`, copying the key and value.
+    pub fn put(&mut self, keyspace: &Keyspace, key: &[u8], value: &[u8]) {
+        self.note(keyspace);
         let key = self.append(key);
         let value = Some(self.append(value));
-        self.operations.push(Operation { key, value });
+        self.operations.push(Operation {
+            keyspace: keyspace.id(),
+            key,
+            value,
+        });
     }
 
-    /// Appends a delete, copying the key.
-    pub fn delete(&mut self, key: &[u8]) {
+    /// Appends a delete of `key` in `keyspace`, copying the key. Deleting a
+    /// missing key succeeds.
+    pub fn delete(&mut self, keyspace: &Keyspace, key: &[u8]) {
+        self.note(keyspace);
         let key = self.append(key);
-        self.operations.push(Operation { key, value: None });
+        self.operations.push(Operation {
+            keyspace: keyspace.id(),
+            key,
+            value: None,
+        });
     }
 
     /// Returns the number of operations, including repeated keys.
@@ -52,6 +85,15 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.operations.clear();
+        self.engine = None;
+        self.foreign = None;
+    }
+
+    fn note(&mut self, keyspace: &Keyspace) {
+        let engine = *self.engine.get_or_insert(keyspace.engine_id());
+        if engine != keyspace.engine_id() && self.foreign.is_none() {
+            self.foreign = Some(keyspace.shared_name());
+        }
     }
 
     fn append(&mut self, bytes: &[u8]) -> Range<usize> {
@@ -69,6 +111,33 @@ impl WriteBatch {
                 }),
             )
         })
+    }
+
+    /// The engine its keyspaces belong to, or the name of one that belongs
+    /// to another engine than the first.
+    pub(super) fn engine(&self) -> Result<Option<u64>, &str> {
+        match &self.foreign {
+            Some(name) => Err(name),
+            None => Ok(self.engine),
+        }
+    }
+
+    /// The one keyspace every operation names, or `None` for an empty
+    /// batch. Operations naming several keyspaces are refused: an engine
+    /// holds one live keyspace, so one of them was dropped.
+    pub(super) fn keyspace(&self) -> Result<Option<u32>, UpdateError> {
+        let Some(first) = self.operations.first() else {
+            return Ok(None);
+        };
+        if self
+            .operations
+            .iter()
+            .all(|op| op.keyspace == first.keyspace)
+        {
+            Ok(Some(first.keyspace))
+        } else {
+            Err(UpdateError::KeyspaceDropped)
+        }
     }
 }
 
@@ -108,27 +177,30 @@ impl WriteBatch {
 }
 
 impl Core {
+    /// Applies `batch` atomically and returns its last sequence number, or
+    /// the current one for an empty batch.
     pub(super) fn write_batch(&self, batch: &WriteBatch) -> Result<u64, UpdateError> {
+        let Some(keyspace) = batch.keyspace()? else {
+            return Ok(self.read_state().last_seq);
+        };
         let charge = batch.validate(self.memtable_budget)?;
         let sorted = batch.is_sorted();
         if !batch.is_empty()
             && (sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget)
         {
-            return self.ingest_batch(batch, sorted);
+            return self.ingest_batch(keyspace, batch, sorted);
         }
         if batch.len() == 1 {
             let (key, value) = batch.records().next().unwrap();
-            return self.update(key, value);
-        }
-        if batch.is_empty() {
-            return Ok(self.read_state().last_seq);
+            return self.update(keyspace, key, value);
         }
         let mut state = self.admit(self.write_state())?;
         loop {
+            state.check_keyspace(keyspace)?;
             let end = state
                 .last_seq
                 .checked_add(batch.len() as u64)
-                .ok_or(UpdateError::SequencesExhausted)?;
+                .expect(SEQUENCES);
             let needed = batch.records().fold(0usize, |sum, (key, value)| {
                 sum.saturating_add(state.active.write_charge(key, value))
             });

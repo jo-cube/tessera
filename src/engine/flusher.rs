@@ -110,6 +110,7 @@ impl FlushReport {
         self.held_bytes += report.held_bytes;
         self.filter_build_bytes = self.filter_build_bytes.max(report.filter_build_bytes);
     }
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn since(self, before: Self) -> Self {
         Self {
             tables: self.tables - before.tables,
@@ -134,10 +135,10 @@ mod tests {
 
     #[test]
     fn writers_continue_during_build_until_the_frozen_limit() {
-        let engine = Engine::new(EngineOptions {
-            memtable_budget: ENTRY_OVERHEAD + 2,
+        let engine = Engine::in_memory(Options {
+            memtable_size: ENTRY_OVERHEAD + 2,
             background_compaction: None,
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let started = Arc::new(Barrier::new(2));
@@ -147,16 +148,16 @@ mod tests {
             a.wait();
             b.wait();
         }));
-        engine.put(b"a", b"v").unwrap();
-        engine.put(b"b", b"v").unwrap();
+        engine.ks().put(b"a", b"v").unwrap();
+        engine.ks().put(b"b", b"v").unwrap();
         started.wait();
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
             let writer = scope.spawn(move || {
-                engine.put(b"c", b"v").unwrap();
+                engine.ks().put(b"c", b"v").unwrap();
                 tx.send(()).unwrap();
-                engine.put(b"d", b"v").unwrap();
+                engine.ks().put(b"d", b"v").unwrap();
                 tx.send(()).unwrap();
             });
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -171,28 +172,21 @@ mod tests {
 
     #[test]
     fn a_failed_background_build_is_readable_and_writers_flush_synchronously() {
-        let engine = Engine::new(EngineOptions {
-            memtable_budget: ENTRY_OVERHEAD + 2,
+        let engine = Engine::in_memory(Options {
+            memtable_size: ENTRY_OVERHEAD + 2,
             max_frozen_memtables: 1,
             background_compaction: None,
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
         *engine.core.before_flush_build.lock().unwrap() =
             Some(Arc::new(|| panic!("injected flush failure")));
-        engine.put(b"a", b"v").unwrap();
-        engine.put(b"b", b"v").unwrap();
-        engine.put(b"c", b"v").unwrap();
+        engine.ks().put(b"a", b"v").unwrap();
+        engine.ks().put(b"b", b"v").unwrap();
+        engine.ks().put(b"c", b"v").unwrap();
         assert!(matches!(engine.flush(), Err(BackgroundError::Panicked(_))));
-        let mut workspace = EngineWorkspace::new();
-        assert_eq!(
-            engine.get(b"a", &mut workspace).unwrap().unwrap().value,
-            b"v"
-        );
-        assert_eq!(
-            engine.get(b"b", &mut workspace).unwrap().unwrap().value,
-            b"v"
-        );
+        assert_eq!(engine.ks().get(b"a").unwrap().unwrap(), b"v");
+        assert_eq!(engine.ks().get(b"b").unwrap().unwrap(), b"v");
         assert!(engine.close().is_err());
     }
 }

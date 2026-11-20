@@ -8,19 +8,9 @@ use super::*;
 /// committed generation is retained.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum CheckpointError {
-    /// Application metadata exceeds the 16 MiB format bound.
+pub(crate) enum CheckpointError {
+    /// Application metadata exceeds [`MAX_METADATA_LEN`].
     MetadataLimit,
-    /// Another operation or process holds the directory's `LOCK`.
-    Locked(PathBuf),
-    /// The checkpoint would exceed [`CheckpointOptions::max_bytes`].
-    #[non_exhaustive]
-    DiskLimit {
-        /// Bytes the checkpoint would have reached.
-        bytes: u64,
-        /// The limit.
-        max_bytes: u64,
-    },
     /// A filesystem operation failed.
     #[non_exhaustive]
     Io {
@@ -38,15 +28,9 @@ pub enum CheckpointError {
 impl fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MetadataLimit => f.write_str("checkpoint metadata exceeds 16 MiB"),
-            Self::Locked(path) => write!(
+            Self::MetadataLimit => write!(
                 f,
-                "{} is locked by another engine or process",
-                path.display()
-            ),
-            Self::DiskLimit { bytes, max_bytes } => write!(
-                f,
-                "checkpoint reached {bytes} bytes, over the limit of {max_bytes}"
+                "checkpoint metadata exceeds the limit of {MAX_METADATA_LEN} bytes"
             ),
             Self::Io {
                 path,
@@ -71,7 +55,7 @@ impl std::error::Error for CheckpointError {}
 /// How stored checkpoint data failed its checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Damage {
+pub(crate) enum Damage {
     /// A file the checkpoint needs does not exist.
     Missing,
     /// The file is shorter or longer than its format or the manifest says.
@@ -108,6 +92,8 @@ pub enum Damage {
     Run(CorruptRun),
     /// Run IDs, levels, flush groups, level ordering or copies of one update disagree.
     Order,
+    /// The keyspace and application metadata in the manifest are malformed.
+    Catalog,
     /// A record has a sequence number above the checkpoint's ceiling.
     #[non_exhaustive]
     Sequence {
@@ -126,16 +112,13 @@ pub enum Damage {
     },
 }
 
-/// Why [`Engine::new`] or [`Engine::recover`] returned no engine. Nothing is
-/// exposed, no worker is left running and any directory lock is released.
-/// Recovery leaves checkpoint data unchanged and may create `LOCK`. It never
-/// substitutes an empty database or a different checkpoint. [`Engine::new`]
-/// fails only with [`Self::Config`] or [`Self::Worker`].
+/// Why an engine did not open. Nothing is exposed, no worker is left
+/// running and the directory lock is released. Recovery leaves checkpoint
+/// data unchanged. It never substitutes an empty database or a different
+/// checkpoint.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum OpenError {
-    /// The directory or its `CURRENT` file does not exist.
-    NoCheckpoint(PathBuf),
+pub(crate) enum OpenError {
     /// Another operation or process holds the directory's `LOCK`.
     Locked(PathBuf),
     /// A file could not be read.
@@ -154,9 +137,6 @@ pub enum OpenError {
         /// How.
         damage: Damage,
     },
-    /// The engine options were refused before anything was started or
-    /// the directory touched.
-    Config(super::ConfigError),
     /// The operating system could not create the background compaction
     /// worker's thread. Recovery changed nothing on disk.
     Worker(io::Error),
@@ -165,7 +145,6 @@ pub enum OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoCheckpoint(path) => write!(f, "no checkpoint in {}", path.display()),
             Self::Locked(path) => write!(
                 f,
                 "{} is locked by another engine or process",
@@ -179,7 +158,6 @@ impl fmt::Display for OpenError {
                     path.display()
                 )
             }
-            Self::Config(error) => error.fmt(f),
             Self::Worker(error) => {
                 write!(f, "cannot start the background compaction worker: {error}")
             }

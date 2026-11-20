@@ -64,8 +64,9 @@ use std::cmp::Ordering;
 pub use builder::{BlockBuilder, BuildError};
 #[cfg(test)]
 pub use reader::Block;
+pub(crate) use reader::Corruption;
 pub(crate) use reader::RecordWalk;
-pub use reader::{BlockPosition, BlockView, CorruptBlock, Corruption, Record, Version};
+pub use reader::{BlockPosition, BlockView, CorruptBlock, Record, Version};
 
 /// Number of records between restart points written by [`BlockBuilder`].
 pub const RESTART_INTERVAL: usize = 16;

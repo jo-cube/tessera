@@ -60,7 +60,7 @@ impl CompactionPolicy {
 /// Why a compaction stopped. Earlier pieces of a bottom job remain published.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum CompactionError {
+pub(crate) enum CompactionError {
     /// An input run is damaged, or two runs disagree about one update. The
     /// current piece is unchanged; earlier pieces stay published. Retrying
     /// damaged inputs meets the same corruption.

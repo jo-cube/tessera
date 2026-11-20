@@ -167,6 +167,7 @@ pub(super) struct Decompressor {
     zstd: Option<DCtx<'static>>,
 }
 impl Decompressor {
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn context_bytes(&self) -> usize {
         self.zstd.as_ref().map_or(0, DCtx::sizeof)
     }

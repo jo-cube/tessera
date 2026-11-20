@@ -7,9 +7,7 @@ use super::*;
 /// [Flushing](super#flushing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum WriteError {
-    /// Sorted ingestion requires strictly ascending keys without duplicates.
-    BatchNotSorted,
+pub(crate) enum WriteError {
     /// The key exceeds [`MAX_KEY_LEN`].
     #[non_exhaustive]
     KeyTooLong {
@@ -23,7 +21,7 @@ pub enum WriteError {
         len: usize,
     },
     /// The record alone would be charged more than a whole memtable budget
-    /// ([`EngineOptions::memtable_budget`]), so no memtable can hold it.
+    /// ([`Options::memtable_size`]), so no memtable can hold it.
     #[non_exhaustive]
     RecordExceedsBudget {
         /// What the record would be charged: its key and value and
@@ -37,7 +35,6 @@ pub enum WriteError {
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::BatchNotSorted => f.write_str("ingestion requires strictly sorted, unique keys"),
             Self::KeyTooLong { len } => {
                 write!(f, "key of {len} bytes exceeds the limit of {MAX_KEY_LEN}")
             }
@@ -49,7 +46,7 @@ impl fmt::Display for WriteError {
             }
             Self::RecordExceedsBudget { charge, budget } => write!(
                 f,
-                "record charged {charge} bytes exceeds the memtable budget of {budget}"
+                "record charged {charge} bytes exceeds the memtable size of {budget}"
             ),
         }
     }
@@ -60,9 +57,8 @@ impl std::error::Error for WriteError {}
 /// A write used no sequence number and changed no reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum UpdateError {
-    /// The write violates key, value or record-budget limits, or a batch
-    /// passed to sorted ingestion is not strictly ordered and unique.
+pub(crate) enum UpdateError {
+    /// The write violates key, value or record-budget limits.
     Rejected(WriteError),
     /// No further memory can currently be reclaimed. The write used no sequence.
     #[non_exhaustive]
@@ -72,8 +68,8 @@ pub enum UpdateError {
         /// Configured budget.
         limit: usize,
     },
-    /// Every sequence number has been used.
-    SequencesExhausted,
+    /// A keyspace the write names is not live.
+    KeyspaceDropped,
 }
 
 impl fmt::Display for UpdateError {
@@ -83,7 +79,7 @@ impl fmt::Display for UpdateError {
             Self::MemoryLimit { used, limit } => {
                 write!(f, "memory use {used} bytes reached the limit of {limit}")
             }
-            Self::SequencesExhausted => f.write_str("sequence numbers are exhausted"),
+            Self::KeyspaceDropped => f.write_str("the keyspace was dropped"),
         }
     }
 }

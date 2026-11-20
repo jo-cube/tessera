@@ -49,17 +49,12 @@ impl Core {
 
     pub(super) fn ingest_batch(
         &self,
+        keyspace: u32,
         batch: &WriteBatch,
         sorted: bool,
     ) -> Result<u64, UpdateError> {
-        let ceiling = self.read_state().last_seq;
-        if batch.is_empty() {
-            return Ok(ceiling);
-        }
-        ceiling
-            .checked_add(1)
-            .ok_or(UpdateError::SequencesExhausted)?;
         let state = self.admit(self.write_state())?;
+        state.check_keyspace(keyspace)?;
         let input = batch.validate(self.memtable_budget)?;
         let mut charge = self.resources.build(
             input.saturating_mul(3),
@@ -154,10 +149,9 @@ impl Core {
             }
             break;
         }
-        let seq = state
-            .last_seq
-            .checked_add(1)
-            .ok_or(UpdateError::SequencesExhausted)?;
+        // A keyspace dropped while the runs were built takes them with it.
+        state.check_keyspace(keyspace)?;
+        let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
         for run in &mut runs {
             Arc::get_mut(run)
                 .expect("unpublished run is private")
@@ -204,36 +198,40 @@ mod tests {
         while engine.core.compact(options, &mut merge).unwrap().is_some() {}
     }
 
-    fn check_snapshot(snapshot: &Snapshot, expected: [Option<&[u8]>; 3]) {
+    fn check_snapshot(snapshot: &Snapshot, ks: &Keyspace, expected: [Option<&[u8]>; 3]) {
+        check_reader(&mut snapshot.reader(), ks, expected);
+    }
+
+    /// Point reads, a multi-get and a scan of keys "a", "b" and "c" agree
+    /// with `expected`.
+    fn check_reader(reader: &mut Reader<'_>, ks: &Keyspace, expected: [Option<&[u8]>; 3]) {
         let keys: &[&[u8]] = &[b"a", b"b", b"c"];
-        let mut ws = EngineWorkspace::new();
         for (key, value) in keys.iter().zip(expected) {
-            assert_eq!(snapshot.get(key, &mut ws).unwrap().map(|v| v.value), value);
+            assert_eq!(reader.get(ks, key).unwrap(), value);
         }
-        snapshot
-            .multi_get(keys, &mut ws, |i, value| assert_eq!(value, expected[i]))
-            .unwrap();
-        let mut scan = snapshot.scan(&mut ws);
+        let probes = [b"c", b"a", b"b", b"c"];
+        let values = [expected[2], expected[0], expected[1], expected[2]];
+        assert_eq!(&*reader.multi_get(ks, &probes).unwrap(), &values);
+        let mut scan = reader.range(ks, ..);
         for (key, value) in keys.iter().zip(expected) {
             if let Some(value) = value {
-                let record = scan.next_record().unwrap().unwrap();
-                assert_eq!((record.key, record.value), (*key, value));
+                assert_eq!(scan.next().unwrap().unwrap(), (*key, value));
             }
         }
-        assert!(scan.next_record().unwrap().is_none());
+        assert!(scan.next().unwrap().is_none());
     }
 
     #[test]
     fn ingestion_orders_after_writes_and_compaction_completed_during_its_build() {
         for compression in [Compression::Uncompressed, Compression::Zstd] {
-            let engine = Engine::new(EngineOptions {
+            let engine = Engine::in_memory(Options {
                 compression,
                 background_compaction: None,
-                ..EngineOptions::default()
+                ..Options::default()
             })
             .unwrap();
-            engine.put(b"a", b"base").unwrap();
-            engine.put(b"b", b"base").unwrap();
+            engine.ks().put(b"a", b"base").unwrap();
+            engine.ks().put(b"b", b"base").unwrap();
             engine.flush().unwrap();
             settle(&engine);
             let built = Arc::new(Barrier::new(2));
@@ -246,21 +244,19 @@ mod tests {
             let snapshot = std::thread::scope(|scope| {
                 let ingest = scope.spawn(|| {
                     let mut batch = WriteBatch::new();
-                    batch.put(b"a", b"ingest");
-                    batch.put(b"b", b"ingest");
-                    batch.put(b"c", b"ingest");
+                    batch.put(&engine.ks(), b"a", b"ingest");
+                    batch.put(&engine.ks(), b"b", b"ingest");
+                    batch.put(&engine.ks(), b"c", b"ingest");
                     engine.ingest_sorted(&batch).unwrap();
                 });
                 built.wait();
-                engine.put(b"a", b"new").unwrap();
-                engine.delete(b"b").unwrap();
+                engine.ks().put(b"a", b"new").unwrap();
+                engine.ks().delete(b"b").unwrap();
                 engine.flush().unwrap();
                 settle(&engine);
-                let mut ws = EngineWorkspace::new();
-                let newer = engine.get(b"a", &mut ws).unwrap().unwrap();
                 // Compaction can settle earlier writes while ingestion builds;
                 // its later publication sequence must still win.
-                assert_eq!((newer.seq, newer.value), (0, &b"new"[..]));
+                assert_eq!(engine.get_seq(b"a"), Some((0, b"new".to_vec())));
                 // The newer deletion has also been physically discarded.
                 for run in &engine.core.read_state().runs {
                     assert!(
@@ -271,35 +267,33 @@ mod tests {
                     );
                 }
                 let snapshot = engine.snapshot();
-                check_snapshot(&snapshot, [Some(b"new"), None, None]);
+                check_snapshot(&snapshot, &engine.ks(), [Some(b"new"), None, None]);
                 resume.wait();
                 ingest.join().unwrap();
                 snapshot
             });
             // One publication sequence orders the already-built ingestion
             // after those settled writes. All reader paths agree.
-            let mut ws = EngineWorkspace::new();
             for key in [b"a", b"b", b"c"] {
-                assert_eq!(engine.get(key, &mut ws).unwrap().unwrap().value, b"ingest");
+                assert_eq!(engine.ks().get(key).unwrap().unwrap(), b"ingest");
             }
-            engine
-                .multi_get(&[b"a", b"b", b"c"], &mut ws, |_, value| {
-                    assert_eq!(value, Some(&b"ingest"[..]));
-                })
-                .unwrap();
-            check_snapshot(&engine.snapshot(), [Some(b"ingest"); 3]);
-            check_snapshot(&snapshot, [Some(b"new"), None, None]);
+            let mut reader = engine.reader();
+            let values = reader.multi_get(&engine.ks(), &[b"a", b"b", b"c"]).unwrap();
+            assert!(values.iter().all(|value| *value == Some(&b"ingest"[..])));
+            drop(values);
+            check_snapshot(&engine.snapshot(), &engine.ks(), [Some(b"ingest"); 3]);
+            check_snapshot(&snapshot, &engine.ks(), [Some(b"new"), None, None]);
             drop(snapshot);
             settle(&engine);
-            check_snapshot(&engine.snapshot(), [Some(b"ingest"); 3]);
-            assert_eq!(engine.stats().last_seq, 5);
+            check_snapshot(&engine.snapshot(), &engine.ks(), [Some(b"ingest"); 3]);
+            assert_eq!(engine.engine_stats().last_seq, 5);
         }
     }
 
     #[test]
     fn a_checkpoint_during_ingestion_recovers_without_the_unpublished_batch() {
-        let engine = Arc::new(Engine::new(EngineOptions::default()).unwrap());
-        engine.put(b"a", b"before").unwrap();
+        let engine = Arc::new(Engine::in_memory(Options::default()).unwrap());
+        engine.ks().put(b"a", b"before").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "tessera-inflight-ingest-{}-{}",
             std::process::id(),
@@ -311,30 +305,36 @@ mod tests {
         let checkpoint_dir = dir.clone();
         let checkpoint_engine = Arc::clone(&engine);
         *engine.core.after_ingest_build.lock().unwrap() = Some(Arc::new(move || {
-            checkpoint_engine
-                .checkpoint(&checkpoint_dir, CheckpointOptions::default())
-                .unwrap();
+            checkpoint_engine.checkpoint_to(&checkpoint_dir).unwrap();
         }));
         let mut batch = WriteBatch::new();
-        batch.put(b"a", b"ingest");
-        batch.put(b"b", b"ingest");
+        batch.put(&engine.ks(), b"a", b"ingest");
+        batch.put(&engine.ks(), b"b", b"ingest");
         assert_eq!(engine.ingest_sorted(&batch), Ok(2));
-        let recovered = Engine::recover(&dir, EngineOptions::default()).unwrap();
-        assert_eq!(recovered.stats().last_seq, 1);
-        check_snapshot(&recovered.snapshot(), [Some(b"before"), None, None]);
-        assert_eq!(recovered.put(b"c", b"after recovery"), Ok(2));
-        check_snapshot(&engine.snapshot(), [Some(b"ingest"), Some(b"ingest"), None]);
+        let recovered = Engine::open(&dir, Options::default()).unwrap();
+        assert_eq!(recovered.engine_stats().last_seq, 1);
+        check_snapshot(
+            &recovered.snapshot(),
+            &recovered.ks(),
+            [Some(b"before"), None, None],
+        );
+        assert_eq!(recovered.ks().put_seq(b"c", b"after recovery"), Ok(2));
+        check_snapshot(
+            &engine.snapshot(),
+            &engine.ks(),
+            [Some(b"ingest"), Some(b"ingest"), None],
+        );
         recovered.close().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_panicking_ingestion_build_publishes_nothing() {
-        let engine = Engine::new(EngineOptions::default()).unwrap();
-        engine.put(b"a", b"before").unwrap();
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        engine.ks().put(b"a", b"before").unwrap();
         let mut batch = WriteBatch::new();
-        batch.put(b"a", b"ingest");
-        batch.put(b"b", b"ingest");
+        batch.put(&engine.ks(), b"a", b"ingest");
+        batch.put(&engine.ks(), b"b", b"ingest");
         *engine.core.after_ingest_build.lock().unwrap() =
             Some(Arc::new(|| panic!("injected ingestion failure")));
         assert!(
@@ -343,49 +343,37 @@ mod tests {
             }))
             .is_err()
         );
-        assert_eq!(engine.stats().last_seq, 1);
-        check_snapshot(&engine.snapshot(), [Some(b"before"), None, None]);
+        assert_eq!(engine.engine_stats().last_seq, 1);
+        check_snapshot(
+            &engine.snapshot(),
+            &engine.ks(),
+            [Some(b"before"), None, None],
+        );
         assert_eq!(engine.ingest_sorted(&batch), Ok(2));
-        check_snapshot(&engine.snapshot(), [Some(b"ingest"), Some(b"ingest"), None]);
+        check_snapshot(
+            &engine.snapshot(),
+            &engine.ks(),
+            [Some(b"ingest"), Some(b"ingest"), None],
+        );
     }
 
     fn check_engine(engine: &Engine, expected: [Option<&[u8]>; 3]) {
-        let mut ws = EngineWorkspace::new();
+        let ks = engine.ks();
         for (key, value) in [b"a", b"b", b"c"].iter().zip(expected) {
-            assert_eq!(engine.get(*key, &mut ws).unwrap().map(|v| v.value), value);
+            assert_eq!(ks.get(*key).unwrap().as_deref(), value);
         }
-        let keys = [b"c", b"a", b"b", b"c"];
-        let values = [expected[2], expected[0], expected[1], expected[2]];
-        engine
-            .multi_get(&keys, &mut ws, |i, value| assert_eq!(value, values[i]))
-            .unwrap();
-        {
-            let read = engine.read();
-            read.multi_get(&keys, &mut ws, |i, value| assert_eq!(value, values[i]))
-                .unwrap();
-            for (key, value) in [b"a", b"b", b"c"].iter().zip(expected) {
-                assert_eq!(read.get(*key, &mut ws).unwrap().map(|v| v.value), value);
-            }
-            let mut scan = read.scan(&mut ws);
-            for (key, value) in [b"a", b"b", b"c"].iter().zip(expected) {
-                if let Some(value) = value {
-                    let record = scan.next_record().unwrap().unwrap();
-                    assert_eq!((record.key, record.value), (&key[..], value));
-                }
-            }
-            assert!(scan.next_record().unwrap().is_none());
-        }
-        check_snapshot(&engine.snapshot(), expected);
+        check_reader(&mut engine.reader(), &ks, expected);
+        check_snapshot(&engine.snapshot(), &ks, expected);
     }
 
     #[test]
     fn unrelated_writes_inside_the_batch_range_never_wait_for_the_flush_worker() {
         for full in [false, true] {
             let engine = Arc::new(
-                Engine::new(EngineOptions {
+                Engine::in_memory(Options {
                     max_frozen_memtables: 1,
                     background_compaction: None,
-                    ..EngineOptions::default()
+                    ..Options::default()
                 })
                 .unwrap(),
             );
@@ -393,20 +381,20 @@ mod tests {
             // here. Test both a free frozen slot and an already full queue.
             let flush = engine.core.serialize_flush();
             if full {
-                engine.put(b"b", b"old unrelated").unwrap();
+                engine.ks().put(b"b", b"old unrelated").unwrap();
                 let mut state = engine.core.write_state();
                 engine.core.freeze_active(&mut state);
                 engine.core.flush_signal.request();
             }
             let during = Arc::clone(&engine);
             *engine.core.after_ingest_build.lock().unwrap() = Some(Arc::new(move || {
-                during.put(b"b", b"unrelated").unwrap();
+                during.ks().put(b"b", b"unrelated").unwrap();
                 *during.core.after_ingest_build.lock().unwrap() =
                     Some(Arc::new(|| panic!("ingestion rebuilt")));
             }));
             let mut batch = WriteBatch::new();
-            batch.put(b"a", b"ingest");
-            batch.put(b"c", b"ingest");
+            batch.put(&engine.ks(), b"a", b"ingest");
+            batch.put(&engine.ks(), b"c", b"ingest");
             let seq = engine.ingest_sorted(&batch).unwrap();
             assert_eq!(seq, if full { 3 } else { 2 });
             assert!(
@@ -418,7 +406,7 @@ mod tests {
                     .take()
                     .is_some()
             );
-            assert_eq!(engine.stats().flushes, 0);
+            assert_eq!(engine.engine_stats().flushes, 0);
             check_engine(
                 &engine,
                 [Some(b"ingest"), Some(b"unrelated"), Some(b"ingest")],
@@ -437,47 +425,46 @@ mod tests {
     fn same_key_writes_and_deletes_order_at_publication_in_every_reader() {
         for compression in [Compression::Uncompressed, Compression::Zstd] {
             let engine = Arc::new(
-                Engine::new(EngineOptions {
+                Engine::in_memory(Options {
                     compression,
                     background_compaction: None,
-                    ..EngineOptions::default()
+                    ..Options::default()
                 })
                 .unwrap(),
             );
             for key in [b"a", b"b", b"c"] {
-                engine.put(key, b"before").unwrap();
+                engine.ks().put(key, b"before").unwrap();
             }
             let during = Arc::clone(&engine);
             *engine.core.after_ingest_build.lock().unwrap() = Some(Arc::new(move || {
-                during.put(b"a", b"during build").unwrap();
-                during.delete(b"b").unwrap();
+                during.ks().put(b"a", b"during build").unwrap();
+                during.ks().delete(b"b").unwrap();
             }));
             let during = Arc::clone(&engine);
             *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
                 // Land in the new active table while ingestion waits for its
                 // first frozen overlap. Publication must drain these too.
-                during.put(b"a", b"during flush").unwrap();
-                during.delete(b"b").unwrap();
+                during.ks().put(b"a", b"during flush").unwrap();
+                during.ks().delete(b"b").unwrap();
             }));
             let mut batch = WriteBatch::new();
             for key in [b"a", b"b", b"c"] {
-                batch.put(key, b"ingest");
+                batch.put(&engine.ks(), key, b"ingest");
             }
             let seq = engine.ingest_sorted(&batch).unwrap();
             assert_eq!(seq, 8);
             check_engine(&engine, [Some(b"ingest"); 3]);
-            let mut ws = EngineWorkspace::new();
             for key in [b"a", b"b", b"c"] {
-                assert_eq!(engine.get(key, &mut ws).unwrap().unwrap().seq, seq);
+                assert_eq!(engine.get_seq(key).unwrap().0, seq);
             }
             let at_publication = engine.snapshot();
-            assert_eq!(engine.put(b"a", b"after"), Ok(seq + 1));
-            assert_eq!(engine.delete(b"b"), Ok(seq + 2));
+            assert_eq!(engine.ks().put_seq(b"a", b"after"), Ok(seq + 1));
+            assert_eq!(engine.ks().delete_seq(b"b"), Ok(seq + 2));
             check_engine(&engine, [Some(b"after"), None, Some(b"ingest")]);
             engine.flush().unwrap();
             settle(&engine);
             check_engine(&engine, [Some(b"after"), None, Some(b"ingest")]);
-            check_snapshot(&at_publication, [Some(b"ingest"); 3]);
+            check_snapshot(&at_publication, &engine.ks(), [Some(b"ingest"); 3]);
         }
     }
 
@@ -485,21 +472,21 @@ mod tests {
     fn effective_sequences_materialize_through_compaction_checkpoint_and_recovery() {
         for compression in [Compression::Uncompressed, Compression::Zstd] {
             for pinned in [false, true] {
-                let options = EngineOptions {
+                let options = Options {
                     compression,
                     target_run_len: 1,
                     background_compaction: None,
-                    ..EngineOptions::default()
+                    ..Options::default()
                 };
-                let engine = Engine::new(options).unwrap();
+                let engine = Engine::in_memory(options).unwrap();
                 for key in [b"a", b"b", b"c"] {
-                    engine.put(key, b"old").unwrap();
+                    engine.ks().put(key, b"old").unwrap();
                 }
                 engine.flush().unwrap();
                 let mut batch = WriteBatch::new();
-                batch.put(b"a", b"ingest");
-                batch.delete(b"b");
-                batch.put(b"c", b"ingest");
+                batch.put(&engine.ks(), b"a", b"ingest");
+                batch.delete(&engine.ks(), b"b");
+                batch.put(&engine.ks(), b"c", b"ingest");
                 let seq = engine.ingest_sorted(&batch).unwrap();
                 assert_eq!(seq, 4);
                 assert_eq!(
@@ -525,20 +512,17 @@ mod tests {
                     }
                     let expected = if compacted { 0 } else { seq };
                     check_engine(&engine, [Some(b"ingest"), None, Some(b"ingest")]);
-                    let mut ws = EngineWorkspace::new();
                     for key in [b"a", b"c"] {
-                        assert_eq!(engine.get(key, &mut ws).unwrap().unwrap().seq, expected);
+                        assert_eq!(engine.get_seq(key).unwrap().0, expected);
                     }
-                    engine
-                        .checkpoint(&dir, CheckpointOptions::default())
-                        .unwrap();
-                    let recovered = Engine::recover(&dir, options).unwrap();
-                    assert_eq!(recovered.stats().last_seq, seq);
+                    engine.checkpoint_to(&dir).unwrap();
+                    let recovered = Engine::open(&dir, options).unwrap();
+                    assert_eq!(recovered.engine_stats().last_seq, seq);
                     check_engine(&recovered, [Some(b"ingest"), None, Some(b"ingest")]);
                     for key in [b"a", b"c"] {
-                        assert_eq!(recovered.get(key, &mut ws).unwrap().unwrap().seq, expected);
+                        assert_eq!(recovered.get_seq(key).unwrap().0, expected);
                     }
-                    assert_eq!(recovered.put(b"b", b"after recovery"), Ok(seq + 1));
+                    assert_eq!(recovered.ks().put_seq(b"b", b"after recovery"), Ok(seq + 1));
                     check_engine(
                         &recovered,
                         [Some(b"ingest"), Some(b"after recovery"), Some(b"ingest")],
@@ -546,46 +530,49 @@ mod tests {
                     recovered.close().unwrap();
                 }
                 if let Some(pin) = pin {
-                    check_snapshot(&pin, [Some(b"ingest"), None, Some(b"ingest")]);
+                    check_snapshot(&pin, &engine.ks(), [Some(b"ingest"), None, Some(b"ingest")]);
                 }
                 std::fs::remove_dir_all(&dir).unwrap();
             }
         }
     }
 
-    #[test]
-    fn ingestion_uses_the_last_sequence_once_and_rechecks_exhaustion_at_publication() {
-        let engine = Engine::new(EngineOptions {
+    fn last_sequence_engine() -> (Engine, WriteBatch) {
+        let engine = Engine::in_memory(Options {
             last_seq: u64::MAX - 1,
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
         let mut batch = WriteBatch::new();
-        batch.put(b"a", b"ingest");
-        batch.put(b"c", b"ingest");
+        batch.put(&engine.ks(), b"a", b"ingest");
+        batch.put(&engine.ks(), b"c", b"ingest");
+        (engine, batch)
+    }
+
+    #[test]
+    fn ingestion_uses_the_last_sequence_once() {
+        let (engine, batch) = last_sequence_engine();
         assert_eq!(engine.ingest_sorted(&batch), Ok(u64::MAX));
         assert_eq!(engine.ingest_sorted(&WriteBatch::new()), Ok(u64::MAX));
-        assert_eq!(
-            engine.ingest_sorted(&batch),
-            Err(UpdateError::SequencesExhausted)
-        );
         check_engine(&engine, [Some(b"ingest"), None, Some(b"ingest")]);
-        let engine = Arc::new(
-            Engine::new(EngineOptions {
-                last_seq: u64::MAX - 1,
-                ..EngineOptions::default()
-            })
-            .unwrap(),
-        );
-        let during = Arc::clone(&engine);
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence numbers are exhausted")]
+    fn ingestion_after_the_last_sequence_panics() {
+        let (engine, batch) = last_sequence_engine();
+        engine.ingest_sorted(&batch).unwrap();
+        let _ = engine.ingest_sorted(&batch);
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence numbers are exhausted")]
+    fn ingestion_rechecks_exhaustion_at_publication() {
+        let (engine, batch) = last_sequence_engine();
+        let during = engine.clone();
         *engine.core.after_ingest_build.lock().unwrap() = Some(Arc::new(move || {
-            assert_eq!(during.put(b"b", b"last write"), Ok(u64::MAX));
+            assert_eq!(during.ks().put_seq(b"b", b"last write"), Ok(u64::MAX));
         }));
-        assert_eq!(
-            engine.ingest_sorted(&batch),
-            Err(UpdateError::SequencesExhausted)
-        );
-        assert_eq!(engine.stats().last_seq, u64::MAX);
-        check_engine(&engine, [None, Some(b"last write"), None]);
+        let _ = engine.ingest_sorted(&batch);
     }
 }

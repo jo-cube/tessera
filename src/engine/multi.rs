@@ -24,22 +24,26 @@ pub(super) struct Workspace {
 }
 
 impl Workspace {
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn capacity(&self) -> usize {
         self.read.capacity()
     }
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn context_bytes(&self) -> usize {
         self.read.context_bytes()
     }
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn blocks_loaded(&self) -> u64 {
         self.read.blocks_loaded()
     }
 
     /// Raw bytes in blocks loaded through this workspace.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn decoded_bytes(&self) -> u64 {
         self.read.decoded_bytes()
     }
 
-    fn prepare<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
+    pub(super) fn prepare<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
         self.order.clear();
         self.order.extend(0..keys.len());
         if !keys
@@ -125,15 +129,6 @@ impl Workspace {
         }
         Ok(())
     }
-
-    fn deliver(&self, mut found: impl FnMut(usize, Option<&[u8]>)) {
-        for (index, hit) in self.hits.iter().enumerate() {
-            found(
-                index,
-                hit.value.as_ref().map(|range| &self.values[range.clone()]),
-            );
-        }
-    }
 }
 
 impl Hit {
@@ -168,26 +163,54 @@ impl Hit {
     }
 }
 
-impl Engine {
-    /// Looks up keys in any order, invoking `found(index, value)` in input
-    /// order, including duplicates and misses. The entire call sees one state.
-    /// Values borrow reusable workspace storage for the callback's duration.
-    /// No callbacks run if reading fails. Run decoding holds no state lock.
-    ///
-    /// # Errors
-    /// Returns [`ReadError`] for touched corrupt data or conflicting copies.
-    ///
-    /// # Panics
-    /// Propagates a panic from `found`. Panics if the engine state lock is poisoned.
-    pub fn multi_get<K: AsRef<[u8]>>(
-        &self,
+impl Workspace {
+    /// The value of each key prepared, in input order.
+    pub(super) fn found(&self) -> impl Iterator<Item = Option<&[u8]>> {
+        self.hits
+            .iter()
+            .map(|hit| hit.value.as_ref().map(|range| &self.values[range.clone()]))
+    }
+
+    /// Looks up `keys` in `view`.
+    pub(super) fn lookup_view<K: AsRef<[u8]>>(
+        &mut self,
         keys: &[K],
-        workspace: &mut EngineWorkspace,
-        found: impl FnMut(usize, Option<&[u8]>),
+        view: &View,
     ) -> Result<(), ReadError> {
-        let multi = &mut workspace.multi;
+        self.prepare(keys);
+        for table in &view.tables {
+            self.table(keys, |key| table.get(key));
+        }
+        self.runs(keys, &view.runs)
+    }
+
+    /// Releases buffers whose capacity exceeds `bytes`.
+    pub(super) fn trim(&mut self, bytes: usize) {
+        if self.values.capacity() > bytes {
+            self.values = Vec::new();
+        }
+        if self.hits.capacity() * size_of::<Hit>() > bytes {
+            self.hits = Vec::new();
+        }
+        if self.order.capacity() * size_of::<usize>() > bytes {
+            self.order = Vec::new();
+            self.probes = Vec::new();
+        }
+    }
+}
+
+impl Core {
+    /// Looks up `keys` in keyspace `keyspace` from one state, leaving the
+    /// values in `multi`. Run decoding holds no state lock.
+    pub(super) fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        keyspace: u32,
+        keys: &[K],
+        multi: &mut Workspace,
+    ) -> Result<()> {
         multi.prepare(keys);
-        let state = self.core.read_state();
+        let state = self.read_state();
+        state.check_keyspace(keyspace)?;
         multi.table(keys, |key| state.active.get(key));
         for table in state.frozen.iter().rev() {
             multi.table(keys, |key| table.get(key));
@@ -195,51 +218,6 @@ impl Engine {
         let directory = Arc::clone(&state.directory);
         drop(state);
         multi.runs(keys, &directory)?;
-        multi.deliver(found);
-        Ok(())
-    }
-}
-
-impl ReadGuard<'_> {
-    /// Looks up keys in input order from this guard's stable state. See
-    /// [`Engine::multi_get`] for callback ordering, read errors and workspace
-    /// lifetimes. A callback panic propagates; while this guard is held a
-    /// callback must not call engine methods that acquire the state lock.
-    pub fn multi_get<K: AsRef<[u8]>>(
-        &self,
-        keys: &[K],
-        workspace: &mut EngineWorkspace,
-        found: impl FnMut(usize, Option<&[u8]>),
-    ) -> Result<(), ReadError> {
-        let multi = &mut workspace.multi;
-        multi.prepare(keys);
-        multi.table(keys, |key| self.0.active.get(key));
-        for table in self.0.frozen.iter().rev() {
-            multi.table(keys, |key| table.get(key));
-        }
-        multi.runs(keys, &self.0.directory)?;
-        multi.deliver(found);
-        Ok(())
-    }
-}
-
-impl Snapshot {
-    /// Looks up keys in input order from this snapshot's state. See
-    /// [`Engine::multi_get`] for callback ordering, read errors and workspace
-    /// lifetimes. A callback panic propagates; no engine lock is held.
-    pub fn multi_get<K: AsRef<[u8]>>(
-        &self,
-        keys: &[K],
-        workspace: &mut EngineWorkspace,
-        found: impl FnMut(usize, Option<&[u8]>),
-    ) -> Result<(), ReadError> {
-        let multi = &mut workspace.multi;
-        multi.prepare(keys);
-        for table in &self.tables {
-            multi.table(keys, |key| table.get(key));
-        }
-        multi.runs(keys, &self.runs)?;
-        multi.deliver(found);
         Ok(())
     }
 }
@@ -281,12 +259,9 @@ mod tests {
                     .map(|value| value.map(|v| v.value.to_vec()));
                 let mut workspace = Workspace::default();
                 workspace.prepare(&[key]);
-                let mut actual = None;
                 let result = workspace.runs(&[key], &directory);
-                if result.is_ok() {
-                    workspace.deliver(|_, value| actual = value.map(<[u8]>::to_vec));
-                }
-                assert_eq!(result.map(|()| actual), expected);
+                let actual = result.map(|()| workspace.found().next().unwrap().map(<[u8]>::to_vec));
+                assert_eq!(actual, expected);
             }
         }
     }
@@ -315,6 +290,8 @@ mod tests {
         workspace.prepare(&probes);
         workspace.runs(&probes, &directory).unwrap();
         assert_eq!(workspace.blocks_loaded(), blocks as u64);
-        workspace.deliver(|_, value| assert_eq!(value, Some(&b"a moderately sized value"[..])));
+        for value in workspace.found() {
+            assert_eq!(value, Some(&b"a moderately sized value"[..]));
+        }
     }
 }

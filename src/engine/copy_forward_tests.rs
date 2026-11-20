@@ -27,37 +27,35 @@ fn value(index: u64, version: u64) -> Vec<u8> {
     out
 }
 
-fn options(threads: usize) -> EngineOptions {
-    EngineOptions {
-        memtable_budget: 64 << 10,
+fn options(threads: usize) -> Options {
+    Options {
+        memtable_size: 64 << 10,
         target_run_len: 32 << 10,
         background_threads: threads,
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
 /// Every key through every reader of `snapshot`, in one comparable form.
-fn observe(snapshot: &Snapshot) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-    let mut ws = EngineWorkspace::new();
+fn observe(snapshot: &Snapshot, ks: &Keyspace) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let mut reader = snapshot.reader();
     let keys: Vec<_> = (0..KEYS).map(key).collect();
     let out: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys
         .iter()
         .map(|key| {
-            let found = snapshot.get(key, &mut ws).unwrap();
-            (key.clone(), found.map(|live| live.value.to_vec()))
+            let found = reader.get(ks, key).unwrap();
+            (key.clone(), found.map(<[u8]>::to_vec))
         })
         .collect();
-    snapshot
-        .multi_get(&keys, &mut ws, |at, found| {
-            assert_eq!(found.map(<[u8]>::to_vec), out[at].1, "multi_get {at}");
-        })
-        .unwrap();
+    for (at, found) in reader.multi_get(ks, &keys).unwrap().iter().enumerate() {
+        assert_eq!(found.map(<[u8]>::to_vec), out[at].1, "multi_get {at}");
+    }
     let mut scanned = Vec::new();
     {
-        let mut scan = snapshot.scan(&mut ws);
-        while let Some(record) = scan.next_record().unwrap() {
-            scanned.push((record.key.to_vec(), record.value.to_vec()));
+        let mut scan = reader.range(ks, ..);
+        while let Some((key, value)) = scan.next().unwrap() {
+            scanned.push((key.to_vec(), value.to_vec()));
         }
     }
     let live: Vec<_> = out
@@ -67,14 +65,11 @@ fn observe(snapshot: &Snapshot) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     assert_eq!(scanned, live, "scan agrees with point reads");
     // A prefix scan from the middle exercises seeks into copied blocks.
     let prefix = b"user/0015";
-    let mut scan = snapshot.scan_prefix(prefix, &mut ws);
+    let mut scan = reader.prefix(ks, prefix);
     let mut expected = live.iter().filter(|(key, _)| key.starts_with(prefix));
-    while let Some(record) = scan.next_record().unwrap() {
+    while let Some(record) = scan.next().unwrap() {
         let (key, value) = expected.next().unwrap();
-        assert_eq!(
-            (record.key, record.value),
-            (key.as_slice(), value.as_slice())
-        );
+        assert_eq!(record, (key.as_slice(), value.as_slice()));
     }
     assert!(expected.next().is_none());
     out
@@ -97,15 +92,15 @@ fn history(copy: bool, threads: usize, piece_budget: usize, seed: u64) -> (Obser
             .piece_budget
             .store(piece_budget, Ordering::Relaxed);
     };
-    let mut engine = Engine::new(options(threads)).unwrap();
+    let mut engine = Engine::in_memory(options(threads)).unwrap();
     set_up(&engine);
     let mut rng = crate::test_support::Rng(seed);
     let mut model = Model::new();
     let mut log = Vec::new();
     let mut snapshots: Vec<(Snapshot, Model)> = Vec::new();
     let mut reused = 0;
-    let check = |snapshot: &Snapshot, model: &Model| {
-        let seen = observe(snapshot);
+    let check = |snapshot: &Snapshot, ks: &Keyspace, model: &Model| {
+        let seen = observe(snapshot, ks);
         for (key, value) in &seen {
             assert_eq!(
                 value.as_ref(),
@@ -126,10 +121,13 @@ fn history(copy: bool, threads: usize, piece_budget: usize, seed: u64) -> (Obser
                 rng.below(KEYS as usize) as u64
             };
             if version > 0 && rng.below(6) == 0 {
-                engine.delete(&key(index)).unwrap();
+                engine.ks().delete(&key(index)).unwrap();
                 model.remove(&key(index));
             } else {
-                engine.put(&key(index), &value(index, version)).unwrap();
+                engine
+                    .ks()
+                    .put(&key(index), &value(index, version))
+                    .unwrap();
                 model.insert(key(index), value(index, version));
             }
         }
@@ -137,13 +135,14 @@ fn history(copy: bool, threads: usize, piece_budget: usize, seed: u64) -> (Obser
             // Sorted ingestion publishes runs whose sequences are assigned
             // by override, which are never copied forward.
             let mut batch = WriteBatch::new();
+            let ks = engine.ks();
             let start = rng.below(KEYS as usize - 100) as u64;
             for index in start..start + 60 {
                 if index % 7 == 0 {
-                    batch.delete(&key(index));
+                    batch.delete(&ks, &key(index));
                     model.remove(&key(index));
                 } else {
-                    batch.put(&key(index), &value(index, version + 100));
+                    batch.put(&ks, &key(index), &value(index, version + 100));
                     model.insert(key(index), value(index, version + 100));
                 }
             }
@@ -155,22 +154,21 @@ fn history(copy: bool, threads: usize, piece_budget: usize, seed: u64) -> (Obser
             snapshots.push((engine.snapshot(), model.clone()));
         }
         if version % 5 == 3 {
-            reused += engine.stats().build.blocks_reused;
+            reused += engine.engine_stats().build.blocks_reused;
             drop(std::mem::take(&mut snapshots));
             let dir = scratch.0.join(format!("v{version}"));
-            engine
-                .checkpoint(&dir, CheckpointOptions::default())
-                .unwrap();
+            engine.checkpoint_to(&dir).unwrap();
             engine.close().unwrap();
-            engine = Engine::recover(&dir, options(threads)).unwrap();
+            engine = Engine::open(&dir, options(threads)).unwrap();
             set_up(&engine);
         }
-        log.push(check(&engine.snapshot(), &model));
+        let ks = engine.ks();
+        log.push(check(&engine.snapshot(), &ks, &model));
         for (snapshot, seen) in &snapshots {
-            log.push(check(snapshot, seen));
+            log.push(check(snapshot, &ks, seen));
         }
     }
-    reused += engine.stats().build.blocks_reused;
+    reused += engine.engine_stats().build.blocks_reused;
     engine.close().unwrap();
     (log, reused)
 }

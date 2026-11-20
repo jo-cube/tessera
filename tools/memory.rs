@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tessera::engine::{Engine, EngineStats};
+use tessera::Engine;
+use tessera::diagnostics::{EngineDiagnostics, EngineStats};
 
 struct Counting;
 static BACKEND: System = System;
@@ -101,7 +102,7 @@ pub fn sample_stats(reason: &str, s: EngineStats) {
     };
     let phase = ["load", "update", "drain", "reads"][usize::from(PHASE.load(Relaxed))];
     if let Some(engine) = ENGINE.get().and_then(Weak::upgrade) {
-        let d = tessera::engine::diagnostics::maintenance(&engine);
+        let d = tessera::diagnostics::maintenance(&engine);
         println!(
             "unpublished,{name},{variant},{phase},{reason},{},{},{},{},{},{}",
             d.unpublished_bytes,
@@ -140,7 +141,7 @@ pub fn phase_end(engine: &Engine, reason: &str, next: u8) {
     let now = Instant::now();
     let cpu = cpu_seconds();
     let mut started = PHASE_STARTED.lock().unwrap();
-    let wait = tessera::engine::diagnostics::maintenance(engine).writer_wait_ns;
+    let wait = tessera::diagnostics::maintenance(engine).writer_wait_ns;
     if let Some((wall_start, cpu_start, wait_start)) = *started {
         let wall = now.duration_since(wall_start).as_secs_f64();
         let (name, variant, _) = META.get().unwrap();
@@ -155,7 +156,7 @@ pub fn phase_end(engine: &Engine, reason: &str, next: u8) {
     }
     *started = Some((now, cpu, wait));
     drop(started);
-    sample_stats(reason, engine.stats());
+    sample_stats(reason, engine.engine_stats());
     PHASE.store(next, Relaxed);
 }
 
@@ -185,18 +186,18 @@ impl Sampler {
         *PHASE_STARTED.lock().unwrap() = Some((
             Instant::now(),
             cpu_seconds(),
-            tessera::engine::diagnostics::maintenance(&engine).writer_wait_ns,
+            tessera::diagnostics::maintenance(&engine).writer_wait_ns,
         ));
         println!(
             "memory,scenario,variant,phase,event,seconds,rss,hwm,swap,live,peak_live,used,memtables,build_output,build_workspace,pool_reserve,pool_in_use,pool_unaccounted,run_bytes,held_bytes,snapshots,active_arena,frozen_tables,retained"
         );
-        sample_stats("start", engine.stats());
+        sample_stats("start", engine.engine_stats());
         let (stop, receiver) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             while let Err(mpsc::RecvTimeoutError::Timeout) =
                 receiver.recv_timeout(Duration::from_secs(1))
             {
-                sample_stats("tick", engine.stats());
+                sample_stats("tick", engine.engine_stats());
             }
         });
         Self { stop, handle }

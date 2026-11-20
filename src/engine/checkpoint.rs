@@ -54,8 +54,8 @@ use std::sync::OnceLock;
 
 use super::levels::Levels;
 use super::{
-    ConfigError, Core, Engine, EngineOptions, FlushJob, Published, SharedRun, directory,
-    physical_runs,
+    Core, Entry, FlushJob, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Options, Published, SharedRun,
+    directory, physical_runs,
 };
 
 mod errors;
@@ -63,8 +63,9 @@ mod manifest;
 mod recover;
 mod write;
 
-pub use errors::{CheckpointError, Damage, OpenError};
+pub(super) use errors::{CheckpointError, Damage, OpenError};
 use manifest::*;
+pub(super) use recover::recover;
 use recover::*;
 #[cfg(test)]
 use write::*;
@@ -85,7 +86,9 @@ const MANIFEST_VERSION: u32 = 5;
 // depth, metadata length, run count. Entries include both file and run lengths.
 const MANIFEST_HEADER_LEN: usize = 80;
 const MANIFEST_ENTRY_LEN: usize = 68;
-const MAX_METADATA_BYTES: usize = 16 << 20;
+// The manifest's metadata field holds the keyspace name and the
+// application's metadata; see `encode_catalog`.
+const MAX_METADATA_BYTES: usize = MAX_METADATA_LEN + 2 + MAX_KEYSPACE_NAME_LEN;
 const RUNS: &str = "runs";
 // Keep namespace and counter together, including when recovery advances the
 // counter to the end of its range. Rollover starts a fresh namespace.
@@ -105,23 +108,74 @@ pub(super) fn new_run_id() -> u128 {
     (u128::from(namespace) << 64) | u128::from(number)
 }
 
-/// Bounds on one checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CheckpointOptions {
-    /// Maximum new run-file and manifest bytes written in this attempt.
-    /// Reused files, CURRENT and filesystem overhead are excluded. Older
-    /// generations remain until the new commit is durable.
-    pub max_bytes: u64,
+const CATALOG_KEYSPACE: u8 = 1;
+const CATALOG_METADATA: u8 = 2;
+
+/// Encodes the live keyspace's name and the application's metadata into the
+/// manifest's metadata field: nothing for neither; otherwise a flags byte
+/// (1: a keyspace, 2: metadata), then the name's length byte and the name if
+/// there is a keyspace, then the metadata.
+fn encode_catalog(keyspace: Option<&str>, metadata: Option<&[u8]>) -> Vec<u8> {
+    if keyspace.is_none() && metadata.is_none() {
+        return Vec::new();
+    }
+    let mut bytes =
+        Vec::with_capacity(2 + keyspace.map_or(0, str::len) + metadata.map_or(0, <[u8]>::len));
+    bytes.push(
+        if keyspace.is_some() {
+            CATALOG_KEYSPACE
+        } else {
+            0
+        } | if metadata.is_some() {
+            CATALOG_METADATA
+        } else {
+            0
+        },
+    );
+    if let Some(name) = keyspace {
+        bytes.push(name.len() as u8);
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    bytes.extend_from_slice(metadata.unwrap_or_default());
+    bytes
 }
 
-impl Default for CheckpointOptions {
-    /// No limit on disk.
-    fn default() -> Self {
-        Self {
-            max_bytes: u64::MAX,
-        }
+/// What [`encode_catalog`] wrote.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Catalog {
+    pub(super) keyspace: Option<String>,
+    pub(super) metadata: Option<Vec<u8>>,
+}
+
+fn decode_catalog(bytes: &[u8]) -> Result<Catalog, Damage> {
+    let Some((&flags, rest)) = bytes.split_first() else {
+        return Ok(Catalog::default());
+    };
+    if flags & !(CATALOG_KEYSPACE | CATALOG_METADATA) != 0 || flags == 0 {
+        return Err(Damage::Catalog);
     }
+    let (keyspace, rest) = if flags & CATALOG_KEYSPACE != 0 {
+        let (&len, rest) = rest.split_first().ok_or(Damage::Catalog)?;
+        let name = rest.get(..usize::from(len)).ok_or(Damage::Catalog)?;
+        let name = std::str::from_utf8(name).map_err(|_| Damage::Catalog)?;
+        if !super::handle::valid_name(name) {
+            return Err(Damage::Catalog);
+        }
+        (Some(name.to_owned()), &rest[usize::from(len)..])
+    } else {
+        (None, rest)
+    };
+    let metadata = if flags & CATALOG_METADATA != 0 {
+        if rest.len() > MAX_METADATA_LEN {
+            return Err(Damage::Catalog);
+        }
+        Some(rest.to_vec())
+    } else if rest.is_empty() {
+        None
+    } else {
+        return Err(Damage::Catalog);
+    };
+    Ok(Catalog { keyspace, metadata })
 }
 
 /// What a committed checkpoint holds and the I/O performed for it.
@@ -130,7 +184,8 @@ impl Default for CheckpointOptions {
 pub struct CheckpointReport {
     /// Its generation, named by CURRENT.
     pub generation: u64,
-    /// Every update through this ceiling is included; later updates are excluded.
+    /// Every update through this sequence ceiling is included; later
+    /// updates are excluded.
     pub last_seq: u64,
     /// Physical records, including retained versions and tombstones.
     pub records: u64,
@@ -195,16 +250,14 @@ mod robustness;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineWorkspace;
+    use crate::engine::{Engine, ErrorKind};
 
     #[test]
     fn an_unsupported_manifest_version_is_rejected_with_a_valid_checksum() {
         let dir = scratch("unsupported-manifest-version");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"key", b"value").unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"key", b"value").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, _, manifest) = committed_manifest(&dir).unwrap();
         let mut bytes = manifest.encode();
@@ -225,11 +278,9 @@ mod tests {
     #[test]
     fn manifest_lengths_are_bounded_by_the_run_and_filter_formats() {
         let dir = scratch("format-allocation-bounds");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"key", b"value").unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"key", b"value").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, _, mut manifest) = committed_manifest(&dir).unwrap();
         for (run_len, len) in [
@@ -250,53 +301,44 @@ mod tests {
     #[test]
     fn recovery_rejects_conflicting_copies_hidden_by_a_newer_version() {
         let dir = scratch("hidden-conflicting-copies");
-        let engine = Engine::new(manual()).unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
         for value in [b"old", b"bad", b"new"] {
             let mut batch = crate::engine::WriteBatch::new();
-            batch.put(b"key", value);
+            batch.put(&engine.ks(), b"key", value);
             engine.ingest_sorted(&batch).unwrap();
         }
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         assert_eq!(manifest.runs.len(), 3);
         manifest.runs[1].seq_override = manifest.runs[0].seq_override;
         fs::write(path, manifest.encode()).unwrap();
-        assert!(matches!(
-            Engine::recover(&dir, manual()),
-            Err(OpenError::Corrupt {
-                damage: Damage::Order,
-                ..
-            })
-        ));
+        assert_eq!(
+            Engine::open(&dir, manual()).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn recovery_with_an_exhausted_run_counter_can_flush_and_checkpoint() {
         let dir = scratch("exhausted-run-counter");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"a", b"old").unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"a", b"old").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.next_run_id = u64::MAX;
         fs::write(path, manifest.encode()).unwrap();
-        let recovered = Engine::recover(&dir, manual()).unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
         for key in [b"b", b"c"] {
-            recovered.put(key, b"new").unwrap();
+            recovered.ks().put(key, b"new").unwrap();
             recovered.flush().unwrap();
         }
         let expected = state(&recovered);
-        recovered
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        recovered.checkpoint().unwrap();
         recovered.close().unwrap();
-        let again = Engine::recover(&dir, manual()).unwrap();
+        let again = Engine::open(&dir, manual()).unwrap();
         assert_eq!(state(&again), expected);
         again.close().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -310,33 +352,25 @@ mod tests {
             } else {
                 "conflicting-copies"
             });
-            let engine = Engine::new(manual()).unwrap();
+            let engine = Engine::in_memory(manual()).unwrap();
             for value in [b"old".as_slice(), if identical { b"old" } else { b"new" }] {
                 let mut batch = crate::engine::WriteBatch::new();
-                batch.put(b"key", value);
+                batch.put(&engine.ks(), b"key", value);
                 engine.ingest_sorted(&batch).unwrap();
             }
-            engine
-                .checkpoint(&dir, CheckpointOptions::default())
-                .unwrap();
+            engine.checkpoint_to(&dir).unwrap();
             engine.close().unwrap();
             let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
             assert_eq!(manifest.runs.len(), 2);
             manifest.runs[1].seq_override = manifest.runs[0].seq_override;
             fs::write(path, manifest.encode()).unwrap();
-            let result = Engine::recover(&dir, manual());
+            let result = Engine::open(&dir, manual());
             if identical {
                 let recovered = result.unwrap();
                 assert_eq!(state(&recovered), vec![(b"key".to_vec(), b"old".to_vec())]);
                 recovered.close().unwrap();
             } else {
-                assert!(matches!(
-                    result,
-                    Err(OpenError::Corrupt {
-                        damage: Damage::Order,
-                        ..
-                    })
-                ));
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Corruption);
             }
             fs::remove_dir_all(dir).unwrap();
         }
@@ -355,28 +389,26 @@ mod tests {
     #[test]
     fn a_manifest_with_an_unlimited_run_length_is_typed_damage() {
         let dir = scratch("unlimited-run-length");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"key", b"value").unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"key", b"value").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.runs[0].len = u64::MAX;
         fs::write(&path, manifest.encode()).unwrap();
-        assert!(matches!(
-            Engine::recover(&dir, manual()),
-            Err(OpenError::Corrupt { .. })
-        ));
+        assert_eq!(
+            Engine::open(&dir, manual()).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
     /// The defaults without the background worker: these tests flush and
     /// compact by hand and count what each step leaves.
-    fn manual() -> EngineOptions {
-        EngineOptions {
+    fn manual() -> Options {
+        Options {
             background_compaction: None,
-            ..EngineOptions::default()
+            ..Options::default()
         }
     }
 
@@ -402,25 +434,25 @@ mod tests {
     #[test]
     fn a_worker_that_cannot_start_leaves_the_directory_as_it_was() {
         let fail_next = || crate::engine::worker::tests::FAIL_SPAWN.with(|f| f.set(true));
-        let options = EngineOptions::default();
+        let options = Options::default();
         let checkpoint = scratch("spawn-failure-checkpoint");
-        let engine = Engine::new(options).unwrap();
-        engine.put(b"k", b"checkpointed").unwrap();
-        engine
-            .checkpoint(&checkpoint, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(options).unwrap();
+        engine.ks().put(b"k", b"checkpointed").unwrap();
+        engine.checkpoint_to(&checkpoint).unwrap();
         engine.close().unwrap();
         let before = files(&checkpoint);
         fail_next();
-        let refused = Engine::recover(&checkpoint, options).map(drop);
-        assert!(matches!(refused, Err(OpenError::Worker(_))), "{refused:?}");
-        assert_eq!(files(&checkpoint), before);
-        let engine = Engine::recover(&checkpoint, options).unwrap();
-        let mut workspace = EngineWorkspace::new();
-        assert_eq!(
-            engine.get(b"k", &mut workspace).unwrap().unwrap().value,
-            b"checkpointed"
-        );
+        let refused = Engine::open(&checkpoint, options).map(drop);
+        assert_eq!(refused.unwrap_err().kind(), ErrorKind::Io);
+        // Apart from the empty lock file `open` creates.
+        let lock = (checkpoint.join(LOCK), Vec::new());
+        let after: Vec<_> = files(&checkpoint)
+            .into_iter()
+            .filter(|file| *file != lock)
+            .collect();
+        assert_eq!(after, before);
+        let engine = Engine::open(&checkpoint, options).unwrap();
+        assert_eq!(engine.ks().get(b"k").unwrap().unwrap(), b"checkpointed");
         engine.close().unwrap();
         fs::remove_dir_all(&checkpoint).unwrap();
     }
@@ -547,12 +579,15 @@ mod tests {
     }
 
     fn state(engine: &Engine) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut workspace = EngineWorkspace::new();
-        let guard = engine.read();
-        let mut scan = guard.scan(&mut workspace);
+        snapshot_state(&engine.snapshot(), &engine.ks())
+    }
+
+    fn snapshot_state(snapshot: &crate::Snapshot, ks: &crate::Keyspace) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut reader = snapshot.reader();
+        let mut scan = reader.range(ks, ..);
         let mut out = Vec::new();
-        while let Some(record) = scan.next_record().unwrap() {
-            out.push((record.key.to_vec(), record.value.to_vec()));
+        while let Some((key, value)) = scan.next().unwrap() {
+            out.push((key.to_vec(), value.to_vec()));
         }
         out
     }
@@ -581,37 +616,33 @@ mod tests {
             (Crash::BeforeReclaim, true),
         ] {
             let dir = scratch(&format!("{crash:?}"));
-            let engine = Engine::new(EngineOptions {
+            let engine = Engine::in_memory(Options {
                 target_run_len: 1024,
                 ..manual()
             })
             .unwrap();
             for i in 0..500u32 {
-                engine.put(&i.to_be_bytes(), b"old").unwrap();
+                engine.ks().put(&i.to_be_bytes(), b"old").unwrap();
             }
             engine.flush().unwrap();
-            engine
-                .checkpoint(&dir, CheckpointOptions::default())
-                .unwrap();
+            engine.checkpoint_to(&dir).unwrap();
             let old = state(&engine);
             for i in 0..500u32 {
-                engine.put(&i.to_be_bytes(), b"new").unwrap();
+                engine.ks().put(&i.to_be_bytes(), b"new").unwrap();
             }
-            engine.delete(&7u32.to_be_bytes()).unwrap();
+            engine.ks().delete(&7u32.to_be_bytes()).unwrap();
             let new = state(&engine);
 
             CRASH_AT.with(|at| at.set(Some(crash)));
-            let error = engine.checkpoint(&dir, CheckpointOptions::default());
+            let error = engine.checkpoint_to(&dir);
             CRASH_AT.with(|at| at.set(None));
             assert!(error.is_err(), "{crash:?}");
-            let recovered = Engine::recover(&dir, manual()).unwrap();
+            let recovered = Engine::open(&dir, manual()).unwrap();
             let expected = if committed { &new } else { &old };
             assert_eq!(&state(&recovered), expected, "{crash:?}");
             drop(recovered);
 
-            let report = engine
-                .checkpoint(&dir, CheckpointOptions::default())
-                .unwrap();
+            let report = engine.checkpoint_to(&dir).unwrap();
             assert_eq!(report.generation, 3, "{crash:?}");
             assert_eq!(report.reclaimed, 1, "{crash:?}");
             assert_eq!(
@@ -624,36 +655,40 @@ mod tests {
                 ],
                 "{crash:?}"
             );
-            let recovered = Engine::recover(&dir, manual()).unwrap();
+            let recovered = Engine::open(&dir, manual()).unwrap();
             assert_eq!(state(&recovered), new, "{crash:?}");
             fs::remove_dir_all(&dir).unwrap();
         }
     }
 
-    /// A second process's lock refuses both a checkpoint and a recovery.
+    /// An open engine holds the directory's lock for its life: a second
+    /// open, or another process's lock, is refused until it is released.
     #[test]
     fn the_lock_keeps_a_second_user_out() {
         let dir = scratch("lock");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"a", b"1").unwrap();
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"a", b"1").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         // A lock taken through another open file description conflicts like
         // another process's.
         let held = lock(&dir).unwrap().unwrap();
-        assert!(matches!(
-            engine.checkpoint(&dir, CheckpointOptions::default()),
-            Err(CheckpointError::Locked(_))
-        ));
-        assert!(matches!(
-            Engine::recover(&dir, manual()),
-            Err(OpenError::Locked(_))
-        ));
+        let error = Engine::open(&dir, manual()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Locked);
+        assert_eq!(error.path(), Some(dir.as_path()));
         drop(held);
-        Engine::recover(&dir, manual()).unwrap();
+        let first = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(
+            Engine::open(&dir, manual()).unwrap_err().kind(),
+            ErrorKind::Locked
+        );
+        assert_eq!(lock(&dir).unwrap().map(drop), Err(()));
+        first.close().unwrap();
+        let second = Engine::open(&dir, manual()).unwrap();
+        drop(second);
+        Engine::open(&dir, manual()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
+
     fn manifest(dir: &Path) -> Manifest {
         committed_manifest(dir).unwrap().2
     }
@@ -675,14 +710,14 @@ mod tests {
     #[test]
     fn incremental_checkpoints_write_only_new_runs_and_gc_keeps_two_commits() {
         let dir = scratch("incremental");
-        let options = EngineOptions {
+        let options = Options {
             compression: super::super::Compression::Uncompressed,
             target_run_len: 1 << 20,
             ..manual()
         };
-        let engine = Engine::new(options).unwrap();
+        let engine = Engine::in_memory(options).unwrap();
         for i in 0..1_000u32 {
-            engine.put(&i.to_be_bytes(), b"original").unwrap();
+            engine.ks().put(&i.to_be_bytes(), b"original").unwrap();
         }
         engine.flush().unwrap();
         let expected: Vec<_> = engine
@@ -700,9 +735,7 @@ mod tests {
                 (r.id, bytes)
             })
             .collect();
-        let first = engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let first = engine.checkpoint_to(&dir).unwrap();
         assert_eq!((first.runs_written, first.runs_reused), (1, 0));
         assert_eq!(first.bytes_reused, 0);
         for (id, bytes) in &expected {
@@ -713,12 +746,10 @@ mod tests {
         }
         let original = manifest(&dir);
         for i in 0..10u32 {
-            engine.put(&i.to_be_bytes(), b"changed").unwrap();
+            engine.ks().put(&i.to_be_bytes(), b"changed").unwrap();
         }
         engine.flush().unwrap();
-        let second = engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let second = engine.checkpoint_to(&dir).unwrap();
         let second_manifest = manifest(&dir);
         assert_eq!(
             (
@@ -742,9 +773,7 @@ mod tests {
         }
 
         compact_all(&engine);
-        let third = engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let third = engine.checkpoint_to(&dir).unwrap();
         let third_manifest = manifest(&dir);
         assert_eq!(
             (third.runs_written, third.runs_reused, third.files_deleted),
@@ -756,14 +785,12 @@ mod tests {
         );
         // The preceding committed generation still recovers after GC.
         fs::write(dir.join(CURRENT), encode_current(second.generation)).unwrap();
-        let previous = Engine::recover(&dir, options).unwrap();
+        let previous = Engine::open(&dir, options).unwrap();
         assert_eq!(state(&previous), state(&engine));
         previous.close().unwrap();
         fs::write(dir.join(CURRENT), encode_current(third.generation)).unwrap();
 
-        let fourth = engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let fourth = engine.checkpoint_to(&dir).unwrap();
         assert_eq!(
             (
                 fourth.runs_written,
@@ -779,7 +806,7 @@ mod tests {
         }
         // Recovery preserves IDs and the persisted filter exactly, allowing a
         // metadata-only checkpoint without rehashing any keys or rewriting files.
-        let recovered = Engine::recover(&dir, options).unwrap();
+        let recovered = Engine::open(&dir, options).unwrap();
         assert!(
             recovered
                 .core
@@ -788,9 +815,7 @@ mod tests {
                 .iter()
                 .all(|r| r.run.filter_build_bytes() == 0)
         );
-        let fifth = recovered
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        let fifth = recovered.checkpoint_to(&dir).unwrap();
         assert_eq!(
             (fifth.runs_written, fifth.runs_reused, fifth.files_deleted),
             (0, 1, 0)
@@ -820,52 +845,57 @@ mod tests {
     }
 
     #[test]
-    fn metadata_commits_with_its_ceiling_and_empty_metadata_remains_supported() {
+    fn metadata_commits_with_its_checkpoint_and_carries_forward() {
         let dir = scratch("metadata");
-        let engine = Engine::new(manual()).unwrap();
-        engine.put(b"offset", b"value").unwrap();
+        let engine = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(engine.metadata(), None);
+        engine.ks().put(b"offset", b"value").unwrap();
         let metadata = b"kafka/partition-7=12345\0\xff";
-        let first = engine
-            .checkpoint_with_metadata(&dir, CheckpointOptions::default(), metadata)
-            .unwrap();
-        let (recovered, found) = Engine::recover_with_metadata(&dir, manual()).unwrap();
-        assert_eq!(found, metadata);
-        assert_eq!(recovered.stats().last_seq, first.last_seq);
-        assert_eq!(state(&recovered), state(&engine));
+        engine.checkpoint_with(metadata).unwrap();
+        assert_eq!(engine.metadata().as_deref(), Some(&metadata[..]));
+        let expected = state(&engine);
+        let ceiling = engine.engine_stats().last_seq;
+        engine.close().unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(recovered.metadata().as_deref(), Some(&metadata[..]));
+        assert_eq!(recovered.engine_stats().last_seq, ceiling);
+        assert_eq!(state(&recovered), expected);
+        // A plain checkpoint keeps the metadata; empty metadata is kept too.
+        recovered.ks().put(b"more", b"value").unwrap();
+        recovered.checkpoint().unwrap();
         recovered.close().unwrap();
-        let second = engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
-        assert_eq!((second.runs_written, second.runs_reused), (0, 1));
-        let (recovered, found) = Engine::recover_with_metadata(&dir, manual()).unwrap();
-        assert!(found.is_empty());
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(recovered.metadata().as_deref(), Some(&metadata[..]));
+        recovered.checkpoint_with(b"").unwrap();
+        let generation = manifest(&dir).generation;
+        let error = recovered
+            .checkpoint_with(&vec![0; MAX_METADATA_LEN + 1])
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(!error.checkpoint_committed());
+        assert_eq!(manifest(&dir).generation, generation);
+        assert_eq!(recovered.metadata().as_deref(), Some(&b""[..]));
         recovered.close().unwrap();
-        assert!(matches!(
-            engine.checkpoint_with_metadata(
-                &dir,
-                CheckpointOptions::default(),
-                &vec![0; MAX_METADATA_BYTES + 1]
-            ),
-            Err(CheckpointError::MetadataLimit)
-        ));
-        assert_eq!(manifest(&dir).generation, second.generation);
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(recovered.metadata().as_deref(), Some(&b""[..]));
+        recovered.close().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_paused_checkpoint_retains_its_ceiling_while_writes_ingestion_and_compaction_continue() {
         let dir = scratch("paused-image");
-        let engine = Arc::new(Engine::new(manual()).unwrap());
+        let engine = Arc::new(Engine::in_memory(manual()).unwrap());
         for i in 0..1_000u32 {
-            engine.put(&i.to_be_bytes(), b"original").unwrap();
+            engine.ks().put(&i.to_be_bytes(), b"original").unwrap();
         }
         engine.flush().unwrap();
         for i in 0..10u32 {
-            engine.delete(&i.to_be_bytes()).unwrap();
+            engine.ks().delete(&i.to_be_bytes()).unwrap();
         }
         let pin = engine.snapshot();
         let expected = state(&engine);
-        let ceiling = engine.stats().last_seq;
+        let ceiling = engine.engine_stats().last_seq;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let checkpoint_engine = Arc::clone(&engine);
@@ -877,19 +907,15 @@ mod tests {
                     resume_rx.recv().unwrap();
                 }))
             });
-            checkpoint_engine.checkpoint_with_metadata(
-                &checkpoint_dir,
-                CheckpointOptions::default(),
-                b"offset=1010",
-            )
+            checkpoint_engine.checkpoint_to_with(&checkpoint_dir, Some(b"offset=1010"))
         });
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        engine.put(b"after-ceiling", b"excluded").unwrap();
+        engine.ks().put(b"after-ceiling", b"excluded").unwrap();
         engine.flush().unwrap();
         let mut batch = super::super::WriteBatch::new();
-        batch.put(b"ingested-later", b"excluded");
+        batch.put(&engine.ks(), b"ingested-later", b"excluded");
         engine.ingest_sorted(&batch).unwrap();
         let before = engine
             .core
@@ -910,63 +936,63 @@ mod tests {
             before, after,
             "compaction published while the checkpoint was paused"
         );
-        assert!(engine.stats().retained_run_bytes > 0);
+        assert!(engine.engine_stats().retained_run_bytes > 0);
         resume_tx.send(()).unwrap();
         let report = checkpoint.join().unwrap().unwrap();
         assert_eq!(report.last_seq, ceiling);
-        let (recovered, metadata) = Engine::recover_with_metadata(&dir, manual()).unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
         assert_eq!(state(&recovered), expected);
-        assert_eq!(metadata, b"offset=1010");
-        let mut ws = EngineWorkspace::new();
-        let mut scan = pin.scan(&mut ws);
-        let mut pinned = Vec::new();
-        while let Some(record) = scan.next_record().unwrap() {
-            pinned.push((record.key.to_vec(), record.value.to_vec()));
-        }
-        assert_eq!(pinned, expected);
+        assert_eq!(recovered.metadata().as_deref(), Some(&b"offset=1010"[..]));
+        assert_eq!(snapshot_state(&pin, &engine.ks()), expected);
         recovered.close().unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Recovers `dir` without its lock, as another process holding a
+    /// copy of the directory would.
+    fn branch(dir: &Path) -> Engine {
+        let (core, _) = recover(dir, &manual()).unwrap().unwrap();
+        Engine::start(core, &manual(), None, None).unwrap()
     }
 
     #[test]
     fn independently_recovered_branches_never_reuse_ids_for_different_outputs() {
         let dir = scratch("recovery-branches");
-        let seed = Engine::new(manual()).unwrap();
-        seed.put(b"shared", b"base").unwrap();
-        seed.checkpoint(&dir, CheckpointOptions::default()).unwrap();
-        let left = Engine::recover(&dir, manual()).unwrap();
-        let right = Engine::recover(&dir, manual()).unwrap();
-        left.put(b"branch", b"left").unwrap();
-        right.put(b"branch", b"right").unwrap();
-        left.checkpoint(&dir, CheckpointOptions::default()).unwrap();
+        let seed = Engine::in_memory(manual()).unwrap();
+        seed.ks().put(b"shared", b"base").unwrap();
+        seed.checkpoint_to(&dir).unwrap();
+        let left = branch(&dir);
+        let right = branch(&dir);
+        left.ks().put(b"branch", b"left").unwrap();
+        right.ks().put(b"branch", b"right").unwrap();
+        left.checkpoint_to(&dir).unwrap();
         let left_manifest = manifest(&dir);
-        right
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        right.checkpoint_to(&dir).unwrap();
         let right_manifest = manifest(&dir);
         assert_eq!(left_manifest.runs[0].id, right_manifest.runs[0].id);
         assert_ne!(left_manifest.runs[1].id, right_manifest.runs[1].id);
-        let recovered = Engine::recover(&dir, manual()).unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
         assert_eq!(state(&recovered), state(&right));
         fs::remove_dir_all(dir).unwrap();
     }
+
     #[test]
     fn writes_during_the_checkpoint_flush_are_excluded_even_if_they_publish_first() {
         let dir = scratch("flush-ceiling");
         let engine = Arc::new(
-            Engine::new(EngineOptions {
+            Engine::in_memory(Options {
                 max_frozen_memtables: 1,
                 ..manual()
             })
             .unwrap(),
         );
-        engine.put(b"a", b"base").unwrap();
+        engine.ks().put(b"a", b"base").unwrap();
         // Leave a full frozen queue and a nonempty successor, as after an
         // abandoned flush. Checkpoint must drain the queue before rotation.
         drop(engine.core.begin_flush().unwrap());
-        engine.put(b"b", b"checkpointed").unwrap();
+        engine.ks().put(b"b", b"checkpointed").unwrap();
         let expected = state(&engine);
-        let ceiling = engine.stats().last_seq;
+        let ceiling = engine.engine_stats().last_seq;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let checkpoint_engine = Arc::clone(&engine);
@@ -978,26 +1004,26 @@ mod tests {
                     resume_rx.recv().unwrap();
                 }))
             });
-            checkpoint_engine.checkpoint(&checkpoint_dir, CheckpointOptions::default())
+            checkpoint_engine.checkpoint_to(&checkpoint_dir)
         });
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         assert_eq!(
-            engine.stats().frozen_tables,
+            engine.engine_stats().frozen_tables,
             1,
             "checkpoint respects the frozen-table limit"
         );
         // Both operations finish while checkpoint compression is paused. The
         // ingestion publishes first, yet its sequence is above the ceiling.
-        assert!(engine.put(b"z", b"later").unwrap() > ceiling);
+        assert!(engine.ks().put_seq(b"z", b"later").unwrap() > ceiling);
         let mut batch = super::super::WriteBatch::new();
-        batch.put(b"zz", b"published-before-checkpoint-flush");
+        batch.put(&engine.ks(), b"zz", b"published-before-checkpoint-flush");
         assert!(engine.ingest_sorted(&batch).unwrap() > ceiling);
         resume_tx.send(()).unwrap();
         let report = checkpoint.join().unwrap().unwrap();
         assert_eq!(report.last_seq, ceiling);
-        let recovered = Engine::recover(&dir, manual()).unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
         assert_eq!(state(&recovered), expected);
         recovered.close().unwrap();
         fs::remove_dir_all(dir).unwrap();

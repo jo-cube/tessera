@@ -136,6 +136,7 @@ impl Drop for BuildCharge<'_> {
     }
 }
 
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 #[derive(Default)]
 pub(super) struct Usage {
     pub used: usize,
@@ -328,11 +329,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn fixture(rounds: u8) -> Core {
-        let core = Core::new(&EngineOptions {
-            memtable_budget: 64 << 10,
+        let core = Core::new(&Options {
+            memtable_size: 64 << 10,
             target_run_len: 8 << 10,
             compression: Compression::Uncompressed,
-            ..EngineOptions::default()
+            ..Options::default()
         });
         for value in 0..rounds {
             core.put(b"key", &[value; 4096]).unwrap();
@@ -345,7 +346,7 @@ mod tests {
     fn start(mut core: Core, limit: usize) -> Engine {
         core.memory_limit = Some(limit);
         core.policy = CompactionPolicy::for_memory(Some(limit));
-        Engine::start(Arc::new(core), &EngineOptions::default()).unwrap()
+        Engine::start(core, &Options::default(), None, None).unwrap()
     }
 
     fn settle(core: &Core) {
@@ -377,15 +378,15 @@ mod tests {
 
     #[test]
     fn writes_below_the_limit_proceed_and_account_for_pool_padding() {
-        let engine = Engine::new(EngineOptions {
+        let engine = Engine::in_memory(Options {
             memory_limit: Some(16 << 20),
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
         for value in 0..100u32 {
-            engine.put(b"key", &value.to_be_bytes()).unwrap();
+            engine.ks().put(b"key", &value.to_be_bytes()).unwrap();
         }
-        let stats = engine.stats();
+        let stats = engine.engine_stats();
         assert!(stats.used < 16 << 20);
         assert!(stats.pool_unaccounted_bytes > stats.active.charged);
         assert_eq!(stats.memtable_bytes, stats.active.charged);
@@ -402,7 +403,7 @@ mod tests {
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
-            scope.spawn(move || tx.send(engine.put(b"new", b"value")).unwrap());
+            scope.spawn(move || tx.send(engine.ks().put(b"new", b"value")).unwrap());
             assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
         });
         drop(held);
@@ -431,10 +432,10 @@ mod tests {
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let engine = &engine;
-            scope.spawn(move || tx.send(engine.put(b"key", b"latest")).unwrap());
+            scope.spawn(move || tx.send(engine.ks().put_seq(b"key", b"latest")).unwrap());
             built_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
-            let stats = engine.stats();
+            let stats = engine.engine_stats();
             assert!(stats.used >= limit);
             assert!(stats.build_output_bytes > 0 && stats.build_workspace_bytes > 0);
             assert_formula(stats);
@@ -442,11 +443,7 @@ mod tests {
             resume_tx.send(()).unwrap();
             assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(4));
         });
-        let mut workspace = EngineWorkspace::new();
-        assert_eq!(
-            engine.get(b"key", &mut workspace).unwrap().unwrap().value,
-            b"latest"
-        );
+        assert_eq!(engine.ks().get(b"key").unwrap().unwrap(), b"latest");
     }
 
     #[test]
@@ -455,14 +452,16 @@ mod tests {
         settle(&core);
         let limit = core.stats().used;
         let engine = start(core, limit);
-        let before = engine.stats().last_seq;
+        let before = engine.engine_stats().last_seq;
         let began = Instant::now();
         assert!(
-            matches!(engine.put(b"new", b"value"), Err(UpdateError::MemoryLimit { used, limit: found }) if used >= limit && found == limit)
+            matches!(engine.ks().put_seq(b"new", b"value"), Err(UpdateError::MemoryLimit { used, limit: found }) if used >= limit && found == limit)
         );
+        let error = engine.ks().put(b"new", b"value").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MemoryLimit);
         assert!(began.elapsed() < Duration::from_secs(1));
-        assert_eq!(engine.stats().last_seq, before);
-        assert_eq!(engine.write(&WriteBatch::new()), Ok(before));
+        assert_eq!(engine.engine_stats().last_seq, before);
+        assert_eq!(engine.write_seq(&WriteBatch::new()), Ok(before));
     }
 
     #[test]
@@ -477,24 +476,17 @@ mod tests {
         assert_eq!(held.snapshot_bytes, held.retained_bytes);
         let limit = held.used - held.snapshot_bytes / 2;
         let engine = start(core, limit);
-        assert!(matches!(
-            engine.put(b"new", b"value"),
-            Err(UpdateError::MemoryLimit { .. })
-        ));
-        assert_formula(engine.stats());
-        assert_eq!(
-            snapshot
-                .get(b"key", &mut EngineWorkspace::new())
-                .unwrap()
-                .unwrap()
-                .value,
-            &[0; 4096]
-        );
+        let error = engine.ks().put(b"new", b"value").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MemoryLimit);
+        assert_formula(engine.engine_stats());
+        let mut logical = crate::run::LogicalWorkspace::default();
+        let found = snapshot.get(b"key", &mut logical).unwrap().unwrap();
+        assert_eq!(found.value, [0; 4096]);
         drop(snapshot);
-        let released = engine.stats();
+        let released = engine.engine_stats();
         assert_eq!(released.snapshot_bytes, 0);
         assert!(released.used < held.used);
-        assert_eq!(engine.put(b"new", b"value"), Ok(3));
+        assert_eq!(engine.ks().put_seq(b"new", b"value"), Ok(3));
     }
 
     #[test]
@@ -528,71 +520,76 @@ mod tests {
         assert_eq!(core.stats().runs, 1);
         let limit = core.stats().used;
         let engine = start(core, limit);
-        assert_eq!(engine.put(b"live", b"value"), Ok(2));
-        assert_eq!(engine.stats().runs, 0);
+        assert_eq!(engine.ks().put_seq(b"live", b"value"), Ok(2));
+        assert_eq!(engine.engine_stats().runs, 0);
     }
 
     #[test]
     fn remaining_options_validate_their_ranges() {
         let cases = [
             (
-                EngineOptions {
-                    memtable_budget: ENTRY_OVERHEAD - 1,
-                    ..EngineOptions::default()
+                Options {
+                    memtable_size: ENTRY_OVERHEAD - 1,
+                    ..Options::default()
                 },
-                "EngineOptions::memtable_budget",
+                "Options::memtable_size",
             ),
             (
-                EngineOptions {
-                    memtable_budget: usize::MAX,
-                    ..EngineOptions::default()
+                Options {
+                    memtable_size: usize::MAX,
+                    ..Options::default()
                 },
-                "EngineOptions::memtable_budget",
+                "Options::memtable_size",
             ),
             (
-                EngineOptions {
+                Options {
                     background_threads: 0,
-                    ..EngineOptions::default()
+                    ..Options::default()
                 },
-                "EngineOptions::background_threads",
+                "Options::background_threads",
             ),
             (
-                EngineOptions {
+                Options {
                     level_ratio: 1,
-                    ..EngineOptions::default()
+                    ..Options::default()
                 },
-                "EngineOptions::level_ratio",
+                "Options::level_ratio",
             ),
             (
-                EngineOptions {
-                    target_block_compressed: 0,
-                    ..EngineOptions::default()
+                Options {
+                    block_size: 0,
+                    ..Options::default()
                 },
-                "EngineOptions::target_block_compressed",
+                "Options::block_size",
             ),
             (
-                EngineOptions {
-                    target_block_compressed: RAW_BLOCK_CAP + 1,
-                    ..EngineOptions::default()
+                Options {
+                    block_size: RAW_BLOCK_CAP + 1,
+                    ..Options::default()
                 },
-                "EngineOptions::target_block_compressed",
+                "Options::block_size",
             ),
         ];
         for (options, setting) in cases {
-            assert!(
-                matches!(Engine::new(options), Err(OpenError::Config(error)) if error.setting == setting)
-            );
+            let error = Engine::in_memory(options).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Config, "{error}");
+            assert!(error.to_string().contains(setting), "{error}");
         }
-        assert_eq!(EngineOptions::default().memory_limit, None);
-        let engine = Engine::new(EngineOptions {
+        assert_eq!(Options::default().memory_limit, None);
+        let engine = Engine::in_memory(Options {
             memory_limit: Some(0),
-            ..EngineOptions::default()
+            ..Options::default()
         })
         .unwrap();
-        assert_eq!(engine.write(&WriteBatch::new()), Ok(0));
+        assert_eq!(engine.write_seq(&WriteBatch::new()), Ok(0));
+        let ks = engine.keyspace("limited").unwrap();
         assert_eq!(
-            engine.put(b"a", b"v"),
+            ks.put_seq(b"a", b"v"),
             Err(UpdateError::MemoryLimit { used: 0, limit: 0 })
+        );
+        assert_eq!(
+            ks.put(b"a", b"v").unwrap_err().kind(),
+            ErrorKind::MemoryLimit
         );
     }
 
@@ -600,29 +597,25 @@ mod tests {
     fn recovered_live_data_needs_no_speculative_rewrite_to_refuse_a_write() {
         let core = fixture(1);
         settle(&core);
-        let engine = Engine::start(Arc::new(core), &EngineOptions::default()).unwrap();
+        let engine = Engine::start(core, &Options::default(), None, None).unwrap();
         let directory = std::env::temp_dir().join(format!(
             "tessera-resources-live-recovery-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
-        engine
-            .checkpoint(&directory, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&directory).unwrap();
         engine.close().unwrap();
-        let recovered = Engine::recover(
+        let recovered = Engine::open(
             &directory,
-            EngineOptions {
+            Options {
                 memory_limit: Some(1),
-                ..EngineOptions::default()
+                ..Options::default()
             },
         )
         .unwrap();
         assert!(!recovered.core.read_state().runs[0].run.reclaimable());
-        assert!(matches!(
-            recovered.put(b"new", b"value"),
-            Err(UpdateError::MemoryLimit { .. })
-        ));
+        let error = recovered.ks().put(b"new", b"value").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MemoryLimit);
         assert_eq!(recovered.background_status().unwrap().compactions, 0);
         recovered.close().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
@@ -648,9 +641,9 @@ mod tests {
                     scope.spawn(move || {
                         barrier.wait();
                         for value in 0..80u32 {
-                            match engine.put(&writer.to_be_bytes(), &value.to_be_bytes()) {
-                                Ok(_) => {}
-                                Err(UpdateError::MemoryLimit { .. }) => {
+                            match engine.ks().put(&writer.to_be_bytes(), &value.to_be_bytes()) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == ErrorKind::MemoryLimit => {
                                     rejected.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(error) => panic!("{error}"),
@@ -662,33 +655,31 @@ mod tests {
                 scope.spawn(move || {
                     barrier.wait();
                     for _ in 0..8 {
-                        engine
-                            .checkpoint(directory, CheckpointOptions::default())
-                            .unwrap();
-                        let recovered =
-                            Engine::recover(directory, EngineOptions::default()).unwrap();
+                        engine.checkpoint_to(directory).unwrap();
+                        let recovered = Engine::open(directory, Options::default()).unwrap();
                         recovered.close().unwrap();
                     }
                 });
                 scope.spawn(|| {
                     barrier.wait();
-                    let mut workspace = EngineWorkspace::new();
+                    let ks = engine.ks();
                     for _ in 0..160 {
-                        engine.get(b"key", &mut workspace).unwrap();
+                        ks.get(b"key").unwrap();
                         let snapshot = engine.snapshot();
-                        let mut scan = snapshot.scan(&mut workspace);
+                        let mut reader = snapshot.reader();
+                        let mut scan = reader.range(&ks, ..);
                         let mut previous = None::<Vec<u8>>;
-                        while let Some(record) = scan.next_record().unwrap() {
+                        while let Some((key, _)) = scan.next().unwrap() {
                             if let Some(previous) = &previous {
-                                assert!(previous.as_slice() < record.key);
+                                assert!(previous.as_slice() < key);
                             }
-                            previous = Some(record.key.to_vec());
+                            previous = Some(key.to_vec());
                         }
                     }
                 });
                 barrier.wait();
             });
-            assert_formula(engine.stats());
+            assert_formula(engine.engine_stats());
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
             tx.send(()).unwrap();

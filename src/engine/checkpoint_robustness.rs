@@ -1,7 +1,7 @@
 //! Mutate real checkpoint files, then exercise both validation and recovery.
 use super::*;
 use crate::block::Value;
-use crate::engine::{CompactionPolicy, Compression, EngineWorkspace};
+use crate::engine::{CompactionPolicy, Compression, Engine, ErrorKind};
 use crate::run::ReadWorkspace;
 use crate::test_support::{Rng, Scratch, mutate};
 use std::collections::BTreeMap;
@@ -10,18 +10,20 @@ use std::time::Instant;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// Every record of the engine's keyspace, whatever its recovered name,
+/// checked against point reads.
 fn contents(engine: &Engine) -> Model {
+    let Some(name) = engine.keyspaces().pop() else {
+        return Model::new();
+    };
+    let ks = engine.keyspace(&name).unwrap();
     let snapshot = engine.snapshot();
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = snapshot.scan(&mut workspace);
+    let mut reader = snapshot.reader();
+    let mut scan = reader.range(&ks, ..);
     let mut records = Model::new();
-    while let Some(record) = scan.next_record().unwrap() {
+    while let Some((key, value)) = scan.next().unwrap() {
         assert!(records.len() < 128, "unbounded scan");
-        assert!(
-            records
-                .insert(record.key.to_vec(), record.value.to_vec())
-                .is_none()
-        );
+        assert!(records.insert(key.to_vec(), value.to_vec()).is_none());
     }
     drop(scan);
     for key in records
@@ -30,10 +32,7 @@ fn contents(engine: &Engine) -> Model {
         .chain((0..36u32).map(|key| key.to_be_bytes().to_vec()))
     {
         let expected = records.get(&key).map(Vec::as_slice);
-        assert_eq!(
-            snapshot.get(&key, &mut workspace).unwrap().map(|v| v.value),
-            expected
-        );
+        assert_eq!(reader.get(&ks, &key).unwrap(), expected);
     }
     records
 }
@@ -139,22 +138,22 @@ fn mutations(iterations: usize) {
     for compression in [Compression::Uncompressed, Compression::Zstd] {
         for filters in [true, false] {
             let scratch = Scratch::new("mutation");
-            let options = EngineOptions {
+            let options = Options {
                 compression,
                 // Each seeded round fits one table, so worker scheduling
                 // cannot change how tables are grouped into checkpoint runs.
-                memtable_budget: 64 << 10,
+                memtable_size: 64 << 10,
                 target_run_len: 2048,
                 background_compaction: None,
-                ..EngineOptions::default()
+                ..Options::default()
             };
-            let engine = Engine::new(options).unwrap();
+            let engine = Engine::in_memory(options).unwrap();
             for round in 0..3u8 {
                 for key in 0..32u32 {
                     if round == 2 && key % 5 == 0 {
-                        engine.delete(&key.to_be_bytes()).unwrap();
+                        engine.ks().delete(&key.to_be_bytes()).unwrap();
                     } else {
-                        engine.put(&key.to_be_bytes(), &[round; 96]).unwrap();
+                        engine.ks().put(&key.to_be_bytes(), &[round; 96]).unwrap();
                     }
                 }
                 engine.flush().unwrap();
@@ -172,9 +171,7 @@ fn mutations(iterations: usize) {
                 {}
             }
             let expected = contents(&engine);
-            engine
-                .checkpoint(&scratch.0, CheckpointOptions::default())
-                .unwrap();
+            engine.checkpoint_to(&scratch.0).unwrap();
             engine.close().unwrap();
             let (_, manifest_path, mut manifest) = committed_manifest(&scratch.0).unwrap();
             // Namespace randomness must not change mutated bytes or checksums.
@@ -272,8 +269,7 @@ fn mutations(iterations: usize) {
                     fs::write(&manifest_path, updated.encode()).unwrap();
                 }
                 fs::write(path, &mutated).unwrap();
-                let result =
-                    catch_unwind(AssertUnwindSafe(|| Engine::recover(&scratch.0, options)));
+                let result = catch_unwind(AssertUnwindSafe(|| Engine::open(&scratch.0, options)));
                 fs::write(path, original).unwrap();
                 fs::write(&manifest_path, &original_manifest).unwrap();
                 match result.expect("mutated recovery panicked") {
@@ -289,11 +285,11 @@ fn mutations(iterations: usize) {
                         accepted += 1;
                     }
                     Err(error) => {
-                        assert!(matches!(error, OpenError::Corrupt { .. }), "{error:?}");
+                        assert_eq!(error.kind(), ErrorKind::Corruption, "{error:?}");
                     }
                 }
             }
-            let recovered = Engine::recover(&scratch.0, options).unwrap();
+            let recovered = Engine::open(&scratch.0, options).unwrap();
             assert_eq!(contents(&recovered), expected);
             recovered.close().unwrap();
         }

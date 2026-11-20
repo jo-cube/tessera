@@ -9,8 +9,7 @@ use std::thread;
 use super::*;
 use crate::block::Value;
 use crate::engine::{
-    CheckpointOptions, CompactionPolicy, Engine, EngineOptions, EngineWorkspace, MergeWorkspace,
-    Published, deepest_overlap,
+    CompactionPolicy, Engine, MergeWorkspace, Options, Published, Snapshot, deepest_overlap,
 };
 use crate::run::{
     Codec, ConflictingCopies, LiveValue, LogicalCursor, LogicalWorkspace, ReadError, RunBuilder,
@@ -554,13 +553,13 @@ fn heavy_overlap_reads_like_the_flat_order() {
 
 // The engine.
 
-fn small() -> EngineOptions {
-    EngineOptions {
-        memtable_budget: 16 << 10,
+fn small() -> Options {
+    Options {
+        memtable_size: 16 << 10,
         target_run_len: 16 << 10,
 
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
@@ -578,12 +577,13 @@ fn assert_published(engine: &Engine) {
 /// runs they leave; a snapshot keeps the directory it was taken with.
 #[test]
 fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
-    let engine = Engine::new(small()).unwrap();
+    let engine = Engine::in_memory(small()).unwrap();
     let value = vec![7u8; 100];
     let mut merge = MergeWorkspace::new();
     for round in 0..6u64 {
         for index in 0..300 {
             engine
+                .ks()
                 .put(&key((index * 7 + round * 13) % 1000), &value)
                 .unwrap();
         }
@@ -591,17 +591,19 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
         assert_published(&engine);
     }
     let snapshot = engine.snapshot();
-    let pinned = Arc::clone(&snapshot.runs);
+    let pinned = Arc::clone(&snapshot.view.runs);
     assert!(Arc::ptr_eq(&pinned, &engine.core.read_state().directory));
-    let mut workspace = EngineWorkspace::new();
-    let before: Vec<Vec<u8>> = {
-        let mut scan = snapshot.scan(&mut workspace);
+    let ks = engine.ks();
+    let keys = |snapshot: &Snapshot| {
+        let mut reader = snapshot.reader();
+        let mut scan = reader.range(&ks, ..);
         let mut keys = Vec::new();
-        while let Some(record) = scan.next_record().unwrap() {
-            keys.push(record.key.to_vec());
+        while let Some((key, _)) = scan.next().unwrap() {
+            keys.push(key.to_vec());
         }
         keys
     };
+    let before = keys(&snapshot);
     loop {
         match engine.core.compact(CompactionPolicy::default(), &mut merge) {
             Ok(Some(_)) => assert_published(&engine),
@@ -609,39 +611,24 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
             Err(error) => panic!("{error:?}"),
         }
     }
-    engine.delete(&key(1)).unwrap();
+    engine.ks().delete(&key(1)).unwrap();
     engine.flush().unwrap();
     assert_published(&engine);
     assert!(!Arc::ptr_eq(&pinned, &engine.core.read_state().directory));
     // The snapshot still reads the runs it was taken with.
-    assert!(Arc::ptr_eq(&pinned, &snapshot.runs));
-    let mut scan = snapshot.scan(&mut workspace);
-    let mut after = Vec::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        after.push(record.key.to_vec());
-    }
-    assert_eq!(after, before);
-    drop(scan);
+    assert!(Arc::ptr_eq(&pinned, &snapshot.view.runs));
+    assert_eq!(keys(&snapshot), before);
     drop(snapshot);
     drop(pinned);
 
     let dir = std::env::temp_dir().join(format!("tessera-directory-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    engine
-        .checkpoint(&dir, CheckpointOptions::default())
-        .unwrap();
-    let recovered = Engine::recover(&dir, small()).unwrap();
+    engine.checkpoint_to(&dir).unwrap();
+    let recovered = Engine::open(&dir, small()).unwrap();
     assert_published(&recovered);
     for index in 0..1000 {
-        let want = engine
-            .get(&key(index), &mut workspace)
-            .unwrap()
-            .map(|found| found.value.to_vec());
-        let mut other = EngineWorkspace::new();
-        let found = recovered
-            .get(&key(index), &mut other)
-            .unwrap()
-            .map(|found| found.value.to_vec());
+        let want = engine.ks().get(&key(index)).unwrap();
+        let found = recovered.ks().get(&key(index)).unwrap();
         assert_eq!(found, want);
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -654,9 +641,9 @@ fn every_publication_rebuilds_the_directory_and_snapshots_keep_theirs() {
 #[test]
 fn readers_see_whole_directories_while_runs_are_published() {
     const KEYS: u64 = 400;
-    let engine = Arc::new(Engine::new(small()).unwrap());
+    let engine = Arc::new(Engine::in_memory(small()).unwrap());
     for index in 0..KEYS {
-        engine.put(&key(index), &0u64.to_le_bytes()).unwrap();
+        engine.ks().put(&key(index), &0u64.to_le_bytes()).unwrap();
     }
     engine.flush().unwrap();
     let start = Arc::new(Barrier::new(3));
@@ -665,23 +652,23 @@ fn readers_see_whole_directories_while_runs_are_published() {
             let engine = Arc::clone(&engine);
             let start = Arc::clone(&start);
             thread::spawn(move || {
-                let mut workspace = EngineWorkspace::new();
+                let ks = engine.ks();
+                let mut reader_handle = engine.reader();
                 let mut seen = vec![0u64; KEYS as usize];
                 start.wait();
                 for pass in 0..40 {
                     for index in (0..KEYS).filter(|index| (index + pass) % 5 == reader) {
-                        let found = engine.get(&key(index), &mut workspace).unwrap();
-                        let value = u64::from_le_bytes(found.unwrap().value.try_into().unwrap());
+                        let found = reader_handle.get(&ks, &key(index)).unwrap();
+                        let value = u64::from_le_bytes(found.unwrap().try_into().unwrap());
                         assert!(value >= seen[index as usize], "went back");
                         seen[index as usize] = value;
                     }
-                    let guard = engine.read();
-                    let mut scan = guard.scan_prefix(b"key/", &mut workspace);
+                    let mut scan = reader_handle.prefix(&ks, b"key/");
                     let mut count = 0;
                     let mut last: Option<Vec<u8>> = None;
-                    while let Some(record) = scan.next_record().unwrap() {
-                        assert!(last.as_deref() < Some(record.key));
-                        last = Some(record.key.to_vec());
+                    while let Some((key, _)) = scan.next().unwrap() {
+                        assert!(last.as_deref() < Some(key));
+                        last = Some(key.to_vec());
                         count += 1;
                     }
                     assert_eq!(count, KEYS);
@@ -693,7 +680,7 @@ fn readers_see_whole_directories_while_runs_are_published() {
     let mut merge = MergeWorkspace::new();
     for round in 1..=30u64 {
         for index in (0..KEYS).filter(|index| index % 3 == round % 3) {
-            engine.put(&key(index), &round.to_le_bytes()).unwrap();
+            engine.ks().put(&key(index), &round.to_le_bytes()).unwrap();
         }
         engine.flush().unwrap();
         if round % 4 == 0 {

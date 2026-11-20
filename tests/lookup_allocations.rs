@@ -1,9 +1,9 @@
-//! Point lookups allocate nothing on the Rust heap once their workspace is
+//! Point lookups allocate nothing on the Rust heap once their reader is
 //! warm, and a present key decodes exactly one block once runs are
 //! consolidated, with and without dictionaries.
 //!
 //! Zstandard's own allocations go through `malloc` and are not visible here:
-//! a lookup reuses the workspace's decompression context, and decoding with
+//! a lookup reuses the reader's decompression context, and decoding with
 //! loading raw-content dictionaries allocates nothing in Zstandard 1.5.
 //!
 //! The counting allocator sees every thread, so this binary holds one test,
@@ -12,11 +12,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tessera::engine::diagnostics::{self, MergeWorkspace};
-use tessera::engine::{Compression, Engine, EngineOptions, EngineWorkspace};
+use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics};
+use tessera::{Compression, Engine, Keyspace, Options, Reader};
 
-fn options() -> EngineOptions {
-    EngineOptions::default()
+fn options() -> Options {
+    Options::default()
 }
 
 struct Counting;
@@ -81,15 +81,16 @@ fn value(index: u32) -> Vec<u8> {
 
 /// An engine of overlapping flushed runs consolidated by compaction, and the
 /// resulting engine after compactions.
-fn consolidated(compression: Compression) -> Engine {
+fn consolidated(compression: Compression) -> (Engine, Keyspace) {
     let mut options = options();
-    options.target_block_compressed = 4 << 10;
+    options.block_size = 4 << 10;
     options.compression = compression;
-    let engine = Engine::new(options).unwrap();
+    let engine = Engine::in_memory(options).unwrap();
+    let ks = engine.keyspace("users").unwrap();
     // A fixed permutation, flushed in four parts whose key ranges overlap.
     for j in 0..RECORDS {
         let index = j.wrapping_mul(7_919) % RECORDS;
-        engine.put(&key(index), &value(index)).unwrap();
+        ks.put(&key(index), &value(index)).unwrap();
         if (j + 1) % (RECORDS / 4) == 0 {
             engine.flush().unwrap();
         }
@@ -97,63 +98,59 @@ fn consolidated(compression: Compression) -> Engine {
     let mut workspace = MergeWorkspace::new();
     while diagnostics::compact_step(&engine, &mut workspace).unwrap() {}
     engine.wait_for_compaction().unwrap();
-    engine
+    (engine, ks)
 }
 
 #[test]
 fn warm_lookups_allocate_nothing_and_decode_one_block() {
     for compression in [Compression::Zstd, Compression::Zstd] {
-        let engine = consolidated(compression);
-        assert_eq!(engine.stats().max_overlap, 1);
-        let lookups = |workspace: &mut EngineWorkspace, from: u32| {
+        let (engine, ks) = consolidated(compression);
+        assert_eq!(engine.engine_stats().max_overlap, 1);
+        let lookups = |reader: &mut Reader<'_>, from: u32| {
             for j in from..from + 4_000 {
                 let index = j.wrapping_mul(104_729) % RECORDS;
-                let found = engine.get(&key(index), workspace).unwrap();
-                assert_eq!(
-                    found.map(|found| found.value.len()),
-                    Some(value(index).len())
-                );
+                let found = reader.get(&ks, &key(index)).unwrap();
+                assert_eq!(found.map(<[u8]>::len), Some(value(index).len()));
             }
         };
-        let mut workspace = EngineWorkspace::new();
-        lookups(&mut workspace, 0);
+        let snapshot = engine.snapshot();
+        for latest in [true, false] {
+            let mut reader = if latest {
+                engine.reader()
+            } else {
+                snapshot.reader()
+            };
+            lookups(&mut reader, 0);
 
-        // `value` allocates for the check, so count only the lookups.
-        let (mut allocations, blocks_before) = (0, workspace.blocks_loaded());
-        for j in 4_000..8_000_u32 {
-            let index = j.wrapping_mul(104_729) % RECORDS;
-            let (expected, key) = (value(index).len(), key(index));
+            // `value` allocates for the check, so count only the lookups.
+            let (mut allocations, blocks_before) = (0, reader.counters().blocks_loaded);
+            for j in 4_000..8_000_u32 {
+                let index = j.wrapping_mul(104_729) % RECORDS;
+                let (expected, key) = (value(index).len(), key(index));
+                engine.wait_for_compaction().unwrap();
+                let before = ALLOCATIONS.load(Ordering::Relaxed);
+                let found = reader.get(&ks, &key).unwrap().map(<[u8]>::len);
+                allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
+                assert_eq!(found, Some(expected));
+            }
+            assert_eq!(allocations, 0, "{compression:?}, latest {latest}");
+            assert_eq!(
+                reader.counters().blocks_loaded - blocks_before,
+                4_000,
+                "{compression:?}, latest {latest}"
+            );
+            let keys: Vec<_> = (0..100).map(|i| key(i * 31)).collect();
+            for _ in 0..2 {
+                std::hint::black_box(&*reader.multi_get(&ks, &keys).unwrap());
+            }
             engine.wait_for_compaction().unwrap();
             let before = ALLOCATIONS.load(Ordering::Relaxed);
-            let found = engine.get(&key, &mut workspace).unwrap();
-            allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
-            assert_eq!(found.map(|found| found.value.len()), Some(expected));
+            std::hint::black_box(&*reader.multi_get(&ks, &keys).unwrap());
+            assert_eq!(
+                ALLOCATIONS.load(Ordering::Relaxed) - before,
+                0,
+                "warm multi-get, latest {latest}"
+            );
         }
-        assert_eq!(allocations, 0, "{compression:?}");
-        assert_eq!(
-            workspace.blocks_loaded() - blocks_before,
-            4_000,
-            "{compression:?}"
-        );
-        let keys: Vec<_> = (0..100).map(|i| key(i * 31)).collect();
-        for _ in 0..2 {
-            engine
-                .multi_get(&keys, &mut workspace, |_, value| {
-                    std::hint::black_box(value);
-                })
-                .unwrap();
-        }
-        engine.wait_for_compaction().unwrap();
-        let before = ALLOCATIONS.load(Ordering::Relaxed);
-        engine
-            .multi_get(&keys, &mut workspace, |_, value| {
-                std::hint::black_box(value);
-            })
-            .unwrap();
-        assert_eq!(
-            ALLOCATIONS.load(Ordering::Relaxed) - before,
-            0,
-            "warm multi-get"
-        );
     }
 }

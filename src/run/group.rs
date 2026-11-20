@@ -82,6 +82,18 @@ impl<'a> GroupCursor<'a> {
         self.cursor.seek(target)
     }
 
+    /// Positions at the first record at or above `target` and reads only
+    /// while keys are within `end`, as [`RunCursor::seek_range`] does.
+    pub(super) fn seek_range(
+        &mut self,
+        target: &[u8],
+        end: std::ops::Bound<&[u8]>,
+    ) -> Result<(), CorruptRun> {
+        self.enter(target);
+        self.closed = false;
+        self.cursor.seek_range(target, end)
+    }
+
     /// Positions at the first record whose key starts with `prefix` and reads
     /// only while keys do, as [`RunCursor::seek_prefix`] does.
     pub(super) fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
@@ -127,7 +139,7 @@ impl<'a> GroupCursor<'a> {
             return false;
         }
         let run = runs.run(next);
-        if !smallest_key(run).starts_with(self.cursor.prefix()) {
+        if !self.cursor.admits(smallest_key(run)) {
             return false;
         }
         self.current = next;

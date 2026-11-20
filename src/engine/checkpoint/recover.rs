@@ -2,33 +2,30 @@
 
 use super::*;
 
-impl Engine {
-    /// Recovers the checkpoint `CURRENT` names, without rewriting checkpoint
-    /// data and with no fallback. Sequences continue after its ceiling.
-    ///
-    /// # Errors
-    /// Returns [`OpenError`] for invalid options, missing or locked checkpoints,
-    /// I/O, validation failures or worker thread creation failures. A failed
-    /// recovery releases its directory lock and leaves no worker running.
-    pub fn recover(dir: &Path, options: EngineOptions) -> Result<Engine, OpenError> {
-        Self::recover_with_metadata(dir, options).map(|(engine, _)| engine)
-    }
+/// A recovered engine core and the checkpoint's metadata.
+pub(in crate::engine) type Recovered = (Core, Option<Vec<u8>>);
 
-    /// Recovers the engine and its opaque application metadata.
-    ///
-    /// # Errors
-    /// Returns the same [`OpenError`] variants as [`Self::recover`].
-    pub fn recover_with_metadata(
-        dir: &Path,
-        options: EngineOptions,
-    ) -> Result<(Engine, Vec<u8>), OpenError> {
-        options.validate().map_err(OpenError::Config)?;
-        let _lock = lock_existing(dir)?;
-        let mut loaded = load(dir)?;
-        let metadata = std::mem::take(&mut loaded.metadata);
-        let engine = Engine::start(Arc::new(loaded.into_core(&options)), &options)?;
-        Ok((engine, metadata))
+/// Recovers the checkpoint `CURRENT` names in `dir`, which the caller has
+/// locked, without rewriting checkpoint data and with no fallback; sequences
+/// continue after its ceiling. Returns `None` if `dir` has no `CURRENT`.
+pub(in crate::engine) fn recover(
+    dir: &Path,
+    options: &Options,
+) -> Result<Option<Recovered>, OpenError> {
+    let current = dir.join(CURRENT);
+    match fs::metadata(&current) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(OpenError::Io {
+                path: current,
+                error,
+            });
+        }
     }
+    let mut loaded = load(dir)?;
+    let metadata = loaded.catalog.metadata.take();
+    Ok(Some((loaded.into_core(options), metadata)))
 }
 
 fn read_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
@@ -44,32 +41,10 @@ fn read_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
     }
 }
 
-/// Locks `dir` for a recovery, which needs `CURRENT`: checked first, since
-/// locking would create `LOCK`.
-pub(super) fn lock_existing(dir: &Path) -> Result<File, OpenError> {
-    let current = dir.join(CURRENT);
-    match fs::metadata(&current) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(OpenError::NoCheckpoint(dir.to_owned()));
-        }
-        Err(error) => {
-            return Err(OpenError::Io {
-                path: current,
-                error,
-            });
-        }
-    }
-    match lock(dir).map_err(read_error(dir))? {
-        Ok(file) => Ok(file),
-        Err(()) => Err(OpenError::Locked(dir.to_owned())),
-    }
-}
-
 /// A committed checkpoint, checked in full before starting any worker.
 pub(super) struct Loaded {
     pub(super) ceiling: u64,
-    metadata: Vec<u8>,
+    catalog: Catalog,
     next_run_id: u64,
     depth: usize,
     runs: Vec<(usize, u64, SharedRun)>,
@@ -79,7 +54,7 @@ pub(super) struct Loaded {
 }
 
 impl Loaded {
-    pub(super) fn into_core(self, options: &EngineOptions) -> Core {
+    pub(super) fn into_core(self, options: &Options) -> Core {
         {
             let mut ids = RUN_IDS.lock().unwrap_or_else(PoisonError::into_inner);
             ids.1 = ids.1.max(self.next_run_id);
@@ -88,8 +63,15 @@ impl Loaded {
         {
             let mut state = core.write_state();
             state.last_seq = self.ceiling;
+            if let Some(name) = self.catalog.keyspace {
+                state.keyspace = Some(Entry {
+                    id: 0,
+                    name: Arc::from(name),
+                });
+                state.next_keyspace = 1;
+            }
             state.active = crate::memtable::Memtable::in_pool(
-                options.memtable_budget,
+                options.memtable_size,
                 Some(self.ceiling),
                 &core.chunks,
             );
@@ -203,6 +185,11 @@ pub(super) fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manife
 /// Reads and checks exactly CURRENT's generation under LOCK.
 pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
     let (_, manifest_path, manifest) = committed_manifest(dir)?;
+    let catalog =
+        decode_catalog(&manifest.metadata).map_err(|damage| corrupt(&manifest_path, damage))?;
+    if catalog.keyspace.is_none() && !manifest.runs.is_empty() {
+        return Err(corrupt(&manifest_path, Damage::Catalog));
+    }
     let pool = ChunkPool::new(RESERVE_BYTES);
     let mut runs: Vec<(usize, u64, SharedRun)> = Vec::with_capacity(manifest.runs.len());
     let mut records = 0u64;
@@ -326,7 +313,7 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         .sum();
     Ok(Loaded {
         ceiling: manifest.last_seq,
-        metadata: manifest.metadata,
+        catalog,
         next_run_id: manifest.next_run_id,
         depth: manifest.depth,
         pool,

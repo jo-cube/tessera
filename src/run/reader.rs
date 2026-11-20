@@ -3,7 +3,7 @@
 //! frames and lend values through caller-owned reusable workspaces.
 
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::sync::{Arc, Weak};
 
 use crate::block::{
@@ -503,12 +503,14 @@ impl<B: AsRef<[u8]>> Run<B> {
         Arc::downgrade(&self.backing) as Weak<dyn Send + Sync>
     }
 
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn chunk_capacity(&self) -> usize {
         self.backing.data.chunk_capacity()
     }
     pub(crate) fn frame_bytes(&self) -> usize {
         self.view().frame_bytes()
     }
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn index_bytes(&self) -> usize {
         let view = self.view();
         view.index_len() + size_of_val(&*self.backing.restart_heads)
@@ -640,6 +642,9 @@ pub struct ReadWorkspace {
     decompressor: Decompressor,
     position: BlockPosition,
     prefix: Vec<u8>,
+    /// The key a cursor's range ends at, and whether that key is included.
+    end: Vec<u8>,
+    end_bound: EndBound,
     blocks_loaded: u64,
     decoded_bytes: u64,
 }
@@ -659,6 +664,7 @@ impl ReadWorkspace {
     /// Returns the bytes held by a decompression context, which Zstandard
     /// allocates outside the Rust heap. It is zero until a Zstandard frame has
     /// been read.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn context_bytes(&self) -> usize {
         self.decompressor.context_bytes()
     }
@@ -667,11 +673,13 @@ impl ReadWorkspace {
     /// of which is a decompression for a compressed run.
     ///
     /// A lookup or a seek that needs no block does not count.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn blocks_loaded(&self) -> u64 {
         self.blocks_loaded
     }
 
     /// Raw bytes in blocks loaded through this workspace.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
     }
@@ -682,6 +690,40 @@ impl ReadWorkspace {
         self.blocks_loaded += 1;
         self.decoded_bytes += frame.decoded_len as u64;
         decode(frame, &mut self.scratch, &mut self.decompressor)
+    }
+}
+
+/// Where a cursor's range ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EndBound {
+    #[default]
+    Unbounded,
+    /// Below the end key.
+    Below,
+    /// Up to and including the end key.
+    Through,
+}
+
+/// Whether `key` starts with `prefix` and is within the end bound.
+fn admits(prefix: &[u8], end: &[u8], bound: EndBound, key: &[u8]) -> bool {
+    key.starts_with(prefix)
+        && match bound {
+            EndBound::Unbounded => true,
+            EndBound::Below => key < end,
+            EndBound::Through => key <= end,
+        }
+}
+
+impl ReadWorkspace {
+    /// Whether `key` has the cursor's prefix and is within its end.
+    fn admits(&self, key: &[u8]) -> bool {
+        admits(&self.prefix, &self.end, self.end_bound, key)
+    }
+
+    fn clear_bounds(&mut self) {
+        self.prefix.clear();
+        self.end.clear();
+        self.end_bound = EndBound::Unbounded;
     }
 }
 
@@ -778,15 +820,18 @@ impl LookupWorkspace {
 
     /// Returns the bytes held by the decompression context, outside the Rust
     /// heap.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn context_bytes(&self) -> usize {
         self.decompressor.context_bytes()
     }
 
     /// Returns how many blocks lookups through this workspace have loaded.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn blocks_loaded(&self) -> u64 {
         self.blocks_loaded
     }
 
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
     }
@@ -890,7 +935,40 @@ impl<'a> RunCursor<'a> {
     /// fails, subsequent reads report the same error until a
     /// later seek succeeds.
     pub fn seek(&mut self, target: &[u8]) -> Result<(), CorruptRun> {
-        self.workspace.prefix.clear();
+        self.workspace.clear_bounds();
+        self.reposition(target)
+    }
+
+    /// Moves before the first record whose user key is at or above
+    /// `target`, as [`seek`](Self::seek) does, and iterates only while keys
+    /// are within `end`. An end key longer than [`MAX_KEY_LEN`] is cut to
+    /// that length and included, which admits the same keys.
+    ///
+    /// A run whose first key is past `end` decodes nothing.
+    pub fn seek_range(&mut self, target: &[u8], end: Bound<&[u8]>) -> Result<(), CorruptRun> {
+        let workspace = &mut *self.workspace;
+        workspace.clear_bounds();
+        match end {
+            Bound::Unbounded => {}
+            Bound::Included(key) | Bound::Excluded(key) if key.len() > MAX_KEY_LEN => {
+                workspace.end.extend_from_slice(&key[..MAX_KEY_LEN]);
+                workspace.end_bound = EndBound::Through;
+            }
+            Bound::Included(key) => {
+                workspace.end.extend_from_slice(key);
+                workspace.end_bound = EndBound::Through;
+            }
+            Bound::Excluded(key) => {
+                workspace.end.extend_from_slice(key);
+                workspace.end_bound = EndBound::Below;
+            }
+        }
+        let first = self.view.slice.map_or(self.view.min_key, |range| range.min);
+        if !self.view.table.is_empty() && !self.workspace.admits(first) {
+            self.failure = None;
+            self.finish();
+            return Ok(());
+        }
         self.reposition(target)
     }
 
@@ -906,7 +984,7 @@ impl<'a> RunCursor<'a> {
     /// A run whose keys all sort below or above the prefix's interval decodes
     /// nothing, so damage in that run is not noticed by this scan.
     pub fn seek_prefix(&mut self, prefix: &[u8]) -> Result<(), CorruptRun> {
-        self.workspace.prefix.clear();
+        self.workspace.clear_bounds();
         if prefix.len() > MAX_KEY_LEN || self.view.min_above_prefix(prefix) {
             // No key in this run can match. An oversized prefix is refused
             // here so the buffer stays bounded.
@@ -982,6 +1060,11 @@ impl<'a> RunCursor<'a> {
         &self.workspace.prefix
     }
 
+    /// Whether `key` is within the cursor's prefix and end.
+    pub(super) fn admits(&self, key: &[u8]) -> bool {
+        self.workspace.admits(key)
+    }
+
     /// Moves past the last record of the run.
     fn finish(&mut self) {
         self.head = None;
@@ -1034,8 +1117,12 @@ impl<'a> RunCursor<'a> {
                 Value::Tombstone => None,
             },
         };
-        if record.key.starts_with(&workspace.prefix)
-            && self.view.slice.is_none_or(|range| record.key <= range.max)
+        if admits(
+            &workspace.prefix,
+            &workspace.end,
+            workspace.end_bound,
+            record.key,
+        ) && self.view.slice.is_none_or(|range| record.key <= range.max)
         {
             self.head = Some(head);
         } else {
@@ -1414,6 +1501,7 @@ impl<'a> RunView<'a> {
     }
 
     /// Returns the bytes used by the table and key area.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub fn index_len(self) -> usize {
         size_of_val(self.table) + self.keys.len()
     }
@@ -1589,7 +1677,7 @@ impl<'a> RunView<'a> {
         'a: 'r,
     {
         workspace.position.reset();
-        workspace.prefix.clear();
+        workspace.clear_bounds();
         RunCursor {
             view: self,
             workspace,

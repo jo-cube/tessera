@@ -157,6 +157,8 @@ struct Image {
     runs: Vec<(usize, u64, SharedRun)>,
     ceiling: u64,
     depth: usize,
+    /// The live keyspace's name at the ceiling.
+    keyspace: Option<Arc<str>>,
     _live: Arc<()>,
 }
 
@@ -185,6 +187,7 @@ impl Core {
                 runs: state.levels.checkpoint_runs(),
                 ceiling: state.last_seq,
                 depth: state.levels.depth(),
+                keyspace: state.keyspace.as_ref().map(|entry| Arc::clone(&entry.name)),
                 _live: Arc::clone(&self.snapshots),
             };
             let flush = state.levels.next_flush();
@@ -248,8 +251,7 @@ fn write_runs(
     dir: &Path,
     generation: u64,
     previous: u64,
-    options: CheckpointOptions,
-    metadata: &[u8],
+    metadata: Option<&[u8]>,
 ) -> Result<Written, Failure> {
     let runs_dir = dir.join(RUNS);
     fs::create_dir_all(&runs_dir).map_err(io_error(&runs_dir))?;
@@ -277,7 +279,7 @@ fn write_runs(
                 .unwrap(),
             previous,
             depth: image.depth,
-            metadata: metadata.to_vec(),
+            metadata: encode_catalog(image.keyspace.as_deref(), metadata),
             runs: Vec::with_capacity(image.runs.len()),
         },
         bytes: 0,
@@ -317,13 +319,6 @@ fn write_runs(
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(io_error(&file)(e).into()),
         };
-        if !exists && written.bytes.saturating_add(len) > options.max_bytes {
-            return Err(CheckpointError::DiskLimit {
-                bytes: written.bytes.saturating_add(len),
-                max_bytes: options.max_bytes,
-            }
-            .into());
-        }
         let sum = if exists {
             written.bytes_reused += len;
             written.runs_reused += 1;
@@ -385,13 +380,6 @@ fn write_runs(
     sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
     let manifest = written.manifest.encode();
     let total = written.bytes.saturating_add(manifest.len() as u64);
-    if total > options.max_bytes {
-        return Err(CheckpointError::DiskLimit {
-            bytes: total,
-            max_bytes: options.max_bytes,
-        }
-        .into());
-    }
     let path = checkpoint_dir(dir, generation);
     let file = path.join(MANIFEST);
     write_synced(&file, &manifest)?;
@@ -402,60 +390,17 @@ fn write_runs(
     Ok(written)
 }
 
-impl Engine {
-    /// Flushes and commits the state at one sequence ceiling. Existing run
-    /// files are reused; file I/O holds no state lock. Keeps one previous
-    /// generation. See [Checkpoints](crate::engine#checkpoints).
-    ///
-    /// # Errors
-    /// Returns [`CheckpointError`] for locking, disk-budget or I/O failures.
-    /// Its I/O variant identifies errors after the commit point.
-    ///
-    /// # Panics
-    /// Panics if the state lock is poisoned or a synchronous flush build panics.
-    pub fn checkpoint(
+impl Core {
+    /// Flushes and commits the state at one sequence ceiling into `dir`,
+    /// with `metadata` if any. Existing run files are reused; file I/O
+    /// holds no state lock. Keeps one previous generation. The caller holds
+    /// `dir`'s lock and the checkpoint serializer.
+    pub(in crate::engine) fn checkpoint_into(
         &self,
         dir: &Path,
-        options: CheckpointOptions,
+        metadata: Option<&[u8]>,
     ) -> Result<CheckpointReport, CheckpointError> {
-        self.checkpoint_with_metadata(dir, options, &[])
-    }
-
-    /// Like checkpoint, with an opaque application blob (at most 16 MiB).
-    /// Recover it with [`Self::recover_with_metadata`].
-    ///
-    /// # Errors
-    /// Returns [`CheckpointError::MetadataLimit`] for oversized metadata and
-    /// the same locking, disk-budget and I/O errors as [`Self::checkpoint`].
-    ///
-    /// # Panics
-    /// Panics under the same conditions as [`Self::checkpoint`].
-    pub fn checkpoint_with_metadata(
-        &self,
-        dir: &Path,
-        options: CheckpointOptions,
-        metadata: &[u8],
-    ) -> Result<CheckpointReport, CheckpointError> {
-        let _serial = self
-            .core
-            .checkpointing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        fs::create_dir_all(dir).map_err(io_error(dir))?;
-        let _lock = match lock(dir).map_err(io_error(dir))? {
-            Ok(file) => file,
-            Err(()) => return Err(CheckpointError::Locked(dir.to_owned())),
-        };
-        self.publish_metadata(dir, options, metadata)
-    }
-
-    fn publish_metadata(
-        &self,
-        dir: &Path,
-        options: CheckpointOptions,
-        metadata: &[u8],
-    ) -> Result<CheckpointReport, CheckpointError> {
-        if metadata.len() > MAX_METADATA_BYTES {
+        if metadata.is_some_and(|metadata| metadata.len() > MAX_METADATA_LEN) {
             return Err(CheckpointError::MetadataLimit);
         }
         let previous = match committed_manifest(dir) {
@@ -479,7 +424,6 @@ impl Engine {
         let path = checkpoint_dir(dir, generation);
         fs::create_dir(&path).map_err(io_error(&path))?;
         let built = self
-            .core
             .checkpoint_image()
             .map_err(Failure::Error)
             .and_then(|image| {
@@ -494,7 +438,6 @@ impl Engine {
                     dir,
                     generation,
                     previous.as_ref().map_or(0, |m| m.generation),
-                    options,
                     metadata,
                 )
             });

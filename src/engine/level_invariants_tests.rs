@@ -15,12 +15,12 @@ use super::*;
 
 const TARGET: usize = 4 << 10;
 
-fn options() -> EngineOptions {
-    EngineOptions {
-        memtable_budget: 16 << 10,
+fn options() -> Options {
+    Options {
+        memtable_size: 16 << 10,
         target_run_len: TARGET,
         background_compaction: None,
-        ..EngineOptions::default()
+        ..Options::default()
     }
 }
 
@@ -85,20 +85,15 @@ fn level_ids(engine: &Engine) -> Vec<Vec<usize>> {
 }
 
 fn get(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
-    engine
-        .get(key, &mut EngineWorkspace::new())
-        .unwrap()
-        .map(|live| live.value.to_vec())
+    engine.ks().get(key).unwrap()
 }
 
 fn scan(snapshot: &Snapshot) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let mut workspace = EngineWorkspace::new();
-    let mut scan = snapshot.scan(&mut workspace);
-    let mut out = BTreeMap::new();
-    while let Some(record) = scan.next_record().unwrap() {
-        out.insert(record.key.to_vec(), record.value.to_vec());
-    }
-    out
+    snapshot
+        .records(b"")
+        .into_iter()
+        .map(|(key, _, value)| (key, value))
+        .collect()
 }
 
 /// Random puts and deletes, flushed and compacted step by step: every read
@@ -106,7 +101,7 @@ fn scan(snapshot: &Snapshot) -> BTreeMap<Vec<u8>, Vec<u8>> {
 /// what they saw across compactions, and each kind of step happens.
 #[test]
 fn reads_match_a_model_through_leveled_compaction() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut rng = Rng(5);
     let mut steps = Steps::default();
@@ -115,11 +110,11 @@ fn reads_match_a_model_through_leveled_compaction() {
         for write in 0..300 {
             let key = key(rng.below(3_000));
             if rng.below(4) == 0 {
-                engine.delete(&key).unwrap();
+                engine.ks().delete(&key).unwrap();
                 model.remove(&key);
             } else {
                 let value = value(round * 1_000 + write);
-                engine.put(&key, &value).unwrap();
+                engine.ks().put(&key, &value).unwrap();
                 model.insert(key, value);
             }
         }
@@ -142,26 +137,26 @@ fn reads_match_a_model_through_leveled_compaction() {
     for (snapshot, seen) in &snapshots {
         assert_eq!(&scan(snapshot), seen, "a snapshot keeps what it saw");
     }
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     assert!(stats.levels >= 2, "{stats:?}");
     for kind in ["Merge", "Move"] {
         assert!(steps.kinds.contains_key(kind), "{steps:?}");
     }
     assert!(stats.level0_flushes <= 4, "{stats:?}");
     drop((now, snapshots));
-    crate::test_support::wait_until(|| engine.stats().retained_run_bytes == 0);
-    assert_eq!(engine.stats().retained_run_bytes, 0);
+    crate::test_support::wait_until(|| engine.engine_stats().retained_run_bytes == 0);
+    assert_eq!(engine.engine_stats().retained_run_bytes, 0);
 }
 
 /// A merge replaces only its inputs: every other run stays the same shared
 /// run in the same level, and a move keeps the run itself.
 #[test]
 fn a_merge_replaces_only_its_range_and_a_move_keeps_its_run() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let mut workspace = MergeWorkspace::new();
     // Ascending loads overlap nothing: every flush moves down unchanged.
     for index in 0..6_000 {
-        engine.put(&key(index), &value(index)).unwrap();
+        engine.ks().put(&key(index), &value(index)).unwrap();
         if index % 500 == 499 {
             engine.flush().unwrap();
             loop {
@@ -181,15 +176,15 @@ fn a_merge_replaces_only_its_range_and_a_move_keeps_its_run() {
             }
         }
     }
-    let runs = engine.stats().runs;
+    let runs = engine.engine_stats().runs;
     assert!(runs > 64, "{runs} runs, expected a multi-level fixture");
-    assert!(engine.stats().levels >= 2);
+    assert!(engine.engine_stats().levels >= 2);
 
     // A database of one level: overwrite a narrow range and compact level
     // 0 at once. Only the runs that range meets are replaced.
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     for index in 0..400 {
-        engine.put(&key(index), &value(index)).unwrap();
+        engine.ks().put(&key(index), &value(index)).unwrap();
         if index % 100 == 99 {
             engine.flush().unwrap();
         }
@@ -205,7 +200,7 @@ fn a_merge_replaces_only_its_range_and_a_move_keeps_its_run() {
     assert_eq!(before.len(), 2);
     assert!(before[1].len() > 8, "{before:?}");
     for index in 200..210 {
-        engine.put(&key(index), b"updated").unwrap();
+        engine.ks().put(&key(index), b"updated").unwrap();
     }
     engine.flush().unwrap();
     let mut workspace = MergeWorkspace::new();
@@ -235,17 +230,15 @@ fn recovery_preserves_run_ids_and_levels() {
     let mut model = BTreeMap::new();
     let expected;
     {
-        let engine = Engine::new(options()).unwrap();
+        let engine = Engine::in_memory(options()).unwrap();
         for index in 0..8_000u64 {
             let key = key(index * 7 % 8_000);
-            engine.put(&key, &value(index)).unwrap();
+            engine.ks().put(&key, &value(index)).unwrap();
             model.insert(key, value(index));
         }
         let mut steps = Steps::default();
         settle(&engine, &mut steps);
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         expected = engine
             .core
             .read_state()
@@ -256,10 +249,10 @@ fn recovery_preserves_run_ids_and_levels() {
             .collect::<Vec<_>>();
         engine.close().unwrap();
     }
-    let engine = Engine::recover(&dir, options()).unwrap();
+    let engine = Engine::open(&dir, options()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     level_ids(&engine);
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     let actual: Vec<Vec<_>> = engine
         .core
         .read_state()
@@ -282,7 +275,7 @@ fn recovery_preserves_run_ids_and_levels() {
     let mut rng = Rng(3);
     for write in 0..4_000 {
         let key = key(rng.below(8_000));
-        engine.put(&key, &value(write + 100_000)).unwrap();
+        engine.ks().put(&key, &value(write + 100_000)).unwrap();
         model.insert(key, value(write + 100_000));
     }
     engine.flush().unwrap();
@@ -299,7 +292,7 @@ fn recovery_preserves_run_ids_and_levels() {
 fn flushes_after_recovery_split_at_the_recovered_runs() {
     // Keep the fixture in level 1 so its recovered boundaries split flushes.
     let original_options = options();
-    let options = || EngineOptions {
+    let options = || Options {
         level_ratio: 1000,
         ..original_options
     };
@@ -307,16 +300,14 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut model = BTreeMap::new();
     {
-        let engine = Engine::new(options()).unwrap();
+        let engine = Engine::in_memory(options()).unwrap();
         for index in 0..6_000u64 {
             let key = key(index * 7 % 6_000);
-            engine.put(&key, &value(index)).unwrap();
+            engine.ks().put(&key, &value(index)).unwrap();
             model.insert(key, value(index));
         }
         settle(&engine, &mut Steps::default());
-        engine
-            .checkpoint(&dir, CheckpointOptions::default())
-            .unwrap();
+        engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
     }
     let checkpointed = model.clone();
@@ -325,32 +316,35 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
         for write in 0..1_500u64 {
             let key = key(rng.below(6_000));
             if write % 5 == 0 {
-                engine.delete(&key).unwrap();
+                engine.ks().delete(&key).unwrap();
                 model.remove(&key);
             } else {
-                engine.put(&key, &value(write + 50_000)).unwrap();
+                engine.ks().put(&key, &value(write + 50_000)).unwrap();
                 model.insert(key, value(write + 50_000));
             }
         }
         engine.flush().unwrap();
-        engine.stats().level0_runs
+        engine.engine_stats().level0_runs
     };
-    let whole = Engine::recover(&dir, options()).unwrap();
+    let whole = Engine::open(&dir, options()).unwrap();
     whole.set_split_flushes(false);
     let unsplit = writes(&whole, &mut model.clone());
     drop(whole);
-    let engine = Engine::recover(&dir, options()).unwrap();
-    let recovered = engine.stats().runs;
-    let existing_level0 = engine.stats().level0_runs;
+    let engine = Engine::open(&dir, options()).unwrap();
+    let recovered = engine.engine_stats().runs;
+    let existing_level0 = engine.engine_stats().level0_runs;
     let before = engine.snapshot();
     let level0 = writes(&engine, &mut model);
     assert!(
         level0 > unsplit,
         "the flushes were cut at recovered boundaries: {level0} level-0 runs, {unsplit} unsplit"
     );
-    assert_eq!(engine.stats().levels, 1, "nothing has compacted yet");
+    assert_eq!(engine.engine_stats().levels, 1, "nothing has compacted yet");
     assert_eq!(scan(&engine.snapshot()), model);
-    assert_eq!(engine.stats().runs, recovered + level0 - existing_level0);
+    assert_eq!(
+        engine.engine_stats().runs,
+        recovered + level0 - existing_level0
+    );
     settle(&engine, &mut Steps::default());
     level_ids(&engine);
     assert_eq!(scan(&engine.snapshot()), model);
@@ -359,11 +353,9 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
 
     let again = dir.with_extension("again");
     let _ = std::fs::remove_dir_all(&again);
-    engine
-        .checkpoint(&again, CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&again).unwrap();
     engine.close().unwrap();
-    let engine = Engine::recover(&again, options()).unwrap();
+    let engine = Engine::open(&again, options()).unwrap();
     assert_eq!(scan(&engine.snapshot()), model);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&again);
@@ -373,10 +365,10 @@ fn flushes_after_recovery_split_at_the_recovered_runs() {
 /// runs, which are merged in pairs until no two neighbours are both small.
 #[test]
 fn small_neighbours_merge() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let mut steps = Steps::default();
     for index in 0..3_000u64 {
-        engine.put(&key(index), &value(index)).unwrap();
+        engine.ks().put(&key(index), &value(index)).unwrap();
         if index % 3 == 2 {
             engine.flush().unwrap();
             settle(&engine, &mut steps);
@@ -386,7 +378,7 @@ fn small_neighbours_merge() {
         steps.kinds.get("Neighbours").copied().unwrap_or(0) > 100,
         "{steps:?}"
     );
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     // 1,000 tiny flushes of about 400 logical bytes; segments of about
     // 4 KiB logical. Pairs of small neighbours merge until one is at least
     // half a segment, so at most about four runs per segment remain.
@@ -400,17 +392,17 @@ fn small_neighbours_merge() {
 /// stays bounded by level-0 flushes and disjoint deeper levels.
 #[test]
 fn growing_data_spans_many_runs_with_bounded_read_overlap() {
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         background_compaction: Some(compaction()),
         ..options()
     })
     .unwrap();
     for index in 0..20_000u64 {
         let key = key(index * 104_729 % 20_000);
-        engine.put(&key, &value(index)).unwrap();
+        engine.ks().put(&key, &value(index)).unwrap();
     }
     engine.wait_for_compaction().unwrap();
-    let stats = engine.stats();
+    let stats = engine.engine_stats();
     assert!(stats.runs > 64, "{stats:?}");
     assert!(stats.levels >= 2, "{stats:?}");
     // A lookup visits a run per level-0 flush and one per level.
@@ -432,7 +424,7 @@ fn growing_data_spans_many_runs_with_bounded_read_overlap() {
 #[test]
 fn flushes_split_at_level_1_boundaries_and_stay_bounded() {
     let engines = [true, false].map(|split| {
-        let engine = Engine::new(options()).unwrap();
+        let engine = Engine::in_memory(options()).unwrap();
         engine.set_split_flushes(split);
         engine
     });
@@ -446,14 +438,14 @@ fn flushes_split_at_level_1_boundaries_and_stay_bounded() {
             let key = key(rng.below(4_000));
             let value = value(round * 1_000 + write);
             for engine in &engines {
-                engine.put(&key, &value).unwrap();
+                engine.ks().put(&key, &value).unwrap();
             }
             model.insert(key, value);
         }
         let flushed = engines
             .each_ref()
             .map(|engine| engine.flush().unwrap().runs);
-        assert_eq!(engines[0].stats().flushes, round + 1);
+        assert_eq!(engines[0].engine_stats().flushes, round + 1);
         assert!(flushed[0] <= 8 * flushed[1], "{flushed:?}");
         for (at, engine) in engines.iter().enumerate() {
             runs[at] += flushed[at];
@@ -473,7 +465,7 @@ fn flushes_split_at_level_1_boundaries_and_stay_bounded() {
 /// right, and the next compactions take the pieces as any level-0 runs.
 #[test]
 fn a_flush_split_at_stale_boundaries_publishes_correctly() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let mut model = BTreeMap::new();
     let eager = CompactionPolicy {
         max_overlap: 1,
@@ -481,7 +473,7 @@ fn a_flush_split_at_stale_boundaries_publishes_correctly() {
     };
     let mut steps = Steps::default();
     let mut put = |engine: &Engine, index: u64, seed: u64| {
-        engine.put(&key(index), &value(seed)).unwrap();
+        engine.ks().put(&key(index), &value(seed)).unwrap();
         model.insert(key(index), value(seed));
     };
     for index in 0..240 {
@@ -521,7 +513,7 @@ fn a_flush_split_at_stale_boundaries_publishes_correctly() {
 /// lock, and completes as soon as the worker can compact.
 #[test]
 fn a_flush_at_the_level_0_stop_waits_for_the_worker() {
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         background_compaction: Some(compaction()),
         ..options()
     })
@@ -534,7 +526,7 @@ fn a_flush_at_the_level_0_stop_waits_for_the_worker() {
             for flush in 0..4u64 {
                 for index in 0..40 {
                     let key = key(index * 7 + flush);
-                    engine.put(&key, &value(flush)).unwrap();
+                    engine.ks().put(&key, &value(flush)).unwrap();
                     model.insert(key, value(flush));
                 }
                 engine.flush().unwrap();
@@ -545,35 +537,34 @@ fn a_flush_at_the_level_0_stop_waits_for_the_worker() {
             std::thread::yield_now();
         }
         // Blocked at the stop, holding no lock a reader needs.
-        assert_eq!(engine.stats().level0_flushes, 2);
+        assert_eq!(engine.engine_stats().level0_flushes, 2);
         assert!(!writer.is_finished());
         drop(held);
         let model = writer.join().unwrap();
         assert_eq!(scan(&engine.snapshot()), model);
     });
     engine.wait_for_compaction().unwrap();
-    assert!(engine.stats().level0_flushes < 2);
+    assert!(engine.engine_stats().level0_flushes < 2);
     engine.close().unwrap();
 }
 
 #[test]
 fn settled_sequences_are_zero_and_a_snapshot_during_build_keeps_its_sequences() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let limits = CompactionPolicy {
         max_overlap: 1,
         ..compaction()
     };
-    engine.put(b"a", b"first").unwrap();
-    engine.put(b"stable", b"base").unwrap();
-    engine.put(b"deleted", b"live").unwrap();
+    engine.ks().put(b"a", b"first").unwrap();
+    engine.ks().put(b"stable", b"base").unwrap();
+    engine.ks().put(b"deleted", b"live").unwrap();
     engine.flush().unwrap();
     settle_with(&engine, limits, &mut Steps::default());
-    engine.put(b"a", b"second").unwrap();
-    engine.delete(b"deleted").unwrap();
+    engine.ks().put(b"a", b"second").unwrap();
+    engine.ks().delete(b"deleted").unwrap();
     engine.flush().unwrap();
-    let ceiling = engine.stats().last_seq;
-    let mut reads = EngineWorkspace::new();
-    let original = engine.get(b"a", &mut reads).unwrap().unwrap().seq;
+    let ceiling = engine.engine_stats().last_seq;
+    let original = engine.get_seq(b"a").unwrap().0;
     assert!(original > 0);
     let job = engine.core.begin_job(limits).unwrap().unwrap();
     assert!(job.zero_seq);
@@ -584,28 +575,21 @@ fn settled_sequences_are_zero_and_a_snapshot_during_build_keeps_its_sequences() 
         .unwrap()
         .publish()
         .unwrap();
-    let value = engine.get(b"a", &mut reads).unwrap().unwrap();
-    assert_eq!((value.seq, value.value), (0, &b"second"[..]));
-    assert_eq!(engine.get(b"stable", &mut reads).unwrap().unwrap().seq, 0);
-    assert_eq!(engine.get(b"deleted", &mut reads).unwrap(), None);
-    let value = snapshot.get(b"a", &mut reads).unwrap().unwrap();
-    assert_eq!((value.seq, value.value), (original, &b"second"[..]));
-    assert_eq!(snapshot.get(b"stable", &mut reads).unwrap().unwrap().seq, 2);
+    assert_eq!(engine.get_seq(b"a"), Some((0, b"second".to_vec())));
+    assert_eq!(engine.get_seq(b"stable").unwrap().0, 0);
+    assert_eq!(engine.ks().get(b"deleted").unwrap(), None);
+    assert_eq!(snapshot.get_seq(b"a"), Some((original, b"second".to_vec())));
+    assert_eq!(snapshot.get_seq(b"stable").unwrap().0, 2);
     assert_eq!(snapshot.last_seq(), ceiling);
     drop(snapshot);
     let dir = std::env::temp_dir().join(format!("tessera-seq-zero-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    engine
-        .checkpoint(&dir, CheckpointOptions::default())
-        .unwrap();
-    let recovered = Engine::recover(&dir, options()).unwrap();
-    assert_eq!(recovered.stats().last_seq, ceiling);
-    assert_eq!(recovered.get(b"a", &mut reads).unwrap().unwrap().seq, 0);
-    recovered.put(b"a", b"third").unwrap();
-    assert_eq!(
-        recovered.get(b"a", &mut reads).unwrap().unwrap().seq,
-        ceiling + 1
-    );
+    engine.checkpoint_to(&dir).unwrap();
+    let recovered = Engine::open(&dir, options()).unwrap();
+    assert_eq!(recovered.engine_stats().last_seq, ceiling);
+    assert_eq!(recovered.get_seq(b"a").unwrap().0, 0);
+    recovered.ks().put(b"a", b"third").unwrap();
+    assert_eq!(recovered.get_seq(b"a").unwrap().0, ceiling + 1);
     assert_eq!(
         scan(&recovered.snapshot()).get(&b"a"[..]),
         Some(&b"third".to_vec())
@@ -615,38 +599,35 @@ fn settled_sequences_are_zero_and_a_snapshot_during_build_keeps_its_sequences() 
 
 #[test]
 fn snapshots_before_compaction_and_snapshots_of_seq_zero_data_stay_visible() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let limits = CompactionPolicy {
         max_overlap: 1,
         ..compaction()
     };
     let drain = || settle_with(&engine, limits, &mut Steps::default());
-    engine.put(b"key", b"one").unwrap();
+    engine.ks().put(b"key", b"one").unwrap();
     engine.flush().unwrap();
     drain();
     let before = engine.snapshot();
-    engine.put(b"key", b"two").unwrap();
+    engine.ks().put(b"key", b"two").unwrap();
     engine.flush().unwrap();
     drain();
-    let mut reads = EngineWorkspace::new();
-    let found = before.get(b"key", &mut reads).unwrap().unwrap();
-    assert_eq!((found.seq, found.value), (1, &b"one"[..]));
-    assert_eq!(engine.get(b"key", &mut reads).unwrap().unwrap().seq, 0);
+    assert_eq!(before.get_seq(b"key"), Some((1, b"one".to_vec())));
+    assert_eq!(engine.get_seq(b"key").unwrap().0, 0);
     drop(before);
-    engine.put(b"key", b"three").unwrap();
+    engine.ks().put(b"key", b"three").unwrap();
     engine.flush().unwrap();
     drain();
-    assert_eq!(engine.get(b"key", &mut reads).unwrap().unwrap().seq, 0);
+    assert_eq!(engine.get_seq(b"key").unwrap().0, 0);
     let settled = engine.snapshot();
-    engine.delete(b"key").unwrap();
+    engine.ks().delete(b"key").unwrap();
     engine.flush().unwrap();
     drain();
-    assert_eq!(engine.get(b"key", &mut reads).unwrap(), None);
-    let found = settled.get(b"key", &mut reads).unwrap().unwrap();
-    assert_eq!((found.seq, found.value), (0, &b"three"[..]));
+    assert_eq!(engine.ks().get(b"key").unwrap(), None);
+    assert_eq!(settled.get_seq(b"key"), Some((0, b"three".to_vec())));
     assert_eq!(scan(&settled).get(&b"key"[..]), Some(&b"three".to_vec()));
     drop(settled);
-    engine.put(b"key", b"four").unwrap();
+    engine.ks().put(b"key", b"four").unwrap();
     engine.flush().unwrap();
     drain();
     assert_eq!(get(&engine, b"key"), Some(b"four".to_vec()));
@@ -654,18 +635,18 @@ fn snapshots_before_compaction_and_snapshots_of_seq_zero_data_stay_visible() {
 
 #[test]
 fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
-    let engine = Engine::new(options()).unwrap();
+    let engine = Engine::in_memory(options()).unwrap();
     let limits = CompactionPolicy {
         max_inputs: 2,
         max_overlap: 1,
         ..compaction()
     };
-    engine.put(b"key", b"one").unwrap();
+    engine.ks().put(b"key", b"one").unwrap();
     engine.flush().unwrap();
     settle_with(&engine, limits, &mut Steps::default());
-    engine.put(b"key", b"two").unwrap();
+    engine.ks().put(b"key", b"two").unwrap();
     engine.flush().unwrap();
-    engine.put(b"key", b"three").unwrap();
+    engine.ks().put(b"key", b"three").unwrap();
     engine.flush().unwrap();
     let job = engine.core.begin_job(limits).unwrap().unwrap();
     assert!(!job.others.is_empty());
@@ -676,9 +657,7 @@ fn an_unselected_overlapping_run_keeps_sequences_until_the_final_merge() {
         .unwrap();
     assert_eq!(get(&engine, b"key"), Some(b"three".to_vec()));
     settle_with(&engine, limits, &mut Steps::default());
-    let mut reads = EngineWorkspace::new();
-    let found = engine.get(b"key", &mut reads).unwrap().unwrap();
-    assert_eq!((found.seq, found.value), (0, &b"three"[..]));
+    assert_eq!(engine.get_seq(b"key"), Some((0, b"three".to_vec())));
 }
 
 /// The bottom level's records by key, with their stored sequences.
@@ -703,7 +682,7 @@ fn bottom_seqs(engine: &Engine) -> BTreeMap<Vec<u8>, u64> {
 /// across it and after it.
 #[test]
 fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
-    let engine = Engine::new(EngineOptions {
+    let engine = Engine::in_memory(Options {
         compression: Compression::Uncompressed,
         ..options()
     })
@@ -712,11 +691,11 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     let mut flush = |records: &[(&[u8], usize)], tag: &str| {
         for &(key, len) in records {
             let value = format!("{tag}-{}", "x".repeat(len)).into_bytes();
-            engine.put(key, &value).unwrap();
+            engine.ks().put(key, &value).unwrap();
             model.insert(key.to_vec(), value);
         }
         engine.flush().unwrap();
-        engine.stats().last_seq
+        engine.engine_stats().last_seq
     };
     let eager = CompactionPolicy {
         max_overlap: 1,
@@ -738,7 +717,7 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     // Level 0, oldest first: the source, a run reaching both bottom runs,
     // and a newer run over the source's bottom run only.
     flush(&[(b"b", 1), (b"d", 1)], "o1");
-    let skipped_min = engine.stats().last_seq + 1;
+    let skipped_min = engine.engine_stats().last_seq + 1;
     flush(&[(b"c", 1), (b"e", 1), (b"q", 1)], "o2");
     let newest = flush(&[(b"b", 1), (b"e", 1)], "o3");
     let job = engine
@@ -759,9 +738,7 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     let base = std::env::temp_dir().join(format!("tessera-mixed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let built = job.build(&mut MergeWorkspace::new()).unwrap();
-    engine
-        .checkpoint(&base.join("across"), CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&base.join("across")).unwrap();
     built.publish().unwrap();
     // Only `e` keeps its sequence: the skipped run holds an older `e`. Its
     // `c` is newer than the output's, and it does not cover `b` or `f`.
@@ -776,25 +753,16 @@ fn a_skipped_interleaved_run_keeps_only_the_sequences_it_may_contest() {
     assert_eq!(seqs[&b"e"[..]], newest);
     assert_eq!(seqs[&b"a"[..]], 0);
     assert_eq!(scan(&engine.snapshot()), model);
-    let mut reads = EngineWorkspace::new();
-    assert_eq!(engine.get(b"e", &mut reads).unwrap().unwrap().seq, newest);
-    assert_eq!(engine.get(b"b", &mut reads).unwrap().unwrap().seq, 0);
+    assert_eq!(engine.get_seq(b"e").unwrap().0, newest);
+    assert_eq!(engine.get_seq(b"b").unwrap().0, 0);
     // The snapshot from before the job still reads its own sequences.
-    assert_eq!(
-        before.get(b"b", &mut reads).unwrap().unwrap().seq,
-        newest - 1
-    );
-    assert_eq!(
-        before.get(b"d", &mut reads).unwrap().unwrap().seq,
-        skipped_min - 1
-    );
+    assert_eq!(before.get_seq(b"b").unwrap().0, newest - 1);
+    assert_eq!(before.get_seq(b"d").unwrap().0, skipped_min - 1);
     assert_eq!(scan(&before), model);
     drop(before);
-    engine
-        .checkpoint(&base.join("after"), CheckpointOptions::default())
-        .unwrap();
+    engine.checkpoint_to(&base.join("after")).unwrap();
     for (name, bottom) in [("across", before_seqs), ("after", seqs)] {
-        let recovered = Engine::recover(&base.join(name), options()).unwrap();
+        let recovered = Engine::open(base.join(name), options()).unwrap();
         assert_eq!(scan(&recovered.snapshot()), model, "{name}");
         assert_eq!(bottom_seqs(&recovered), bottom, "{name}");
         let state = recovered.core.read_state();

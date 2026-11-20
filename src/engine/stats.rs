@@ -24,6 +24,7 @@ pub struct FlushReport {
 }
 
 /// A summary of an engine's state.
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EngineStats {
