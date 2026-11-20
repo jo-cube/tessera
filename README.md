@@ -1,5 +1,7 @@
 # Tessera
 
+[![ci](https://github.com/jo-cube/tessera/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jo-cube/tessera/actions/workflows/ci.yml)
+
 Tessera 0.1.0 is a general-purpose, RAM-first compressed LSM key–value engine
 embedded in the application process, written in safe Rust. Use it when the
 working dataset fits in RAM, ordered scans and atomic batches are useful, and
@@ -7,8 +9,20 @@ explicit checkpoints meet the application's persistence needs. It has no
 write-ahead log, per-write durability, disk tier, replication or multi-operation
 read/write transactions. Closing or dropping an engine writes nothing.
 
-The package is consumed by path or Git revision (`publish = false`). Rust 1.89
-and a C compiler for bundled Zstandard are required. The license is [MIT](LICENSE).
+## Install
+
+Depend on a release tag once it is published:
+
+```toml
+[dependencies]
+tessera = { git = "https://github.com/jo-cube/tessera.git", tag = "v0.1.0" }
+```
+
+Tessera needs Rust 1.89 or newer and a C compiler, which builds the bundled
+Zstandard. Linux (x86-64, arm64) and macOS (arm64, x86-64) are supported;
+Windows is not. It is pre-1.0: minor versions may break the API and checkpoint
+format. [Releases](docs/releases.md) covers versioning, platforms and
+limitations. The license is [MIT](LICENSE).
 
 ## Usage
 
@@ -62,10 +76,18 @@ std::fs::remove_dir_all(&dir)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Run the same code with `cargo run --example basic`. API contracts are in the
-[engine documentation](src/engine.rs); build local rustdoc with
-`cargo doc --open`. [ARCHITECTURE.md](ARCHITECTURE.md) describes the data
-flow, the run format and the design decisions behind them.
+Run the same code with `cargo run --example basic`.
+
+## Documentation
+
+- API documentation: `cargo doc --open`; the contracts are in the
+  [engine module](src/engine.rs)
+- [ARCHITECTURE.md](ARCHITECTURE.md): the data flow, the run format and the
+  design decisions behind them
+- [docs/releases.md](docs/releases.md): installation, versioning, platforms,
+  limitations and the release process
+- [docs/development.md](docs/development.md): checks, container validation,
+  diagnostics and benchmarks
 
 ## Operations and consistency
 
@@ -215,22 +237,8 @@ run file while packing it into chunks, and one decoded block per overlapping
 group for cross-run validation. It leaves checkpoint data unchanged and may
 create `LOCK`. Rejections return typed `OpenError`s.
 
-## Validation
+## Development
 
-```sh
-cargo fmt --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked
-cargo test --locked --features diagnostics --test lookup_allocations --test retention
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo +1.89.0 check --locked --all-targets --all-features
-cargo +1.89.0 clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --lib long_ -- --ignored
-```
-
-The default suite includes bounded mutation tests and a concurrent sequence
-model with a 20-second process deadline. Ignored campaigns are longer variants;
-large-allocation boundary tests run separately. `scripts/validate.sh check`
-runs checks in a resource-limited Linux container; `limits` runs boundaries and
-`msrv` checks Rust 1.89. See the [release checklist](docs/release.md),
-[diagnostic counters](tools/README.md) and [macOS comparison tool](tools/bench/README.md).
+`just all` runs every check CI runs. [docs/development.md](docs/development.md)
+describes the recipes, the resource-limited container validation, the
+diagnostic counters and the macOS comparison with RocksDB.
