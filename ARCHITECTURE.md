@@ -93,16 +93,25 @@ pool.
 ## Runs
 
 A run is an immutable, self-contained sorted file image held in pooled 1 MiB
-chunks. It is built in one pass: blocks are cut as records arrive, and each
-segment of about 4 MiB raw is compressed once complete.
+chunks. It is built in one pass: blocks are cut as records arrive, each sampled
+segment buffers its first 4 MiB raw to build a dictionary, and compressible
+segments continue streaming following blocks against that dictionary until a
+stopping rule closes the scope.
 
 - **Blocks.** Prefix-compressed records with restart keys every sixteen
   records. Block length adapts: each segment compresses its first 64 KiB at
   zstd level 1 without a dictionary, and that ratio sets the raw length
   expected to compress to the target (1 KiB by default), capped at 64 KiB raw.
 - **Segments.** Each segment stores a raw-content zstd dictionary of at most
-  16 KiB, sampled from evenly spaced records; blocks decode independently with
-  it, by reference, through one reusable context.
+  16 KiB, sampled from evenly spaced records of its buffered 4 MiB raw prefix;
+  blocks decode independently with it, by reference, through one reusable
+  context. After compressing the buffered prefix, a Zstandard segment streams
+  subsequent blocks directly against the same prepared context until stored
+  frames reach 16 times the dictionary length (256 KiB for a full dictionary),
+  raw bytes reach 8 times the segment length (32 MiB), or a 64 KiB check
+  window's stored-to-raw ratio exceeds the prefix's by more than a quarter of
+  the pro-rated dictionary cost. High-entropy segments already exceed the stored
+  target in their 4 MiB prefix and close at once.
 - **Frames.** Magicless zstd frames with a header binding codec, dictionary
   reference and decoded length, and a CRC-32 checked before every decode.
 - **Index.** A sparse index of each block's last key, prefix-compressed, with
@@ -195,7 +204,22 @@ keeps only the newest version of each key.
   frame anyway.
 - A raw block floor: no measured benefit.
 
-**Per-segment raw-content dictionaries of 16 KiB, sampled.**
+**Per-segment raw-content dictionaries of 16 KiB, sampled and amortized.**
+- Fixed 4 MiB raw scope: on globally redundant grouped data, 4 MiB raw
+  compresses to about 38 KiB of frames, making the 16 KiB dictionary nearly a
+  third of stored bytes. Continuing a segment against the same prepared
+  dictionary up to 16 times the dictionary length in stored frames (capped at
+  8 times the segment length raw, with a cost-based drift guard over 64 KiB
+  windows) reduces bottom-level stored bytes per record by about 23% on
+  globally redundant grouped data and 15% on clustered data while leaving
+  weakly compressible workloads at one sampled prefix.
+- Scope widening without a cost-based drift guard (fixed multipliers or a
+  coarse 25% relative drift guard over 1 MiB windows): on workloads where
+  consecutive key groups carry disjoint random payloads, frame growth from
+  stale group strings exceeds the saved dictionary bytes and increases stored
+  bytes by over 10%. Checking drift against a quarter of the pro-rated
+  dictionary cost over 64 KiB windows closes early at group boundaries and
+  keeps those workloads smaller as well.
 - Trained dictionaries: slow to build and to load.
 - Digested entropy tables reduce decode CPU. Their residency and less
   adaptive sequence coding increase memory on grouped data. Loading the

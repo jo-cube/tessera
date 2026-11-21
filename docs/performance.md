@@ -13,12 +13,17 @@ detail, with the alternatives that were rejected.
   adapts to the data, up to 64 KiB raw, so data that compresses well packs
   many records into one block. Memory therefore follows the compressed size
   of the data, not its raw size.
-- **Dictionaries.** Each segment of about 4 MiB raw carries a dictionary of at
-  most 16 KiB sampled from its own records. Small blocks compress poorly on
-  their own; the dictionary gives each block the segment's common strings, so
-  redundant data such as grouped JSON stays small even in 1 KiB blocks. Data
-  with little in common across records gains little from it and is stored
-  close to its raw size.
+- **Dictionaries.** Each segment samples a dictionary of at most 16 KiB from
+  its first 4 MiB of raw records. Small blocks compress poorly on their own;
+  the dictionary gives each block the segment's common strings, so redundant
+  data such as grouped JSON stays small even in 1 KiB blocks. When a segment's
+  4 MiB prefix compresses well, subsequent blocks continue sharing that
+  dictionary until stored frames reach 16 times the dictionary length, raw
+  bytes reach 32 MiB, or compression drifts enough to eat into the dictionary
+  savings, which bounds dictionary overhead on redundant data without growing
+  the transient build buffer. Data with little in common across records
+  exceeds the stored target within its 4 MiB prefix, closes at once, and is
+  stored close to its raw size.
 - **Indexes and filters.** A sparse, prefix-compressed index holds each
   block's last key. Bloom filters (10 bits per key) exist only above the
   bottom level, which holds most keys, so they cost a small fraction of the
