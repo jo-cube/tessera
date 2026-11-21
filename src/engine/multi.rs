@@ -44,6 +44,14 @@ impl Workspace {
         self.read.decoded_bytes()
     }
 
+    pub(super) fn prepare_empty(&mut self, len: usize) {
+        self.order.clear();
+        self.hits.clear();
+        self.hits.resize_with(len, Hit::default);
+        self.values.clear();
+        self.unresolved = len;
+    }
+
     pub(super) fn prepare<K: AsRef<[u8]>>(&mut self, keys: &[K]) {
         self.order.clear();
         self.order.extend(0..keys.len());

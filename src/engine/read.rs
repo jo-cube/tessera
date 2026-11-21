@@ -442,14 +442,17 @@ impl<'a> Reader<'a> {
             results,
             ..
         } = &mut self.buffers;
-        // Resolve user `AsRef` implementations before taking an admission
-        // stripe so caller code cannot synchronize with another thread and
-        // deadlock against `Engine::close`.
-        let resolved = ResolvedKeys::new(keys, spare_keys);
+        // Validate engine/keyspace ownership before resolving keys so rejected
+        // calls neither allocate scratch nor invoke caller `AsRef` code, while
+        // still resolving keys outside the admission stripe.
         match self.source {
             Source::Latest(shared) => {
-                let _open = shared.enter()?;
+                if shared.is_closed() {
+                    return Err(Error::stopped());
+                }
                 own(shared.id, keyspace)?;
+                let resolved = ResolvedKeys::new(keys, spare_keys);
+                let _open = shared.enter()?;
                 shared
                     .core
                     .multi_get(keyspace.id(), &resolved.keys, multi)
@@ -458,18 +461,20 @@ impl<'a> Reader<'a> {
             Source::Snapshot(snapshot) => {
                 own(snapshot.engine, keyspace)?;
                 match snapshot.view.visible(keyspace.id()) {
-                    Visible::Live(runs) => multi.lookup_view(
-                        &resolved.keys,
-                        &snapshot.view.tables,
-                        KeyPrefix::new(keyspace.id()),
-                        runs,
-                    )?,
-                    Visible::Later => multi.prepare(&resolved.keys),
+                    Visible::Live(runs) => {
+                        let resolved = ResolvedKeys::new(keys, spare_keys);
+                        multi.lookup_view(
+                            &resolved.keys,
+                            &snapshot.view.tables,
+                            KeyPrefix::new(keyspace.id()),
+                            runs,
+                        )?;
+                    }
+                    Visible::Later => multi.prepare_empty(keys.len()),
                     Visible::Dropped => return Err(Error::keyspace_dropped(keyspace.name())),
                 }
             }
         }
-        drop(resolved);
         let multi: &multi::Workspace = multi;
         // The vector is empty; collecting in place reuses its allocation
         // while changing its element lifetime, in safe code.

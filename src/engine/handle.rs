@@ -51,6 +51,9 @@ pub(super) struct Shared {
     /// shared for their duration; closing locks every stripe exclusively to
     /// wait for in-flight operations and mark the engine closed.
     open: Box<[OpenStripe; OPEN_STRIPES]>,
+    /// Set once every stripe is locked exclusively during [`Engine::close`],
+    /// allowing cheap lock-free pre-checks before running caller callbacks.
+    closed: std::sync::atomic::AtomicBool,
     pub(super) pool: Arc<read::Pool>,
     /// The metadata of the latest committed checkpoint.
     metadata: Mutex<Option<Vec<u8>>>,
@@ -65,6 +68,11 @@ struct Workers {
 }
 
 impl Shared {
+    /// Reports whether [`Engine::close`] has already committed the closed state.
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Admits an operation while the engine is open, until the guard drops.
     pub(super) fn enter(&self) -> Result<RwLockReadGuard<'_, bool>> {
         let open = self.open[open_stripe()]
@@ -202,6 +210,7 @@ impl Engine {
                 flush: None,
             }),
             open: Box::new(std::array::from_fn(|_| OpenStripe(RwLock::new(true)))),
+            closed: std::sync::atomic::AtomicBool::new(false),
             pool: Arc::new(read::Pool::new()),
             metadata: Mutex::new(metadata),
             #[cfg(feature = "diagnostics")]
@@ -488,8 +497,13 @@ impl Engine {
     /// [`ErrorKind::Background`] if a worker panicked at any time; the
     /// engine is closed all the same.
     pub fn close(self) -> Result<()> {
+        self.close_with(|_| {})
+    }
+
+    fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
         {
             let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
+                on_stripe(i);
                 self.shared.open[i]
                     .0
                     .write()
@@ -498,6 +512,9 @@ impl Engine {
             if !*guards[0] {
                 return Ok(());
             }
+            self.shared
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
             for guard in &mut guards {
                 **guard = false;
             }
@@ -808,16 +825,19 @@ mod close_tests {
     fn close_holds_every_stripe_before_exposing_stopped() {
         let engine = Engine::in_memory(Options::default()).unwrap();
         let in_flight = engine.shared.open[2].0.read().unwrap();
+        let (at_stripe_2_tx, at_stripe_2_rx) = mpsc::channel();
         let closer_engine = engine.clone();
-        let closer = std::thread::spawn(move || closer_engine.close());
+        let closer = std::thread::spawn(move || {
+            closer_engine.close_with(|stripe| {
+                if stripe == 2 {
+                    at_stripe_2_tx.send(()).unwrap();
+                }
+            })
+        });
 
-        // Wait until close has acquired stripe 1 (after stripe 0) and moved on
-        // to wait on stripe 2.
-        while engine.shared.open[1].0.try_read().is_ok_and(|open| *open) {
-            std::thread::yield_now();
-        }
-        // Give close time to reach stripe 2 if it had released stripe 1 early.
-        std::thread::sleep(Duration::from_millis(5));
+        at_stripe_2_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close should reach stripe 2");
         // Stripes 0 and 1 must still be held exclusively (blocking callers
         // instead of exposing Stopped early), while stripe 3 is still open.
         assert!(matches!(
@@ -829,9 +849,11 @@ mod close_tests {
             Err(std::sync::TryLockError::WouldBlock)
         ));
         assert!(*engine.shared.open[3].0.try_read().unwrap());
+        assert!(!engine.shared.is_closed());
 
         drop(in_flight);
         closer.join().unwrap().unwrap();
+        assert!(engine.shared.is_closed());
         for stripe in engine.shared.open.iter() {
             assert!(!*stripe.0.read().unwrap());
         }
@@ -851,7 +873,9 @@ mod close_tests {
         impl AsRef<[u8]> for ClosingKey<'_> {
             fn as_ref(&self) -> &[u8] {
                 self.entered.send(()).unwrap();
-                self.closed.recv().unwrap();
+                self.closed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("close must not deadlock on multi_get key resolution");
                 self.bytes
             }
         }
@@ -864,7 +888,9 @@ mod close_tests {
         let (closed_tx, closed_rx) = mpsc::channel();
         let closer_engine = engine.clone();
         let closer = std::thread::spawn(move || {
-            entered_rx.recv().unwrap();
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("multi_get should invoke AsRef before taking an open stripe");
             closer_engine.close().unwrap();
             closed_tx.send(()).unwrap();
         });
@@ -876,7 +902,66 @@ mod close_tests {
         }];
         let mut reader = engine.reader();
         let err = reader.multi_get(&ks, &keys).unwrap_err();
+        drop(keys);
         assert_eq!(err.kind(), ErrorKind::Stopped);
         closer.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_multi_get_skips_key_conversion() {
+        struct PanicKey;
+        impl AsRef<[u8]> for PanicKey {
+            fn as_ref(&self) -> &[u8] {
+                panic!("key conversion should not run for a rejected multi_get");
+            }
+        }
+
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let other = Engine::in_memory(Options::default()).unwrap();
+        let ks = engine.keyspace("test").unwrap();
+        let foreign = other.keyspace("test").unwrap();
+        let snap = engine.snapshot();
+        engine.drop_keyspace("test").unwrap();
+        let after_drop = engine.snapshot();
+        let later_ks = engine.keyspace("later").unwrap();
+
+        let mut reader = engine.reader();
+        assert_eq!(
+            reader.multi_get(&foreign, &[PanicKey]).unwrap_err().kind(),
+            ErrorKind::UnknownKeyspace
+        );
+
+        let mut snap_reader = snap.reader();
+        assert_eq!(
+            snap_reader
+                .multi_get(&foreign, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnknownKeyspace
+        );
+        assert_eq!(
+            snap_reader.multi_get(&later_ks, &[PanicKey]).unwrap().len(),
+            1
+        );
+
+        let mut dropped_reader = after_drop.reader();
+        assert_eq!(
+            dropped_reader
+                .multi_get(&ks, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::KeyspaceDropped
+        );
+
+        drop(reader);
+        engine.clone().close().unwrap();
+        let mut closed_reader = engine.reader();
+        assert_eq!(
+            closed_reader
+                .multi_get(&foreign, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Stopped
+        );
     }
 }
