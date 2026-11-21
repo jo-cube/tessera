@@ -30,22 +30,42 @@ tools/bench/run.sh --dataset B --engine tessera,r-small --case update
 TESSERA_BENCH_SCALE=32 tools/bench/run.sh --engine tessera
 ```
 
-Cases are `load,update,reads,scan,mixed,bulk`. Read cases also prepare the load
-and updated state. Tessera-only selections skip RAM-disk setup. Each child
-process has a 300-second deadline and a memory guard of 8 GiB RSS plus used
-RAM-disk bytes for the regular suite.
+Cases are `load,update,reads,scan,mixed,bulk` (default selection), plus
+`reader_scale`, `writer_scale`, and `zipf` when named via `--case`. Datasets
+are `A`, `B` (default) and `C` (small records, via `--dataset A,B,C`). Read
+cases (`reads`, `scan`, `mixed`, `reader_scale`, `zipf`) prepare the load and
+updated state first; `writer_scale` opens a fresh store per configuration.
+Tessera-only selections skip RAM-disk setup. Each child process has a
+300-second deadline and a memory guard of 8 GiB RSS plus used RAM-disk bytes
+for the regular suite.
 
 ## Workloads and accounting
 
-Dataset A is 1 GiB of grouped JSON; B is 512 MiB of weak-locality JSON. Both
-are generated before timing. Regular workloads use shuffled 256-record write
-batches, 50% updates and 2% deletes, 220k point reads with 10% misses, 1 or 4
-readers, multi-get batches of 100 random or adjacent keys, 20k prefix scans,
-and 64 MiB sorted bulk batches: Tessera writes each as one `WriteBatch`,
-which it builds into runs outside its lock, and RocksDB ingests each as an
-SST file. Mixed work offers writes at 70% of
-Tessera's update rate (or the selected engine's rate when Tessera is absent).
-Write measurements include maintenance drains. `r-large` skips bulk and mixed.
+Dataset A is 1 GiB of grouped JSON; B is 512 MiB of weak-locality JSON; C is
+512 MiB of small records (20-byte structured keys, ~52-byte compact JSON
+values, 64 keys per 8-byte group prefix). All are generated before timing.
+Regular workloads use shuffled 256-record write batches, 50% updates and 2%
+deletes, 220k point reads with 10% misses, 1 or 4 readers, multi-get batches
+of 100 random or adjacent keys, 20k prefix scans, and 64 MiB sorted bulk
+batches: Tessera writes each as one `WriteBatch`, which it builds into runs
+outside its lock, and RocksDB ingests each as an SST file. Mixed work offers
+writes at 70% of Tessera's update rate (or the selected engine's rate when
+Tessera is absent). Write measurements include maintenance drains. `r-large`
+skips bulk and mixed.
+
+Additional selectable cases:
+
+- `reader_scale`: 1, 2, 4, 8 reader threads (plus `maxt` at available
+  parallelism when larger), measuring latest-state `Reader` and (on Tessera)
+  `Snapshot` readers over uniform and scrambled Zipfian (θ = 0.99) lookups,
+  both read-only and with one background writer offering 20k records/s in
+  256-record batches. Every read is checked against the oracle.
+- `writer_scale`: 1, 2, 4, 8 writer threads across batch sizes 1, 16 and 256
+  records, on both disjoint per-thread key ranges and an overlapping 4,096-key
+  pool, with post-drain oracle checks.
+- `zipf`: scrambled Zipfian (θ = 0.99) point gets (1 and 4 threads, 10%
+  misses) and 4-thread read/update mixes at 95/5 and 50/50 read/write ratios
+  with live and post-drain oracle checks.
 
 Tessera uses default options and one keyspace, and reads through one
 `Reader` per thread. RocksDB disables WAL and syncs, uses four

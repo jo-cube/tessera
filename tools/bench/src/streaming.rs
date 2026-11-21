@@ -38,7 +38,12 @@ fn digits(n: usize) -> usize {
 
 impl StreamData {
     fn new(name: char, target: usize) -> Self {
-        let mut data = Self { name, groups: Vec::new(), n: 0, raw: 0 };
+        let mut data = Self {
+            name,
+            groups: Vec::new(),
+            n: 0,
+            raw: 0,
+        };
         let mut rng = Rng(0x4c53504b ^ name as u64);
         let mut urng = Rng(0x55504454 ^ name as u64);
         while data.raw < target {
@@ -49,7 +54,12 @@ impl StreamData {
                 100
             };
             let start = data.n;
-            data.groups.push(Group { start, original: rng.0, update: urng.0, base_len: 0 });
+            data.groups.push(Group {
+                start,
+                original: rng.0,
+                update: urng.0,
+                base_len: 0,
+            });
             data.n += n;
             // One representative establishes the JSON's fixed-length portion.
             let len = data.record(start, ORIGINAL).1.len();
@@ -60,9 +70,15 @@ impl StreamData {
                 let ts = mix(g.original.wrapping_add(STEP.wrapping_mul(680 + 507))) % 2_000_000_000;
                 len - digits(ts as usize)
             };
-            data.raw += (start..data.n).map(|i| 16 + data.original_len(i)).sum::<usize>();
+            data.raw += (start..data.n)
+                .map(|i| 16 + data.original_len(i))
+                .sum::<usize>();
             advance(&mut rng, 680 + n * if name == 'A' { 8 } else { 507 });
-            advance(&mut urng, (start..data.n).filter(|&i| updated(i)).count() * if name == 'A' { 12 } else { 101 });
+            advance(
+                &mut urng,
+                (start..data.n).filter(|&i| updated(i)).count()
+                    * if name == 'A' { 12 } else { 101 },
+            );
         }
         data
     }
@@ -86,7 +102,10 @@ impl StreamData {
         if self.name == 'A' {
             g.base_len + digits(member) + digits(member % 17) + if member % 3 == 1 { 7 } else { 6 }
         } else {
-            let ts = mix(g.original.wrapping_add(STEP.wrapping_mul((680 + (member + 1) * 507) as u64))) % 2_000_000_000;
+            let ts = mix(g
+                .original
+                .wrapping_add(STEP.wrapping_mul((680 + (member + 1) * 507) as u64)))
+                % 2_000_000_000;
             g.base_len + digits(ts as usize)
         }
     }
@@ -105,7 +124,11 @@ impl StreamData {
         let upd = version == UPDATED;
         let mut urng = Rng(group.update);
         if upd {
-            advance(&mut urng, (group.start..i).filter(|&j| updated(j)).count() * if name == 'A' { 12 } else { 101 });
+            advance(
+                &mut urng,
+                (group.start..i).filter(|&j| updated(j)).count()
+                    * if name == 'A' { 12 } else { 101 },
+            );
         }
         let (value, update) = if name == 'A' {
             let json = |ts: usize, q: usize, p: usize, st: &str, tok: String| {
@@ -114,8 +137,22 @@ impl StreamData {
                 )
             };
             let st = ["active", "pending", "paused"];
-            let v = json(1700000000 + member, member % 17, 1000 + member % 250, st[member % 3], rng.text(8));
-            let u = upd.then(|| json(1700086400 + urng.n(86400), urng.n(17), 1000 + urng.n(250), st[urng.n(3)], urng.text(8)));
+            let v = json(
+                1700000000 + member,
+                member % 17,
+                1000 + member % 250,
+                st[member % 3],
+                rng.text(8),
+            );
+            let u = upd.then(|| {
+                json(
+                    1700086400 + urng.n(86400),
+                    urng.n(17),
+                    1000 + urng.n(250),
+                    st[urng.n(3)],
+                    urng.text(8),
+                )
+            });
             (v, u)
         } else {
             let (id, nm, em, dom) = (rng.hex(32), rng.hex(24), rng.hex(16), rng.hex(12));
@@ -130,11 +167,28 @@ impl StreamData {
             let u = upd.then(|| json(&free, &urng.hex(100), urng.next() % 2000000000, "updated"));
             (v, u)
         };
-        (self.key(i), if upd { update.unwrap() } else { value }.into_bytes())
+        (
+            self.key(i),
+            if upd { update.unwrap() } else { value }.into_bytes(),
+        )
     }
 
     fn expected(&self, i: usize, changed: bool) -> Option<Vec<u8>> {
-        if changed && deleted(i) { None } else { Some(self.record(i, if changed && updated(i) { UPDATED } else { ORIGINAL }).1) }
+        if changed && deleted(i) {
+            None
+        } else {
+            Some(
+                self.record(
+                    i,
+                    if changed && updated(i) {
+                        UPDATED
+                    } else {
+                        ORIGINAL
+                    },
+                )
+                .1,
+            )
+        }
     }
 }
 
@@ -149,9 +203,16 @@ struct Permutation {
 impl Permutation {
     fn new(n: usize, seed: u64) -> Self {
         assert!(n > 0);
-        let bits = (usize::BITS - (n - 1).leading_zeros()).max(2).next_multiple_of(2);
+        let bits = (usize::BITS - (n - 1).leading_zeros())
+            .max(2)
+            .next_multiple_of(2);
         let half = bits / 2;
-        Self { n, half, mask: (1u64 << half) - 1, seed }
+        Self {
+            n,
+            half,
+            mask: (1u64 << half) - 1,
+            seed,
+        }
     }
     fn at(&self, i: usize) -> usize {
         assert!(i < self.n);
@@ -159,7 +220,10 @@ impl Permutation {
         loop {
             let (mut l, mut r) = (x >> self.half, x & self.mask);
             for round in 0..6 {
-                (l, r) = (r, l ^ (mix(r ^ self.seed.wrapping_add(STEP.wrapping_mul(round))) & self.mask));
+                (l, r) = (
+                    r,
+                    l ^ (mix(r ^ self.seed.wrapping_add(STEP.wrapping_mul(round))) & self.mask),
+                );
             }
             x = (l << self.half) | r;
             if x < self.n as u64 {
@@ -171,7 +235,14 @@ impl Permutation {
 
 /// Sample through drains too. The condition variable stops the sampler without
 /// waiting for a sampling interval; all buffers are bounded by the run timeout.
-fn measured<T>(store: &Store, trace: &mut fs::File, base: MemoryReference, origin: Instant, phase: &str, f: impl FnOnce() -> T) -> T {
+fn measured<T>(
+    store: &Store,
+    trace: &mut fs::File,
+    base: MemoryReference,
+    origin: Instant,
+    phase: &str,
+    f: impl FnOnce() -> T,
+) -> T {
     let done = (Mutex::new(false), Condvar::new());
     thread::scope(|scope| {
         let done_ref = &done;
@@ -181,13 +252,21 @@ fn measured<T>(store: &Store, trace: &mut fs::File, base: MemoryReference, origi
                 let ram = rss().saturating_sub(base.rss);
                 let physical = footprint().saturating_sub(base.footprint);
                 let stored = store.counters()[2];
-                writeln!(trace, "{:.2},{phase},{heap},{ram},{physical},{stored},{}", origin.elapsed().as_secs_f64(), heap as i64 - stored as i64)
-                    .unwrap();
+                writeln!(
+                    trace,
+                    "{:.2},{phase},{heap},{ram},{physical},{stored},{}",
+                    origin.elapsed().as_secs_f64(),
+                    heap as i64 - stored as i64
+                )
+                .unwrap();
             };
             sample(trace);
             let mut stopped = done_ref.0.lock().unwrap();
             while !*stopped {
-                let (guard, _) = done_ref.1.wait_timeout(stopped, Duration::from_secs(2)).unwrap();
+                let (guard, _) = done_ref
+                    .1
+                    .wait_timeout(stopped, Duration::from_secs(2))
+                    .unwrap();
                 stopped = guard;
                 if !*stopped {
                     sample(trace);
@@ -207,14 +286,28 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
     let scale: usize = std::env::var("TESSERA_BENCH_SCALE").map_or(1, |s| s.parse().unwrap());
     assert!(scale > 0);
     let target = if ds == 'A' { 8192 * MIB } else { 4096 * MIB } / scale;
-    let out = Out { prefix: format!("{ds},{engine}") };
+    let out = Out {
+        prefix: format!("{ds},{engine}"),
+    };
     let setup = Instant::now();
     let data = StreamData::new(ds, target);
     let memory = MemoryReference::capture();
     out.emit("setup", "records", data.n);
-    out.emit("setup", "raw_mib", format!("{:.2}", data.raw as f64 / MIB as f64));
-    out.emit("setup", "generate_s", format!("{:.2}", setup.elapsed().as_secs_f64()));
-    out.emit("setup", "group_index_bytes", data.groups.capacity() * std::mem::size_of::<Group>());
+    out.emit(
+        "setup",
+        "raw_mib",
+        format!("{:.2}", data.raw as f64 / MIB as f64),
+    );
+    out.emit(
+        "setup",
+        "generate_s",
+        format!("{:.2}", setup.elapsed().as_secs_f64()),
+    );
+    out.emit(
+        "setup",
+        "group_index_bytes",
+        data.groups.capacity() * std::mem::size_of::<Group>(),
+    );
     memory.emit(&out);
     let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sampled_peak = peak.clone();
@@ -229,7 +322,11 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
             thread::sleep(Duration::from_millis(100));
         }
     });
-    let dir = if engine == "tessera" { format!("{outdir}/{ds}-{engine}") } else { format!("{MOUNT}/{ds}-{engine}") };
+    let dir = if engine == "tessera" {
+        format!("{outdir}/{ds}-{engine}")
+    } else {
+        format!("{MOUNT}/{ds}-{engine}")
+    };
     fs::create_dir_all(&dir).unwrap();
     let store = match engine {
         "tessera" => Store::tessera(),
@@ -238,10 +335,17 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         _ => panic!("unsupported streaming engine {engine}"),
     };
     if engine != "tessera" {
-        copy_options(&format!("{dir}/db"), &format!("{outdir}/OPTIONS-{ds}-{engine}"));
+        copy_options(
+            &format!("{dir}/db"),
+            &format!("{outdir}/OPTIONS-{ds}-{engine}"),
+        );
     }
     let mut trace = fs::File::create(format!("{outdir}/samples-{ds}-{engine}.csv")).unwrap();
-    writeln!(trace, "time_s,phase,live_heap_bytes,rss_bytes,footprint_bytes,stored_bytes,heap_overhead_bytes").unwrap();
+    writeln!(
+        trace,
+        "time_s,phase,live_heap_bytes,rss_bytes,footprint_bytes,stored_bytes,heap_overhead_bytes"
+    )
+    .unwrap();
     let origin = Instant::now();
     let mut live = data.raw;
     let mut b = store.batch();
@@ -254,9 +358,14 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         let mut write = || {
             let span = Span::new();
             let (mut ops, mut bytes) = (0, 0);
-            let kinds: &[u8] = if phase == "load" { &[ORIGINAL] } else { &[UPDATED, DELETED] };
+            let kinds: &[u8] = if phase == "load" {
+                &[ORIGINAL]
+            } else {
+                &[UPDATED, DELETED]
+            };
             for &kind in kinds {
-                let perm = Permutation::new(data.n, 0x62656e6368 ^ ds as u64 ^ ((kind as u64) << 32));
+                let perm =
+                    Permutation::new(data.n, 0x62656e6368 ^ ds as u64 ^ ((kind as u64) << 32));
                 for index in 0..data.n {
                     let i = perm.at(index);
                     if kind == UPDATED && !updated(i) || kind == DELETED && !deleted(i) {
@@ -323,9 +432,20 @@ pub(super) fn run(ds: char, engine: &str, outdir: &str, cases: &str) {
         point_reads(&store, &data, &out);
     }
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
-    out.emit("process", "peak_rss_mib", unsafe { usage.assume_init() }.ru_maxrss as u64 >> 20);
-    out.emit("process", "peak_rss_plus_disk_mib", peak.load(Ordering::Relaxed) >> 20);
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+        0
+    );
+    out.emit(
+        "process",
+        "peak_rss_mib",
+        unsafe { usage.assume_init() }.ru_maxrss as u64 >> 20,
+    );
+    out.emit(
+        "process",
+        "peak_rss_plus_disk_mib",
+        peak.load(Ordering::Relaxed) >> 20,
+    );
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -356,21 +476,43 @@ fn point_reads(store: &Store, data: &StreamData, out: &Out) {
                 .map(|chunk| {
                     scope.spawn(move || {
                         let mut reader = store.reader();
-                        let bad = chunk.iter().filter(|(key, expected)| store.get(key, &mut reader, |v| v.map(<[u8]>::len)) != *expected).count();
+                        let bad = chunk
+                            .iter()
+                            .filter(|(key, expected)| {
+                                store.get(key, &mut reader, |v| v.map(<[u8]>::len)) != *expected
+                            })
+                            .count();
                         let (decoded, blocks, filters) = reader.read_counters();
                         (bad, decoded, blocks, filters)
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).fold((0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .fold((0, 0, 0, 0), |a, b| {
+                    (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+                })
         });
         let case = format!("get_{threads}t");
         span.finish(out, &case, queries.len(), 0);
         out.emit(&case, "errors", bad);
         if matches!(store, Store::T(..)) {
-        out.emit(&case, "decoded_bytes_per_get", format!("{:.2}", decoded as f64 / queries.len() as f64));
-        out.emit(&case, "blocks_per_get", format!("{:.6}", blocks as f64 / queries.len() as f64));
-        out.emit(&case, "filter_probes_per_get", format!("{:.6}", filters as f64 / queries.len() as f64));
+            out.emit(
+                &case,
+                "decoded_bytes_per_get",
+                format!("{:.2}", decoded as f64 / queries.len() as f64),
+            );
+            out.emit(
+                &case,
+                "blocks_per_get",
+                format!("{:.6}", blocks as f64 / queries.len() as f64),
+            );
+            out.emit(
+                &case,
+                "filter_probes_per_get",
+                format!("{:.6}", filters as f64 / queries.len() as f64),
+            );
         }
         assert_eq!(bad, 0, "streaming timed reads");
     }
@@ -389,7 +531,7 @@ mod tests {
             assert_eq!(stream.raw, original.raw);
             let mut live = stream.raw;
             for i in 0..stream.n {
-                assert_eq!(stream.key(i), original.recs[i].key);
+                assert_eq!(stream.key(i), original.recs[i].key());
                 assert_eq!(stream.record(i, ORIGINAL).1, original.value(i));
                 assert_eq!(stream.original_len(i), original.value(i).len());
                 assert_eq!(updated(i), original.updates.contains(&(i as u32)));
@@ -408,9 +550,20 @@ mod tests {
                 assert_eq!(stream.expected(i, true).as_deref(), expected);
             }
             for &i in &original.deletes {
-                live -= 16 + if updated(i as usize) { original.update(i as usize).len() } else { original.value(i as usize).len() };
+                live -= 16
+                    + if updated(i as usize) {
+                        original.update(i as usize).len()
+                    } else {
+                        original.value(i as usize).len()
+                    };
             }
-            assert_eq!(live, (0..stream.n).filter_map(|i| stream.expected(i, true)).map(|v| 16 + v.len()).sum::<usize>());
+            assert_eq!(
+                live,
+                (0..stream.n)
+                    .filter_map(|i| stream.expected(i, true))
+                    .map(|v| 16 + v.len())
+                    .sum::<usize>()
+            );
         }
     }
 
