@@ -215,20 +215,29 @@ fn an_input_segment_is_inherited_from_half_its_blocks_copyable() {
 }
 
 #[test]
-fn an_inherited_segment_ends_at_twice_the_segment_length() {
-    // One input segment of about 400 KiB raw, at most 4 MiB.
+fn an_inherited_segment_ends_at_its_raw_cap() {
+    // One input segment of about 700 KiB raw, exceeding the limited builder's
+    // inherited cap of (SCOPE_MAX_RAW_MULTIPLE + 1) * RAW_BLOCK_CAP (576 KiB).
     let mut source = RunBuilder::with_raw_block_target(Codec::Zstd, 1);
-    for i in 0..400 {
+    for i in 0..750 {
         source.add(&key(i), 0, Value::Bytes(&value(i))).unwrap();
     }
     let source = source.finish();
     let view = source.view();
     let frame = view.frame(0).unwrap();
-    assert!((1..400).all(|b| view.frame(b).unwrap().dictionary_ref == frame.dictionary_ref));
+    assert!((1..750).all(|b| view.frame(b).unwrap().dictionary_ref == frame.dictionary_ref));
     let dictionary = view.inherited_dictionary(frame.dictionary_ref).unwrap();
-    let (raw, stored): (usize, usize) = (0..400)
+    let (raw, stored): (usize, usize) = (0..750)
         .map(|b| view.frame(b).unwrap())
         .fold((0, 0), |(r, s), f| (r + f.decoded_len, s + f.stored.len()));
+    let expected_cap = dictionary
+        .len()
+        .saturating_mul(16)
+        .saturating_mul(raw)
+        .checked_div(stored)
+        .unwrap_or(RAW_BLOCK_CAP)
+        .saturating_add(RAW_BLOCK_CAP)
+        .clamp(2 * RAW_BLOCK_CAP, 9 * RAW_BLOCK_CAP);
 
     let mut builder = RunBuilder::new(Codec::Zstd);
     builder.limit_segment_len(RAW_BLOCK_CAP);
@@ -248,10 +257,10 @@ fn an_inherited_segment_ends_at_twice_the_segment_length() {
         block += 1;
     }
     assert!(!builder.inheriting());
-    assert!(copied_raw <= 2 * RAW_BLOCK_CAP);
-    assert!(copied_raw + view.frame(block).unwrap().decoded_len > 2 * RAW_BLOCK_CAP);
+    assert!(copied_raw <= expected_cap);
+    assert!(copied_raw + view.frame(block).unwrap().decoded_len > expected_cap);
     // The rest of the input segment goes into sampled segments.
-    for i in block..400 {
+    for i in block..750 {
         builder.add(&key(i), 0, Value::Bytes(&value(i))).unwrap();
     }
     let run = builder.finish();
@@ -261,6 +270,99 @@ fn an_inherited_segment_ends_at_twice_the_segment_length() {
     let counts = settled(&run);
     assert!(counts[..block].iter().all(|&n| n == 1) && counts.iter().all(|&n| n > 0));
     assert_eq!(settled(&recovered), counts);
+}
+
+#[test]
+fn copy_forward_into_and_out_of_a_widened_segment() {
+    // Build a settled bottom run with two segments:
+    // - Segment 1: incompressible 4.2 MiB (stays at one sampled segment)
+    // - Segment 2: compressible 10 MiB (widens past 2 * 4 MiB = 8 MiB)
+    let mut b = RunBuilder::new(Codec::Zstd);
+    let mut state = 0x1234_5678_9abc_def0u64;
+    for i in 0..4_200usize {
+        let mut v = vec![0u8; 1024];
+        for byte in &mut v {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state >> 24) as u8;
+        }
+        b.add(&key(i), 0, Value::Bytes(&v)).unwrap();
+    }
+    let compressible = vec![b'a'; 1024];
+    for i in 4_200..18_000usize {
+        b.add(&key(i), 0, Value::Bytes(&compressible)).unwrap();
+    }
+    let run = b.finish();
+    let view = run.view();
+    assert!(view.segment_count() >= 2);
+    let widened_ref = view.frame(view.block_count() - 1).unwrap().dictionary_ref;
+    let (widened_blocks, widened_raw): (usize, usize) = (0..view.block_count())
+        .map(|blk| view.frame(blk).unwrap())
+        .filter(|f| f.dictionary_ref == widened_ref)
+        .fold((0, 0), |(n, r), f| (n + 1, r + f.decoded_len));
+    assert!(widened_raw > 9 << 20, "widened segment raw: {widened_raw}");
+
+    // Case 1 (copy out of a widened segment): touch every block before the
+    // widened segment so earlier segments rewrite while the widened segment
+    // (> 9 MiB) is inherited and copied verbatim past twice the sampled
+    // segment length (8 MiB).
+    let first_widened_block = (0..view.block_count())
+        .find(|&blk| view.frame(blk).unwrap().dictionary_ref == widened_ref)
+        .unwrap();
+    let before_widened = view.last_key(first_widened_block - 1).unwrap().to_vec();
+    let touch_first: Vec<Vec<u8>> = (0..18_000)
+        .step_by(2)
+        .map(key)
+        .filter(|k| k <= &before_widened)
+        .collect();
+    let updates = newer(&touch_first);
+    let tail_update = newer(&[key(17_999)]);
+    let out = merge(&[&updates, &tail_update, &run], true).unwrap();
+    let off = merge(&[&updates, &tail_update, &run], false).unwrap();
+    assert_eq!(records(&out.runs), records(&off.runs));
+    assert_eq!(out.copied.inherited, 1);
+    assert_eq!(out.copied.blocks as usize, widened_blocks - 1);
+    assert!(out.copied.raw > 9 << 20);
+    for r in &out.runs {
+        let (recovered, _) = Run::recover(r.as_bytes().to_vec()).unwrap();
+        assert_eq!(settled(&recovered), settled(r));
+    }
+
+    // Case 2 (copy into a run that first writes a widened sampled segment):
+    // rewrite a 10 MiB compressible prefix (which opens a continued sampled
+    // segment) followed by an untouched widened segment (begin_inherited closes
+    // the continued segment cleanly and inherits the second widened segment).
+    let mut b2 = RunBuilder::new(Codec::Zstd);
+    for i in 0..10_000usize {
+        b2.add(&key(i), 0, Value::Bytes(&compressible)).unwrap();
+    }
+    // High-entropy bridge forces a segment close before the second widened segment.
+    for i in 10_000..14_500usize {
+        let mut v = vec![0u8; 1024];
+        for byte in &mut v {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state >> 24) as u8;
+        }
+        b2.add(&key(i), 0, Value::Bytes(&v)).unwrap();
+    }
+    for i in 14_500..24_500usize {
+        b2.add(&key(i), 0, Value::Bytes(&compressible)).unwrap();
+    }
+    let run2 = b2.finish();
+    let touch_prefix: Vec<Vec<u8>> = (0..10_000).step_by(20).map(key).collect();
+    let updates2 = newer(&touch_prefix);
+    let out2 = merge(&[&updates2, &run2], true).unwrap();
+    let off2 = merge(&[&updates2, &run2], false).unwrap();
+    assert_eq!(records(&out2.runs), records(&off2.runs));
+    assert!(out2.copied.inherited >= 1);
+    assert!(out2.copied.raw > 9 << 20);
+    for r in &out2.runs {
+        let (recovered, _) = Run::recover(r.as_bytes().to_vec()).unwrap();
+        assert_eq!(settled(&recovered), settled(r));
+    }
 }
 
 #[test]

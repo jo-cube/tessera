@@ -103,7 +103,7 @@ fn multiple_allocations_preserve_serialization_and_all_read_paths() {
         let run = build(codec);
         assert_eq!(
             run.view().segments.len(),
-            if codec == Codec::Zstd { 3 } else { 0 }
+            if codec == Codec::Zstd { 1 } else { 0 }
         );
         if codec == Codec::Zstd {
             assert_eq!(parts(&run).allocations.len(), 1);

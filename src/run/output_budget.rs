@@ -146,4 +146,40 @@ mod tests {
         drop(budget);
         assert_eq!(counters.current.load(Relaxed), 0);
     }
+
+    #[test]
+    fn output_budget_refusal_mid_continuation_stops_cleanly() {
+        let counters = Arc::new(OutputCounters::default());
+        // Enough room for the sampled 64 KiB prefix (16 KiB dictionary +
+        // prefix frames + index) plus a couple of continuation blocks, then
+        // refuses mid-continuation.
+        let budget = OutputBudget::new(&counters, 19 << 10);
+        let mut builder = RunBuilder::new(Codec::Zstd);
+        builder.limit_segment_len(crate::run::RAW_BLOCK_CAP);
+        builder.limit_filter_build_bytes(0);
+        builder.limit_output(budget.clone());
+        let mut state = 0x517c_c1b7_2722_0a95u64;
+        let mut refused_at = None;
+        for key in 0..2_000u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let value = format!("prefix-shared-record-{:016x}-{}", state, "x".repeat(450));
+            builder
+                .add(&key.to_be_bytes(), 0, Value::Bytes(value.as_bytes()))
+                .unwrap();
+            if builder.output_refused() {
+                refused_at = Some(key);
+                break;
+            }
+        }
+        let at = refused_at.expect("budget must refuse during continuation");
+        // Prefix holds ~130 records (64 KiB raw); refusal must happen well
+        // after cut_segment opened continuation.
+        assert!(at > 150, "refused too early at record {at}");
+        assert!(builder.finish_checked().is_err());
+        assert!(budget.used.load(Relaxed) <= budget.limit());
+        drop(budget);
+        assert_eq!(counters.current.load(Relaxed), 0);
+    }
 }
