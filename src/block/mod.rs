@@ -8,7 +8,7 @@
 //!
 //! Full validation costs O(block length), so it is separated from access:
 //!
-//! - [`RecordWalk::validate_block`] validates bytes of unknown origin.
+//! - [`RecordWalk::validate_block_with`] validates bytes of unknown origin.
 //! - [`BlockView::open`] costs O(1) and suits bytes already known to be valid,
 //!   such as a validated block decompressed again into a scratch buffer. Its
 //!   reads stay panic free and report what they touch; its documentation

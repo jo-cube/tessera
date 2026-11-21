@@ -447,7 +447,7 @@ struct Table {
     family: Arc<()>,
 }
 
-/// An update [`Table::admit`] accepted, and where it goes.
+/// An update [`Table::admit_checked`] accepted, and where it goes.
 struct Admitted<'v> {
     path: Path,
     new: bool,

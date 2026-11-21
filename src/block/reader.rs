@@ -282,7 +282,7 @@ impl BlockPosition {
 ///
 /// A correct answer therefore requires bytes known to be a valid block: built
 /// by [`BlockBuilder`](super::BlockBuilder), or accepted once by
-/// [`RecordWalk::validate_block`], and unchanged since. A checksum can show bytes are
+/// [`RecordWalk::validate_block_with`], and unchanged since. A checksum can show bytes are
 /// unchanged. It cannot show that whoever wrote them produced a valid block.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockView<'a> {
