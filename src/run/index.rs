@@ -56,19 +56,38 @@ impl<'a> IndexKey<'a> {
     pub fn len(self) -> usize {
         self.len
     }
-    fn bytes(&self) -> impl Iterator<Item = u8> + '_ {
-        self.pieces[..self.count]
-            .iter()
-            .flat_map(|piece| piece.iter().copied())
+    pub fn cmp(&self, mut other: &[u8]) -> std::cmp::Ordering {
+        for &piece in &self.pieces[..self.count] {
+            let n = piece.len().min(other.len());
+            match piece[..n].cmp(&other[..n]) {
+                std::cmp::Ordering::Equal => {}
+                order => return order,
+            }
+            if piece.len() > other.len() {
+                return std::cmp::Ordering::Greater;
+            }
+            other = &other[n..];
+        }
+        if other.is_empty() {
+            std::cmp::Ordering::Equal
+        } else {
+            std::cmp::Ordering::Less
+        }
     }
-    pub fn cmp(&self, other: &[u8]) -> std::cmp::Ordering {
-        self.bytes().cmp(other.iter().copied())
+    pub fn copy_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        for piece in &self.pieces[..self.count] {
+            out.extend_from_slice(piece);
+        }
+    }
+    pub fn extend_into(&self, out: &mut Vec<u8>) {
+        for piece in &self.pieces[..self.count] {
+            out.extend_from_slice(piece);
+        }
     }
     pub fn to_vec(self) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.len);
-        for piece in &self.pieces[..self.count] {
-            key.extend_from_slice(piece);
-        }
+        self.extend_into(&mut key);
         key
     }
 }

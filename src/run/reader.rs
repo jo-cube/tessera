@@ -8,6 +8,7 @@ use std::sync::{Arc, Weak};
 
 use crate::block::{
     BlockPosition, BlockView, MAX_KEY_LEN, RESTART_INTERVAL, Record, RecordWalk, Value, Version,
+    common_prefix_len,
 };
 
 use super::codec::{Codec, Decompressor, plausible_decoded_len};
@@ -58,6 +59,9 @@ pub struct Run<B> {
 #[derive(Debug)]
 struct RunBacking<B> {
     data: RunData<B>,
+    /// Pre-parsed region boundaries from the validated footer so `Run::view()`
+    /// avoids re-parsing and re-validating the footer and first index key.
+    layout: RunLayout,
     /// One contiguous search head per index restart, rebuilt from stored keys.
     restart_heads: Box<[u64]>,
     /// Boxed so that a run without one costs no more than a pointer.
@@ -72,6 +76,65 @@ struct RunBacking<B> {
     /// Which blocks are settled, recorded when the run was built or
     /// validated; `None` if none is.
     settled: Option<SettledCounts>,
+}
+
+/// Validated byte boundaries within a run's immutable storage.
+#[derive(Clone, Copy, Debug)]
+struct RunLayout {
+    frames_len: usize,
+    dictionaries_len: usize,
+    segments_len: usize,
+    table_len: usize,
+    min_key_len: usize,
+    record_count: usize,
+}
+
+impl RunLayout {
+    fn from_view(view: RunView<'_>) -> Self {
+        Self {
+            frames_len: view.frames.len(),
+            dictionaries_len: view.dictionaries.len(),
+            segments_len: size_of_val(view.segments),
+            table_len: size_of_val(view.table),
+            min_key_len: view.min_key.len(),
+            record_count: view.record_count,
+        }
+    }
+
+    fn view<'a, B: AsRef<[u8]>>(self, data: &'a RunData<B>) -> RunView<'a> {
+        let (frames, dictionaries, tail) = match data {
+            RunData::Segmented(segmented) => (
+                Region::Frames(segmented),
+                Region::Dictionaries(segmented),
+                &segmented.tail[..segmented.tail.len() - FOOTER_LEN],
+            ),
+            RunData::Contiguous(bytes) => {
+                let bytes = bytes.as_ref();
+                let dict_end = self.frames_len + self.dictionaries_len;
+                (
+                    Region::Contiguous(&bytes[..self.frames_len]),
+                    Region::Contiguous(&bytes[self.frames_len..dict_end]),
+                    &bytes[dict_end..bytes.len() - FOOTER_LEN],
+                )
+            }
+        };
+        let (segments, index) = tail.split_at(self.segments_len);
+        let (table, keys) = index.split_at(self.table_len);
+        RunView {
+            frames,
+            dictionaries,
+            segments: segments.as_chunks().0,
+            table: table.as_chunks().0,
+            keys,
+            min_key: &keys[..self.min_key_len],
+            record_count: self.record_count,
+            seq_override: None,
+            restart_heads: None,
+            largest_block: None,
+            settled: None,
+            slice: None,
+        }
+    }
 }
 
 /// What a builder or a validation pass found in a run's blocks.
@@ -97,12 +160,8 @@ struct KeyBounds {
 
 impl KeyBounds {
     /// The bounds of the valid run `data`.
-    fn of(data: &RunData<impl AsRef<[u8]>>) -> Option<Self> {
-        let range = data
-            .view()
-            .expect(VALIDATED)
-            .key_range()
-            .expect(VALIDATED)?;
+    fn from_view(data: &RunData<impl AsRef<[u8]>>, view: RunView<'_>) -> Option<Self> {
+        let range = view.key_range().expect(VALIDATED)?;
         let within = |key| subslice(data.key_data(), key).expect("a run's keys lie in its bytes");
         Some(Self {
             min: within(range.min),
@@ -132,11 +191,14 @@ impl<B: AsRef<[u8]>> Run<B> {
     pub fn new(data: B) -> Result<Self, CorruptRun> {
         let (seqs, reclaimable, sizes) = validate(data.as_ref(), None)?;
         let data = RunData::Contiguous(data);
-        let bounds = KeyBounds::of(&data);
-        let restart_heads = Self::restart_heads(&data);
+        let view = data.view().expect(VALIDATED);
+        let layout = RunLayout::from_view(view);
+        let bounds = KeyBounds::from_view(&data, view);
+        let restart_heads = Self::restart_heads_from(view);
         Ok(Self {
             backing: Arc::new(RunBacking {
                 data,
+                layout,
                 restart_heads,
                 filter: None,
                 bounds,
@@ -158,11 +220,14 @@ impl<B: AsRef<[u8]>> Run<B> {
         reclaimable: bool,
         sizes: BlockSizes,
     ) -> Self {
-        let bounds = KeyBounds::of(&data);
-        let restart_heads = Self::restart_heads(&data);
+        let view = data.view().expect(VALIDATED);
+        let layout = RunLayout::from_view(view);
+        let bounds = KeyBounds::from_view(&data, view);
+        let restart_heads = Self::restart_heads_from(view);
         Self {
             backing: Arc::new(RunBacking {
                 data,
+                layout,
                 restart_heads,
                 filter: filter.map(Box::new),
                 bounds,
@@ -177,8 +242,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         }
     }
 
-    fn restart_heads(data: &RunData<B>) -> Box<[u64]> {
-        let view = data.view().expect(VALIDATED);
+    fn restart_heads_from(view: RunView<'_>) -> Box<[u64]> {
         (0..view.block_count())
             .step_by(RESTART_INTERVAL)
             .map(|block| head(view.unshared_key(block).expect(VALIDATED)))
@@ -268,6 +332,7 @@ impl<B: AsRef<[u8]>> Run<B> {
         Run {
             backing: Arc::new(RunBacking {
                 data,
+                layout: self.backing.layout,
                 restart_heads: self.backing.restart_heads.clone(),
                 filter: self.backing.filter.clone(),
                 bounds: self.backing.bounds.clone(),
@@ -297,7 +362,7 @@ impl<B: AsRef<[u8]>> Run<B> {
 
     /// Returns the number of stored records, counting every version.
     pub fn len(&self) -> usize {
-        self.view().len()
+        self.backing.layout.record_count
     }
 
     /// Returns whether the run stores no records.
@@ -382,7 +447,7 @@ impl<B: AsRef<[u8]>> Run<B> {
                 min: &r.0,
                 max: &r.1,
             }),
-            ..self.backing.data.view().expect(VALIDATED)
+            ..self.backing.layout.view(&self.backing.data)
         }
     }
 
@@ -853,27 +918,14 @@ impl LookupWorkspace {
         buffer: usize,
     ) -> Result<Option<(u64, Found<'a>)>, CorruptRun> {
         let scratch = &mut self.buffers[buffer];
-        let found = view.find(
+        let found = view.find_located(
             target,
             scratch,
             &mut self.decompressor,
             &mut self.blocks_loaded,
             &mut self.decoded_bytes,
         )?;
-        let Some((block, version)) = found else {
-            return Ok(None);
-        };
-        let value = match version.value {
-            Value::Tombstone => Located::Tombstone,
-            Value::Bytes(value) => match view.frames.stored_subslice(value) {
-                Some(value) => Located::Stored(value),
-                None => {
-                    let range = subslice(block, value).expect("a value lies in its block");
-                    Located::Decoded(range.start, range.end)
-                }
-            },
-        };
-        Ok(Some((version.seq, Found { buffer, value })))
+        Ok(found.map(|(seq, value)| (seq, Found { buffer, value })))
     }
 
     /// Returns the value of a version [`get`](Self::get) found. Its buffer
@@ -1118,10 +1170,9 @@ impl<'a> RunCursor<'a> {
         };
         let workspace = &mut *self.workspace;
         let bytes = loaded_bytes(&workspace.scratch, &block.frame);
-        let view = BlockView::open(bytes).map_err(|error| block.frame.block_error(error))?;
         let Some(record) = workspace
             .position
-            .next_record(view)
+            .next_record_entries(&bytes[..block.entries_len])
             .map_err(|error| block.frame.block_error(error))?
         else {
             return Ok(());
@@ -1573,10 +1624,27 @@ impl<'a> RunView<'a> {
         }
         let start = low.saturating_sub(1) * RESTART_INTERVAL;
         let end = (low * RESTART_INTERVAL).min(self.table.len());
-        let mut key = IndexKey::new();
+        // Track the common prefix length with `target` while keys stay below
+        // it, just as `BlockView::get` does: any entry sharing more bytes than
+        // `matched` keeps the earlier byte that was already below `target`.
+        let mut prev_len = 0usize;
+        let mut matched = 0usize;
         for block in start..end {
-            self.append_index_key(block, &mut key)?;
-            if !key.cmp(target).is_lt() {
+            let (shared, suffix) = self.index_entry(block)?;
+            let len = shared
+                .checked_add(suffix.len())
+                .ok_or(self.invalid_index(block))?;
+            if shared > prev_len || len > MAX_KEY_LEN {
+                return Err(self.invalid_index(block));
+            }
+            prev_len = len;
+            if shared > matched {
+                continue;
+            }
+            let target_rest = &target[shared..];
+            let common = common_prefix_len(suffix, target_rest);
+            matched = shared + common;
+            if suffix.get(common) >= target_rest.get(common) {
                 return Ok(Some(block));
             }
         }
@@ -1652,7 +1720,8 @@ impl<'a> RunView<'a> {
     }
 
     /// Point lookup, with the buffer, context and block count given
-    /// separately. Also returns the block the version is in.
+    /// separately.
+    #[cfg(test)]
     fn find<'r>(
         self,
         target: &[u8],
@@ -1678,6 +1747,56 @@ impl<'a> RunView<'a> {
             .and_then(|view| view.get(target))
             .map_err(|error| frame.block_error(error))?;
         Ok(version.map(|version| (bytes, self.effective(version))))
+    }
+
+    /// Point lookup returning a value located directly in the run (for
+    /// uncompressed frames) or at an offset inside `scratch` (for compressed
+    /// frames), without scanning physical pieces.
+    fn find_located(
+        self,
+        target: &[u8],
+        scratch: &mut Vec<u8>,
+        decompressor: &mut Decompressor,
+        blocks_loaded: &mut u64,
+        decoded_bytes: &mut u64,
+    ) -> Result<Option<(u64, Located<'a>)>, CorruptRun> {
+        if target < self.min_key || self.slice.is_some_and(|r| target < r.min || target > r.max) {
+            return Ok(None);
+        }
+        let Some(block) = self.locate(target)? else {
+            return Ok(None);
+        };
+        let frame = self.frame(block)?;
+        *blocks_loaded += 1;
+        *decoded_bytes += frame.decoded_len as u64;
+        if frame.codec == Codec::None {
+            let version = BlockView::open(frame.stored)
+                .and_then(|view| view.get(target))
+                .map_err(|error| frame.block_error(error))?;
+            return Ok(version.map(|version| {
+                let version = self.effective(version);
+                let located = match version.value {
+                    Value::Tombstone => Located::Tombstone,
+                    Value::Bytes(bytes) => Located::Stored(bytes),
+                };
+                (version.seq, located)
+            }));
+        }
+        let bytes = decode(&frame, scratch, decompressor)?;
+        let version = BlockView::open(bytes)
+            .and_then(|view| view.get(target))
+            .map_err(|error| frame.block_error(error))?;
+        Ok(version.map(|version| {
+            let version = self.effective(version);
+            let located = match version.value {
+                Value::Tombstone => Located::Tombstone,
+                Value::Bytes(value) => {
+                    let range = subslice(bytes, value).expect("a value lies in its block");
+                    Located::Decoded(range.start, range.end)
+                }
+            };
+            (version.seq, located)
+        }))
     }
 
     fn effective(self, version: Version<'_>) -> Version<'_> {
@@ -1741,7 +1860,11 @@ impl<'a> RunView<'a> {
         }
         Ok(suffix)
     }
-    fn append_index_key(self, block: usize, key: &mut IndexKey<'a>) -> Result<(), CorruptRun> {
+    pub(super) fn append_index_key(
+        self,
+        block: usize,
+        key: &mut IndexKey<'a>,
+    ) -> Result<(), CorruptRun> {
         let (shared, suffix) = self.index_entry(block)?;
         key.append(shared, suffix).ok_or(self.invalid_index(block))
     }
@@ -1833,6 +1956,7 @@ fn validate(
     let mut walk = RecordWalk::default();
     let mut sizes = BlockSizes::default();
     let mut settled = Vec::with_capacity(view.table.len());
+    let mut index_key = IndexKey::new();
     for block in 0..view.table.len() {
         let frame = view.frame(block)?;
         sizes.largest_block = sizes.largest_block.max(frame.decoded_len);
@@ -1843,41 +1967,43 @@ fn validate(
         let decoded = workspace.load(&frame)?;
 
         let records_before = walk.record_count;
-        walk.validate_block(decoded)
-            .map_err(|error| frame.block_error(error))?;
+        let mut first_in_run = block == 0;
+        let mut min_key_mismatch = false;
+        let mut filter_mismatch = false;
+        let mut last_hashed: Option<u64> = None;
+        walk.validate_block_with(decoded, |key| {
+            if first_in_run {
+                first_in_run = false;
+                min_key_mismatch = key != view.min_key;
+            }
+            if !filter_mismatch && let Some(filter) = filter {
+                let hash = super::filter::hash(key);
+                if last_hashed != Some(hash) {
+                    if !filter.may_contain(hash) {
+                        filter_mismatch = true;
+                    } else {
+                        last_hashed = Some(hash);
+                    }
+                }
+            }
+        })
+        .map_err(|error| frame.block_error(error))?;
         if walk.record_count == records_before {
             return Err(frame.error(RunCorruption::EmptyBlock));
+        }
+        if min_key_mismatch {
+            return Err(view.invalid_key_range());
+        }
+        if filter_mismatch {
+            return Err(corrupt(bytes.len(), RunCorruption::InvalidFilter));
         }
         settled.push(if walk.block_settled {
             u32::try_from(walk.record_count - records_before).unwrap_or(u32::MAX)
         } else {
             0
         });
-        if block == 0 || filter.is_some() {
-            let opened = BlockView::open(decoded).map_err(|error| frame.block_error(error))?;
-            let mut position = BlockPosition::new();
-            let first = position
-                .next_record(opened)
-                .map_err(|error| frame.block_error(error))?;
-            if block == 0 && first.map(|record| record.key) != Some(view.min_key) {
-                return Err(view.invalid_key_range());
-            }
-            // A checksummed filter must also agree with the records: a false
-            // negative would make point reads disagree with scans. Reuse the
-            // decoded block rather than decompressing it a second time.
-            if let Some(filter) = filter {
-                let mut record = first;
-                while let Some(current) = record {
-                    if !filter.may_contain(super::filter::hash(current.key)) {
-                        return Err(corrupt(bytes.len(), RunCorruption::InvalidFilter));
-                    }
-                    record = position
-                        .next_record(opened)
-                        .map_err(|error| frame.block_error(error))?;
-                }
-            }
-        }
-        if !view.last_key(block)?.cmp(&walk.key).is_eq() {
+        view.append_index_key(block, &mut index_key)?;
+        if !index_key.cmp(&walk.key).is_eq() {
             return Err(view.invalid_index(block));
         }
     }

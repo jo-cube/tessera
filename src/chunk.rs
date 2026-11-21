@@ -341,6 +341,7 @@ impl Chunk {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_used(&mut self, used: usize) {
         if used == self.used {
             return;

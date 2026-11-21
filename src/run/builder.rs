@@ -21,7 +21,7 @@ use super::{
 };
 use crate::block::{
     BlockBuilder, BlockPosition, BlockView, BuildError, MAX_KEY_LEN, RESTART_INTERVAL, Value,
-    cmp_internal,
+    common_prefix_len,
 };
 use crate::chunk::ChunkPool;
 use std::fmt;
@@ -154,13 +154,18 @@ impl RunBuilder {
     }
     pub fn add(&mut self, key: &[u8], seq: u64, value: Value<'_>) -> Result<(), BuildError> {
         BlockBuilder::check_limits(key, value)?;
-        if self.record_count > 0 {
-            match cmp_internal(self.block.last_key(), self.last_seq, key, seq) {
-                std::cmp::Ordering::Less => {}
+        let (common, duplicate) = if self.record_count > 0 {
+            let last_key = self.block.last_key();
+            let common = common_prefix_len(last_key, key);
+            let key_ord = last_key.get(common).cmp(&key.get(common));
+            match key_ord.then(seq.cmp(&self.last_seq)) {
+                std::cmp::Ordering::Less => (common, key_ord.is_eq()),
                 std::cmp::Ordering::Equal => return Err(BuildError::DuplicateKey),
                 std::cmp::Ordering::Greater => return Err(BuildError::OutOfOrder),
             }
-        }
+        } else {
+            (0, false)
+        };
         // Reserve index room even for an open block cut into singletons.
         if !index_has_room(
             self.table.len() / TABLE_ENTRY_LEN + self.block.len(),
@@ -170,7 +175,7 @@ impl RunBuilder {
         }
         // The record's lengths, computed once and kept while the open block
         // is unchanged.
-        let mut projection = self.block.project(key, seq, value);
+        let mut projection = self.block.project_with_common(key, seq, value, common);
         // Bound the complete serialized run, including the buffered segment,
         // before accepting a record. No truncating offset casts can follow.
         // The record adds at most a block of its own to the raw bytes.
@@ -229,7 +234,6 @@ impl RunBuilder {
         if self.record_count == 0 && !self.reserve_output(key.len()) {
             return Ok(());
         }
-        let duplicate = self.record_count > 0 && self.block.last_key() == key;
         self.block.append_projected(key, seq, value, projection)?;
         if self.record_count == 0 {
             self.keys.extend_from_slice(key);
@@ -391,18 +395,10 @@ impl RunBuilder {
         ) {
             return Ok(false);
         }
-        let mut copy = std::mem::take(&mut self.frames);
-        copy.clear();
-        let sealed = frame.copy_resealed(&mut copy, reference);
-        if let Err(error) = sealed {
-            self.frames = copy;
-            return Err(error);
-        }
+        let header = frame.verify_and_reseal(reference)?;
         let offset = u32::try_from(self.storage.frames_len).expect("bounded run offset");
-        self.storage.reused(copy.len());
-        self.storage.frame(&copy);
-        retain_scratch(&mut copy, 2 * RAW_BLOCK_CAP);
-        self.frames = copy;
+        self.storage.reused(frame::HEADER_LEN + frame.stored.len());
+        self.storage.frame_parts(&header, frame.stored);
         if self.record_count == 0 {
             let first = first_key.expect("checked above");
             self.keys.extend_from_slice(first);
@@ -726,26 +722,34 @@ impl RunBuilder {
     /// Compresses the pending bytes of block `number` into its frame and
     /// records the frame's offset in the index.
     fn compress_block(&mut self, number: usize, bytes: Range<usize>, reference: u32) {
-        let block = &self.block.sealed()[bytes];
-        self.frames.clear();
         let offset = self.storage.frames_len;
-        let len = block.len();
+        let len = bytes.len();
         let codec = self.compressor.codec();
-        self.frames.resize(frame::HEADER_LEN, 0);
-        if codec == Codec::None {
-            self.frames.extend_from_slice(block);
+        let stored_len = if codec == Codec::None {
+            let frame_len = frame::HEADER_LEN + len;
+            if !self.reserve_output(frame_len) {
+                return;
+            }
+            let block = &self.block.sealed()[bytes];
+            let header = frame::header(codec, len, reference, block);
+            self.storage.frame_parts(&header, block);
+            frame_len
         } else {
+            let block = &self.block.sealed()[bytes];
             self.compressor.compress(block, &mut self.frames);
-        }
-        frame::seal(&mut self.frames, codec, len, reference);
-        if !self.reserve_output(self.frames.len()) {
-            return;
-        }
+            let header = frame::header(codec, len, reference, &self.frames);
+            let frame_len = frame::HEADER_LEN + self.frames.len();
+            if !self.reserve_output(frame_len) {
+                retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
+                return;
+            }
+            self.storage.frame_parts(&header, &self.frames);
+            retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
+            frame_len
+        };
         self.largest_block = self.largest_block.max(len);
         self.storage
-            .compressed(len, self.frames.len(), codec == Codec::Zstd);
-        self.storage.frame(&self.frames);
-        retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
+            .compressed(len, stored_len, codec == Codec::Zstd);
         let at = number * TABLE_ENTRY_LEN;
         self.table[at..at + 4].copy_from_slice(
             &u32::try_from(offset)
@@ -767,12 +771,7 @@ fn push_index(
     let shared = if (table.len() / TABLE_ENTRY_LEN).is_multiple_of(RESTART_INTERVAL) {
         0
     } else {
-        index_last_key
-            .iter()
-            .zip(last)
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(u16::MAX as usize)
+        common_prefix_len(index_last_key, last).min(u16::MAX as usize)
     };
     keys.extend_from_slice(&(shared as u16).to_le_bytes());
     keys.extend_from_slice(&last[shared..]);

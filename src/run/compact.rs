@@ -454,16 +454,14 @@ pub(crate) fn compact_parallel_in<'a>(
             (pool, floors),
         );
     }
-    // Reconstruct sparse-index keys, weighted by compressed input bytes. Equal user
-    // keys stay together even when their versions span several input blocks.
+    // Reconstruct sparse-index keys sequentially into one flat buffer,
+    // weighted by compressed input bytes. Equal user keys stay together even
+    // when their versions span several input blocks.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
-    let mut metadata = count.saturating_mul(size_of::<(Vec<u8>, usize)>());
-    for input in inputs {
-        for block in 0..input.block_count() {
-            metadata = metadata.saturating_add(input.last_key(block)?.len());
-        }
-    }
-    if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
+    let max_metadata = limits.max_workspace_bytes.saturating_sub(needed);
+    let mut metadata = count
+        .saturating_mul(size_of::<(std::ops::Range<usize>, usize)>() + size_of::<(&[u8], usize)>());
+    if metadata > max_metadata {
         return compact_with_in(
             inputs,
             keep_tombstone,
@@ -473,18 +471,41 @@ pub(crate) fn compact_parallel_in<'a>(
             (pool, floors),
         );
     }
+    let mut boundary_bytes = Vec::new();
     let mut boundaries = Vec::with_capacity(count);
     for input in inputs {
+        let mut key = super::index::IndexKey::new();
         for block in 0..input.block_count() {
-            boundaries.push((input.last_key(block)?.to_vec(), input.block_bytes(block)));
+            input.append_index_key(block, &mut key)?;
+            metadata = metadata.saturating_add(key.len());
+            if metadata > max_metadata {
+                return compact_with_in(
+                    inputs,
+                    keep_tombstone,
+                    limits,
+                    cuts,
+                    workspace,
+                    (pool, floors),
+                );
+            }
+            let start = boundary_bytes.len();
+            key.extend_into(&mut boundary_bytes);
+            boundaries.push((start..boundary_bytes.len(), input.block_bytes(block)));
         }
     }
-    boundaries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let slices: Vec<(&[u8], usize)> = {
+        boundaries
+            .sort_unstable_by(|a, b| boundary_bytes[a.0.clone()].cmp(&boundary_bytes[b.0.clone()]));
+        boundaries
+            .iter()
+            .map(|(span, bytes)| (&boundary_bytes[span.clone()], *bytes))
+            .collect()
+    };
     let largest = inputs
         .iter()
         .map(|input| input.largest_block_len())
         .collect::<Result<Vec<_>, _>>()?;
-    let mut threads = threads.min(boundaries.len());
+    let mut threads = threads.min(slices.len());
     // Keep selection's workspace limit. Divide the segment allowance rather
     // than multiplying a full-size builder by N; reduce N for high fan-in.
     let (segment_len, per_builder) = loop {
@@ -506,7 +527,7 @@ pub(crate) fn compact_parallel_in<'a>(
             );
         }
     };
-    let starts = partition_starts(&boundaries, estimated_run_bytes, threads);
+    let starts = partition_starts(&slices, estimated_run_bytes, threads);
     if starts.is_empty() {
         return compact_with_in(
             inputs,
@@ -730,6 +751,7 @@ fn compact_range_checked<'a>(
         end: range.end,
         judged: None,
         stats: CopyStats::default(),
+        last_key: Vec::new(),
     };
     if copies.contains(&true) {
         merge.copy_blocks(copies);
@@ -841,6 +863,7 @@ struct Forward<'e> {
     /// the block after its last.
     judged: Option<(usize, u32, usize)>,
     stats: CopyStats,
+    last_key: Vec<u8>,
 }
 
 impl Forward<'_> {
@@ -894,7 +917,8 @@ impl Forward<'_> {
             return Ok(0);
         }
         let first = (block == 0).then(|| view.min_key());
-        if !output.copy(&frame, &last.to_vec(), records, first)? {
+        last.copy_into(&mut self.last_key);
+        if !output.copy(&frame, &self.last_key, records, first)? {
             return Ok(0);
         }
         self.stats.blocks += 1;
