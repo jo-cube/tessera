@@ -1674,8 +1674,17 @@ impl<'a> RunView<'a> {
             decoded_bytes,
             ..
         } = workspace;
-        let found = self.find(target, scratch, decompressor, blocks_loaded, decoded_bytes)?;
-        Ok(found.map(|(_, version)| version))
+        let Some((seq, located)) =
+            self.find_located(target, scratch, decompressor, blocks_loaded, decoded_bytes)?
+        else {
+            return Ok(None);
+        };
+        let value = match located {
+            Located::Tombstone => Value::Tombstone,
+            Located::Stored(bytes) => Value::Bytes(bytes),
+            Located::Decoded(start, end) => Value::Bytes(&scratch[start..end]),
+        };
+        Ok(Some(Version { seq, value }))
     }
 
     /// Probes sorted indices, loading each candidate block once. Callbacks
@@ -1717,36 +1726,6 @@ impl<'a> RunView<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Point lookup, with the buffer, context and block count given
-    /// separately.
-    #[cfg(test)]
-    fn find<'r>(
-        self,
-        target: &[u8],
-        scratch: &'r mut Vec<u8>,
-        decompressor: &mut Decompressor,
-        blocks_loaded: &mut u64,
-        decoded_bytes: &mut u64,
-    ) -> Result<Option<(&'r [u8], Version<'r>)>, CorruptRun>
-    where
-        'a: 'r,
-    {
-        if target < self.min_key || self.slice.is_some_and(|r| target < r.min || target > r.max) {
-            return Ok(None);
-        }
-        let Some(block) = self.locate(target)? else {
-            return Ok(None);
-        };
-        let frame = self.frame(block)?;
-        *blocks_loaded += 1;
-        *decoded_bytes += frame.decoded_len as u64;
-        let bytes = decode(&frame, scratch, decompressor)?;
-        let version = BlockView::open(bytes)
-            .and_then(|view| view.get(target))
-            .map_err(|error| frame.block_error(error))?;
-        Ok(version.map(|version| (bytes, self.effective(version))))
     }
 
     /// Point lookup returning a value located directly in the run (for
