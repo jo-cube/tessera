@@ -57,3 +57,36 @@ Rust allocation bytes and sample `/proc/self/status` plus engine memory
 components every second and at phase ends. Run one named scenario per process.
 Native Zstandard allocations are outside the Rust counter. `--threads COUNT`
 sets builders; `--threads default` uses the engine default (otherwise one).
+
+## Zstandard entropy measurements
+
+Run the isolated harness under validation limits, with scenario names from
+the counters tool. The optional scale shift reduces each input for smoke runs.
+
+```sh
+scripts/validate.sh exec 1200 cargo run --locked --release \
+  --manifest-path tools/entropy/Cargo.toml -- A B A-large small
+```
+
+The harness settles the bottom level and samples evenly spaced segments. It
+inspects stored frames, checks that raw-dictionary recompression reproduces
+them and verifies every decoded block in each mode. Timed single-thread
+replays rotate variant order. Build and dictionary-load rows use thread CPU
+time. Build measurements start with encoded raw blocks and sampled dictionary
+content.
+
+- `sample` gives sampled segment, frame, raw-byte and record counts.
+- `layout` gives frame and Zstandard block counts, then total, header,
+  raw-block, RLE-block, literal-section and sequence-section bytes.
+- `mode` gives each literal or sequence mode's section count and explicit
+  table-description bytes. `reuse` counts frames with fresh Huffman or FSE
+  descriptions and frames that reuse each type of table from the dictionary.
+- `storage` gives frame bytes, dictionary bytes, resident DDict bytes,
+  total and peak local CDict bytes including the content copy, and frames
+  with fresh non-RLE descriptions.
+- `timing` gives the repeat number, wall nanoseconds to decode the sample,
+  thread CPU nanoseconds to build it, and the portions spent finalizing
+  dictionaries and digesting DDicts.
+- `proof` gives segment counts sampled, spliced and accepted by zstd, followed
+  by verified frames and the counts that reused dictionary Huffman or FSE
+  tables.

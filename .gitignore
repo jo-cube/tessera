@@ -1,6 +1,7 @@
 # Cargo build output and Rust diagnostics
 /target/
 /tools/bench/target/
+/tools/entropy/target/
 **/*.rs.bk
 *.pdb
 rustc-ice-*.txt

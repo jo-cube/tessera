@@ -41,7 +41,7 @@ fn varint(bytes: &[u8], at: &mut usize) -> u64 {
 }
 
 /// End offsets of each record in a raw block, by walking it.
-fn record_ends(block: &[u8]) -> Vec<usize> {
+pub fn record_ends(block: &[u8]) -> Vec<usize> {
     let n = block.len();
     let restarts = u32::from_le_bytes(block[n - 4..].try_into().unwrap()) as usize;
     let records_end = n - 4 * (restarts + 1);
@@ -82,7 +82,7 @@ fn zstd_blocks(frame: &[u8]) -> Vec<usize> {
     }
 }
 
-fn cctx(setting: Setting) -> CCtx<'static> {
+pub fn cctx(setting: Setting) -> CCtx<'static> {
     let mut ctx = CCtx::create();
     for p in [
         CParameter::Format(FrameFormat::Magicless),
@@ -135,7 +135,7 @@ fn compress(samples: &[SegmentSample], setting: Setting) -> Compressed {
     Compressed { frames, stored }
 }
 
-fn dctx() -> DCtx<'static> {
+pub fn dctx() -> DCtx<'static> {
     let mut ctx = DCtx::create();
     ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
         .unwrap();

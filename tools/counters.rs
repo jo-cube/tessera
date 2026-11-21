@@ -13,10 +13,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
-use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics};
+use tessera::diagnostics::{
+    self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics, SegmentSample,
+};
 use tessera::{Engine, Keyspace, Options};
 
-mod c2;
+pub(crate) mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
 mod memory;
 mod zipf;
@@ -133,9 +135,12 @@ struct Scenario {
     clustered: bool,
 }
 
+type SampleProbe = fn(&str, &[SegmentSample]);
+
 struct Flags {
     copy_audit: bool,
     c2: bool,
+    sample_probe: Option<SampleProbe>,
     write_only: bool,
     worst: bool,
     zipf: bool,
@@ -148,6 +153,7 @@ impl Default for Flags {
         Self {
             copy_audit: false,
             c2: false,
+            sample_probe: None,
             write_only: false,
             worst: false,
             zipf: false,
@@ -554,6 +560,25 @@ fn print_copy_audit(name: &str, variant: &str) {
     }
 }
 
+fn sample_bottom(engine: &Engine) -> Vec<SegmentSample> {
+    const RAW_TARGET: usize = 64 << 20;
+    let raw = diagnostics::bottom_raw(engine);
+    let every = (raw / RAW_TARGET).max(1);
+    let samples = diagnostics::bottom_segments(engine, every);
+    let sampled: usize = samples.iter().flat_map(|s| &s.blocks).map(Vec::len).sum();
+    if every > 1 && sampled < RAW_TARGET {
+        diagnostics::bottom_segments(engine, every - 1)
+    } else {
+        samples
+    }
+}
+
+fn settle_bottom(engine: &Engine) {
+    let mut merge = MergeWorkspace::new();
+    while diagnostics::compact_step(engine, &mut merge).unwrap() {}
+    engine.wait_for_compaction().unwrap();
+}
+
 fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags) {
     let started = Instant::now();
     let (name, kind, records, len) = (s.name, s.kind, s.records, s.value_len);
@@ -624,6 +649,16 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     if flags.write_only {
         eprintln!("write_only,{name},{load_seconds:.1}");
         std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        return;
+    }
+
+    if let Some(probe) = flags.sample_probe {
+        settle_bottom(&engine);
+        let samples = sample_bottom(&engine);
+        #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+        sampler.stop();
+        std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        probe(name, &samples);
         return;
     }
 
@@ -739,10 +774,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         print_copy_audit(name, variant);
     }
     if flags.c2 {
-        // At least 64 MiB raw of evenly spaced bottom segments, or all.
-        let every = (diagnostics::bottom_raw(&engine) / (64 << 20)).max(1);
-        let samples = diagnostics::bottom_segments(&engine, every);
-        c2::run(name, &samples);
+        c2::run(name, &sample_bottom(&engine));
     }
     let flush_raw = work[0].raw_out;
     let raw: u64 = work.iter().map(|w| w.raw_out).sum();
@@ -839,9 +871,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     if settle {
         // A control without timing effects: rewrite everything into the
         // bottom level, where sequences are erased, then measure again.
-        let mut merge = MergeWorkspace::new();
-        while diagnostics::compact_step(&engine, &mut merge).unwrap() {}
-        engine.wait_for_compaction().unwrap();
+        settle_bottom(&engine);
         let mut hits = engine.reader();
         for at in 0..10_000 {
             let i = at * 7919 % records;
@@ -970,6 +1000,10 @@ fn worst_point(
 }
 
 fn main() {
+    entry(None);
+}
+
+pub fn entry(sample_probe: Option<SampleProbe>) {
     diagnostics::set_bottom_job_observer(|job| {
         BOTTOM_JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
@@ -982,7 +1016,10 @@ fn main() {
     let mut settle = false;
     let mut threads = 1;
     let mut scale = 0;
-    let mut flags = Flags::default();
+    let mut flags = Flags {
+        sample_probe,
+        ..Flags::default()
+    };
     let mut memtable = None;
     let mut memtable_key = 16usize;
     let mut names = Vec::new();

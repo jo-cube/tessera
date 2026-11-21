@@ -2161,12 +2161,16 @@ pub struct SegmentSample {
     pub hint: usize,
     /// Decoded blocks, in order.
     pub blocks: Vec<Vec<u8>>,
+    /// Stored Zstandard frames in the same order as the decoded blocks.
+    pub frames: Vec<Vec<u8>>,
+    /// Compressed representation of the dictionary-free block-size probe.
+    pub probe: Vec<u8>,
 }
 
 /// Recomputes the builder's ratio probe: the segment's first 64 KiB of
 /// records encoded as one block, compressed at level 1 without a dictionary.
 #[cfg(feature = "diagnostics")]
-fn builder_hint(blocks: &[Vec<u8>]) -> usize {
+fn builder_probe(blocks: &[Vec<u8>]) -> (usize, Vec<u8>) {
     let mut sample = crate::block::BlockBuilder::new();
     'blocks: for bytes in blocks {
         let view = BlockView::open(bytes).expect(VALIDATED);
@@ -2186,12 +2190,14 @@ fn builder_hint(blocks: &[Vec<u8>]) -> usize {
     let mut raw = Vec::new();
     sample.flush_into(&mut raw);
     let raw = &raw[..raw.len().min(super::dictionary::SAMPLE_LEN)];
-    let stored = super::codec::Compressor::new(Codec::Zstd).probe(raw, &mut Vec::new());
-    super::TARGET_BLOCK_COMPRESSED
+    let mut probe = Vec::new();
+    let stored = super::codec::Compressor::new(Codec::Zstd).probe(raw, &mut probe);
+    let hint = super::TARGET_BLOCK_COMPRESSED
         .saturating_mul(raw.len())
         .checked_div(stored)
         .unwrap_or(1)
-        .clamp(1, super::RAW_BLOCK_CAP)
+        .clamp(1, super::RAW_BLOCK_CAP);
+    (hint, probe)
 }
 
 /// Stored bytes of one run by component, and its raw block bytes.
@@ -2265,18 +2271,20 @@ impl<B: AsRef<[u8]>> Run<B> {
                 end += 1;
             }
             if first.codec == Codec::Zstd && keep() {
-                let blocks: Vec<Vec<u8>> = (block..end)
-                    .map(|at| {
-                        let frame = view.frame(at).expect(VALIDATED);
-                        workspace.load(&frame).expect(VALIDATED).to_vec()
-                    })
-                    .collect();
-                let dictionary = first.dictionary.to_vec();
-                let hint = builder_hint(&blocks);
+                let mut blocks = Vec::with_capacity(end - block);
+                let mut frames = Vec::with_capacity(end - block);
+                for at in block..end {
+                    let frame = view.frame(at).expect(VALIDATED);
+                    blocks.push(workspace.load(&frame).expect(VALIDATED).to_vec());
+                    frames.push(frame.stored.to_vec());
+                }
+                let (hint, probe) = builder_probe(&blocks);
                 out.push(SegmentSample {
-                    dictionary,
+                    dictionary: first.dictionary.to_vec(),
                     hint,
                     blocks,
+                    frames,
+                    probe,
                 });
             }
             block = end;
