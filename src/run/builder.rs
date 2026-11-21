@@ -468,6 +468,10 @@ impl RunBuilder {
     pub(super) fn output_refused(&self) -> bool {
         self.output_refused
     }
+    #[cfg(test)]
+    pub(super) fn open_block_len(&self) -> usize {
+        self.block.len()
+    }
     fn reserve_output(&mut self, bytes: usize) -> bool {
         if self.output_refused {
             return false;
