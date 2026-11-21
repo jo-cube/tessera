@@ -485,8 +485,7 @@ fn try_compact_parallel_in<'a>(
     // starts only after every partition buffer has been dropped.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
     let max_metadata = limits.max_workspace_bytes.saturating_sub(needed);
-    let fixed_metadata = count
-        .saturating_mul(size_of::<(std::ops::Range<usize>, usize)>() + size_of::<(&[u8], usize)>());
+    let fixed_metadata = count.saturating_mul(size_of::<(std::ops::Range<usize>, usize)>());
     if fixed_metadata > max_metadata {
         return Ok(None);
     }
@@ -509,13 +508,14 @@ fn try_compact_parallel_in<'a>(
         .iter()
         .map(|input| input.largest_block_len())
         .collect::<Result<Vec<_>, _>>()?;
-    let metadata = fixed_metadata + key_bytes;
-    // Keep selection's workspace limit. Divide the segment allowance rather
-    // than multiplying a full-size builder by N; reduce N for high fan-in.
+    // Keep selection's workspace limit. `boundaries` is dropped before workers
+    // start, so only `boundary_bytes` and `starts` share the workspace limit
+    // with the parallel builders.
     let (segment_len, builder_workspace) = loop {
         let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
         let builder = workspace_for_segment(largest.iter().copied(), segment);
-        let allowance = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+        let live = key_bytes.saturating_add(threads.saturating_sub(1) * size_of::<&[u8]>());
+        let allowance = limits.max_workspace_bytes.saturating_sub(live) / threads;
         if builder <= allowance {
             break (segment, builder);
         }
@@ -537,28 +537,30 @@ fn try_compact_parallel_in<'a>(
             boundaries.push((start..boundary_bytes.len(), input.block_bytes(block)));
         }
     }
-    let slices: Vec<(&[u8], usize)> = {
-        boundaries
-            .sort_unstable_by(|a, b| boundary_bytes[a.0.clone()].cmp(&boundary_bytes[b.0.clone()]));
-        let mut slices = Vec::new();
-        slices.reserve_exact(boundaries.len());
-        slices.extend(
-            boundaries
-                .iter()
-                .map(|(span, bytes)| (&boundary_bytes[span.clone()], *bytes)),
-        );
-        slices
-    };
-    let metadata = boundary_bytes
+    let peak_metadata = boundary_bytes
         .capacity()
-        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>())
-        .saturating_add(slices.capacity() * size_of::<(&[u8], usize)>());
-    let per_builder = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
-    if metadata > max_metadata || builder_workspace > per_builder {
+        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>());
+    if peak_metadata > max_metadata {
         return Ok(None);
     }
-    let starts = partition_starts(&slices, estimated_run_bytes, threads);
+    boundaries
+        .sort_unstable_by(|a, b| boundary_bytes[a.0.clone()].cmp(&boundary_bytes[b.0.clone()]));
+    let starts = partition_with(
+        boundaries.len(),
+        |at| &boundary_bytes[boundaries[at].0.clone()],
+        |at| boundaries[at].1,
+        estimated_run_bytes,
+        threads,
+    );
+    drop(boundaries);
     if starts.is_empty() {
+        return Ok(None);
+    }
+    let metadata = boundary_bytes
+        .capacity()
+        .saturating_add(starts.capacity() * size_of::<&[u8]>());
+    let per_builder = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+    if metadata > max_metadata || builder_workspace > per_builder {
         return Ok(None);
     }
     let parts = std::thread::scope(|scope| {
@@ -627,25 +629,42 @@ fn try_compact_parallel_in<'a>(
 /// Approximate serial run boundaries with the same size estimate as planning.
 /// Balance whole runs, not arbitrary byte fractions: the final partial run
 /// belongs to the last builder. Repeated index keys always stay together.
+#[cfg(test)]
 pub(super) fn partition_starts<K: AsRef<[u8]>>(
     boundaries: &[(K, usize)],
     target: usize,
     threads: usize,
 ) -> Vec<&[u8]> {
-    let full_runs = boundaries.iter().map(|(_, bytes)| bytes).sum::<usize>() / target;
+    partition_with(
+        boundaries.len(),
+        |at| boundaries[at].0.as_ref(),
+        |at| boundaries[at].1,
+        target,
+        threads,
+    )
+}
+
+fn partition_with<'a>(
+    len: usize,
+    key_at: impl Fn(usize) -> &'a [u8],
+    bytes_at: impl Fn(usize) -> usize,
+    target: usize,
+    threads: usize,
+) -> Vec<&'a [u8]> {
+    let full_runs = (0..len).map(&bytes_at).sum::<usize>() / target;
     let mut starts = Vec::with_capacity(threads - 1);
     let mut seen = 0;
     let mut at = 0;
-    while at < boundaries.len() && starts.len() < threads - 1 {
-        let key = boundaries[at].0.as_ref();
-        while at < boundaries.len() && boundaries[at].0.as_ref() == key {
-            seen += boundaries[at].1;
+    while at < len && starts.len() < threads - 1 {
+        let key = key_at(at);
+        while at < len && key_at(at) == key {
+            seen += bytes_at(at);
             at += 1;
         }
         let split_run = (full_runs as u128 * (starts.len() + 1) as u128 / threads as u128) as usize;
-        if seen >= split_run * target && at < boundaries.len() {
+        if seen >= split_run * target && at < len {
             // Splitting before the first key would create an empty builder.
-            if key != boundaries[0].0.as_ref() {
+            if key != key_at(0) {
                 starts.push(key);
             }
         }
