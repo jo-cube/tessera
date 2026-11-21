@@ -156,6 +156,7 @@ check() {
   bounded build-tests 300 cargo test --locked --no-run
   bounded test 300 just test
   bounded doc 120 just doc
+  bounded examples 300 just examples
   bounded long 300 just long
   bounded package 300 just package
   bounded scripts-test 60 just scripts-test

@@ -22,6 +22,13 @@ test:
 doc:
     RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --locked --no-deps
 
+# Run every example program; each checks its own results.
+examples:
+    cargo run --locked --example basic
+    cargo run --locked --example keyspaces
+    cargo run --locked --example offsets
+    cargo run --locked --example hot_reads
+
 # The ignored long correctness campaigns, one at a time.
 long:
     cargo test --locked --lib long_ -- --ignored --test-threads=1
@@ -42,7 +49,7 @@ msrv:
 scripts-test:
     python3 -m unittest discover -s scripts/tests
 
-all: fmt clippy test doc long package scripts-test
+all: fmt clippy test doc examples long package scripts-test
 
 # The checks in a resource-limited Linux container; see docs/development.md.
 validate *args:
