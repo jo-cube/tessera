@@ -258,7 +258,6 @@ impl Core {
                             .map(|op| KeyPrefix::new(op.keyspace))
                     })
                     .flatten();
-                let mut ingested = 0usize;
                 for (keyspace, key, value) in batch.records() {
                     let prefix = single_prefix.unwrap_or_else(|| KeyPrefix::new(keyspace));
                     let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
@@ -267,13 +266,8 @@ impl Core {
                         .write(prefix.key(key), seq, value)
                         .expect("preflight admitted every batch operation");
                     state.last_seq = seq;
-                    ingested += key.len()
-                        + match value {
-                            Value::Bytes(bytes) => bytes.len(),
-                            Value::Tombstone => 0,
-                        };
                 }
-                self.chunks.ingested(ingested);
+                self.chunks.ingested(batch.bytes.len());
                 return Ok(end);
             }
             state = self.admit(self.make_room(state))?;
