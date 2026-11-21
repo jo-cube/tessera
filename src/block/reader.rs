@@ -227,16 +227,28 @@ impl BlockPosition {
         &'p mut self,
         block: BlockView<'p>,
     ) -> Result<Option<Record<'p>>, CorruptBlock> {
-        let Some(mut rest) = block.entries.get(self.offset..) else {
+        self.next_record_entries(block.entries)
+    }
+
+    /// Advances to the next record directly from a block's validated record
+    /// region, avoiding re-parsing the restart trailer on every record.
+    pub(crate) fn next_record_entries<'p>(
+        &'p mut self,
+        entries: &'p [u8],
+    ) -> Result<Option<Record<'p>>, CorruptBlock> {
+        let Some(mut rest) = entries.get(self.offset..) else {
             return Err(CorruptBlock {
-                offset: block.entries.len(),
+                offset: entries.len(),
                 kind: Corruption::Truncated,
             });
         };
         if rest.is_empty() {
             return Ok(None);
         }
-        let record = block.decode(&mut rest)?;
+        let record = decode_record(&mut rest).map_err(|kind| CorruptBlock {
+            offset: self.offset,
+            kind,
+        })?;
         record
             .check_key_len(self.key.len())
             .map_err(|kind| CorruptBlock {
@@ -244,7 +256,7 @@ impl BlockPosition {
                 kind,
             })?;
 
-        self.offset = block.entries.len() - rest.len();
+        self.offset = entries.len() - rest.len();
         self.key.truncate(record.shared);
         self.key.extend_from_slice(record.suffix);
         Ok(Some(Record {
@@ -338,7 +350,7 @@ impl<'a> BlockView<'a> {
             let target_rest = &target[record.shared..];
             let common = common_prefix_len(record.suffix, target_rest);
             matched = record.shared + common;
-            match record.suffix[common..].cmp(&target_rest[common..]) {
+            match record.suffix.get(common).cmp(&target_rest.get(common)) {
                 Ordering::Less => {}
                 Ordering::Equal => {
                     return Ok(Some(Version {
@@ -503,7 +515,19 @@ pub(crate) struct RecordWalk {
 impl RecordWalk {
     /// Checks every format invariant of one block and returns the length of
     /// its record region.
+    #[cfg(test)]
     pub(crate) fn validate_block(&mut self, bytes: &[u8]) -> Result<usize, CorruptBlock> {
+        self.validate_block_with(bytes, |_| {})
+    }
+
+    /// Checks every format invariant of one block, invoking `visit` with each
+    /// reconstructed user key in order so callers can check filter membership
+    /// or the minimum key in the same pass.
+    pub(crate) fn validate_block_with(
+        &mut self,
+        bytes: &[u8],
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<usize, CorruptBlock> {
         let corrupt = |offset, kind| CorruptBlock { offset, kind };
 
         let BlockView { entries, restarts } = BlockView::open(bytes)?;
@@ -545,6 +569,7 @@ impl RecordWalk {
                 || (self.record_count > 0 && self.key[record.shared..] == *record.suffix);
             self.key.truncate(record.shared);
             self.key.extend_from_slice(record.suffix);
+            visit(&self.key);
             let value_bytes = match record.value {
                 Value::Bytes(bytes) => bytes.len(),
                 Value::Tombstone => 0,

@@ -8,6 +8,22 @@ use super::Corruption;
 /// Encoded length of `u64::MAX`.
 pub(super) const MAX_LEN: usize = 10;
 
+pub(super) fn write_into(buf: &mut [u8], pos: &mut usize, mut value: u64) {
+    if value < 0x80 {
+        buf[*pos] = value as u8;
+        *pos += 1;
+        return;
+    }
+    while value >= 0x80 {
+        buf[*pos] = value as u8 | 0x80;
+        *pos += 1;
+        value >>= 7;
+    }
+    buf[*pos] = value as u8;
+    *pos += 1;
+}
+
+#[cfg(test)]
 pub(super) fn write(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push(value as u8 | 0x80);
@@ -22,7 +38,20 @@ pub(super) const fn encoded_len(value: u64) -> usize {
 }
 
 /// Reads one varint from the front of `input`, advancing it on success.
+#[inline]
 pub(super) fn read(input: &mut &[u8]) -> Result<u64, Corruption> {
+    let Some(&first) = input.first() else {
+        return Err(Corruption::Truncated);
+    };
+    if first < 0x80 {
+        *input = &input[1..];
+        return Ok(u64::from(first));
+    }
+    read_multi(input)
+}
+
+#[cold]
+fn read_multi(input: &mut &[u8]) -> Result<u64, Corruption> {
     let mut value = 0u64;
     for (i, &byte) in input.iter().take(MAX_LEN).enumerate() {
         let payload = u64::from(byte & 0x7f);
