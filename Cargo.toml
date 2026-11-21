@@ -1,0 +1,59 @@
+[package]
+# Engine suites are included as unit modules so scheduling hooks stay private.
+autotests = false
+name = "tessera"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A safe Rust, RAM-first compressed LSM key-value engine with explicit checkpoints"
+license = "MIT"
+repository = "https://github.com/jo-cube/tessera"
+readme = "README.md"
+# Consume by Git tag; build API documentation with `cargo doc`. The .crate,
+# a release asset, holds what a consumer builds and reads, and none of the
+# repository's tooling (`scripts/release.py check-package` enforces this).
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/ARCHITECTURE.md",
+]
+keywords = ["key-value", "lsm", "compression", "in-memory", "embedded"]
+categories = ["database-implementations", "data-structures"]
+publish = false
+
+[features]
+# Hidden work and memory counters by level. Not part of the stable API.
+diagnostics = []
+# Counting allocator and Linux process samples in the counters example only.
+tools-memory = []
+
+[dependencies]
+crc32fast = "1"
+zstd-safe = { version = "8", default-features = false, features = ["std", "vendored", "experimental"] }
+
+# Line tables retain file and line numbers in panics and backtraces while
+# bounding test binary size and rebuild writes.
+[profile.dev]
+debug = "line-tables-only"
+[[test]]
+name = "process"
+path = "tests/process.rs"
+
+[[test]]
+name = "lookup_allocations"
+path = "tests/lookup_allocations.rs"
+required-features = ["diagnostics"]
+
+[[test]]
+name = "retention"
+path = "tests/retention.rs"
+required-features = ["diagnostics"]
+
+[[example]]
+name = "counters"
+path = "tools/counters.rs"
+required-features = ["diagnostics"]

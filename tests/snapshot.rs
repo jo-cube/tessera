@@ -1,0 +1,466 @@
+//! Snapshots: views that hold no lock, what they keep alive, and the limits on
+//! taking them.
+//!
+//! Merging, flushing and compaction have their own tests and are not repeated.
+//! The compaction model test also retains snapshots across random histories,
+//! and the memtable tests check the copy-on-write tree on its own.
+//! Concurrency tests use barriers and joins and never sleep.
+
+use crate::test_support::wait_until;
+use std::sync::Barrier;
+use std::thread;
+
+use crate::engine::{CompactionPolicy, Engine, MergeWorkspace, Options, Snapshot};
+
+/// The defaults without the background worker: these tests flush and
+/// compact by hand and count what each step leaves.
+fn manual() -> Options {
+    Options {
+        background_compaction: None,
+        ..Options::default()
+    }
+}
+
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn pairs(items: &[(&[u8], &[u8])]) -> Pairs {
+    items
+        .iter()
+        .map(|&(k, v)| (k.to_vec(), v.to_vec()))
+        .collect()
+}
+
+/// Every live record under `prefix`, checking that none is newer than the
+/// snapshot.
+fn scanned(snapshot: &Snapshot, prefix: &[u8]) -> Pairs {
+    let records = snapshot.records(prefix);
+    assert!(
+        records
+            .iter()
+            .all(|(_, seq, _)| *seq <= snapshot.last_seq())
+    );
+    records
+        .into_iter()
+        .map(|(key, _, value)| (key, value))
+        .collect()
+}
+
+fn value(snapshot: &Snapshot, key: &[u8]) -> Option<Vec<u8>> {
+    snapshot.value(key)
+}
+
+fn merge_all() -> CompactionPolicy {
+    CompactionPolicy {
+        max_overlap: 1,
+        ..CompactionPolicy::default()
+    }
+}
+
+/// Compacts until no key is in more than one run, returning how many
+/// compactions that took.
+fn compact_all(engine: &Engine) -> usize {
+    let mut workspace = MergeWorkspace::new();
+    let mut done = 0;
+    while engine
+        .core
+        .compact(merge_all(), &mut workspace)
+        .unwrap()
+        .is_some()
+    {
+        done += 1;
+    }
+    done
+}
+
+#[test]
+fn a_snapshot_keeps_its_state_through_writes_flushes_and_compactions() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    for key in [&b"a"[..], b"b", b"c", b"\xff\x00"] {
+        engine.ks().put(key, b"1").unwrap();
+    }
+    engine.flush().unwrap();
+    engine.ks().put(b"a", b"2").unwrap();
+    // A tombstone in a table over a value in a run.
+    engine.ks().delete(b"b").unwrap();
+    let first = engine.snapshot();
+    // Nothing was frozen, flushed or copied.
+    wait_until(|| engine.engine_stats().retained_sources == 0);
+    let stats = engine.engine_stats();
+    assert_eq!((stats.frozen_tables, stats.runs), (0, 1));
+    assert_eq!((stats.retained_sources, stats.retained_bytes), (0, 0));
+    let then = pairs(&[(b"a", b"2"), (b"c", b"1"), (b"\xff\x00", b"1")]);
+
+    engine.ks().put(b"a", b"3").unwrap();
+    engine.ks().put(b"b", b"2").unwrap();
+    engine.ks().delete(b"c").unwrap();
+    engine.ks().put(b"ab", b"1").unwrap();
+    let second = engine.snapshot();
+    let later = pairs(&[
+        (b"a", b"3"),
+        (b"ab", b"1"),
+        (b"b", b"2"),
+        (b"\xff\x00", b"1"),
+    ]);
+    assert!(second.last_seq() > first.last_seq());
+
+    engine.ks().delete(b"b").unwrap();
+    engine.flush().unwrap();
+    engine.ks().put(b"c", b"4").unwrap();
+    engine.flush().unwrap();
+    // Merging every run drops the tombstones both snapshots depend on.
+    assert!(compact_all(&engine) > 0);
+    assert_eq!(engine.engine_stats().runs, 1);
+
+    for (snapshot, expected) in [(&first, &then), (&second, &later)] {
+        assert_eq!(&scanned(snapshot, b""), expected);
+        for (key, value_then) in expected {
+            assert_eq!(value(snapshot, key).as_ref(), Some(value_then));
+        }
+    }
+    assert_eq!(value(&first, b"b"), None);
+    assert_eq!(value(&second, b"c"), None);
+    assert_eq!(scanned(&first, b"a"), pairs(&[(b"a", b"2")]));
+    assert_eq!(
+        scanned(&second, b"a"),
+        pairs(&[(b"a", b"3"), (b"ab", b"1")])
+    );
+    assert_eq!(scanned(&second, b"\xff"), pairs(&[(b"\xff\x00", b"1")]));
+
+    let now = engine.snapshot();
+    assert_eq!(
+        scanned(&now, b""),
+        pairs(&[
+            (b"a", b"3"),
+            (b"ab", b"1"),
+            (b"c", b"4"),
+            (b"\xff\x00", b"1")
+        ])
+    );
+}
+
+#[test]
+fn a_long_scan_lets_writes_flushes_and_compactions_publish() {
+    const KEYS: usize = 200;
+    let key = |i: usize| format!("k{i:03}").into_bytes();
+    let engine = Engine::in_memory(manual()).unwrap();
+    for round in [b"0", b"1"] {
+        for i in 0..KEYS {
+            engine.ks().put(&key(i), round).unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    engine.ks().put(&key(0), b"2").unwrap();
+
+    let snapshot = engine.snapshot();
+    let ks = engine.ks();
+    let mut reader = snapshot.reader();
+    let mut scan = reader.range(&ks, ..);
+    assert_eq!(scan.next().unwrap().unwrap().1, b"2");
+
+    // With the scan part way, writes, flushes and compactions run to
+    // completion on another thread.
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                for i in 0..KEYS {
+                    engine.ks().put(&key(i), b"3").unwrap();
+                }
+                engine.ks().delete(&key(1)).unwrap();
+                engine.flush().unwrap();
+                assert!(compact_all(&engine) > 0);
+            })
+            .join()
+            .unwrap();
+    });
+    let stats = engine.engine_stats();
+    assert_eq!((stats.runs, stats.frozen_tables), (1, 0));
+    assert!(stats.retained_sources >= 3);
+
+    let mut rest = 0;
+    while let Some((_, value)) = scan.next().unwrap() {
+        assert_eq!(value, b"1");
+        rest += 1;
+    }
+    assert_eq!(rest, KEYS - 1);
+}
+
+#[test]
+fn released_sources_are_freed_after_the_last_snapshot_holding_them() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    engine.ks().put(b"a", b"1").unwrap();
+    engine.flush().unwrap();
+    engine.ks().put(b"a", b"2").unwrap();
+    let first = engine.snapshot();
+    // Nothing written since: the second shares the first's view.
+    let second = engine.snapshot();
+    wait_until(|| engine.engine_stats().retained_sources == 0);
+    let stats = engine.engine_stats();
+    assert_eq!((stats.snapshots, stats.frozen_tables), (2, 0));
+    assert_eq!((stats.retained_sources, stats.retained_bytes), (0, 0));
+
+    // The overwrite copies the leaf the snapshots share and keeps the value
+    // they see, both pinned in the active table.
+    engine.ks().put(b"a", b"3").unwrap();
+    let pinned = engine.engine_stats().active.pinned;
+    assert!(pinned > 0);
+    assert_eq!(engine.engine_stats().retained_bytes, pinned);
+    let report = engine.flush().unwrap();
+    assert_eq!(report.tables, 1);
+    assert!(compact_all(&engine) > 0);
+    wait_until(|| engine.engine_stats().retained_sources == 2);
+    let held = engine.engine_stats();
+    // The flushed table, charged as the snapshots' view with what it
+    // pinned, and the run it shadowed, since merged away. The compaction
+    // freed the run flushed after the snapshots.
+    assert_eq!(held.retained_sources, 2);
+    assert!(held.retained_bytes > pinned);
+    assert!(held.retained_run_bytes > 0);
+    assert!(held.retained_run_bytes < held.retained_bytes - pinned);
+
+    drop(first);
+    let stats = engine.engine_stats();
+    assert_eq!(stats.snapshots, 1);
+    assert_eq!(
+        (stats.retained_sources, stats.retained_bytes),
+        (held.retained_sources, held.retained_bytes)
+    );
+    assert_eq!(value(&second, b"a").unwrap(), b"2");
+
+    drop(second);
+    wait_until(|| engine.engine_stats().retained_sources == 0);
+    let stats = engine.engine_stats();
+    assert_eq!((stats.snapshots, stats.retained_sources), (0, 0));
+    assert_eq!((stats.retained_bytes, stats.retained_run_bytes), (0, 0));
+}
+
+#[test]
+fn a_released_table_is_charged_only_what_its_snapshots_can_hold() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 256 << 10,
+        ..manual()
+    })
+    .unwrap();
+    engine.ks().put(b"seen", b"1").unwrap();
+    let small = engine.snapshot();
+    let seen = engine.engine_stats().active.charged;
+    // Nearly full: a write that found no room would flush.
+    let mut key = 0u32;
+    while engine.engine_stats().active.charged + (4 << 10) <= 256 << 10 {
+        engine.ks().put(&key.to_be_bytes(), &[7; 100]).unwrap();
+        key += 1;
+    }
+    let full = engine.engine_stats().active.charged;
+    let pinned = engine.engine_stats().active.pinned;
+    engine.flush().unwrap();
+    // Only the small view and the leaves the inserts copied away from it
+    // remain once the table is freed; the table's own charge is not kept.
+    wait_until(|| engine.engine_stats().retained_bytes == seen + pinned);
+    let retained = engine.engine_stats().retained_bytes;
+    assert_eq!(retained, seen + pinned);
+    assert!(retained * 20 < full, "{retained} of {full}");
+
+    // Holding a frozen table retains all of it through publication.
+    engine.ks().put(b"seen", b"2").unwrap();
+    let job = engine.core.begin_flush().unwrap();
+    let whole = engine.snapshot();
+    let frozen = engine.engine_stats().frozen.unwrap().charged;
+    job.build().publish();
+    assert_eq!(engine.engine_stats().retained_bytes, retained + frozen);
+
+    assert_eq!(value(&small, b"seen").unwrap(), b"1");
+    assert_eq!(value(&whole, b"seen").unwrap(), b"2");
+    drop((small, whole));
+    wait_until(|| engine.engine_stats().retained_bytes == 0);
+    assert_eq!(engine.engine_stats().retained_bytes, 0);
+}
+
+/// Snapshots after every write cost no generation: nothing is frozen or
+/// flushed for them, and a write after each copies one leaf at most.
+#[test]
+fn frequent_snapshots_freeze_and_flush_nothing() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    let key = |i: usize| format!("k{i:05}").into_bytes();
+    for i in 0..2_000 {
+        engine.ks().put(&key(i), b"0").unwrap();
+    }
+    for i in 0..2_000 {
+        let snapshot = engine.snapshot();
+        engine.ks().put(&key(i * 7 % 2_000), b"1").unwrap();
+        assert!(engine.engine_stats().active.pinned > 0);
+        assert_eq!(value(&snapshot, &key(i * 7 % 2_000)).unwrap(), b"0");
+    }
+    let stats = engine.engine_stats();
+    assert_eq!((stats.frozen_tables, stats.runs), (0, 0));
+    assert_eq!((stats.snapshots, stats.active.pinned), (0, 0));
+    assert_eq!(stats.retained_bytes, 0);
+}
+
+/// A table's budget covers the history its snapshots pin, so a long-lived
+/// snapshot brings the next flush forward: the write that finds no room
+/// makes it.
+#[test]
+fn pinned_history_is_charged_to_the_budget_until_the_snapshot_is_dropped() {
+    // Leave room for the snapshot's copied partial arena chunk before rotation.
+    const BUDGET: usize = 80 << 10;
+    let engine = Engine::in_memory(Options {
+        memtable_size: BUDGET,
+        ..manual()
+    })
+    .unwrap();
+    let key = |i: usize| format!("k{i:03}").into_bytes();
+    for i in 0..200 {
+        engine.ks().put(&key(i), &[0; 100]).unwrap();
+    }
+    let live = engine.engine_stats().active.charged;
+    let snapshot = engine.snapshot();
+    let (mut written, mut full) = (0, engine.engine_stats());
+    loop {
+        engine.ks().put(&key(written % 200), &[1; 100]).unwrap();
+        let stats = engine.engine_stats();
+        if stats.frozen_tables > 0 || stats.runs > 0 {
+            break;
+        }
+        (written, full) = (written + 1, stats);
+    }
+    assert!(full.active.charged <= BUDGET);
+    assert_eq!(
+        full.active.charged,
+        // Each write: a 1-byte keyspace prefix, a 4-byte key and 100 bytes.
+        live + written * 105 + full.active.pinned
+    );
+    assert!(full.active.pinned > 0);
+    // Every key was overwritten at most once: the leaves and values the
+    // snapshot shares are pinned once each.
+    assert!(written <= 200, "{written}");
+    engine.flush().unwrap();
+    let stats = engine.engine_stats();
+    assert_eq!((stats.frozen_tables, stats.active.pinned), (0, 0));
+    assert_eq!(scanned(&snapshot, b"k").len(), 200);
+    assert!(scanned(&snapshot, b"k").iter().all(|(_, v)| v == &[0; 100]));
+
+    drop(snapshot);
+    wait_until(|| engine.engine_stats().retained_bytes == 0);
+    assert_eq!(engine.engine_stats().retained_bytes, 0);
+}
+
+/// A writer appends keys in order, flushing as it goes, while snapshots are
+/// taken beside it. Each snapshot sees exactly the writes up to its
+/// sequence number: a prefix of the keys, never with a gap.
+#[test]
+fn concurrent_snapshots_see_a_prefix_of_the_writes() {
+    const WRITES: usize = 3_000;
+    let key = |i: usize| format!("k{i:05}").into_bytes();
+    let engine = Engine::in_memory(Options {
+        background_compaction: Some(merge_all()),
+        ..manual()
+    })
+    .unwrap();
+    // Snapshots taken before the first write read the keyspace too.
+    engine.ks();
+    let start = Barrier::new(2);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            start.wait();
+            for i in 0..WRITES {
+                assert_eq!(
+                    engine.ks().put_seq(&key(i), &i.to_le_bytes()).unwrap(),
+                    i as u64 + 1
+                );
+                if i % 500 == 499 {
+                    engine.flush().unwrap();
+                }
+            }
+        });
+        start.wait();
+        let mut seen = 0;
+        while seen < WRITES {
+            let snapshot = engine.snapshot();
+            let records = scanned(&snapshot, b"");
+            let len = records.len();
+            assert_eq!(len as u64, snapshot.last_seq());
+            assert!(len >= seen);
+            for (i, (k, v)) in records.iter().enumerate() {
+                assert_eq!((k, v.as_slice()), (&key(i), &i.to_le_bytes()[..]));
+            }
+            if len > 0 {
+                assert!(value(&snapshot, &key(len - 1)).is_some());
+            }
+            assert_eq!(value(&snapshot, &key(len)), None);
+            seen = len;
+        }
+    });
+}
+
+#[test]
+fn snapshots_are_shared_across_threads_and_outlive_the_engine() {
+    fn shareable<T: Send + Sync>(_: &T) {}
+    const READERS: usize = 2;
+    let key = |i: usize| format!("k{i:03}").into_bytes();
+    let engine = Engine::in_memory(Options {
+        target_run_len: 1 << 10,
+        background_compaction: Some(CompactionPolicy {
+            max_overlap: 1,
+            ..CompactionPolicy::default()
+        }),
+        ..manual()
+    })
+    .unwrap();
+    for round in 0..3u8 {
+        for i in 0..100 {
+            engine.ks().put(&key(i), &[round]).unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    let snapshot = engine.snapshot();
+    shareable(&snapshot);
+    let expected: Pairs = (0..100).map(|i| (key(i), vec![2])).collect();
+
+    let start = Barrier::new(READERS + 1);
+    thread::scope(|scope| {
+        for _ in 0..READERS {
+            scope.spawn(|| {
+                start.wait();
+                assert_eq!(scanned(&snapshot, b""), expected);
+            });
+        }
+        start.wait();
+        for i in 0..100 {
+            engine.ks().delete(&key(i)).unwrap();
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+    });
+    assert!(engine.background_status().unwrap().compactions > 0);
+
+    // Dropping the engine stops its worker; the snapshot keeps its sources.
+    drop(engine);
+    let reader = thread::spawn(move || scanned(&snapshot, b""));
+    assert_eq!(reader.join().unwrap(), expected);
+}
+
+/// A point read takes the runs it reads without the lock, and lets go of
+/// them before it returns, so a reader kept between reads holds nothing a
+/// compaction has replaced.
+#[test]
+fn a_point_read_keeps_no_replaced_run_alive_after_it_returns() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    // Overlapping ranges, so that compaction replaces both runs.
+    for keys in [[b"a", b"z"], [b"b", b"y"]] {
+        for key in keys {
+            engine.ks().put(key, b"1").unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    let ks = engine.ks();
+    let mut reader = engine.reader();
+    assert_eq!(reader.get(&ks, b"a").unwrap(), Some(&b"1"[..]));
+    assert_eq!(reader.get(&ks, b"c").unwrap(), None);
+    assert!(compact_all(&engine) > 0);
+    wait_until(|| engine.engine_stats().retained_sources == 0);
+    let stats = engine.engine_stats();
+    assert_eq!(
+        (stats.runs, stats.retained_sources, stats.retained_bytes),
+        (1, 0, 0)
+    );
+    assert_eq!(reader.get(&ks, b"b").unwrap(), Some(&b"1"[..]));
+}

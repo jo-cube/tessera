@@ -1,0 +1,23 @@
+[package]
+name = "tessera-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+tessera = { path = "../..", features = ["diagnostics"] }
+hdrhistogram = { version = "=7.6.0", default-features = false }
+libc = "0.2"
+# Enables ZDICT_* in the shared static zstd, which RocksDB needs.
+zstd-sys = { version = "2", default-features = false, features = ["zdict_builder"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+codegen-units = 1
+lto = "thin"
