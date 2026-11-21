@@ -1322,10 +1322,11 @@ mod tests {
     #[test]
     fn a_waiting_writer_holds_the_gate_until_it_has_the_lock() {
         let engine = Engine::in_memory(manual()).unwrap();
-        engine.ks().put(b"k", b"old").unwrap();
+        let ks = engine.ks();
+        ks.put(b"k", b"old").unwrap();
         let held = engine.core.read_state();
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| engine.ks().put(b"k", b"new").unwrap());
+            let writer = scope.spawn(|| ks.put(b"k", b"new").unwrap());
             // The read lock keeps the writer waiting, so once it has the gate it
             // keeps it until the guard is dropped.
             while engine.core.gate.try_lock().is_ok() {
@@ -1340,7 +1341,7 @@ mod tests {
             writer.join().unwrap();
         });
         assert!(engine.core.gate.try_lock().is_ok());
-        assert_eq!(engine.ks().get(b"k").unwrap().unwrap(), b"new");
+        assert_eq!(ks.get(b"k").unwrap().unwrap(), b"new");
     }
 
     #[test]
@@ -1513,6 +1514,7 @@ mod tests {
             .begin_job(options(8, usize::MAX))
             .unwrap()
             .unwrap();
+        let ks = engine.ks();
         let (held, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
@@ -1522,7 +1524,7 @@ mod tests {
                 drop(guard);
             });
             held.wait();
-            let writer = scope.spawn(|| engine.ks().put(b"m", b"new").unwrap());
+            let writer = scope.spawn(|| ks.put(b"m", b"new").unwrap());
             while engine.core.gate.try_lock().is_ok() {
                 std::thread::yield_now();
             }
@@ -1803,6 +1805,69 @@ mod tests {
         let core = Arc::clone(&engine.core);
         drop(engine);
         assert_eq!(Arc::strong_count(&core), 1);
+    }
+
+    #[test]
+    fn pooled_readers_trim_large_decoding_and_result_buffers() {
+        let engine = Engine::in_memory(Options {
+            memtable_size: 4 << 20,
+            compression: Compression::Zstd,
+            ..manual()
+        })
+        .unwrap();
+        let ks = engine.ks();
+        // A >1 MiB compressible value produces a >1 MiB decoded block.
+        let big = vec![b'x'; (1 << 20) + 4096];
+        ks.put(b"big", &big).unwrap();
+        ks.put(b"small", b"tiny").unwrap();
+        engine.flush().unwrap();
+
+        {
+            let mut reader = engine.reader();
+            assert_eq!(reader.get(&ks, b"big").unwrap(), Some(big.as_slice()));
+            assert!(reader.buffers.logical.capacity() > (1 << 20));
+            assert!(reader.value_buffer().1 > (1 << 20));
+
+            let got = reader.multi_get(&ks, &[b"big"]).unwrap();
+            assert_eq!(got[0], Some(big.as_slice()));
+            drop(got);
+            assert!(reader.buffers.multi.capacity() > (1 << 20));
+
+            let mut scan = reader.range(&ks, ..);
+            assert_eq!(scan.next().unwrap(), Some((&b"big"[..], big.as_slice())));
+            drop(scan);
+        }
+
+        // The returned buffers must have trimmed every >1 MiB allocation.
+        let mut reused = engine.reader();
+        assert_eq!(reused.buffers.logical.capacity(), 0);
+        assert_eq!(reused.buffers.multi.capacity(), 0);
+        assert_eq!(reused.value_buffer().1, 0);
+
+        // Normal-sized buffers stay pooled across readers.
+        assert_eq!(reused.get(&ks, b"small").unwrap(), Some(&b"tiny"[..]));
+        let warm_cap = reused.buffers.logical.capacity();
+        assert!(warm_cap > 0);
+        drop(reused);
+        let reused_again = engine.reader();
+        assert_eq!(reused_again.buffers.logical.capacity(), warm_cap);
+    }
+
+    #[test]
+    fn debug_format_engine_does_not_block_or_double_panic() {
+        let engine = Engine::in_memory(manual()).unwrap();
+        let _ks = engine.ks();
+        assert!(format!("{engine:?}").contains("test"));
+
+        let guard = engine.core.write_state();
+        assert!(format!("{engine:?}").contains("<locked>"));
+        drop(guard);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.core.write_state();
+            panic!("poison state lock");
+        }));
+        assert!(format!("{engine:?}").contains("<poisoned>"));
     }
 }
 

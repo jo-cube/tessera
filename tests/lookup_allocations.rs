@@ -1,6 +1,6 @@
 //! Point lookups allocate nothing on the Rust heap once their reader is
 //! warm, and a present key decodes exactly one block once runs are
-//! consolidated, with and without dictionaries.
+//! consolidated, compressed and uncompressed.
 //!
 //! Zstandard's own allocations go through `malloc` and are not visible here:
 //! a lookup reuses the reader's decompression context, and decoding with
@@ -103,7 +103,7 @@ fn consolidated(compression: Compression) -> (Engine, Keyspace) {
 
 #[test]
 fn warm_lookups_allocate_nothing_and_decode_one_block() {
-    for compression in [Compression::Zstd, Compression::Zstd] {
+    for compression in [Compression::Zstd, Compression::Uncompressed] {
         let (engine, ks) = consolidated(compression);
         assert_eq!(engine.engine_stats().max_overlap, 1);
         let lookups = |reader: &mut Reader<'_>, from: u32| {

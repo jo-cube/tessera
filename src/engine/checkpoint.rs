@@ -586,9 +586,9 @@ mod tests {
             let new = state(&engine);
 
             CRASH_AT.with(|at| at.set(Some(crash)));
-            let error = engine.checkpoint_to(&dir);
+            let error = engine.checkpoint_to(&dir).unwrap_err();
             CRASH_AT.with(|at| at.set(None));
-            assert!(error.is_err(), "{crash:?}");
+            assert_eq!(error.checkpoint_committed(), committed, "{crash:?}");
             let recovered = Engine::open(&dir, manual()).unwrap();
             let expected = if committed { &new } else { &old };
             assert_eq!(&state(&recovered), expected, "{crash:?}");

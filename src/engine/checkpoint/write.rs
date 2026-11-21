@@ -29,11 +29,11 @@ pub(super) fn crash(at: Crash) -> bool {
 
 /// Stands for the crash a test asked for.
 #[cfg(test)]
-pub(super) fn crashed(path: &Path) -> CheckpointError {
+pub(super) fn crashed(path: &Path, after_commit_point: bool) -> CheckpointError {
     CheckpointError::Io {
         path: path.to_owned(),
         error: io::Error::other("crash injected by a test"),
-        after_commit_point: false,
+        after_commit_point,
     }
 }
 
@@ -41,7 +41,7 @@ pub(super) fn crashed(path: &Path) -> CheckpointError {
 macro_rules! crash_point {
     ($at:expr, $path:expr) => {
         if crash($at) {
-            return Err(Failure::Crashed(crashed($path)));
+            return Err(Failure::Crashed(crashed($path, false)));
         }
     };
 }
@@ -372,7 +372,7 @@ fn write_runs(
                 output
                     .write_all(&run.chunks().next().unwrap()[..1])
                     .map_err(io_error(&tmp))?;
-                return Err(Failure::Crashed(crashed(&tmp)));
+                return Err(Failure::Crashed(crashed(&tmp, false)));
             }
             let mut sum = Hasher::new();
             run_parts(run, |bytes| {
@@ -483,7 +483,7 @@ impl Core {
         #[cfg(test)]
         if crash(Crash::BeforeRename) {
             write_synced(&tmp, &current)?;
-            return Err(crashed(&tmp));
+            return Err(crashed(&tmp, false));
         }
         let committed = write_synced(&tmp, &current)
             .and_then(|()| fs::rename(&tmp, dir.join(CURRENT)).map_err(io_error(dir)));
@@ -494,7 +494,7 @@ impl Core {
         }
         #[cfg(test)]
         if crash(Crash::AfterRename) {
-            return Err(crashed(dir));
+            return Err(crashed(dir, true));
         }
         if let Err(error) = sync_dir(dir) {
             return Err(CheckpointError::Io {
@@ -505,7 +505,7 @@ impl Core {
         }
         #[cfg(test)]
         if crash(Crash::BeforeReclaim) {
-            return Err(crashed(dir));
+            return Err(crashed(dir, true));
         }
         let (files_deleted, reclaimed, unreclaimed) =
             reclaim(dir, &found, &written.manifest, previous.as_ref());

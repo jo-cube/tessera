@@ -533,7 +533,7 @@ fn dictionary_runs_recover_mix_and_are_rewritten() {
     drop(snapshot);
     assert_eq!(contents(&engine, b""), model);
 
-    // A checkpoint writes the existing version-6 runs unchanged.
+    // A checkpoint writes the existing version-1 runs unchanged.
     let scratch = Scratch::new("dictionary-runs");
     engine.checkpoint_to(&scratch.0).unwrap();
     let versions = run_versions(&scratch.0);
