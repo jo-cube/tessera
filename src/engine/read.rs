@@ -277,6 +277,10 @@ enum Source<'a> {
 /// snapshot does, from the call that starts it until the reader's next call
 /// or drop.
 ///
+/// A [`Scan`] borrows its reader for its whole life, so to look keys up
+/// while scanning, take a second reader of the same snapshot: both read the
+/// same state.
+///
 /// A borrowed value lives until the reader's next call:
 ///
 /// ```compile_fail,E0499
@@ -613,7 +617,10 @@ pub struct ReaderCounters {
 
 /// The values of one [`Reader::multi_get`], one per key in input order.
 /// Derefs to `[Option<&[u8]>]`: index it, iterate it, take its `len`. It
-/// borrows the reader, which takes no other call while it lives:
+/// borrows the reader, which takes no other call while it lives. It hands
+/// its vector back to the reader when dropped, so the borrow lasts until it
+/// goes out of scope, not just until its last use: drop it before the
+/// reader's next call in the same scope.
 ///
 /// ```compile_fail,E0499
 /// # fn f(engine: &tessera::Engine, users: &tessera::Keyspace) -> tessera::Result<()> {
