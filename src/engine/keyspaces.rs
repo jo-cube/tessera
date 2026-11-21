@@ -63,11 +63,10 @@ pub(super) struct KeyspaceState {
     /// flushes publish beside them.
     pub(super) runs: Vec<SharedRun>,
     /// The same runs, indexed for reading: grouped into key-disjoint runs,
-    /// newest group first. Rebuilt by [`State::published`] in the same write
-    /// section as every change to `runs`, so readers only ever see the two
-    /// agree; `runs` keeps publication order, which compaction selection uses
-    /// to break ties. Immutable once built, so a lookup, a scan or a snapshot
-    /// shares it with one reference count.
+    /// newest group first. Installed together with `runs` at publication
+    /// or recovery. The `runs` vector keeps publication order, which
+    /// compaction uses to break ties. The immutable directory is shared
+    /// by lookups, scans and snapshots.
     pub(super) directory: Arc<RunDirectory>,
     pub(super) run_bytes: usize,
     pub(super) held_bytes: usize,
