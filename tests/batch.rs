@@ -192,16 +192,25 @@ fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
     })
     .unwrap();
     let ks = engine.ks();
+    // Exercise both one-byte and multi-byte memtable keyspace prefixes.
+    for index in 0..128 {
+        engine.keyspace(&format!("unused-{index}")).unwrap();
+    }
+    let other = engine.keyspace("other").unwrap();
     let mut batch = WriteBatch::new();
     for index in (0..40u64).rev() {
         batch.put(&ks, &index.to_be_bytes(), &index.to_le_bytes());
     }
+    batch.put(&other, &7u64.to_be_bytes(), b"other");
+    batch.delete(&other, &3u64.to_be_bytes());
     batch.delete(&ks, &7u64.to_be_bytes());
     batch.put(&ks, &3u64.to_be_bytes(), b"last");
     assert_eq!(engine.write_seq(&batch), Ok(1));
     assert_eq!(engine.engine_stats().active.charged, 0);
     assert!(ks.get(&7u64.to_be_bytes()).unwrap().is_none());
     assert_eq!(ks.get(&3u64.to_be_bytes()).unwrap().unwrap(), b"last");
+    assert_eq!(other.get(&7u64.to_be_bytes()).unwrap().unwrap(), b"other");
+    assert!(other.get(&3u64.to_be_bytes()).unwrap().is_none());
 }
 
 #[test]

@@ -83,41 +83,34 @@ impl Core {
             crate::run::workspace_estimate([]).saturating_add(if sorted { 0 } else { input }),
         );
         drop(state);
-        // The batch's keys as the memtables store them, for the overlap
-        // checks: one buffer, in batch order.
+        // Sort the keys once for both run building and memtable overlap
+        // checks. Keep the position of the last operation for each key so
+        // the builder can borrow values directly from the batch.
         let mut stored = Vec::new();
-        let mut spans = Vec::with_capacity(batch.len());
-        for (keyspace, key, _) in batch.records() {
+        let mut indexed_keys = Vec::with_capacity(batch.len());
+        let mut logical: BTreeMap<u32, usize> = BTreeMap::new();
+        for (index, (keyspace, key, value)) in batch.records().enumerate() {
             let start = stored.len();
             stored.extend_from_slice(KeyPrefix::new(keyspace).as_bytes());
             stored.extend_from_slice(key);
-            spans.push(start..stored.len());
-        }
-        let mut keys: Vec<&[u8]> = spans.iter().map(|span| &stored[span.clone()]).collect();
-        let mut built = if sorted {
-            self.build_ingestion(batch.records())
-        } else {
-            // Local staging sequences choose the last duplicate operation.
-            // The final unique records are built with zero placeholders too.
-            keys.sort_unstable();
-            keys.dedup();
-            let budget = input.saturating_add(batch.len().saturating_mul(8));
-            let mut table = Memtable::in_pool(budget, None, &self.chunks);
-            for (index, (keyspace, key, value)) in batch.records().enumerate() {
-                let prefix = KeyPrefix::new(keyspace);
-                table
-                    .write(prefix.key(key), index as u64 + 1, value)
-                    .expect("the private table admits the whole batch");
-            }
-            self.build_ingestion(table.iter().map(|record| {
-                let (keyspace, key) = keyspaces::split(record.key);
-                (keyspace, key, record.value)
-            }))
-        };
-        let mut logical: BTreeMap<u32, usize> = BTreeMap::new();
-        for (keyspace, key, value) in batch.records() {
+            indexed_keys.push((index, start..stored.len()));
             *logical.entry(keyspace).or_default() += crate::run::input_len(key, value);
         }
+        let stored_key = |span: &std::ops::Range<usize>| &stored[span.clone()];
+        if !sorted {
+            indexed_keys.sort_unstable_by(|(a, a_key), (b, b_key)| {
+                stored_key(a_key)
+                    .cmp(stored_key(b_key))
+                    .then_with(|| b.cmp(a))
+            });
+            indexed_keys.dedup_by(|(_, a), (_, b)| stored_key(a) == stored_key(b));
+        }
+        let mut built =
+            self.build_ingestion(indexed_keys.iter().map(|&(index, _)| batch.record(index)));
+        let keys: Vec<_> = indexed_keys
+            .into_iter()
+            .map(|(_, span)| stored_key(&span))
+            .collect();
         for space in &mut built {
             space.logical = logical.get(&space.keyspace).copied().unwrap_or(0);
         }

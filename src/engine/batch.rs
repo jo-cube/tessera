@@ -111,15 +111,22 @@ impl WriteBatch {
 
     /// Each operation's keyspace, key and value, in insertion order.
     pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], Value<'_>)> + Clone {
-        self.operations.iter().map(|op| {
-            (
-                op.keyspace,
-                &self.bytes[op.key.clone()],
-                op.value.as_ref().map_or(Value::Tombstone, |range| {
-                    Value::Bytes(&self.bytes[range.clone()])
-                }),
-            )
-        })
+        self.operations.iter().map(|op| self.operation_record(op))
+    }
+
+    /// The operation at this position, borrowing directly from the batch.
+    pub(super) fn record(&self, index: usize) -> (u32, &[u8], Value<'_>) {
+        self.operation_record(&self.operations[index])
+    }
+
+    fn operation_record(&self, op: &Operation) -> (u32, &[u8], Value<'_>) {
+        (
+            op.keyspace,
+            &self.bytes[op.key.clone()],
+            op.value.as_ref().map_or(Value::Tombstone, |range| {
+                Value::Bytes(&self.bytes[range.clone()])
+            }),
+        )
     }
 
     /// The engine its keyspaces belong to, or the name of one that belongs

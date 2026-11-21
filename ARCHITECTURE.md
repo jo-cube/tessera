@@ -36,7 +36,9 @@ large write ─▶ private runs ────────────▶ level 0 
   and whose keys ascend, or that is larger than a memtable, is built into
   runs outside the lock with placeholder sequences. The runs are published
   at one overridden sequence after draining only the tables that share one
-  of the batch's keys, so the batch stays atomic.
+  of the batch's keys, so the batch stays atomic. Oversized unsorted batches
+  sort operation positions by key and retain the last operation per key. Run
+  builders borrow those operations from the batch.
 - **Levels.** Level 0 holds flushes in publication order and may overlap.
   Deeper levels are sorted and strictly disjoint, with targets set by
   `level_ratio` (default 10) and dynamic level sizing. Level 0 is compacted at

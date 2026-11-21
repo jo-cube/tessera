@@ -55,18 +55,6 @@ impl KeyPrefix {
     }
 }
 
-/// The keyspace ID and the caller's key of a memtable key.
-pub(super) fn split(stored: &[u8]) -> (u32, &[u8]) {
-    let mut id = 0u32;
-    for (at, &byte) in stored.iter().enumerate().take(MAX_PREFIX_LEN) {
-        id |= u32::from(byte & 0x7f) << (7 * at);
-        if byte & 0x80 == 0 {
-            return (id, &stored[at + 1..]);
-        }
-    }
-    unreachable!("memtable keys start with a keyspace prefix")
-}
-
 /// One keyspace's published runs and what is kept beside them.
 pub(super) struct KeyspaceState {
     pub(super) name: Arc<str>,
@@ -283,12 +271,10 @@ mod tests {
             KeyPrefix::new(u32::MAX).as_bytes(),
             [0xff, 0xff, 0xff, 0xff, 0x0f]
         );
-        let ids = (0..300u32).chain([16_383, 16_384, 1 << 21, 1 << 28, u32::MAX]);
-        let prefixes: Vec<KeyPrefix> = ids.clone().map(KeyPrefix::new).collect();
-        for id in ids {
-            let stored = [KeyPrefix::new(id).as_bytes(), b"key"].concat();
-            assert_eq!(split(&stored), (id, &b"key"[..]));
-        }
+        let prefixes: Vec<_> = (0..300u32)
+            .chain([16_383, 16_384, 1 << 21, 1 << 28, u32::MAX])
+            .map(KeyPrefix::new)
+            .collect();
         for a in &prefixes {
             for b in &prefixes {
                 if a != b {

@@ -774,6 +774,7 @@ impl Memtable {
     }
 
     /// Returns each key's latest update, in ascending key order.
+    #[cfg(test)]
     pub fn iter(&self) -> Records<'_> {
         self.0.iter_from(Key::plain(&[]))
     }
