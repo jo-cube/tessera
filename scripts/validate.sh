@@ -179,9 +179,8 @@ limits() {
 # Write budgets: tests and fixtures stay on the 512 MiB /tmp tmpfs (charged
 # to the container's 3 GiB), a few MiB per database and never more than a
 # few hundred MiB at once; each test removes its directory. Builds write the
-# cache volume (measured: 20–40 MiB for an incremental test build, a few
-# hundred MiB when every test binary relinks); prefer one final `full` to
-# repeated ones.
+# cache volume (tens of MiB for an incremental test build, a few hundred MiB
+# when every test binary relinks); prefer one final `full` to repeated ones.
 # Each probe is bounded on its own, so a failed limit cannot run away.
 verify() {
   local failures=0 status output

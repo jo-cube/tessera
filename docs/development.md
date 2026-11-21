@@ -33,17 +33,18 @@ The `justfile` is the one list of checks. CI runs its recipes, and so does
 The default suite includes bounded mutation tests, a concurrent sequence
 model with a 20-second process deadline and a model of five keyspaces with
 drops, snapshots and reopening. The long campaigns are longer variants of
-these; together they take about two and a half minutes in the container,
-half the `long` step's bound. The large-allocation boundary tests are also ignored and
-run only in the container (`scripts/validate.sh limits`).
+these, sized to finish within half the `long` step's bound in the container.
+The large-allocation boundary tests are also ignored and run only in the
+container (`scripts/validate.sh limits`).
 
 ## Container validation
 
 Run tests, Clippy, fault injection and anything else that can loop or
 allocate without bound through `scripts/validate.sh`, not in a macOS shell.
 macOS cannot enforce a per-process memory ceiling, and a broken change
-under test can exhaust the host: a fault-injection run once used all the memory of
-a development machine and forced a restart. The script runs each step in a
+under test can exhaust the host: a fault-injection run that retains every
+record can take all of a development machine's memory and force a restart.
+The script runs each step in a
 container inside the Colima VM, which the hypervisor caps at 4 GiB, under a
 3 GiB cgroup with no swap, two CPUs, 256 processes and its own timeout. Tests
 write only to a 512 MiB tmpfs. Every step except `image` and `deps` is offline.
@@ -87,9 +88,11 @@ Run large scenarios with `scripts/validate.sh exec`.
 RAM disks. It needs Homebrew LZ4 and Zstandard, and RocksDB 11.13.2 built from
 source into `~/.cache/tessera-bench/rocksdb-11.13.2/`, a cache kept outside the
 repository so it survives clean checkouts. `just bench` builds and runs the
-suite and writes results under `.work/bench/`. It is not a release gate.
+suite and writes results under `target/bench/<date>-<commit>/`, which git
+ignores; the run's `environment.txt` describes the host and stays local. It
+is not a release gate.
 [tools/bench/README.md](../tools/bench/README.md) covers the build, workloads
-and accounting, and [performance](performance.md) the published results.
+and accounting, and [performance](performance.md) how to read the results.
 
 ## Commits
 

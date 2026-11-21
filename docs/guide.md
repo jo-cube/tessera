@@ -98,13 +98,13 @@ can charge about 192 MiB at the default `memtable_size`.
 ### Resident memory on Linux
 
 With glibc, freed buffers can stay resident, so RSS may remain well above
-`memory_used` after compaction; in one measurement RSS was 1.7 times the
-budget figure. Setting `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=524288` at
-process start lets large freed allocations return to the operating system
-(it cut that case's final RSS by 38%). It affects every allocation in the
-process and can change throughput, so measure it with the application's
-workload. Allocators that return freed memory, such as mimalloc or jemalloc
-with default settings, avoid the retention too. See
+`memory_used` after compaction. Setting
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=524288` at process start lets
+large freed allocations return to the operating system, which removes most of
+that gap. It affects every allocation in the process and can change
+throughput, so measure it with the application's workload. Allocators that
+return freed memory, such as mimalloc or jemalloc with default settings,
+avoid the retention too. See
 [performance](performance.md#linux-resident-memory).
 
 ## Threads and handles

@@ -9,34 +9,33 @@ in safe Rust, with named keyspaces, atomic batches across them, lock-free
 snapshots and ordered scans. It has no write-ahead log: writes since the
 latest checkpoint are lost when the process ends.
 
-- **Small in memory.** Zstandard blocks with per-segment dictionaries hold
-  grouped JSON in a fifth to a third of the heap RocksDB uses for it.
-- **Fast reads.** Point reads run 1.6 to 3.8 times RocksDB's rate on the
-  benchmark data, with zero-copy readers and snapshot reads.
-- **Simple durability.** One call checkpoints every keyspace atomically, with
-  application metadata in the same commit, while writes continue.
+- **Compressed in RAM.** Data lives in memory as Zstandard blocks of about
+  1 KiB stored, with a dictionary per segment, so records that share
+  structure compress well together and a read decodes one small block.
+- **Keyspaces.** Named, independent sets of keys share one memory budget, and
+  one `WriteBatch` across them commits atomically.
+- **Fast point reads and ordered scans.** Lookups skip runs by key range,
+  Bloom filter and sequence before decoding anything, readers reuse their
+  buffers and return values without copying, and scans merge one cursor per
+  group of disjoint runs.
+- **Snapshots.** A snapshot is a consistent view of every keyspace that takes
+  no lock; writes and compaction continue beside it.
+- **Explicit checkpoints with atomic metadata.** One call writes every
+  keyspace at one moment while writes continue, reuses unchanged run files and
+  commits with application metadata, such as stream offsets, in one rename.
 - **Safe Rust, two dependencies.** `#![forbid(unsafe_code)]`, with only
   `crc32fast` and a bundled Zstandard beneath it.
 
-## Performance at a glance
+## Performance
 
-Tessera ÷ RocksDB on identical traces; lower heap and CPU are better, higher
-reads are better.
-
-| | A, 8 GiB grouped JSON: `r-small` | `r-mid` | B, 4 GiB weak locality: `r-small` | `r-mid` |
-| --- | ---: | ---: | ---: | ---: |
-| live heap after updates | 0.32× | 0.21× | 1.08× | 0.90× |
-| point reads, 1 thread | 1.88× | 1.65× | 3.68× | 3.79× |
-| point reads, 4 threads | 2.05× | 1.71× | 3.53× | 3.54× |
-| write CPU per record, load | 1.98× | 2.35× | 1.44× | 1.41× |
-| write CPU per record, updates | 3.00× | 2.69× | 1.59× | 1.59× |
-
-Writes are Tessera's weak point: they cost 1.4 to 3.0 times RocksDB's CPU per
-record, most of it recompressing the bottom level, and run at 0.39 to 0.56
-times its rate. Conditions: one machine, single runs;
-RocksDB 11.13.2 with a 128 MiB (`r-small`) or 1 GiB (`r-mid`) block cache,
-its files on a RAM disk and its write-ahead log off.
-[docs/performance.md](docs/performance.md) has the full tables and method.
+Tessera is strongest where its data shares structure and reads dominate:
+redundant data such as grouped JSON takes much less memory than in an engine
+that compresses for disk, and point reads and scans are served from memory
+without I/O or a block cache. It pays for this on writes, which spend more
+CPU per record than disk-oriented LSM engines because compaction
+recompresses data at the bottom level, and its compressed working set must
+fit in RAM. [docs/performance.md](docs/performance.md) explains where the
+memory and CPU go, which options move them and how to measure a workload.
 
 ## When to use it, and when not
 
@@ -156,7 +155,8 @@ Start from `Options::default()` and set the fields to change.
 - API reference: `cargo doc --open`
 - [docs/guide.md](docs/guide.md): consistency, memory, threads, durability,
   the on-disk layout, errors and limits
-- [docs/performance.md](docs/performance.md): the benchmark method and results
+- [docs/performance.md](docs/performance.md): where memory and CPU go, the
+  options that move them and how to measure a workload
 - [ARCHITECTURE.md](ARCHITECTURE.md): the internals and design decisions
 - [docs/releases.md](docs/releases.md): versioning, the format and platforms
 - [docs/development.md](docs/development.md): checks, validation and
