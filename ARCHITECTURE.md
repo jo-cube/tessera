@@ -148,8 +148,9 @@ flush groups, bounded views, sequence overrides, the ceiling and application
 metadata. The
 commit is the rename of `CURRENT` after every file and directory is synced; GC
 then keeps the files of the last two generations. Recovery reads exactly the
-generation `CURRENT` names and validates every frame, dictionary, record,
-filter and cross-run copy before any worker starts.
+generation `CURRENT` names and validates every frame, dictionary, record and
+filter before any worker starts. A separate merge checks for conflicting
+copies in keyspaces whose run ranges overlap.
 
 Manifest version 1, all integers little-endian, closed by a CRC-32:
 

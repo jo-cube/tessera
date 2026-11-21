@@ -58,7 +58,6 @@ use super::keyspaces::{KeyspaceState, MAX_KEYSPACES};
 use super::levels::Levels;
 use super::{
     Core, FlushJob, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Options, Published, SharedRun,
-    directory,
 };
 
 mod errors;
