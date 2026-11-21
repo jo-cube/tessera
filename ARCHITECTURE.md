@@ -197,6 +197,9 @@ keeps only the newest version of each key.
 
 **Per-segment raw-content dictionaries of 16 KiB, sampled.**
 - Trained dictionaries: slow to build and to load.
+- Digested entropy tables reduce decode CPU. Their residency and less
+  adaptive sequence coding increase memory on grouped data. Loading the
+  serialized tables on every decode increases CPU.
 - A 4 KiB dictionary: grouped JSON 16–20% larger. Revisit with real datasets.
 
 **Zstd level 1 only, with uncompressed as the other codec.**
