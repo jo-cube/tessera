@@ -17,6 +17,26 @@ pub const MAX_KEYSPACE_NAME_LEN: usize = 64;
 /// Engines in this process, numbered so that a handle can tell its own.
 static ENGINE_IDS: AtomicU64 = AtomicU64::new(1);
 
+/// Number of cache-line-isolated open-state stripes so concurrent operations do
+/// not bounce a single `RwLock<bool>` cache line across CPU clusters.
+const OPEN_STRIPES: usize = 16;
+
+static NEXT_OPEN_STRIPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_OPEN_STRIPE: usize =
+        NEXT_OPEN_STRIPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % OPEN_STRIPES;
+}
+
+fn open_stripe() -> usize {
+    THREAD_OPEN_STRIPE.with(|&stripe| stripe)
+}
+
+/// 128-byte aligned to avoid false sharing on both 64-byte and 128-byte cache
+/// line architectures (such as Apple Silicon).
+#[repr(align(128))]
+struct OpenStripe(RwLock<bool>);
+
 /// Everything the handles of one engine share. Dropping it, when the last
 /// [`Engine`] and [`Keyspace`] handle is dropped, stops the workers and
 /// releases the directory lock.
@@ -27,9 +47,10 @@ pub(super) struct Shared {
     /// Holds `dir/LOCK` until the engine closes.
     lock: Mutex<Option<File>>,
     workers: Mutex<Workers>,
-    /// Whether the engine is open. Operations hold it shared for their
-    /// duration, so closing waits for them and later ones see it closed.
-    open: RwLock<bool>,
+    /// Whether the engine is open. Operations hold their thread's stripe
+    /// shared for their duration; closing locks every stripe exclusively to
+    /// wait for in-flight operations and mark the engine closed.
+    open: Box<[OpenStripe; OPEN_STRIPES]>,
     pub(super) pool: Arc<read::Pool>,
     /// The metadata of the latest committed checkpoint.
     metadata: Mutex<Option<Vec<u8>>>,
@@ -46,7 +67,10 @@ struct Workers {
 impl Shared {
     /// Admits an operation while the engine is open, until the guard drops.
     pub(super) fn enter(&self) -> Result<RwLockReadGuard<'_, bool>> {
-        let open = self.open.read().unwrap_or_else(PoisonError::into_inner);
+        let open = self.open[open_stripe()]
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         if *open {
             Ok(open)
         } else {
@@ -177,7 +201,7 @@ impl Engine {
                 compaction,
                 flush: None,
             }),
-            open: RwLock::new(true),
+            open: Box::new(std::array::from_fn(|_| OpenStripe(RwLock::new(true)))),
             pool: Arc::new(read::Pool::new()),
             metadata: Mutex::new(metadata),
             #[cfg(feature = "diagnostics")]
@@ -465,15 +489,17 @@ impl Engine {
     /// engine is closed all the same.
     pub fn close(self) -> Result<()> {
         {
-            let mut open = self
-                .shared
-                .open
+            let mut first = self.shared.open[0]
+                .0
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            if !*open {
+            if !*first {
                 return Ok(());
             }
-            *open = false;
+            *first = false;
+            for stripe in &self.shared.open[1..] {
+                *stripe.0.write().unwrap_or_else(PoisonError::into_inner) = false;
+            }
         }
         let stopped = self.shared.stop_workers();
         drop(

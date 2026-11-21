@@ -263,9 +263,12 @@ struct Core {
     chunks: ChunkPool,
     state: RwLock<State>,
     /// Gives writers priority. A writer holds it while waiting for the state
-    /// lock, and a reader passes through it first, so new readers cannot keep
-    /// overtaking a waiting writer. The standard lock does not promise this.
+    /// lock, and a reader passes through it only when a writer is waiting, so
+    /// new readers cannot keep overtaking a waiting writer while uncontended
+    /// reads never serialize on this mutex.
     gate: Mutex<()>,
+    /// Number of writers currently waiting to acquire `state` exclusively.
+    waiting_writers: std::sync::atomic::AtomicUsize,
     /// Held by a flush from start to end, so that flushes run one at a time.
     flushing: Mutex<()>,
     /// Held by a compaction from selection to publication, so that runs are
@@ -381,6 +384,7 @@ impl Core {
                 flush_totals: FlushReport::default(),
             }),
             gate: Mutex::new(()),
+            waiting_writers: std::sync::atomic::AtomicUsize::new(0),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             background_threads: options.background_threads,
@@ -628,6 +632,20 @@ impl Core {
 
     /// A consistent view of the state now, sharing every source.
     fn snapshot(&self) -> View {
+        // When the active table is empty, taking a snapshot mutates nothing
+        // and needs only a shared read lock.
+        {
+            let state = self.read_state();
+            if state.active.is_empty() {
+                return View {
+                    tables: state.frozen.iter().rev().cloned().collect(),
+                    directories: Arc::clone(&state.directories),
+                    last_seq: state.last_seq,
+                    next_keyspace: state.next_keyspace,
+                    _live: Arc::clone(&self.snapshots),
+                };
+            }
+        }
         let mut state = self.write_state();
         let mut tables =
             Vec::with_capacity(state.frozen.len() + usize::from(!state.active.is_empty()));
@@ -1091,11 +1109,26 @@ impl Core {
     }
 
     fn read_state(&self) -> RwLockReadGuard<'_, State> {
-        drop(self.pass_gate());
+        if self
+            .waiting_writers
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            drop(self.pass_gate());
+        }
         self.state.read().expect(LOCK)
     }
 
     fn write_state(&self) -> RwLockWriteGuard<'_, State> {
+        struct WaitingWriter<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for WaitingWriter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.waiting_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _waiting = WaitingWriter(&self.waiting_writers);
         let _gate = self.pass_gate();
         self.state.write().expect(LOCK)
     }
