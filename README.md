@@ -2,12 +2,51 @@
 
 [![ci](https://github.com/jo-cube/tessera/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jo-cube/tessera/actions/workflows/ci.yml)
 
-Tessera 0.1.0 is a general-purpose, RAM-first compressed LSM key–value engine
-embedded in the application process, written in safe Rust. Use it when the
-working dataset fits in RAM, ordered scans and atomic batches are useful, and
-explicit checkpoints meet the application's persistence needs. It has no
-write-ahead log, per-write durability, disk tier, replication or multi-operation
-read/write transactions. Closing or dropping an engine writes nothing.
+Tessera is an embedded key–value engine for Rust that keeps the whole dataset
+in memory as compressed, sorted runs, and writes it to disk only when the
+application asks for a checkpoint. It is a log-structured merge tree written
+in safe Rust, with named keyspaces, atomic batches across them, lock-free
+snapshots and ordered scans. It has no write-ahead log: writes since the
+latest checkpoint are lost when the process ends.
+
+- **Small in memory.** Zstandard blocks with per-segment dictionaries hold
+  grouped JSON in a fifth to a third of the heap RocksDB uses for it.
+- **Fast reads.** Point reads run 1.6 to 3.8 times RocksDB's rate on the
+  benchmark data, with zero-copy readers and snapshot reads.
+- **Simple durability.** One call checkpoints every keyspace atomically, with
+  application metadata in the same commit, while writes continue.
+- **Safe Rust, two dependencies.** `#![forbid(unsafe_code)]`, with only
+  `crc32fast` and a bundled Zstandard beneath it.
+
+## Performance at a glance
+
+Tessera ÷ RocksDB on identical traces; lower heap and CPU are better, higher
+reads are better.
+
+| | A, 8 GiB grouped JSON: `r-small` | `r-mid` | B, 4 GiB weak locality: `r-small` | `r-mid` |
+| --- | ---: | ---: | ---: | ---: |
+| live heap after updates | 0.32× | 0.21× | 1.08× | 0.90× |
+| point reads, 1 thread | 1.88× | 1.65× | 3.68× | 3.79× |
+| point reads, 4 threads | 2.05× | 1.71× | 3.53× | 3.54× |
+| write CPU per record, load | 1.98× | 2.35× | 1.44× | 1.41× |
+| write CPU per record, updates | 3.00× | 2.69× | 1.59× | 1.59× |
+
+Writes are Tessera's weak point: they cost 1.4 to 3.0 times RocksDB's CPU per
+record, most of it recompressing the bottom level, and run at 0.39 to 0.56
+times its rate. Conditions: one machine, single runs;
+RocksDB 11.13.2 with a 128 MiB (`r-small`) or 1 GiB (`r-mid`) block cache,
+its files on a RAM disk and its write-ahead log off.
+[docs/performance.md](docs/performance.md) has the full tables and method.
+
+## When to use it, and when not
+
+Use Tessera when the dataset, compressed, fits in RAM; when reads, point or
+ordered, dominate; and when periodic checkpoints are enough durability, for
+example a cache, a materialized view rebuilt from a log, or a stream
+consumer's state that stores its input offsets beside its data.
+
+Look elsewhere for per-write durability, datasets larger than memory,
+replication, read/write transactions or Windows.
 
 ## Install
 
@@ -24,222 +63,100 @@ Windows is not. It is pre-1.0: minor versions may break the API and checkpoint
 format. [Releases](docs/releases.md) covers versioning, platforms and
 limitations. The license is [MIT](LICENSE).
 
-## Usage
+## Quick start
 
 ```rust
 use tessera::{Engine, Options, WriteBatch};
 
-// Use an application-owned directory for persistent checkpoints.
-let dir = std::env::temp_dir().join(format!("tessera-basic-{}", std::process::id()));
-let mut options = Options::default();
-options.memory_limit = Some(256 << 20);
-let engine = Engine::open(&dir, options)?;
-let users = engine.keyspace("users")?;
+let dir = std::env::temp_dir().join(format!("tessera-readme-{}", std::process::id()));
+let engine = Engine::open(&dir, Options::default())?; // recovers or starts empty
+let users = engine.keyspace("users")?; // opened or created
+let emails = engine.keyspace("emails")?;
 users.put(b"user/1", b"ada")?;
 assert_eq!(users.get(b"user/1")?.as_deref(), Some(&b"ada"[..]));
 
-let mut batch = WriteBatch::new();
+let mut batch = WriteBatch::new(); // atomic across keyspaces
 batch.put(&users, b"user/2", b"grace");
-batch.put(&users, b"user/3", b"katherine");
-engine.write(&batch)?; // All operations become visible together.
+batch.put(&emails, b"grace@example.com", b"user/2");
+engine.write(&batch)?;
 
-let mut reader = engine.reader(); // Reuses its buffers across reads.
-let values = reader.multi_get(&users, &[b"user/1", b"user/0"])?;
-assert_eq!(&*values, &[Some(&b"ada"[..]), None]);
-drop(values);
-drop(reader);
-
-let snapshot = engine.snapshot(); // Holds no lock after acquisition.
-users.delete(b"user/1")?;
-let mut reader = snapshot.reader();
+let snapshot = engine.snapshot(); // consistent across keyspaces, lock-free
+let mut reader = snapshot.reader(); // one per thread; values borrow it
 let mut scan = reader.prefix(&users, b"user/");
-for expected in [b"ada".as_slice(), b"grace", b"katherine"] {
-    assert_eq!(scan.next()?.unwrap().1, expected);
+while let Some((key, value)) = scan.next()? {
+    println!("{} = {}", String::from_utf8_lossy(key), String::from_utf8_lossy(value));
 }
-assert_eq!(scan.next()?, None);
 drop(scan);
-let mut scan = reader.range(&users, &b"user/2"[..]..);
-assert_eq!(scan.next()?.unwrap().0, b"user/2");
-drop(scan);
-drop(reader);
-drop(snapshot);
 
-engine.checkpoint_with(b"schema=1")?;
+engine.checkpoint_with(b"offset=42")?; // every keyspace, plus metadata
 engine.close()?;
-
-let recovered = Engine::open(&dir, options)?;
-assert_eq!(recovered.metadata().as_deref(), Some(&b"schema=1"[..]));
-let users = recovered.keyspace("users")?;
-assert_eq!(users.get(b"user/1")?, None);
-assert_eq!(users.get(b"user/3")?.as_deref(), Some(&b"katherine"[..]));
-recovered.close()?;
-std::fs::remove_dir_all(&dir)?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+let engine = Engine::open(&dir, Options::default())?;
+assert_eq!(engine.metadata().as_deref(), Some(&b"offset=42"[..]));
+# engine.close()?;
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), tessera::Error>(())
 ```
 
-Run the same code with `cargo run --example basic`.
+[`examples/`](examples) holds longer programs: `basic`, `keyspaces` (related
+keyspaces kept in step), `offsets` (a stream consumer that resumes exactly)
+and `hot_reads` (a reader per thread). Run one with
+`cargo run --example keyspaces`.
+
+## Concepts
+
+**Engine and directory.** `Engine::open(dir, options)` recovers the checkpoint
+in `dir`, or starts empty, and holds `dir/LOCK` until the engine closes.
+`Engine::in_memory` has no directory. `Engine`, `Keyspace` and `Snapshot`
+are cheap, cloneable, thread-safe handles. Closing writes nothing.
+
+**Keyspaces.** A keyspace is a named, independent set of keys:
+`engine.keyspace("orders")` opens or creates one, and `drop_keyspace` removes
+it with its data. Keyspaces share one memory budget and one memtable, so a
+batch spanning several is atomic, and a snapshot sees all of them at one
+moment. An engine holds up to 4096.
+
+**Reads.** `Keyspace::get` returns an owned copy of the latest value. A
+`Reader`, from `engine.reader()` or `snapshot.reader()`, reads without
+copying: `get`, `multi_get`, `prefix` and `range` return values that borrow
+the reader until its next call, and its buffers are reused across calls.
+Keep one reader per thread.
+
+**Snapshots.** `engine.snapshot()` is a consistent view of every keyspace that
+holds no lock; writes and compactions continue. It keeps alive whatever it
+sees, and that memory counts against the budget, so drop it once read. It
+stays readable after the engine closes.
+
+**Checkpoints and metadata.** `checkpoint()` writes every keyspace at one
+moment into the directory while writes continue, reusing unchanged run files,
+and commits atomically; a failure leaves the previous checkpoint intact.
+`checkpoint_with(blob)` adds application metadata to the same commit and
+`metadata()` returns it. To record a stream offset exactly, write it into a
+keyspace in the same batch as the data it covers.
+
+**Errors.** Every call returns `tessera::Error`; match on `error.kind()`
+(`InvalidInput`, `MemoryLimit`, `KeyspaceDropped`, `Locked`, `Io`,
+`Corruption` and others).
+
+## Options
+
+Start from `Options::default()` and set the fields to change.
+
+| Option | Default | What it trades |
+| --- | --- | --- |
+| `memory_limit` | none | A budget for writes: near it writers wait for compaction, at it they fail with `MemoryLimit`. Not a cap on process memory. |
+| `memtable_size` | 64 MiB | Bytes buffered before a flush. Larger flushes less often but holds up to three tables' worth in memory. It also caps one record. |
+| `level_ratio` | 10 | Size ratio between levels. Larger favours reads and memory; smaller rewrites less on writes. |
+| `background_threads` | half the CPUs, 1–4 | Threads building one compaction. More gives faster writes for more CPU and transient memory. |
+| `compression` | `Zstd` | `Uncompressed` stores 16 KiB raw blocks: less CPU, much more memory. |
+| `block_size` | 1 KiB | Target **stored** bytes of a block after compression, not raw bytes. Smaller blocks decode less per point read and compress worse. |
 
 ## Documentation
 
-- API documentation: `cargo doc --open`; the contracts are in the
-  [engine module](src/engine.rs)
-- [ARCHITECTURE.md](ARCHITECTURE.md): the data flow, the run format and the
-  design decisions behind them
-- [docs/releases.md](docs/releases.md): installation, versioning, platforms,
-  limitations and the release process
-- [docs/development.md](docs/development.md): checks, container validation,
-  diagnostics and benchmarks
-
-## Operations and consistency
-
-Keys and values are byte strings. Keys compare bytewise; empty keys and values
-are valid. Keys are limited to 64 KiB and values to 64 MiB. A record's key,
-value and 80-byte entry charge must also fit the memtable budget.
-
-- `put`, `delete` and `write` publish atomically and return a sequence ceiling.
-  Memtable batches take consecutive sequences; later duplicate keys win.
-  Batches built into runs take one shared publication sequence. Empty batches
-  return the current ceiling. Snapshots never see a partial batch.
-- `ingest_sorted` requires strictly increasing, unique keys and builds outside
-  the state lock. Sorted batches reaching half the memtable budget automatically
-  use this path; oversized unsorted batches use private staging. Publication
-  follows concurrent writes and drains tables sharing actual batch keys.
-- `get` and `multi_get` each see one consistent state. Multi-get callbacks run
-  after successful decoding, in input order, including duplicates and misses.
-- Snapshots preserve their state through writes, maintenance and engine closure.
-  They share immutable runs and copy-on-write memtables. Scans yield each live
-  key once in ascending order; prefixes use raw bytes. A value's sequence may be
-  zero after bottom-level compaction, so it is not a stable update identifier.
-
-Compaction keeps disjoint levels below level 0. Large level-0 jobs into the
-bottom run as disjoint key ranges aligned to bottom-run boundaries, with about
-one target run of bottom input per piece. Up to `background_threads` pieces
-build at once within a shared unpublished-output allowance. Each piece
-publishes atomically and releases its bottom inputs. Bounded views of level-0
-sources expose only the remaining ranges; snapshots and checkpoints preserve
-the bounds they captured. A later piece failure leaves earlier publications
-intact and stops the job.
-
-A level-0 merge into the bottom copies settled bottom blocks forward without
-decoding them. A block is settled when every record has sequence 0 and a value,
-and it is copied when no other input holds a key in its range. When at least
-half the blocks of a bottom input segment are expected to be copied, the output
-starts a segment that inherits that segment's dictionary. It copies those frames,
-after checking each one's CRC, and compresses the touched blocks with the same
-dictionary. Such a segment holds at most twice the usual raw length, and output
-runs end only at its edges. Runs keep a one- or two-byte record count per block
-to mark settled blocks. It is held beside the run, counted in its held bytes
-and rebuilt on recovery.
-
-## Options and memory
-
-`EngineOptions` is fixed when the engine starts. Set fields on its default,
-since new options may be added:
-
-| Option | Default | Trade-off |
-| --- | --- | --- |
-| `memory_limit` | `None` | Writer admission budget; held snapshots can prevent admission |
-| `memtable_budget` | 64 MiB | Larger tables flush less often and retain more transient memory |
-| `level_ratio` | 10 | Larger ratios favor reads and memory; smaller ratios reduce rewriting |
-| `background_threads` | Half the CPUs, clamped to 1–4 | Bounds concurrent compaction pieces and builders; trades write throughput for CPU and transient memory |
-| `compression` | `Compression::Zstd` | Compression costs CPU; `Uncompressed` reads blocks in place |
-| `target_block_compressed` | 1024 bytes | Larger blocks reduce metadata and increase point-read decoding |
-
-The memtable budget must be between 80 and `usize::MAX / 2` bytes, the level
-ratio at least 2, the builder count at least 1, and the compressed block target
-between 1 byte and 64 KiB. Zstandard level 1 uses raw dictionaries up to 16 KiB
-per roughly 4 MiB segment. Ordinary raw blocks are capped at 64 KiB; a larger
-record gets its own block. Uncompressed runs target 16 KiB raw blocks.
-
-At 90% of the admission budget writers wait briefly for publication. At 100%
-they request maintenance while reclamation can progress, then return
-`MemoryLimit` if live data or held snapshots prevent admission. Reads and
-maintenance remain available. Writers also wait at two frozen memtables or
-twelve level-0 flushes. `flush()` waits until preceding writes are in runs.
-
-`EngineStats::used` includes charged memtables, stored runs and metadata,
-retained snapshot sources, pool reserve, unused checked-out capacity and build
-estimates. It is an admission budget with transient maintenance headroom;
-caller-owned workspaces and allocator overhead are outside it. Memtables charge
-arena bytes used, including overwritten garbage, entry charges and pinned
-history. The budget reserves no memory in advance. An active table plus two
-frozen tables can charge about 192 MiB at the default memtable budget.
-
-Frames and dictionaries share 1 MiB chunks. Large frames use exact allocations;
-finished runs trim their partial final chunk. The free reserve is capped at
-32 MiB. Concurrent bottom compaction bounds unpublished output by the builder
-count times one estimated target stored run. A piece reserves its inputs'
-stored bytes plus an eighth; one larger than the whole allowance runs alone.
-A piece that outgrows its reservation retries alone with at least the whole
-allowance, doubling each time, so the allowance never fails a job. With one
-builder, bottom pieces publish consecutively using the serial piece budget. A
-level-0 source is released when its final range is merged. Snapshots can keep
-replaced storage alive. Workspaces retain decode buffers and contexts; there
-is no decoded-block cache. Use `Engine::stats()` and workspace counters to
-inspect memory and work.
-
-On Linux with glibc, freed buffers can remain resident, so RSS may stay above
-`EngineStats::used` after maintenance. Applications can evaluate
-`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=524288` at process startup. This
-[fixes the mmap threshold](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
-and lets large freed allocations return to the OS; it affects allocations
-throughout the process and can change throughput. Measure with the application
-workload before adopting it. Allocators that purge freed memory, such as mimalloc
-or jemalloc with default settings, also avoid this retention.
-
-## Thread safety and errors
-
-`Engine` and `Snapshot` are `Send + Sync`. Share them across threads and use
-one reusable `EngineWorkspace` per concurrent reader. State changes use an
-exclusive lock; run decoding and builds happen outside it. Dedicated flush and
-compaction workers perform maintenance; compaction can use several builders.
-A `ReadGuard` holds a shared lock and is not `Send`. Drop it before calling
-engine methods that acquire the state lock. Use snapshots for long reads.
-`close()` joins workers; snapshots can outlive the engine.
-
-Invalid configuration returns `OpenError::Config(ConfigError)`. Invalid writes
-return `UpdateError::Rejected(WriteError)`; admission pressure and sequence
-exhaustion return `MemoryLimit` and `SequencesExhausted`. Reads report corruption
-or conflicting copies through `ReadError`. Maintenance reports read failures,
-stale selections or worker panics. A build panic leaves published sources
-readable; a panic under the exclusive state lock poisons the engine, and later
-operations acquiring that lock panic.
-
-## Durability and checkpoints
-
-`checkpoint` flushes and pins one structural snapshot at its sequence ceiling,
-then writes files while updates and compactions continue. Immutable runs are
-written once and reused by stable ID, without recompression. Reports count new,
-reused and deleted files and bytes. GC retains the latest two generations.
-`checkpoint_with_metadata` and `recover_with_metadata` include an opaque blob
-of at most 16 MiB in the same commit. All writes since the latest successful
-checkpoint are lost on process exit.
-
-The layout is `CURRENT`, `LOCK`, `runs/<32-hex-digit ID>` and
-`ckpt-<20-digit generation>/MANIFEST`. Run format 1 uses magicless Zstandard
-frames and a prefix-compressed sparse index. Run files append Bloom words and
-their CRC-32. Manifest version 1 records the keyspaces, checksums, lengths,
-levels, flush groups, bounded views, sequence overrides, the ceiling and
-application metadata. Unsupported versions are rejected. CRC-32 detects accidental
-damage; it does not authenticate files.
-
-Runs and the manifest are synced before renaming `CURRENT`, the commit point;
-the parent directory is synced before GC. An error before the rename retains
-the preceding commit. An I/O error after it reports `after_commit_point = true`
-and retains both generations. Durability assumes local POSIX rename and working
-file and directory fsync. An advisory lock excludes cooperating directory users.
-Network filesystems and external modifications are unsupported.
-
-Recovery validates exactly the generation named by `CURRENT`, with no fallback.
-It checks lengths, checksums, run structure, Bloom membership, sequence bounds
-and cross-run consistency before starting workers. Allocation is bounded by
-actual file sizes and format limits. Recovery temporarily holds a contiguous
-run file while packing it into chunks, and one decoded block per overlapping
-group for cross-run validation. It leaves checkpoint data unchanged and may
-create `LOCK`. Rejections return typed `OpenError`s.
-
-## Development
-
-`just all` runs every check CI runs. [docs/development.md](docs/development.md)
-describes the recipes, the resource-limited container validation, the
-diagnostic counters and the macOS comparison with RocksDB.
+- API reference: `cargo doc --open`
+- [docs/guide.md](docs/guide.md): consistency, memory, threads, durability,
+  the on-disk layout, errors and limits
+- [docs/performance.md](docs/performance.md): the benchmark method and results
+- [ARCHITECTURE.md](ARCHITECTURE.md): the internals and design decisions
+- [docs/releases.md](docs/releases.md): versioning, the format and platforms
+- [docs/development.md](docs/development.md): checks, validation and
+  benchmarks
