@@ -74,10 +74,10 @@ impl Core {
         &self,
         batch: &WriteBatch,
         sorted: bool,
+        input: usize,
     ) -> Result<u64, UpdateError> {
         let state = self.admit(self.write_state())?;
         batch.check_keyspaces(&state)?;
-        let input = batch.validate(self.memtable_budget)?;
         let mut charge = self.resources.build(
             input.saturating_mul(3),
             crate::run::workspace_estimate([]).saturating_add(if sorted { 0 } else { input }),
@@ -131,6 +131,8 @@ impl Core {
         let runs = || built.iter().flat_map(|space| &space.runs);
         let bytes: usize = runs().map(|run| run.stored_len()).sum();
         let held: usize = runs().map(Run::held_bytes).sum();
+        #[cfg(feature = "diagnostics")]
+        let raw: usize = runs().map(Run::raw_len).sum();
         charge.finished(bytes + held);
         let mut built: Vec<(u32, usize, Vec<SharedRun>)> = built
             .into_iter()
@@ -144,6 +146,7 @@ impl Core {
             .collect();
         let (lo, hi) = (keys[0], keys[keys.len() - 1]);
         let mut state = self.write_state();
+        batch.check_keyspaces(&state)?;
         // Freeze a potentially large table cheaply, then inspect it unlocked.
         // At the frozen limit, probe active exactly below: unrelated keys must
         // not make ingestion wait for a slot just to perform a coarse check.
@@ -212,6 +215,8 @@ impl Core {
             state.published(*keyspace);
         }
         state.last_seq = seq;
+        #[cfg(feature = "diagnostics")]
+        self.chunks.work(0, 0, raw, bytes);
         self.chunks.ingested(
             batch
                 .records()

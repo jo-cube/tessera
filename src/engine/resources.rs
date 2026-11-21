@@ -132,7 +132,7 @@ impl Drop for BuildCharge<'_> {
         estimates.output -= self.output;
         estimates.workspace -= self.workspace;
         drop(estimates);
-        self.progress.changed();
+        self.progress.changed.notify_all();
     }
 }
 

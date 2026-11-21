@@ -206,7 +206,7 @@ impl Core {
         let charge = batch.validate(self.memtable_budget)?;
         let sorted = batch.is_sorted();
         if sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget {
-            return self.ingest_batch(batch, sorted);
+            return self.ingest_batch(batch, sorted, charge);
         }
         if batch.len() == 1 {
             let (keyspace, key, value) = batch.records().next().unwrap();

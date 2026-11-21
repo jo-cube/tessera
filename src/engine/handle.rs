@@ -489,10 +489,25 @@ impl Engine {
 
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Engine")
-            .field("path", &self.shared.dir)
-            .field("keyspaces", &self.keyspaces())
-            .finish_non_exhaustive()
+        let mut out = f.debug_struct("Engine");
+        out.field("path", &self.shared.dir);
+        match self.core.state.try_read() {
+            Ok(state) => {
+                let names: Vec<&str> = state
+                    .keyspaces
+                    .values()
+                    .map(|space| space.name.as_ref())
+                    .collect();
+                out.field("keyspaces", &names);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                out.field("keyspaces", &"<locked>");
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                out.field("keyspaces", &"<poisoned>");
+            }
+        }
+        out.finish_non_exhaustive()
     }
 }
 
@@ -690,8 +705,8 @@ impl Engine {
         if batch.is_empty() {
             return Ok(self.core.read_state().last_seq);
         }
-        batch.validate(self.core.memtable_budget)?;
-        self.core.ingest_batch(batch, true)
+        let charge = batch.validate(self.core.memtable_budget)?;
+        self.core.ingest_batch(batch, true, charge)
     }
 
     /// Opens or creates the keyspace the crate's tests write to.
