@@ -7,7 +7,7 @@ use crate::chunk::{CHUNK_BYTES, Chunk, ChunkPool};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Location {
-    allocation: usize,
+    allocation: u32,
     offset: u32,
     len: u32,
 }
@@ -94,13 +94,13 @@ impl Arena {
                 end += part.len();
             }
             page.used += len;
-            page.chunk.set_used(page.used);
+            page.chunk.set_used_in(&self.pool, page.used);
             (at, offset, copied)
         };
         self.used += len;
         (
             Location {
-                allocation,
+                allocation: u32::try_from(allocation).expect("arena page index fits in u32"),
                 offset: offset as u32,
                 len: len as u32,
             },
@@ -113,7 +113,8 @@ impl Arena {
             return &[];
         }
         let offset = location.offset as usize;
-        &self.pages[location.allocation].chunk.bytes()[offset..offset + location.len as usize]
+        &self.pages[location.allocation as usize].chunk.bytes()
+            [offset..offset + location.len as usize]
     }
 }
 
@@ -130,7 +131,7 @@ mod tests {
         let (large, _) = arena.append(&[b"c", &vec![3; CHUNK_BYTES + 1]]);
         assert_ne!(first.allocation, second.allocation);
         assert_eq!(
-            arena.pages[large.allocation].chunk.bytes().len(),
+            arena.pages[large.allocation as usize].chunk.bytes().len(),
             CHUNK_BYTES + 2
         );
         assert_eq!(arena.used(), CHUNK_BYTES - 9 + 33 + CHUNK_BYTES + 2);

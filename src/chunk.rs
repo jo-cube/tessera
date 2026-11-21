@@ -346,13 +346,28 @@ impl Chunk {
             return;
         }
         if let Some(pool) = self.pool.upgrade() {
-            if used > self.used {
-                pool.used.fetch_add(used - self.used, Ordering::Relaxed);
-            } else {
-                pool.used.fetch_sub(self.used - used, Ordering::Relaxed);
-            }
+            Self::update_pool_used(&pool, self.used, used);
         }
         self.used = used;
+    }
+
+    /// Updates used bytes using the caller's strong handle to this chunk's
+    /// pool, avoiding a `Weak::upgrade` and `Arc::drop` on every write.
+    pub(crate) fn set_used_in(&mut self, pool: &ChunkPool, used: usize) {
+        if used == self.used {
+            return;
+        }
+        debug_assert!(self.pool.ptr_eq(&Arc::downgrade(&pool.0)));
+        Self::update_pool_used(&pool.0, self.used, used);
+        self.used = used;
+    }
+
+    fn update_pool_used(pool: &Pool, old: usize, new: usize) {
+        if new > old {
+            pool.used.fetch_add(new - old, Ordering::Relaxed);
+        } else {
+            pool.used.fetch_sub(old - new, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -366,9 +381,10 @@ impl Chunk {
 impl Clone for Chunk {
     fn clone(&self) -> Self {
         if let Some(pool) = self.pool.upgrade() {
-            let mut copy = ChunkPool(pool).take();
-            copy.bytes.copy_from_slice(&self.bytes);
-            copy.set_used(self.used);
+            let pool = ChunkPool(pool);
+            let mut copy = pool.take();
+            copy.bytes[..self.used].copy_from_slice(&self.bytes[..self.used]);
+            copy.set_used_in(&pool, self.used);
             copy
         } else {
             Self::exact(&self.bytes)

@@ -250,11 +250,30 @@ impl Core {
             };
             let memory = state.active.memory();
             if needed <= memory.budget.saturating_sub(memory.charged) {
+                let single_prefix = (!batch.mixed)
+                    .then(|| {
+                        batch
+                            .operations
+                            .first()
+                            .map(|op| KeyPrefix::new(op.keyspace))
+                    })
+                    .flatten();
+                let mut ingested = 0usize;
                 for (keyspace, key, value) in batch.records() {
-                    let prefix = KeyPrefix::new(keyspace);
-                    self.write(&mut state, prefix.key(key), value)
+                    let prefix = single_prefix.unwrap_or_else(|| KeyPrefix::new(keyspace));
+                    let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
+                    state
+                        .active
+                        .write(prefix.key(key), seq, value)
                         .expect("preflight admitted every batch operation");
+                    state.last_seq = seq;
+                    ingested += key.len()
+                        + match value {
+                            Value::Bytes(bytes) => bytes.len(),
+                            Value::Tombstone => 0,
+                        };
                 }
+                self.chunks.ingested(ingested);
                 return Ok(end);
             }
             state = self.admit(self.make_room(state))?;

@@ -120,6 +120,12 @@ impl<'a> Key<'a> {
 
     /// How a stored key compares with this one.
     fn order(&self, stored: &[u8]) -> Ordering {
+        if let &[prefix] = self.prefix {
+            return match stored.split_first() {
+                Some((&first, rest)) => first.cmp(&prefix).then_with(|| rest.cmp(self.key)),
+                None => Ordering::Less,
+            };
+        }
         let shared = self.prefix.len().min(stored.len());
         match stored[..shared].cmp(&self.prefix[..shared]) {
             Ordering::Equal if stored.len() < self.prefix.len() => Ordering::Less,
@@ -129,41 +135,51 @@ impl<'a> Key<'a> {
     }
 }
 
+/// High bit of [`Slot::key_len_and_flag`] marks a tombstone; stored keys are
+/// at most `MAX_KEY_LEN + MAX_PREFIX_LEN`, far below `1 << 31`.
+const TOMBSTONE_BIT: u32 = 1 << 31;
+
 /// The latest update of one key in one tree. The arena also keeps overwritten
 /// payloads until its last table or snapshot is dropped.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Slot {
     seq: u64,
     data: Location,
-    key_len: u32,
-    tombstone: bool,
+    key_len_and_flag: u32,
 }
 
 impl Slot {
     fn new(key: Key<'_>, seq: u64, value: Option<&[u8]>, arena: &mut Arena) -> (Self, usize) {
         let (data, copied) = arena.append(&[key.prefix, key.key, value.unwrap_or_default()]);
+        let key_len = key.len() as u32;
+        debug_assert!(key_len & TOMBSTONE_BIT == 0);
         (
             Self {
                 seq,
                 data,
-                key_len: key.len() as u32,
-                tombstone: value.is_none(),
+                key_len_and_flag: key_len | if value.is_none() { TOMBSTONE_BIT } else { 0 },
             },
             copied,
         )
     }
+    fn key_len(&self) -> usize {
+        (self.key_len_and_flag & !TOMBSTONE_BIT) as usize
+    }
+    fn is_tombstone(&self) -> bool {
+        self.key_len_and_flag & TOMBSTONE_BIT != 0
+    }
     fn key<'a>(&self, arena: &'a Arena) -> &'a [u8] {
-        &arena.get(self.data)[..self.key_len as usize]
+        &arena.get(self.data)[..self.key_len()]
     }
     fn value<'a>(&self, arena: &'a Arena) -> Value<'a> {
-        if self.tombstone {
+        if self.is_tombstone() {
             Value::Tombstone
         } else {
-            Value::Bytes(&arena.get(self.data)[self.key_len as usize..])
+            Value::Bytes(&arena.get(self.data)[self.key_len()..])
         }
     }
     fn value_len(&self, arena: &Arena) -> usize {
-        arena.get(self.data).len() - self.key_len as usize
+        arena.get(self.data).len() - self.key_len()
     }
 }
 
@@ -334,6 +350,64 @@ fn insert(
     }
 }
 
+type Split = (Arc<[u8]>, Arc<Node>);
+
+/// Single-pass write into a uniquely owned tree (no live snapshots).
+/// Returns the overwritten value's byte length if the key existed, and the
+/// right half and its separator if `node` split.
+fn insert_unique(
+    node: &mut Arc<Node>,
+    key: Key<'_>,
+    seq: u64,
+    value: Option<&[u8]>,
+    edge: bool,
+    arena: &mut Arena,
+) -> (Option<usize>, Option<Split>) {
+    match Arc::get_mut(node).expect("no live snapshots share this tree") {
+        Node::Leaf(leaf) => match leaf.search(key, arena) {
+            Ok(at) => {
+                let released = leaf.slots[at].value_len(arena);
+                let (slot, _) = Slot::new(key, seq, value, arena);
+                leaf.slots[at] = slot;
+                (Some(released), None)
+            }
+            Err(at) => {
+                let (slot, _) = Slot::new(key, seq, value, arena);
+                if leaf.slots.capacity() <= NODE_CAPACITY {
+                    leaf.slots
+                        .reserve_exact(NODE_CAPACITY + 1 - leaf.slots.len());
+                }
+                leaf.slots.insert(at, slot);
+                let split = (leaf.slots.len() > NODE_CAPACITY)
+                    .then(|| leaf.split(edge && at == NODE_CAPACITY, arena));
+                (None, split)
+            }
+        },
+        Node::Branch(branch) => {
+            let at = branch.route(key);
+            let last = at + 1 == branch.children.len();
+            let (released, split) = insert_unique(
+                &mut branch.children[at],
+                key,
+                seq,
+                value,
+                edge && last,
+                arena,
+            );
+            let Some((separator, right)) = split else {
+                return (released, None);
+            };
+            branch.separators.insert(at, separator);
+            branch.children.insert(at + 1, right);
+            let full = branch.children.len() > NODE_CAPACITY;
+            (
+                released,
+                full.then(|| branch.split(edge && at + 1 == NODE_CAPACITY)),
+            )
+        }
+    }
+}
+
 /// A snapshot as its table tracks it.
 struct View {
     /// Dead once the snapshot is dropped.
@@ -449,7 +523,60 @@ impl Table {
     }
 
     fn write(&mut self, key: Key<'_>, seq: u64, value: Value<'_>) -> Result<(), TableError> {
-        let admitted = self.admit(key, seq, value)?;
+        let bytes = match value {
+            Value::Bytes(bytes) => Some(bytes),
+            Value::Tombstone => None,
+        };
+        let value_len = bytes.map_or(0, <[u8]>::len);
+        // The prefix is the table user's, so the limit is on the caller's key.
+        if key.key.len() > MAX_KEY_LEN {
+            return Err(TableError::KeyTooLong { len: key.key.len() });
+        }
+        if value_len > MAX_VALUE_LEN {
+            return Err(TableError::ValueTooLong { len: value_len });
+        }
+        if let Some(last) = self.last_seq.filter(|&last| seq <= last) {
+            return Err(TableError::SequenceNotIncreasing { seq, last });
+        }
+        // Both lengths are within the limits above, so this cannot overflow.
+        let charge = key.len() + value_len + ENTRY_OVERHEAD;
+        if charge > self.budget {
+            return Err(TableError::RecordExceedsBudget {
+                charge,
+                budget: self.budget,
+            });
+        }
+        while self.views.front().is_some_and(|view| !view.is_alive()) {
+            self.views.pop_front();
+        }
+        // Without live snapshots, every node and arena chunk is uniquely owned,
+        // so an update that fits even as a new entry can descend once in place.
+        if self.views.is_empty() && Arc::get_mut(&mut self.family).is_some() {
+            let used = self.arena.used() + self.len * ENTRY_OVERHEAD;
+            if charge <= self.budget.saturating_sub(used) {
+                let (released, split) =
+                    insert_unique(&mut self.root, key, seq, bytes, true, &mut self.arena);
+                if let Some((separator, right)) = split {
+                    let left = Arc::clone(&self.root);
+                    self.root = Arc::new(Node::Branch(Branch {
+                        separators: node_buffer(&[separator]),
+                        children: node_buffer(&[left, right]),
+                    }));
+                    self.depth += 1;
+                    assert!(self.depth < MAX_DEPTH, "a budget cannot fill a deeper tree");
+                }
+                match released {
+                    Some(old_value_len) => self.live = self.live - old_value_len + value_len,
+                    None => {
+                        self.len += 1;
+                        self.live += charge;
+                    }
+                }
+                self.last_seq = Some(seq);
+                return Ok(());
+            }
+        }
+        let admitted = self.admit_checked(key, bytes, value_len, charge)?;
         self.insert(key, seq, admitted);
         Ok(())
     }
@@ -486,41 +613,15 @@ impl Table {
         self.last_seq = Some(seq);
     }
 
-    /// Every check of [`Self::write`], changing nothing but forgetting dead
-    /// snapshots.
-    fn admit<'v>(
+    /// Remaining checks of [`Self::write`] when snapshots may share storage or
+    /// the budget is tight enough that an overwrite may still fit.
+    fn admit_checked<'v>(
         &mut self,
         key: Key<'_>,
-        seq: u64,
-        value: Value<'v>,
+        bytes: Option<&'v [u8]>,
+        value_len: usize,
+        charge: usize,
     ) -> Result<Admitted<'v>, TableError> {
-        let bytes = match value {
-            Value::Bytes(bytes) => Some(bytes),
-            Value::Tombstone => None,
-        };
-        let value_len = bytes.map_or(0, <[u8]>::len);
-        // The prefix is the table user's, so the limit is on the caller's key.
-        if key.key.len() > MAX_KEY_LEN {
-            return Err(TableError::KeyTooLong { len: key.key.len() });
-        }
-        if value_len > MAX_VALUE_LEN {
-            return Err(TableError::ValueTooLong { len: value_len });
-        }
-        if let Some(last) = self.last_seq.filter(|&last| seq <= last) {
-            return Err(TableError::SequenceNotIncreasing { seq, last });
-        }
-        // Both lengths are within the limits above, so this cannot overflow.
-        let charge = key.len() + value_len + ENTRY_OVERHEAD;
-        if charge > self.budget {
-            return Err(TableError::RecordExceedsBudget {
-                charge,
-                budget: self.budget,
-            });
-        }
-
-        while self.views.front().is_some_and(|view| !view.is_alive()) {
-            self.views.pop_front();
-        }
         let (path, slot, detach) = self.plan(key);
         let (grows, released) = match slot {
             Some(slot) => (value_len, slot.value_len(&self.arena)),
@@ -1038,7 +1139,9 @@ pub(crate) fn flush_merged(
     // Input still to come in each space, for the rule that a cut leaves a
     // piece after it: exact for one table, an overestimate where tables
     // share keys.
-    let rests: Vec<usize> = if let [space] = spaces {
+    let rests: Vec<usize> = if spaces.iter().all(|space| space.cuts.at.is_empty()) {
+        vec![0; spaces.len()]
+    } else if let [space] = spaces {
         vec![
             tables
                 .iter()
@@ -1053,7 +1156,9 @@ pub(crate) fn flush_merged(
         for table in tables {
             let mut current = None;
             for record in table.iter() {
-                if let Some((at, key)) = locate(spaces, &mut current, record.key) {
+                if let Some((at, key)) = locate(spaces, &mut current, record.key)
+                    && !spaces[at].cuts.at.is_empty()
+                {
                     rests[at] += crate::run::input_len(key, record.value);
                 }
             }
