@@ -105,4 +105,25 @@ mod tests {
             assert_eq!(counters.current.load(Relaxed), 0);
         }
     }
+
+    #[test]
+    fn output_budget_refusal_during_probe_stops_cleanly() {
+        let counters = Arc::new(OutputCounters::default());
+        // Tight enough to allow initial key reservation and one index entry,
+        // then fail inside probe() while re-cutting the 64 KiB sample.
+        let budget = OutputBudget::new(&counters, 256);
+        let mut builder = RunBuilder::new(Codec::Zstd);
+        builder.limit_filter_build_bytes(0);
+        builder.limit_output(budget.clone());
+        let value = vec![b'a'; 256];
+        for key in 0..400u32 {
+            builder
+                .add(&key.to_be_bytes(), 0, Value::Bytes(&value))
+                .unwrap();
+        }
+        assert!(builder.finish_checked().is_err());
+        assert!(budget.used.load(Relaxed) <= budget.limit());
+        drop(budget);
+        assert_eq!(counters.current.load(Relaxed), 0);
+    }
 }

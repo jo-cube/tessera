@@ -197,10 +197,16 @@ impl RunBuilder {
             if self.block_target.is_none() && projection.after > SAMPLE_LEN {
                 // Re-cutting the sample leaves its last records open.
                 self.probe();
+                if self.output_refused {
+                    return Ok(());
+                }
                 projection = self.block.project(key, seq, value);
             }
             if !self.block.is_empty() && self.cuts_before(key, value, projection.after) {
                 self.finish_block();
+                if self.output_refused {
+                    return Ok(());
+                }
                 projection = projection.in_new_block();
             }
         }
@@ -576,6 +582,9 @@ impl RunBuilder {
                 && self.cuts_before(record.key, record.value, projection.after)
             {
                 self.finish_block();
+                if self.output_refused {
+                    break;
+                }
                 projection = projection.in_new_block();
             }
             self.pending_key_bytes += record.key.len();
@@ -596,6 +605,9 @@ impl RunBuilder {
         }
         if self.block_target.is_none() {
             self.probe();
+            if self.output_refused {
+                return;
+            }
         }
         let last = self.block.last_key();
         // Full keys twice bound both index suffixes and the final unshared key;
