@@ -15,7 +15,10 @@ use std::{
     hint::black_box,
     io::{BufRead, BufReader, Write},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Barrier, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -699,6 +702,68 @@ fn read_keys(data: &Data, rng: &mut Rng) -> (Vec<KeyBuf>, Vec<u32>) {
     v.into_iter().unzip()
 }
 
+fn timed_reads(
+    store: &Store,
+    queries: (&[KeyBuf], &[u32]),
+    threads: usize,
+    batch_size: usize,
+    case: &str,
+    out: &Out,
+    op: impl Fn(&mut store::Reader<'_>, &[KeyBuf], &[u32], &mut Histogram<u64>) -> usize + Sync,
+) {
+    let (keys, want) = queries;
+    let chunk = keys.len().div_ceil(threads);
+    let ready = Barrier::new(threads);
+    let start = OnceLock::new();
+    let parts = thread::scope(|scope| {
+        let handles: Vec<_> = keys
+            .chunks(chunk)
+            .zip(want.chunks(chunk))
+            .map(|(keys, want)| {
+                let (ready, start, op) = (&ready, &start, &op);
+                scope.spawn(move || {
+                    let mut reader = store.reader();
+                    let mut h = hist();
+                    let mut batches = keys.chunks(batch_size).zip(want.chunks(batch_size)).cycle();
+                    let warm_until = Instant::now() + Duration::from_millis(150);
+                    while Instant::now() < warm_until {
+                        let (keys, want) = batches.next().unwrap();
+                        op(&mut reader, keys, want, &mut h);
+                    }
+                    h.reset();
+                    ready.wait();
+                    let span = start.get_or_init(|| {
+                        trace_phase(case);
+                        Span::new()
+                    });
+                    let until = span.t + Duration::from_millis(1500);
+                    let (mut ops, mut bad) = (0, 0);
+                    while Instant::now() < until {
+                        let (keys, want) = batches.next().unwrap();
+                        bad += op(&mut reader, keys, want, &mut h);
+                        ops += keys.len();
+                    }
+                    (h, ops, bad)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    start
+        .get()
+        .unwrap()
+        .finish(out, case, parts.iter().map(|p| p.1).sum(), 0);
+    let mut h = hist();
+    for (part, _, _) in &parts {
+        h.add(part).unwrap();
+    }
+    out.lat(case, &h);
+    out.emit(case, "errors", parts.iter().map(|p| p.2).sum::<usize>());
+}
+
 fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     let (keys, want) = read_keys(data, rng);
     let check = |bad: usize, case: &str| out.emit(case, "errors", bad);
@@ -716,46 +781,38 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     out.lat("get_1t", &h);
     check(bad, "get_1t");
     // (b) four threads, get, the same keys split four ways.
-    let span = Span::new();
-    let parts: Vec<(Histogram<u64>, usize)> = thread::scope(|s| {
-        let q = keys.len().div_ceil(4);
-        let handles: Vec<_> = keys
-            .chunks(q)
-            .zip(want.chunks(q))
-            .map(|(ks, ws)| {
-                s.spawn(move || {
-                    let mut r = store.reader();
-                    let (mut h, mut bad) = (hist(), 0);
-                    for (k, &i) in ks.iter().zip(ws) {
-                        let t = Instant::now();
-                        let got = store.get(k.as_slice(), &mut r, |v| v.map(<[u8]>::len));
-                        rec(&mut h, t);
-                        bad += (got != expect(data, i)) as usize;
-                    }
-                    (h, bad)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    span.finish(out, "get_4t", keys.len(), 0);
-    let mut h = hist();
-    parts.iter().for_each(|p| h.add(&p.0).unwrap());
-    out.lat("get_4t", &h);
-    check(parts.iter().map(|p| p.1).sum(), "get_4t");
+    timed_reads(
+        store,
+        (&keys, &want),
+        4,
+        1,
+        "get_4t",
+        out,
+        |r, keys, want, h| {
+            let t = Instant::now();
+            let got = store.get(keys[0].as_slice(), r, |v| v.map(<[u8]>::len));
+            rec(h, t);
+            usize::from(got != expect(data, want[0]))
+        },
+    );
     // (c) multi_get, 100 random keys per batch.
-    let (mut h, mut bad) = (hist(), 0);
-    let span = Span::new();
-    for (ks, ws) in keys.chunks(100).zip(want.chunks(100)) {
-        let t = Instant::now();
-        store.multi_get(ks, false, &mut r, |j, v| {
-            bad += (v.map(<[u8]>::len) != expect(data, ws[j])) as usize
-        });
-        rec(&mut h, t);
-    }
-    span.finish(out, "mget_random", keys.len(), 0);
-    out.lat("mget_random", &h);
-    check(bad, "mget_random");
+    timed_reads(
+        store,
+        (&keys, &want),
+        1,
+        100,
+        "mget_random",
+        out,
+        |r, keys, want, h| {
+            let mut bad = 0;
+            let t = Instant::now();
+            store.multi_get(keys, false, r, |j, v| {
+                bad += usize::from(v.map(<[u8]>::len) != expect(data, want[j]));
+            });
+            rec(h, t);
+            bad
+        },
+    );
     // (d) multi_get, 100 adjacent keys per batch, sorted.
     let starts: Vec<usize> = (0..2000).map(|_| rng.n(data.recs.len() - 100)).collect();
     let sorted: Vec<KeyBuf> = starts
@@ -844,6 +901,7 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
         let start = Instant::now();
         let (mut max, mut lag, mut written, mut next) =
             (Duration::ZERO, Duration::ZERO, 0usize, 0usize);
+        let mut batch_latencies = hist();
         let mut b = store.batch();
         for burst in (0..20).step_by(2) {
             let burst = start + Duration::from_secs(burst);
@@ -862,7 +920,9 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
                 }
                 let t = Instant::now();
                 store.write(&mut b);
-                max = max.max(t.elapsed());
+                let elapsed = t.elapsed();
+                max = max.max(elapsed);
+                batch_latencies.saturating_record(elapsed.as_nanos() as u64);
                 written += 256;
                 due += interval;
             }
@@ -874,13 +934,27 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
         stop.store(true, Ordering::Relaxed);
         let wall = start.elapsed().as_secs_f64();
         let readers: Vec<_> = readers.into_iter().map(|h| h.join().unwrap()).collect();
-        (readers, (max, lag, written, wall))
+        (
+            readers,
+            (
+                batch_latencies.value_at_quantile(0.99),
+                max,
+                lag,
+                written,
+                wall,
+            ),
+        )
     });
     let mut h = hist();
     readers.iter().for_each(|r| h.add(&r.0).unwrap());
-    let (max, lag, written, wall) = writer;
+    let (p99_ns, max, lag, written, wall) = writer;
     out.emit("mixed", "offered_rec_s", format!("{rate:.0}"));
     out.emit("mixed", "written_records", written);
+    out.emit(
+        "mixed",
+        "writer_p99_batch_ms",
+        format!("{:.2}", p99_ns as f64 / 1e6),
+    );
     out.emit(
         "mixed",
         "writer_max_batch_ms",

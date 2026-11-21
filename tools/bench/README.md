@@ -45,10 +45,13 @@ Dataset A is 1 GiB of grouped JSON; B is 512 MiB of weak-locality JSON; C is
 512 MiB of small records (20-byte structured keys, ~52-byte compact JSON
 values, 64 keys per 8-byte group prefix). All are generated before timing.
 Regular workloads use shuffled 256-record write batches, 50% updates and 2%
-deletes, 220k point reads with 10% misses, 1 or 4 readers, multi-get batches
-of 100 random or adjacent keys, 20k prefix scans, and 64 MiB sorted bulk
+deletes, a 220k-key point-read set with 10% misses, multi-get batches of
+100 random or adjacent keys, 20k prefix scans, and 64 MiB sorted bulk
 batches: Tessera writes each as one `WriteBatch`, which it builds into runs
-outside its lock, and RocksDB ingests each as an SST file. Mixed work offers
+outside its lock, and RocksDB ingests each as an SST file. Four-thread point
+reads and random multi-get cycle through the query set in 1.5 s windows,
+starting after all readers warm up. Mixed work reports p99 and maximum
+writer batch latency and offers
 writes at 70% of Tessera's update rate (or the selected engine's rate when
 Tessera is absent). Write measurements include maintenance drains. `r-large`
 skips bulk and mixed.
