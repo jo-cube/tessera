@@ -244,6 +244,7 @@ fn run_reader_point(
             thread::sleep(Duration::from_millis(1));
         }
         let span = Span::new();
+        crate::trace_phase(case);
         go.store(true, Ordering::Release);
         thread::sleep(SCALE_WINDOW);
         stop.store(true, Ordering::Relaxed);
@@ -349,6 +350,7 @@ pub fn writer_scale(engine: &str, data: &Data, dir: &str, out: &Out) {
                         }));
                     }
                     let t0 = Instant::now();
+                    crate::trace_phase(&case);
                     go.store(true, Ordering::Release);
                     let end = t0 + SCALE_WINDOW;
                     while Instant::now() < end && global_written.load(Ordering::Relaxed) < total_cap

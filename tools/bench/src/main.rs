@@ -184,6 +184,12 @@ fn rec(h: &mut Histogram<u64>, t: Instant) {
     h.saturating_record(t.elapsed().as_nanos() as u64)
 }
 
+pub(crate) fn trace_phase(name: &str) {
+    if std::env::var_os("TESSERA_BENCH_TRACE_PHASES").is_some() {
+        eprintln!("[phase] {name} pid={}", std::process::id());
+    }
+}
+
 struct Out {
     prefix: String,
 }
@@ -516,6 +522,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             );
         }
         let span = Span::new();
+        trace_phase("load");
         let mut b = store.batch();
         for chunk in perm.chunks(256) {
             for &i in chunk {
@@ -534,6 +541,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             // 3. Update half the keys, then delete 2%, drained.
             let c0 = store.counters();
             let span = Span::new();
+            trace_phase("update");
             let mut bytes = 0;
             for chunk in data.updates.chunks(256) {
                 for &i in chunk {
@@ -595,6 +603,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         let store = open("bulk");
         fs::create_dir_all(format!("{dir}/sst")).unwrap();
         let span = Span::new();
+        trace_phase("bulk");
         let mut b = store.batch();
         let (mut bytes, mut files) = (0, 0);
         for i in 0..n {
@@ -782,6 +791,7 @@ fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     let mut r = store.reader();
     let (mut h, mut bad, mut total) = (hist(), 0, 0);
     let span = Span::new();
+    trace_phase("scan");
     for (&g, &w) in picks.iter().zip(&want) {
         let mut count = 0;
         let t = Instant::now();
