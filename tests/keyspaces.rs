@@ -597,7 +597,7 @@ fn a_keyspace_model_agrees_through_drops_snapshots_and_recovery() {
 #[test]
 #[ignore = "long keyspace model campaign"]
 fn long_keyspace_model() {
-    for seed in 3..9 {
-        keyspace_model(seed, 3000);
+    for seed in 3..12 {
+        keyspace_model(seed, 5000);
     }
 }
