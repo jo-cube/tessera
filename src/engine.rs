@@ -475,6 +475,8 @@ impl Core {
         while state.frozen.len() >= self.max_frozen_memtables {
             #[cfg(feature = "diagnostics")]
             let _waiting = self.resources.waiting();
+            #[cfg(feature = "diagnostics")]
+            let _flush = self.resources.flush_waiting();
             state = self.wait_for_flush(state);
         }
         if !state.active.is_empty() {
@@ -1114,6 +1116,10 @@ impl Core {
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
+            #[cfg(feature = "diagnostics")]
+            self.resources
+                .gate_waits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.pass_gate());
         }
         self.state.read().expect(LOCK)
@@ -1130,7 +1136,12 @@ impl Core {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let _waiting = WaitingWriter(&self.waiting_writers);
         let _gate = self.pass_gate();
-        self.state.write().expect(LOCK)
+        let guard = self.state.write().expect(LOCK);
+        #[cfg(feature = "diagnostics")]
+        self.resources
+            .write_locks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        guard
     }
 
     fn pass_gate(&self) -> MutexGuard<'_, ()> {

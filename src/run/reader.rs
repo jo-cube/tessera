@@ -26,6 +26,85 @@ use super::{
 };
 use crate::chunk::ChunkPool;
 
+/// One block decoded by a reader lookup, multi-get or scan.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockDecode {
+    /// Physical storage identity of the run holding the block.
+    pub run_id: usize,
+    /// Zero-based block index within the run.
+    pub block: usize,
+    /// Decoded raw block length in bytes.
+    pub decoded_bytes: usize,
+    /// Stored frame payload bytes (excluding the frame header).
+    pub stored_bytes: usize,
+    /// Whether the frame was compressed (and CRC-checked on decode).
+    pub compressed: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+mod observer {
+    use super::BlockDecode;
+    use std::cell::{Cell, RefCell};
+
+    type Sink = Box<dyn FnMut(BlockDecode)>;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static SINK: RefCell<Option<Sink>> = RefCell::new(None);
+    }
+
+    struct Guard {
+        previous: Option<Sink>,
+        was_active: bool,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SINK.with(|slot| *slot.borrow_mut() = self.previous.take());
+            ACTIVE.with(|flag| flag.set(self.was_active));
+        }
+    }
+
+    /// Runs `f` on the current thread while delivering each decoded block's
+    /// identity and size to `observer`.
+    pub fn with_block_observer<R>(observer: Sink, f: impl FnOnce() -> R) -> R {
+        let was_active = ACTIVE.with(|flag| flag.replace(true));
+        let previous = SINK.with(|slot| slot.borrow_mut().replace(observer));
+        let _guard = Guard {
+            previous,
+            was_active,
+        };
+        f()
+    }
+
+    #[inline]
+    pub(super) fn record(
+        run_id: usize,
+        block: usize,
+        decoded_bytes: usize,
+        stored_bytes: usize,
+        compressed: bool,
+    ) {
+        if ACTIVE.with(Cell::get) {
+            SINK.with(|slot| {
+                if let Some(sink) = slot.borrow_mut().as_mut() {
+                    sink(BlockDecode {
+                        run_id,
+                        block,
+                        decoded_bytes,
+                        stored_bytes,
+                        compressed,
+                    });
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub use observer::with_block_observer;
+
 /// A valid run over any byte storage, such as `Vec<u8>`, `Arc<[u8]>` or
 /// `&[u8]`. Built and recovered runs own pooled chunks plus an exact
 /// index/footer buffer; the serialized format is the same.
@@ -133,6 +212,8 @@ impl RunLayout {
             largest_block: None,
             settled: None,
             slice: None,
+            #[cfg(feature = "diagnostics")]
+            storage_id: 0,
         }
     }
 }
@@ -447,6 +528,8 @@ impl<B: AsRef<[u8]>> Run<B> {
                 min: &r.0,
                 max: &r.1,
             }),
+            #[cfg(feature = "diagnostics")]
+            storage_id: self.storage_id(),
             ..self.backing.layout.view(&self.backing.data)
         }
     }
@@ -712,6 +795,8 @@ pub struct ReadWorkspace {
     end_bound: EndBound,
     blocks_loaded: u64,
     decoded_bytes: u64,
+    #[cfg(feature = "diagnostics")]
+    crc_bytes: u64,
 }
 
 impl ReadWorkspace {
@@ -749,11 +834,21 @@ impl ReadWorkspace {
         self.decoded_bytes
     }
 
+    /// Bytes verified by CRC-32 across compressed frames loaded through this workspace.
+    #[cfg(feature = "diagnostics")]
+    pub fn crc_bytes(&self) -> u64 {
+        self.crc_bytes
+    }
+
     /// Returns a frame's block, decoding and verifying it if it is compressed.
     /// The frame borrows its raw segment dictionary from the stored run.
     pub(super) fn load<'r>(&'r mut self, frame: &Frame<'r>) -> Result<&'r [u8], CorruptRun> {
         self.blocks_loaded += 1;
         self.decoded_bytes += frame.decoded_len as u64;
+        #[cfg(feature = "diagnostics")]
+        if frame.codec != Codec::None {
+            self.crc_bytes += 8 + frame.stored.len() as u64;
+        }
         decode(frame, &mut self.scratch, &mut self.decompressor)
     }
 
@@ -864,6 +959,8 @@ pub(crate) struct LookupWorkspace {
     decompressor: Decompressor,
     blocks_loaded: u64,
     decoded_bytes: u64,
+    #[cfg(feature = "diagnostics")]
+    crc_bytes: u64,
 }
 
 /// A version [`LookupWorkspace::get`] found, located rather than borrowed so
@@ -908,6 +1005,11 @@ impl LookupWorkspace {
         self.decoded_bytes
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn crc_bytes(&self) -> u64 {
+        self.crc_bytes
+    }
+
     /// Returns the sequence number and location of the newest version of
     /// `target` in `view`, decoding into `buffer`
     /// (0 or 1) and leaving the other buffer as it was.
@@ -924,6 +1026,8 @@ impl LookupWorkspace {
             &mut self.decompressor,
             &mut self.blocks_loaded,
             &mut self.decoded_bytes,
+            #[cfg(feature = "diagnostics")]
+            &mut self.crc_bytes,
         )?;
         Ok(found.map(|(seq, value)| (seq, Found { buffer, value })))
     }
@@ -1303,6 +1407,14 @@ impl<'a> RunCursor<'a> {
     fn load_block(&mut self, index: usize) -> Result<LoadedBlock<'a>, CorruptRun> {
         self.loaded = None;
         let frame = self.view.frame(index)?;
+        #[cfg(feature = "diagnostics")]
+        observer::record(
+            self.view.storage_id,
+            index,
+            frame.decoded_len,
+            frame.stored.len(),
+            frame.codec != Codec::None,
+        );
         let bytes = self.workspace.load(&frame)?;
         let entries_len = BlockView::open(bytes)
             .map_err(|error| frame.block_error(error))?
@@ -1354,6 +1466,8 @@ pub struct RunView<'a> {
     // Owned runs attach their settled block counts.
     settled: Option<&'a SettledCounts>,
     slice: Option<KeyRange<'a>>,
+    #[cfg(feature = "diagnostics")]
+    storage_id: usize,
 }
 
 impl<'a> RunView<'a> {
@@ -1435,6 +1549,8 @@ impl<'a> RunView<'a> {
             largest_block: None,
             settled: None,
             slice: None,
+            #[cfg(feature = "diagnostics")]
+            storage_id: 0,
         };
         match (view.table.first(), view.table.last()) {
             (Some(&first), Some(&last)) => {
@@ -1672,10 +1788,19 @@ impl<'a> RunView<'a> {
             decompressor,
             blocks_loaded,
             decoded_bytes,
+            #[cfg(feature = "diagnostics")]
+            crc_bytes,
             ..
         } = workspace;
-        let Some((seq, located)) =
-            self.find_located(target, scratch, decompressor, blocks_loaded, decoded_bytes)?
+        let Some((seq, located)) = self.find_located(
+            target,
+            scratch,
+            decompressor,
+            blocks_loaded,
+            decoded_bytes,
+            #[cfg(feature = "diagnostics")]
+            crc_bytes,
+        )?
         else {
             return Ok(None);
         };
@@ -1713,6 +1838,14 @@ impl<'a> RunView<'a> {
                 next += 1;
             }
             let frame = self.frame(block)?;
+            #[cfg(feature = "diagnostics")]
+            observer::record(
+                self.storage_id,
+                block,
+                frame.decoded_len,
+                frame.stored.len(),
+                frame.codec != Codec::None,
+            );
             let bytes = workspace.load(&frame)?;
             let view = BlockView::open(bytes).map_err(|error| frame.block_error(error))?;
             for &index in &indices[start..next] {
@@ -1738,6 +1871,7 @@ impl<'a> RunView<'a> {
         decompressor: &mut Decompressor,
         blocks_loaded: &mut u64,
         decoded_bytes: &mut u64,
+        #[cfg(feature = "diagnostics")] crc_bytes: &mut u64,
     ) -> Result<Option<(u64, Located<'a>)>, CorruptRun> {
         if target < self.min_key || self.slice.is_some_and(|r| target < r.min || target > r.max) {
             return Ok(None);
@@ -1748,6 +1882,14 @@ impl<'a> RunView<'a> {
         let frame = self.frame(block)?;
         *blocks_loaded += 1;
         *decoded_bytes += frame.decoded_len as u64;
+        #[cfg(feature = "diagnostics")]
+        observer::record(
+            self.storage_id,
+            block,
+            frame.decoded_len,
+            frame.stored.len(),
+            frame.codec != Codec::None,
+        );
         if frame.codec == Codec::None {
             let version = BlockView::open(frame.stored)
                 .and_then(|view| view.get(target))
@@ -1760,6 +1902,10 @@ impl<'a> RunView<'a> {
                 };
                 (version.seq, located)
             }));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            *crc_bytes += 8 + frame.stored.len() as u64;
         }
         let bytes = decode(&frame, scratch, decompressor)?;
         let version = BlockView::open(bytes)

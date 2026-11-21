@@ -18,6 +18,14 @@ pub(super) struct Progress {
     #[cfg(feature = "diagnostics")]
     pub(super) level0_wait_ns: std::sync::atomic::AtomicU64,
     #[cfg(feature = "diagnostics")]
+    pub(super) flush_wait_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    pub(super) memory_wait_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    pub(super) gate_waits: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    pub(super) write_locks: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
     pub(super) output_limit: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "diagnostics")]
     pub(super) peak_reserved: std::sync::atomic::AtomicUsize,
@@ -64,12 +72,39 @@ impl Drop for Level0Charge<'_> {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(super) struct AtomicWaitCharge<'a> {
+    counter: &'a std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
+}
+#[cfg(feature = "diagnostics")]
+impl Drop for AtomicWaitCharge<'_> {
+    fn drop(&mut self) {
+        let nanos = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.counter.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 impl Progress {
     /// Charges one writer wait at the level-0 stop, counted and timed.
     #[cfg(feature = "diagnostics")]
     pub(super) fn level0_waiting(&self) -> Level0Charge<'_> {
         Level0Charge {
             progress: self,
+            started: std::time::Instant::now(),
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn flush_waiting(&self) -> AtomicWaitCharge<'_> {
+        AtomicWaitCharge {
+            counter: &self.flush_wait_ns,
+            started: std::time::Instant::now(),
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn memory_waiting(&self) -> AtomicWaitCharge<'_> {
+        AtomicWaitCharge {
+            counter: &self.memory_wait_ns,
             started: std::time::Instant::now(),
         }
     }
@@ -234,6 +269,8 @@ impl Core {
         drop(state);
         #[cfg(feature = "diagnostics")]
         let _waiting = self.resources.waiting();
+        #[cfg(feature = "diagnostics")]
+        let _memory = self.resources.memory_waiting();
         if briefly {
             drop(
                 self.resources
@@ -285,6 +322,8 @@ impl Core {
                 self.flush_signal.request();
                 #[cfg(feature = "diagnostics")]
                 let _waiting = self.resources.waiting();
+                #[cfg(feature = "diagnostics")]
+                let _flush = self.resources.flush_waiting();
                 state = self.wait_for_flush(state);
                 continue;
             }
@@ -311,6 +350,8 @@ impl Core {
             drop(state);
             #[cfg(feature = "diagnostics")]
             let waiting = self.resources.waiting();
+            #[cfg(feature = "diagnostics")]
+            let memory_waiting = self.resources.memory_waiting();
             self.reclaim.store(true, Ordering::SeqCst);
             let waited = self
                 .background
@@ -326,7 +367,7 @@ impl Core {
             }
             state = self.write_state();
             #[cfg(feature = "diagnostics")]
-            drop(waiting);
+            drop((memory_waiting, waiting));
         }
     }
 }
