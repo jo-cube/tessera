@@ -20,8 +20,10 @@ ROCKSDB_DIR="$HOME/.cache/tessera-bench/rocksdb-11.13.2" \
 
 `tools/bench/run.sh` builds and runs the regular suite. It creates a 4 GiB
 APFS RAM disk at `/Volumes/tessbench` and detaches it on exit. Results go to
-`.work/bench/<date>-<sha>/`: `results.csv`, `summary.md`, `environment.txt`
-and RocksDB OPTIONS files. Filtered runs include a time suffix.
+`target/bench/<date>-<sha>/`, which git ignores: `results.csv`, `summary.md`,
+`environment.txt` and RocksDB OPTIONS files. Filtered runs include a time
+suffix. `environment.txt` records the host's hardware and toolchain; keep it
+local and out of commits.
 
 ```sh
 tools/bench/run.sh --dataset B --engine tessera,r-small --case update

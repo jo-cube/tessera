@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the full Tessera vs RocksDB comparison on a 4 GiB APFS RAM disk.
-# Results go to .work/bench/<date>-<sha>/. See README.md.
+# Results go to target/bench/<date>-<sha>/, which git ignores. See README.md.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 rocks=$HOME/.cache/tessera-bench/rocksdb-11.13.2
@@ -10,7 +10,7 @@ export MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion | cut -d. -f1).0
 cargo build --release --locked --quiet --manifest-path "$root/tools/bench/Cargo.toml"
 
 sha=$(git -C "$root" rev-parse --short HEAD)
-out=$root/.work/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
+out=$root/target/bench/$(date +%Y-%m-%d)-$sha${TESSERA_BENCH_SCALE:+-scale$TESSERA_BENCH_SCALE}${1:+-$(date +%H%M%S)}
 mkdir -p "$out"
 # A Tessera-only selection needs no RAM disk or privileged volume setup.
 engine_filter=
