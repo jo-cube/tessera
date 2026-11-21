@@ -489,16 +489,17 @@ impl Engine {
     /// engine is closed all the same.
     pub fn close(self) -> Result<()> {
         {
-            let mut first = self.shared.open[0]
-                .0
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !*first {
+            let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
+                self.shared.open[i]
+                    .0
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+            });
+            if !*guards[0] {
                 return Ok(());
             }
-            *first = false;
-            for stripe in &self.shared.open[1..] {
-                *stripe.0.write().unwrap_or_else(PoisonError::into_inner) = false;
+            for guard in &mut guards {
+                **guard = false;
             }
         }
         let stopped = self.shared.stop_workers();
@@ -794,5 +795,40 @@ impl Keyspace {
 
     pub(crate) fn delete_seq(&self, key: &[u8]) -> Result<u64, UpdateError> {
         self.shared.core.update(self.id, key, Value::Tombstone)
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn close_holds_every_stripe_before_exposing_stopped() {
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let in_flight = engine.shared.open[2].0.read().unwrap();
+        let closer_engine = engine.clone();
+        let closer = std::thread::spawn(move || closer_engine.close());
+
+        // Wait until close has acquired stripe 0 and is blocked on stripe 2.
+        while engine.shared.open[0].0.try_read().is_ok() {
+            std::thread::yield_now();
+        }
+        // Stripe 0 is held exclusively (callers block rather than observing
+        // Stopped early), while stripe 3 has not been marked closed yet.
+        assert!(matches!(
+            engine.shared.open[0].0.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(*engine.shared.open[3].0.try_read().unwrap());
+
+        drop(in_flight);
+        closer.join().unwrap().unwrap();
+        for stripe in engine.shared.open.iter() {
+            assert!(!*stripe.0.read().unwrap());
+        }
+        assert_eq!(
+            engine.shared.enter().unwrap_err().kind(),
+            ErrorKind::Stopped
+        );
     }
 }
