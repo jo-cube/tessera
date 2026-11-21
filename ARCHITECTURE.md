@@ -5,19 +5,22 @@ The whole dataset lives in memory, compressed; disk is touched only by explicit
 checkpoints and recovery. Its priorities, in order, are memory efficiency, read
 performance (point and scan) and write performance. A small set of options lets
 an application trade memory and reads for writes. The module documentation
-(`src/engine.rs`, `src/run/mod.rs`, `src/block/mod.rs`, `src/memtable.rs`) states
-the contracts; this file explains how the parts fit and why they are shaped so.
+(`src/lib.rs`, `src/engine.rs`, `src/run/mod.rs`, `src/block/mod.rs`,
+`src/memtable.rs`) states the contracts, and [docs/guide.md](docs/guide.md)
+the behaviour an application sees; this file explains how the parts fit and
+why they are shaped so.
 
 ## Data flow
 
 ```text
 put / delete / write ─▶ active memtable ─freeze─▶ frozen memtables (≤ 2)
-                                                        │ flush worker
-ingest_sorted ─▶ private runs ───────────┐              ▼
-                                         ├──────▶ level 0 (overlapping runs)
-                                         │              │ compaction worker
-                                         │              ▼
-                                         └──────▶ levels 1..n (disjoint runs)
+  (every keyspace)        (shared, keys prefixed      │ flush worker,
+                           by keyspace ID)            │ split by keyspace
+                                                      ▼
+large write ─▶ private runs ────────────▶ level 0 of each keyspace (overlapping)
+                                                      │ compaction worker
+                                                      ▼
+                                          levels 1..n of each keyspace (disjoint)
 ```
 
 - **Memtable.** A copy-on-write B+ tree whose payloads live in a chunk arena.
@@ -27,11 +30,13 @@ ingest_sorted ─▶ private runs ───────────┐          
   snapshots pin, against a 64 MiB budget.
 - **Flush.** Writers rotate a full table in constant time. A dedicated worker
   merges the frozen tables (newest update wins) into runs outside the state
-  lock, cut at the target run length and at level 1's run boundaries so that
-  each piece's next merge meets fewer runs.
-- **Sorted ingestion.** `ingest_sorted` builds runs outside the lock with
-  placeholder sequences, then publishes them at one overridden sequence after
-  draining only the tables that share one of its keys.
+  lock, cut at every keyspace boundary, at the target run length and at
+  level 1's run boundaries so that each piece's next merge meets fewer runs.
+- **Large writes.** A `write` whose batch is charged at least half a memtable
+  and whose keys ascend, or that is larger than a memtable, is built into
+  runs outside the lock with placeholder sequences. The runs are published
+  at one overridden sequence after draining only the tables that share one
+  of the batch's keys, so the batch stays atomic.
 - **Levels.** Level 0 holds flushes in publication order and may overlap.
   Deeper levels are sorted and strictly disjoint, with targets set by
   `level_ratio` (default 10) and dynamic level sizing. Level 0 is compacted at
@@ -43,6 +48,44 @@ ingest_sorted ─▶ private runs ───────────┐          
   shrink to bounded views of their remaining range. Up to
   `background_threads` pieces build at once within a shared output allowance;
   a piece that outgrows its reservation retries alone with a doubled request.
+
+## Keyspaces
+
+A keyspace is a name, an internal `u32` ID that is never reused, and its own
+runs, levels, run directory and byte counts. Everything else is shared: the
+memtables, the sequence counter, the memory budget, the chunk pool, the flush
+and compaction workers, the builders' output allowance and the readers' buffer
+pool.
+
+- **Memtables.** A memtable key is `LEB128(id) ++ key`, held as a composite
+  `(prefix, key)` compared as if concatenated, so no lookup builds it.
+  LEB128 is prefix-free, so keys stay in user order within a keyspace and the
+  keyspaces occupy disjoint, ordered ranges. The prefix is 1 byte for the
+  first 128 IDs and at most 5; memtables charge it with the entry. One
+  `WriteBatch` across keyspaces is one memtable insertion at one sequence
+  range, which makes it atomic without a cross-keyspace protocol.
+- **Flushes split by keyspace.** The flush merge finds each record's keyspace
+  as the last prefix at or below it, cuts the output there, strips the
+  prefix and publishes each keyspace's runs into that keyspace's level 0.
+  Records of dropped keyspaces are skipped, which frees their memory. No run
+  holds two keyspaces.
+- **Levels and scheduling.** Each keyspace sizes its own levels from its own
+  bottom. The compaction worker scores every keyspace's plan and takes the
+  highest; a keyspace whose level 0 is at the writer stop always ranks first,
+  and ties go round-robin from a cursor. Under memory pressure it takes the
+  keyspace with the most reclaimable bytes. The piece allowance and builder
+  count are shared, so one keyspace's job never takes more than they allow.
+- **Reads.** A point read probes the memtables with the prefixed key, then
+  only its keyspace's directory. A scan merges the memtables, bounded by the
+  prefix, with its keyspace's groups. A snapshot holds one shared list of
+  every keyspace's directory, taken with one reference count; a keyspace not
+  in the list reads as empty.
+- **Drop and recreate.** Dropping takes the flush and compaction locks,
+  removes the keyspace from the catalog and retires its runs; snapshots that
+  hold them keep reading. Handles and batches carry the ID, so after a drop
+  they fail, and batches are checked again at publication. A recreated name
+  gets the next ID, so the dropped keyspace's handles and memtable entries
+  never reach it.
 
 ## Runs
 
@@ -89,20 +132,44 @@ build output and workspace. Shared sources count once. Below 90% writers
 proceed; above it they wait briefly on publication; at 100% they request
 reclamation and fail with `MemoryLimit` only when live data and held
 snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
-never refused, so maintenance can always finish and free space. Caller-owned
-workspaces and allocator overhead are outside the budget.
+never refused, so maintenance can always finish and free space. Readers'
+buffers and allocator overhead are outside the budget.
 
 ## Checkpoints
 
 A checkpoint pins one structural snapshot at a flush rotation, flushes the
 tables it covers with the normal builder and writes outside the state lock.
 Each run is written once under a stable ID as its exact bytes plus its filter;
-later checkpoints reuse those files. A manifest records levels, flush groups,
-bounded views, sequence overrides, the ceiling and application metadata. The
+later checkpoints reuse those files. A manifest records the keyspaces, levels,
+flush groups, bounded views, sequence overrides, the ceiling and application
+metadata. The
 commit is the rename of `CURRENT` after every file and directory is synced; GC
 then keeps the files of the last two generations. Recovery reads exactly the
 generation `CURRENT` names and validates every frame, dictionary, record,
 filter and cross-run copy before any worker starts.
+
+Manifest version 1, all integers little-endian, closed by a CRC-32:
+
+```text
+header (88 bytes)  magic "TSRCKPT\x01", version 1, flags (bit 0: metadata present);
+                   generation, sequence ceiling, records, next run ID and
+                   previous generation (u64 each); next keyspace ID, keyspace
+                   count, keyspace-table bytes and run count (u32 each);
+                   bounds bytes and metadata bytes (u64 each)
+keyspace table     per keyspace, ascending ID: ID u32, level depth u32,
+                   name length u8, name
+run entries        72 bytes each: run ID u128, keyspace u32, level, flags,
+                   sequence override, flush group, file length, run length,
+                   CRC and two bound lengths; grouped by keyspace in table
+                   order, then by level and flush
+bounds, metadata   the bounded views' keys, then the application blob
+```
+
+Recovery checks the version before the length, then rejects, as corruption,
+a run of an unknown keyspace, a duplicate name or ID, an ID at or above the
+next ID, a malformed table (bad name, zero depth, descending IDs, wrong
+length, more than 4096 keyspaces) and runs out of table order. The run
+format and `CURRENT` are also version 1.
 
 ## Concurrency
 
@@ -193,6 +260,24 @@ gives the output a segment that inherits its dictionary.
 - Runs holding several keyspaces behind their prefixes: a keyspace's scans
   and compactions would read and rewrite the others' data, and a drop could
   not release its runs at once.
+
+**Keyspace IDs only in memtables, not in runs.** Flushes cut at keyspace
+boundaries, so a run's keyspace is one manifest field and its keys carry no
+prefix: zero bytes per key in memory and on disk, and blocks, filters,
+dictionaries, copy-forward and sequence erasure need no change. The cost is
+at least one run per keyspace a flush touches, which many tiny keyspaces
+feel as extra indexes, filters and dictionaries.
+- Prefixed keys in runs as well: a byte or more per key before prefix
+  compression, filters and dictionaries trained across keyspaces, and the
+  multi-keyspace runs rejected above.
+
+**One level-0 writer stop shared by all keyspaces.** Writers wait when any
+keyspace's level 0 reaches twelve flushes. The memtables are shared, so one
+keyspace's backlog cannot be held back alone: the stop bounds that
+keyspace's read fan-out at the price of stalling writes to the others, and
+the scheduler ranks a keyspace at the stop first so the stall is short.
+- Per-keyspace stops: a write to a stalled keyspace would still enter the
+  shared memtable, so the stop could not hold without per-keyspace tables.
 - A snapshot holding one reference per keyspace: taking it would cost one
   reference count per keyspace; the engine keeps one shared list of the
   keyspaces' directories instead.
