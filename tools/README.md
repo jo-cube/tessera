@@ -36,7 +36,11 @@ in range, all sequences 0, no tombstone), and the level-0 block bytes those
 merges decoded. `--c2` recompresses evenly spaced bottom segments (at least
 64 MiB raw) as the builder does, with Zstandard `targetCBlockSize` and
 `maxBlockSize` variants, and prints stored bytes, raw bytes an early-stopping
-point read would decode, and relative decompression time. `--write-only`
+point read would decode, and relative decompression time. `--dict-scope`
+settles the bottom level, takes consecutive segments and evaluates reusing one
+segment's dictionary across subsequent segments under fixed scope multipliers
+and stopping rules, reporting per-offset frame drift, frames plus dictionaries
+bytes per record and decode time per frame. `--write-only`
 stops after the drain, for profiling. `--worst` also measures reads and
 memory with level 0 at its fullest: new jobs are held off while random updates
 fill it to the writer stop. `--memtable VALUE_LEN` (with `tools-memory`,

@@ -5,8 +5,9 @@
 //! long-format CSV rows. See tools/README.md.
 //!
 //! `counters [--variant LABEL] [--settle] [--scale SHIFT] [--copy-audit]
-//! [--c2] [--write-only] [--memtable VALUE_LEN] [--memtable-key KEY_LEN]
-//! [--worst] [--zipf] [--read-shapes] [--keyspaces N] [SCENARIO...]`
+//! [--c2] [--dict-scope] [--write-only] [--memtable VALUE_LEN]
+//! [--memtable-key KEY_LEN] [--worst] [--zipf] [--read-shapes] [--keyspaces N]
+//! [SCENARIO...]`
 //!
 //! With `--keyspaces N`, record `i` goes to keyspace `i % N`, so the same
 //! records spread over N keyspaces; every read is checked in its keyspace.
@@ -140,6 +141,7 @@ type SampleProbe = fn(&str, &[SegmentSample]);
 struct Flags {
     copy_audit: bool,
     c2: bool,
+    dict_scope: bool,
     sample_probe: Option<SampleProbe>,
     write_only: bool,
     worst: bool,
@@ -153,6 +155,7 @@ impl Default for Flags {
         Self {
             copy_audit: false,
             c2: false,
+            dict_scope: false,
             sample_probe: None,
             write_only: false,
             worst: false,
@@ -652,6 +655,16 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         return;
     }
 
+    if flags.dict_scope {
+        settle_bottom(&engine);
+        let samples = diagnostics::bottom_segments(&engine, 1);
+        #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+        sampler.stop();
+        std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        c2::run_dict_scope(name, &samples);
+        return;
+    }
+
     if let Some(probe) = flags.sample_probe {
         settle_bottom(&engine);
         let samples = sample_bottom(&engine);
@@ -1039,6 +1052,7 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
             "--copy-audit" => flags.copy_audit = true,
             "--c2" => flags.c2 = true,
+            "--dict-scope" => flags.dict_scope = true,
             "--write-only" => flags.write_only = true,
             "--worst" => flags.worst = true,
             "--zipf" => flags.zipf = true,
@@ -1102,6 +1116,14 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
     if flags.c2 {
         println!(
             "c2,scenario,setting,stored,stored_ratio,decoded_per_record,zstd_blocks_per_frame,decompress_time_ratio,raw_per_record"
+        );
+    }
+    if flags.dict_scope {
+        println!(
+            "scope_offset,scenario,offset,segs_measured,base_payload,recomp_payload,drift_pct"
+        );
+        println!(
+            "scope_spike,scenario,rule,segments,blocks,records,raw_bytes,scopes,mean_segs,max_segs,frames_payload,frames_hdr,dicts,total_bytes,b_per_rec,delta_pct,frame_drift_pct,decode_ns_per_frame"
         );
     }
     println!("work,scenario,variant,destination,raw_in,raw_out,stored");

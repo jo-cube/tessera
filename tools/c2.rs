@@ -252,3 +252,384 @@ pub fn run(name: &str, samples: &[SegmentSample]) {
         );
     }
 }
+
+const FRAME_HEADER_LEN: usize = 12;
+
+#[derive(Clone, Copy)]
+struct ScopeRule {
+    label: &'static str,
+    stored_mult: Option<usize>,
+    raw_max_segs: Option<usize>,
+    drift_pct: Option<usize>,
+}
+
+/// Evaluates consecutive bottom segments when a segment's dictionary is reused
+/// across subsequent segments under fixed scope multipliers and stopping rules.
+pub fn run_dict_scope(name: &str, samples: &[SegmentSample]) {
+    if samples.is_empty() {
+        return;
+    }
+    let seg_count = samples.len();
+    let seg_raw: Vec<u64> = samples
+        .iter()
+        .map(|s| s.blocks.iter().map(|b| b.len() as u64).sum())
+        .collect();
+    let seg_blocks: Vec<u64> = samples.iter().map(|s| s.blocks.len() as u64).collect();
+    let seg_records: Vec<u64> = samples
+        .iter()
+        .map(|s| s.blocks.iter().map(|b| record_ends(b).len() as u64).sum())
+        .collect();
+    let total_raw: u64 = seg_raw.iter().sum();
+    let total_blocks: u64 = seg_blocks.iter().sum();
+    let total_records: u64 = seg_records.iter().sum();
+
+    // Verify exact byte parity with the stored frames at scope 1.
+    let mut ctx = cctx(Setting::Off);
+    let mut scratch_out = Vec::new();
+    let mut base_seg_payload = Vec::with_capacity(seg_count);
+    for (idx, s) in samples.iter().enumerate() {
+        ctx.set_parameter(CParameter::CompressionLevel(1)).unwrap();
+        ctx.set_parameter(CParameter::SrcSizeHint(s.hint as u32))
+            .unwrap();
+        ctx.load_dictionary(&s.dictionary).unwrap();
+        let mut payload = 0u64;
+        for (bi, (block, orig)) in s.blocks.iter().zip(&s.frames).enumerate() {
+            let bound = zstd_safe::compress_bound(block.len());
+            if scratch_out.len() < bound {
+                scratch_out.resize(bound, 0);
+            }
+            let n = ctx.compress2(&mut scratch_out[..bound], block).unwrap();
+            assert_eq!(
+                &scratch_out[..n],
+                orig.as_slice(),
+                "frame parity mismatch at segment {idx} block {bi}"
+            );
+            payload += n as u64;
+        }
+        base_seg_payload.push(payload);
+    }
+
+    let base_payload: u64 = base_seg_payload.iter().sum();
+    let base_hdr: u64 = base_payload + total_blocks * FRAME_HEADER_LEN as u64;
+    let base_dicts: u64 = samples.iter().map(|s| s.dictionary.len() as u64).sum();
+    let base_total = base_hdr + base_dicts;
+
+    // Offset drift curve: recompress segment i + offset with segment i's dictionary.
+    let max_offset = 15.min(seg_count.saturating_sub(1));
+    let mut off_base = vec![0u64; max_offset + 1];
+    let mut off_recomp = vec![0u64; max_offset + 1];
+    let mut off_count = vec![0usize; max_offset + 1];
+    for i in 0..seg_count {
+        let dict = &samples[i].dictionary;
+        let hint = samples[i].hint;
+        ctx.set_parameter(CParameter::CompressionLevel(1)).unwrap();
+        ctx.set_parameter(CParameter::SrcSizeHint(hint as u32))
+            .unwrap();
+        ctx.load_dictionary(dict).unwrap();
+        off_base[0] += base_seg_payload[i];
+        off_recomp[0] += base_seg_payload[i];
+        off_count[0] += 1;
+        let limit = (i + max_offset).min(seg_count - 1);
+        for j in (i + 1)..=limit {
+            let offset = j - i;
+            let mut recomp = 0u64;
+            for block in &samples[j].blocks {
+                let bound = zstd_safe::compress_bound(block.len());
+                if scratch_out.len() < bound {
+                    scratch_out.resize(bound, 0);
+                }
+                let n = ctx.compress2(&mut scratch_out[..bound], block).unwrap();
+                recomp += n as u64;
+            }
+            off_base[offset] += base_seg_payload[j];
+            off_recomp[offset] += recomp;
+            off_count[offset] += 1;
+        }
+    }
+    for offset in 0..=max_offset {
+        let drift = if off_base[offset] == 0 {
+            0.0
+        } else {
+            (off_recomp[offset] as f64 - off_base[offset] as f64) / off_base[offset] as f64 * 100.0
+        };
+        println!(
+            "scope_offset,{name},{offset},{},{},{},{drift:.3}",
+            off_count[offset], off_base[offset], off_recomp[offset]
+        );
+    }
+
+    let rules = [
+        ScopeRule {
+            label: "fixed_n1",
+            stored_mult: None,
+            raw_max_segs: Some(1),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "fixed_n2",
+            stored_mult: None,
+            raw_max_segs: Some(2),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "fixed_n4",
+            stored_mult: None,
+            raw_max_segs: Some(4),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "fixed_n8",
+            stored_mult: None,
+            raw_max_segs: Some(8),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "fixed_n16",
+            stored_mult: None,
+            raw_max_segs: Some(16),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "stored_k8",
+            stored_mult: Some(8),
+            raw_max_segs: None,
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "stored_k12",
+            stored_mult: Some(12),
+            raw_max_segs: None,
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "stored_k16",
+            stored_mult: Some(16),
+            raw_max_segs: None,
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "stored_k24",
+            stored_mult: Some(24),
+            raw_max_segs: None,
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "stored_k32",
+            stored_mult: Some(32),
+            raw_max_segs: None,
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k8_m8",
+            stored_mult: Some(8),
+            raw_max_segs: Some(8),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k12_m8",
+            stored_mult: Some(12),
+            raw_max_segs: Some(8),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k16_m8",
+            stored_mult: Some(16),
+            raw_max_segs: Some(8),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k16_m16",
+            stored_mult: Some(16),
+            raw_max_segs: Some(16),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k24_m16",
+            stored_mult: Some(24),
+            raw_max_segs: Some(16),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k32_m16",
+            stored_mult: Some(32),
+            raw_max_segs: Some(16),
+            drift_pct: None,
+        },
+        ScopeRule {
+            label: "k12_m8_d25",
+            stored_mult: Some(12),
+            raw_max_segs: Some(8),
+            drift_pct: Some(25),
+        },
+        ScopeRule {
+            label: "k16_m8_d20",
+            stored_mult: Some(16),
+            raw_max_segs: Some(8),
+            drift_pct: Some(20),
+        },
+        ScopeRule {
+            label: "k16_m8_d25",
+            stored_mult: Some(16),
+            raw_max_segs: Some(8),
+            drift_pct: Some(25),
+        },
+        ScopeRule {
+            label: "k16_m8_d35",
+            stored_mult: Some(16),
+            raw_max_segs: Some(8),
+            drift_pct: Some(35),
+        },
+        ScopeRule {
+            label: "k16_m16_d20",
+            stored_mult: Some(16),
+            raw_max_segs: Some(16),
+            drift_pct: Some(20),
+        },
+        ScopeRule {
+            label: "k16_m16_d25",
+            stored_mult: Some(16),
+            raw_max_segs: Some(16),
+            drift_pct: Some(25),
+        },
+        ScopeRule {
+            label: "k16_m16_d35",
+            stored_mult: Some(16),
+            raw_max_segs: Some(16),
+            drift_pct: Some(35),
+        },
+        ScopeRule {
+            label: "k24_m16_d25",
+            stored_mult: Some(24),
+            raw_max_segs: Some(16),
+            drift_pct: Some(25),
+        },
+    ];
+
+    let timed_segs = seg_count.min(32);
+    let mut decode_ctx = dctx();
+    let mut decode_buf = vec![0u8; 64 << 10];
+
+    for rule in rules {
+        let mut scopes = 0usize;
+        let mut max_segs = 0usize;
+        let mut total_payload = 0u64;
+        let mut total_dicts = 0u64;
+        // Decoded timing fixtures for the first `timed_segs` segments.
+        let mut timed_frames: Vec<(usize, Vec<Vec<u8>>)> = Vec::with_capacity(timed_segs);
+
+        let mut i = 0;
+        while i < seg_count {
+            scopes += 1;
+            let dict = &samples[i].dictionary;
+            let dict_len = dict.len() as u64;
+            total_dicts += dict_len;
+            let hint = samples[i].hint;
+            ctx.set_parameter(CParameter::CompressionLevel(1)).unwrap();
+            ctx.set_parameter(CParameter::SrcSizeHint(hint as u32))
+                .unwrap();
+            ctx.load_dictionary(dict).unwrap();
+
+            let prefix_raw = seg_raw[i];
+            let prefix_payload = base_seg_payload[i];
+            let mut scope_stored_hdr = prefix_payload + seg_blocks[i] * FRAME_HEADER_LEN as u64;
+            let mut scope_segs = 1usize;
+            total_payload += prefix_payload;
+            if i < timed_segs {
+                timed_frames.push((i, samples[i].frames.clone()));
+            }
+
+            let mut j = i + 1;
+            let mut last_drifted = false;
+            while j < seg_count {
+                if rule.raw_max_segs.is_some_and(|max| scope_segs >= max) {
+                    break;
+                }
+                if rule
+                    .stored_mult
+                    .is_some_and(|k| scope_stored_hdr >= k as u64 * dict_len)
+                {
+                    break;
+                }
+                if last_drifted {
+                    break;
+                }
+                let mut seg_payload = 0u64;
+                let mut frames_j = if j < timed_segs {
+                    Vec::with_capacity(samples[j].blocks.len())
+                } else {
+                    Vec::new()
+                };
+                for block in &samples[j].blocks {
+                    let bound = zstd_safe::compress_bound(block.len());
+                    if scratch_out.len() < bound {
+                        scratch_out.resize(bound, 0);
+                    }
+                    let n = ctx.compress2(&mut scratch_out[..bound], block).unwrap();
+                    seg_payload += n as u64;
+                    if j < timed_segs {
+                        frames_j.push(scratch_out[..n].to_vec());
+                    }
+                }
+                if j < timed_segs {
+                    timed_frames.push((i, frames_j));
+                }
+                total_payload += seg_payload;
+                scope_stored_hdr += seg_payload + seg_blocks[j] * FRAME_HEADER_LEN as u64;
+                scope_segs += 1;
+                if let Some(drift_limit) = rule.drift_pct {
+                    // seg_payload / seg_raw[j] > prefix_payload / prefix_raw * (100 + drift_limit) / 100
+                    let lhs = u128::from(seg_payload) * u128::from(prefix_raw) * 100;
+                    let rhs = u128::from(prefix_payload)
+                        * u128::from(seg_raw[j])
+                        * u128::from(100 + drift_limit as u64);
+                    if lhs > rhs {
+                        last_drifted = true;
+                    }
+                }
+                j += 1;
+            }
+            max_segs = max_segs.max(scope_segs);
+            i = j;
+        }
+
+        // Warmup + 5 timed decode passes on `timed_frames`.
+        let timed_block_count: usize = timed_frames.iter().map(|(_, fs)| fs.len()).sum();
+        let mut ns_samples = [0.0f64; 5];
+        for pass in 0..6 {
+            let started = Instant::now();
+            for (seg_idx, (dict_seg, frames)) in timed_frames.iter().enumerate() {
+                let dict = &samples[*dict_seg].dictionary;
+                for (block, frame) in samples[seg_idx].blocks.iter().zip(frames) {
+                    if decode_buf.len() < block.len() {
+                        decode_buf.resize(block.len(), 0);
+                    }
+                    let n = decode_ctx
+                        .decompress_using_dict(&mut decode_buf[..block.len()], frame, dict)
+                        .unwrap();
+                    assert_eq!(n, block.len());
+                    if pass == 0 {
+                        assert_eq!(&decode_buf[..n], block.as_slice());
+                    }
+                }
+            }
+            if pass > 0 {
+                ns_samples[pass - 1] =
+                    started.elapsed().as_nanos() as f64 / timed_block_count.max(1) as f64;
+            }
+        }
+        ns_samples.sort_by(f64::total_cmp);
+        let median_ns = ns_samples[2];
+
+        let total_hdr = total_payload + total_blocks * FRAME_HEADER_LEN as u64;
+        let total_bytes = total_hdr + total_dicts;
+        let b_per_rec = total_bytes as f64 / total_records as f64;
+        let delta_pct = (total_bytes as f64 - base_total as f64) / base_total as f64 * 100.0;
+        let frame_drift_pct =
+            (total_payload as f64 - base_payload as f64) / base_payload as f64 * 100.0;
+        println!(
+            "scope_spike,{name},{},{seg_count},{total_blocks},{total_records},{total_raw},{scopes},{:.2},{max_segs},{total_payload},{total_hdr},{total_dicts},{total_bytes},{b_per_rec:.4},{delta_pct:+.3},{frame_drift_pct:+.3},{median_ns:.1}",
+            rule.label,
+            seg_count as f64 / scopes as f64,
+        );
+    }
+}
