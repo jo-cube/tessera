@@ -111,15 +111,22 @@ impl WriteBatch {
 
     /// Each operation's keyspace, key and value, in insertion order.
     pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], Value<'_>)> + Clone {
-        self.operations.iter().map(|op| {
-            (
-                op.keyspace,
-                &self.bytes[op.key.clone()],
-                op.value.as_ref().map_or(Value::Tombstone, |range| {
-                    Value::Bytes(&self.bytes[range.clone()])
-                }),
-            )
-        })
+        self.operations.iter().map(|op| self.operation_record(op))
+    }
+
+    /// The operation at this position, borrowing directly from the batch.
+    pub(super) fn record(&self, index: usize) -> (u32, &[u8], Value<'_>) {
+        self.operation_record(&self.operations[index])
+    }
+
+    fn operation_record(&self, op: &Operation) -> (u32, &[u8], Value<'_>) {
+        (
+            op.keyspace,
+            &self.bytes[op.key.clone()],
+            op.value.as_ref().map_or(Value::Tombstone, |range| {
+                Value::Bytes(&self.bytes[range.clone()])
+            }),
+        )
     }
 
     /// The engine its keyspaces belong to, or the name of one that belongs
@@ -155,6 +162,12 @@ impl WriteBatch {
     }
 }
 
+/// The batch's memtable charge and the bytes needed to stage its prefixed keys.
+pub(super) struct BatchSize {
+    pub(super) charge: usize,
+    pub(super) key_bytes: usize,
+}
+
 impl WriteBatch {
     /// Whether the operations are strictly ascending in the memtables'
     /// order: by keyspace prefix, then key.
@@ -166,8 +179,9 @@ impl WriteBatch {
         })
     }
 
-    pub(super) fn validate(&self, budget: usize) -> Result<usize, UpdateError> {
+    pub(super) fn validate(&self, budget: usize) -> Result<BatchSize, UpdateError> {
         let mut charge = 0usize;
+        let mut key_bytes = 0;
         for (keyspace, key, value) in self.records() {
             let len = match value {
                 Value::Bytes(bytes) => bytes.len(),
@@ -182,8 +196,8 @@ impl WriteBatch {
                 return Err(UpdateError::Rejected(WriteError::ValueTooLong { len }));
             }
             // As the memtable charges it: the key behind its keyspace prefix.
-            let record =
-                KeyPrefix::new(keyspace).as_bytes().len() + key.len() + len + ENTRY_OVERHEAD;
+            let key_len = KeyPrefix::new(keyspace).as_bytes().len() + key.len();
+            let record = key_len + len + ENTRY_OVERHEAD;
             if record > budget {
                 return Err(UpdateError::Rejected(WriteError::RecordExceedsBudget {
                     charge: record,
@@ -191,8 +205,9 @@ impl WriteBatch {
                 }));
             }
             charge = charge.saturating_add(record);
+            key_bytes += key_len;
         }
-        Ok(charge)
+        Ok(BatchSize { charge, key_bytes })
     }
 }
 
@@ -203,10 +218,13 @@ impl Core {
         if batch.is_empty() {
             return Ok(self.read_state().last_seq);
         }
-        let charge = batch.validate(self.memtable_budget)?;
-        let sorted = batch.is_sorted();
-        if sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget {
-            return self.ingest_batch(batch, sorted);
+        let size = batch.validate(self.memtable_budget)?;
+        let charge = size.charge;
+        if charge >= self.bulk_ingest_min || charge > self.memtable_budget {
+            let sorted = batch.is_sorted();
+            if sorted || charge > self.memtable_budget {
+                return self.ingest_batch(batch, sorted, size);
+            }
         }
         if batch.len() == 1 {
             let (keyspace, key, value) = batch.records().next().unwrap();
@@ -219,17 +237,37 @@ impl Core {
                 .last_seq
                 .checked_add(batch.len() as u64)
                 .expect(SEQUENCES);
-            let needed = batch.records().fold(0usize, |sum, (keyspace, key, value)| {
-                let prefix = KeyPrefix::new(keyspace);
-                sum.saturating_add(state.active.write_charge(prefix.key(key), value))
-            });
+            // Without shared storage, the validated charge already bounds the
+            // append and a new slot for every operation. Only snapshots can
+            // add copy-on-write costs, and none can start under the state lock.
+            let needed = if state.active.has_shared_storage() {
+                batch.records().fold(0usize, |sum, (keyspace, key, value)| {
+                    let prefix = KeyPrefix::new(keyspace);
+                    sum.saturating_add(state.active.write_charge(prefix.key(key), value))
+                })
+            } else {
+                charge
+            };
             let memory = state.active.memory();
             if needed <= memory.budget.saturating_sub(memory.charged) {
+                let single_prefix = (!batch.mixed)
+                    .then(|| {
+                        batch
+                            .operations
+                            .first()
+                            .map(|op| KeyPrefix::new(op.keyspace))
+                    })
+                    .flatten();
                 for (keyspace, key, value) in batch.records() {
-                    let prefix = KeyPrefix::new(keyspace);
-                    self.write(&mut state, prefix.key(key), value)
+                    let prefix = single_prefix.unwrap_or_else(|| KeyPrefix::new(keyspace));
+                    let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
+                    state
+                        .active
+                        .write(prefix.key(key), seq, value)
                         .expect("preflight admitted every batch operation");
+                    state.last_seq = seq;
                 }
+                self.chunks.ingested(batch.bytes.len());
                 return Ok(end);
             }
             state = self.admit(self.make_room(state))?;

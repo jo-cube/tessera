@@ -55,18 +55,6 @@ impl KeyPrefix {
     }
 }
 
-/// The keyspace ID and the caller's key of a memtable key.
-pub(super) fn split(stored: &[u8]) -> (u32, &[u8]) {
-    let mut id = 0u32;
-    for (at, &byte) in stored.iter().enumerate().take(MAX_PREFIX_LEN) {
-        id |= u32::from(byte & 0x7f) << (7 * at);
-        if byte & 0x80 == 0 {
-            return (id, &stored[at + 1..]);
-        }
-    }
-    unreachable!("memtable keys start with a keyspace prefix")
-}
-
 /// One keyspace's published runs and what is kept beside them.
 pub(super) struct KeyspaceState {
     pub(super) name: Arc<str>,
@@ -75,11 +63,10 @@ pub(super) struct KeyspaceState {
     /// flushes publish beside them.
     pub(super) runs: Vec<SharedRun>,
     /// The same runs, indexed for reading: grouped into key-disjoint runs,
-    /// newest group first. Rebuilt by [`State::published`] in the same write
-    /// section as every change to `runs`, so readers only ever see the two
-    /// agree; `runs` keeps publication order, which compaction selection uses
-    /// to break ties. Immutable once built, so a lookup, a scan or a snapshot
-    /// shares it with one reference count.
+    /// newest group first. Installed together with `runs` at publication
+    /// or recovery. The `runs` vector keeps publication order, which
+    /// compaction uses to break ties. The immutable directory is shared
+    /// by lookups, scans and snapshots.
     pub(super) directory: Arc<RunDirectory>,
     pub(super) run_bytes: usize,
     pub(super) held_bytes: usize,
@@ -157,24 +144,32 @@ impl State {
         Ok(id)
     }
 
-    /// Rebuilds keyspace `id`'s directory and byte counts after its runs
-    /// or levels changed, and what the engine keeps over all keyspaces.
-    /// Publication is rare, so this builds a fresh directory rather than
-    /// maintaining one, in O(n log n) for n runs, and readers holding the
-    /// previous directory keep it.
-    pub(super) fn published(&mut self, id: u32) {
-        let space = self.keyspaces.get_mut(&id).expect("a live keyspace");
-        space.directory = Arc::new(RunDirectory::build(&space.runs));
+    /// Rebuilds the directories and byte counts of the changed keyspaces,
+    /// then publishes the shared directory and level-0 count once.
+    pub(super) fn published(&mut self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            let space = self.space_mut(id);
+            space.directory = Arc::new(RunDirectory::build(&space.runs));
+            self.account_runs(id);
+        }
+        self.refresh_directories();
+        self.levels_changed();
+    }
+
+    /// Updates the byte counts after changing a keyspace's runs.
+    pub(super) fn account_runs(&mut self, id: u32) {
+        let space = self.space_mut(id);
         if cfg!(any(test, debug_assertions)) {
             space.levels.check(&space.runs);
         }
         let (run_bytes, held_bytes) = (space.run_bytes, space.held_bytes);
-        space.run_bytes = physical_runs(&space.runs).map(|r| r.run.stored_len()).sum();
-        space.held_bytes = physical_runs(&space.runs).map(|r| r.run.held_bytes()).sum();
-        self.run_bytes = self.run_bytes - run_bytes + space.run_bytes;
-        self.held_bytes = self.held_bytes - held_bytes + space.held_bytes;
-        self.refresh_directories();
-        self.levels_changed();
+        let (stored, held) = physical_runs(&space.runs).fold((0, 0), |(stored, held), run| {
+            (stored + run.run.stored_len(), held + run.run.held_bytes())
+        });
+        space.run_bytes = stored;
+        space.held_bytes = held;
+        self.run_bytes = self.run_bytes - run_bytes + stored;
+        self.held_bytes = self.held_bytes - held_bytes + held;
     }
 
     /// Recomputes the deepest level 0 after levels changed.
@@ -283,12 +278,10 @@ mod tests {
             KeyPrefix::new(u32::MAX).as_bytes(),
             [0xff, 0xff, 0xff, 0xff, 0x0f]
         );
-        let ids = (0..300u32).chain([16_383, 16_384, 1 << 21, 1 << 28, u32::MAX]);
-        let prefixes: Vec<KeyPrefix> = ids.clone().map(KeyPrefix::new).collect();
-        for id in ids {
-            let stored = [KeyPrefix::new(id).as_bytes(), b"key"].concat();
-            assert_eq!(split(&stored), (id, &b"key"[..]));
-        }
+        let prefixes: Vec<_> = (0..300u32)
+            .chain([16_383, 16_384, 1 << 21, 1 << 28, u32::MAX])
+            .map(KeyPrefix::new)
+            .collect();
         for a in &prefixes {
             for b in &prefixes {
                 if a != b {

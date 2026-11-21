@@ -444,86 +444,133 @@ pub(crate) fn compact_parallel_in<'a>(
     let estimated_run_bytes = estimated_run_bytes.max(1);
     let full_runs = stored / estimated_run_bytes;
     let threads = threads.min(full_runs).min(stored / (256 << 10)).max(1);
+    if let Some(compacted) = try_compact_parallel_in(
+        inputs,
+        &keep_tombstone,
+        limits,
+        needed,
+        cuts,
+        threads,
+        estimated_run_bytes,
+        (pool, floors),
+    )? {
+        return Ok(compacted);
+    }
+    compact_with_in(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        (pool, floors),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_compact_parallel_in<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: &(impl Fn(&[u8]) -> bool + Sync),
+    limits: CompactLimits,
+    needed: usize,
+    cuts: &OutputCuts,
+    threads: usize,
+    estimated_run_bytes: usize,
+    (pool, floors): (&ChunkPool, &[SeqFloor<'_>]),
+) -> Result<Option<Compacted>, ReadError> {
     if threads == 1 || cuts.single {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+        return Ok(None);
     }
-    // Reconstruct sparse-index keys, weighted by compressed input bytes. Equal user
-    // keys stay together even when their versions span several input blocks.
+    // Size the sparse-index key buffer before allocating partition scratch so
+    // Vec growth cannot exceed max_workspace_bytes and any serial fallback
+    // starts only after every partition buffer has been dropped.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
-    let mut metadata = count.saturating_mul(size_of::<(Vec<u8>, usize)>());
+    let max_metadata = limits.max_workspace_bytes.saturating_sub(needed);
+    let fixed_metadata = count.saturating_mul(size_of::<(std::ops::Range<usize>, usize)>());
+    if fixed_metadata > max_metadata {
+        return Ok(None);
+    }
+    let mut key_bytes = 0usize;
     for input in inputs {
+        let mut key = super::index::IndexKey::new();
         for block in 0..input.block_count() {
-            metadata = metadata.saturating_add(input.last_key(block)?.len());
+            input.append_index_key(block, &mut key)?;
+            key_bytes = key_bytes.saturating_add(key.len());
+            if fixed_metadata.saturating_add(key_bytes) > max_metadata {
+                return Ok(None);
+            }
         }
     }
-    if metadata > limits.max_workspace_bytes.saturating_sub(needed) {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+    let mut threads = threads.min(count);
+    if threads <= 1 {
+        return Ok(None);
     }
-    let mut boundaries = Vec::with_capacity(count);
-    for input in inputs {
-        for block in 0..input.block_count() {
-            boundaries.push((input.last_key(block)?.to_vec(), input.block_bytes(block)));
-        }
-    }
-    boundaries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let largest = inputs
         .iter()
         .map(|input| input.largest_block_len())
         .collect::<Result<Vec<_>, _>>()?;
-    let mut threads = threads.min(boundaries.len());
-    // Keep selection's workspace limit. Divide the segment allowance rather
-    // than multiplying a full-size builder by N; reduce N for high fan-in.
-    let (segment_len, per_builder) = loop {
+    // Keep selection's workspace limit. `boundaries` is dropped before workers
+    // start, so only `boundary_bytes` and `starts` share the workspace limit
+    // with the parallel builders.
+    let (segment_len, builder_workspace) = loop {
         let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
         let builder = workspace_for_segment(largest.iter().copied(), segment);
-        let allowance = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
-        if builder <= allowance {
-            break (segment, allowance);
+        let starts_bytes = threads.saturating_sub(1) * size_of::<&[u8]>();
+        let live = key_bytes.saturating_add(starts_bytes);
+        let allowance = limits.max_workspace_bytes.saturating_sub(live) / threads;
+        if fixed_metadata.saturating_add(live) <= max_metadata && builder <= allowance {
+            break (segment, builder);
         }
         threads -= 1;
         if threads == 1 {
-            return compact_with_in(
-                inputs,
-                keep_tombstone,
-                limits,
-                cuts,
-                workspace,
-                (pool, floors),
-            );
+            return Ok(None);
         }
     };
-    let starts = partition_starts(&boundaries, estimated_run_bytes, threads);
-    if starts.is_empty() {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+    let mut boundary_bytes = Vec::new();
+    boundary_bytes.reserve_exact(key_bytes);
+    let mut boundaries = Vec::new();
+    boundaries.reserve_exact(count);
+    for input in inputs {
+        let mut key = super::index::IndexKey::new();
+        for block in 0..input.block_count() {
+            input.append_index_key(block, &mut key)?;
+            let start = boundary_bytes.len();
+            key.extend_into(&mut boundary_bytes);
+            boundaries.push((start..boundary_bytes.len(), input.block_bytes(block)));
+        }
     }
-    let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
+    let starts_bytes = threads.saturating_sub(1) * size_of::<&[u8]>();
+    let peak_metadata = boundary_bytes
+        .capacity()
+        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>())
+        .saturating_add(starts_bytes);
+    if peak_metadata > max_metadata {
+        return Ok(None);
+    }
+    boundaries
+        .sort_unstable_by(|a, b| boundary_bytes[a.0.clone()].cmp(&boundary_bytes[b.0.clone()]));
+    let starts = partition_with(
+        boundaries.len(),
+        |at| &boundary_bytes[boundaries[at].0.clone()],
+        |at| boundaries[at].1,
+        estimated_run_bytes,
+        threads,
+    );
+    drop(boundaries);
+    if starts.is_empty() {
+        return Ok(None);
+    }
+    let metadata = boundary_bytes
+        .capacity()
+        .saturating_add(starts.capacity() * size_of::<&[u8]>());
+    let per_builder = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+    if metadata > max_metadata || builder_workspace > per_builder {
+        return Ok(None);
+    }
     let parts = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..=starts.len())
             .map(|at| {
                 let start = at.checked_sub(1).map(|i| starts[i]);
                 let end = starts.get(at).copied();
-                let keep = &keep_tombstone;
                 #[cfg(feature = "diagnostics")]
                 let bottom = super::copy_audit::bottom_inputs();
                 scope.spawn(move || {
@@ -531,7 +578,7 @@ pub(crate) fn compact_parallel_in<'a>(
                     super::copy_audit::set_bottom_inputs(bottom);
                     compact_range(
                         inputs,
-                        keep,
+                        keep_tombstone,
                         CompactLimits {
                             max_workspace_bytes: per_builder,
                             ..limits
@@ -579,31 +626,49 @@ pub(crate) fn compact_parallel_in<'a>(
         out.stats.tombstones_dropped += part.stats.tombstones_dropped;
         out.copied.add(part.copied);
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Approximate serial run boundaries with the same size estimate as planning.
 /// Balance whole runs, not arbitrary byte fractions: the final partial run
 /// belongs to the last builder. Repeated index keys always stay together.
+#[cfg(test)]
 pub(super) fn partition_starts<K: AsRef<[u8]>>(
     boundaries: &[(K, usize)],
     target: usize,
     threads: usize,
 ) -> Vec<&[u8]> {
-    let full_runs = boundaries.iter().map(|(_, bytes)| bytes).sum::<usize>() / target;
-    let mut starts = Vec::with_capacity(threads - 1);
+    partition_with(
+        boundaries.len(),
+        |at| boundaries[at].0.as_ref(),
+        |at| boundaries[at].1,
+        target,
+        threads,
+    )
+}
+
+fn partition_with<'a>(
+    len: usize,
+    key_at: impl Fn(usize) -> &'a [u8],
+    bytes_at: impl Fn(usize) -> usize,
+    target: usize,
+    threads: usize,
+) -> Vec<&'a [u8]> {
+    let full_runs = (0..len).map(&bytes_at).sum::<usize>() / target;
+    let mut starts = Vec::new();
+    starts.reserve_exact(threads - 1);
     let mut seen = 0;
     let mut at = 0;
-    while at < boundaries.len() && starts.len() < threads - 1 {
-        let key = boundaries[at].0.as_ref();
-        while at < boundaries.len() && boundaries[at].0.as_ref() == key {
-            seen += boundaries[at].1;
+    while at < len && starts.len() < threads - 1 {
+        let key = key_at(at);
+        while at < len && key_at(at) == key {
+            seen += bytes_at(at);
             at += 1;
         }
         let split_run = (full_runs as u128 * (starts.len() + 1) as u128 / threads as u128) as usize;
-        if seen >= split_run * target && at < boundaries.len() {
+        if seen >= split_run * target && at < len {
             // Splitting before the first key would create an empty builder.
-            if key != boundaries[0].0.as_ref() {
+            if key != key_at(0) {
                 starts.push(key);
             }
         }
@@ -730,6 +795,7 @@ fn compact_range_checked<'a>(
         end: range.end,
         judged: None,
         stats: CopyStats::default(),
+        last_key: Vec::new(),
     };
     if copies.contains(&true) {
         merge.copy_blocks(copies);
@@ -841,6 +907,7 @@ struct Forward<'e> {
     /// the block after its last.
     judged: Option<(usize, u32, usize)>,
     stats: CopyStats,
+    last_key: Vec<u8>,
 }
 
 impl Forward<'_> {
@@ -894,7 +961,8 @@ impl Forward<'_> {
             return Ok(0);
         }
         let first = (block == 0).then(|| view.min_key());
-        if !output.copy(&frame, &last.to_vec(), records, first)? {
+        last.copy_into(&mut self.last_key);
+        if !output.copy(&frame, &self.last_key, records, first)? {
             return Ok(0);
         }
         self.stats.blocks += 1;

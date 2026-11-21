@@ -105,4 +105,45 @@ mod tests {
             assert_eq!(counters.current.load(Relaxed), 0);
         }
     }
+
+    #[test]
+    fn output_budget_refusal_during_probe_stops_cleanly() {
+        let counters = Arc::new(OutputCounters::default());
+        // Allows footer/header reserve (240), the first key (4), and one block
+        // index entry (84) during probe(), then refuses on the second block.
+        let budget = OutputBudget::new(&counters, 340);
+        let mut builder = RunBuilder::with_target_block_compressed(Codec::Zstd, 512);
+        builder.limit_filter_build_bytes(0);
+        builder.limit_output(budget.clone());
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut value = [0u8; 256];
+        let mut refused_during_add = false;
+        for key in 0..400u32 {
+            for chunk in value.as_chunks_mut::<8>().0 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *chunk = state.to_le_bytes();
+            }
+            builder
+                .add(&key.to_be_bytes(), 0, Value::Bytes(&value))
+                .unwrap();
+            if builder.output_refused() {
+                refused_during_add = true;
+                break;
+            }
+        }
+        assert!(refused_during_add, "refusal must occur during probe in add");
+        // probe() must stop on the refused block rather than continuing to
+        // append the remaining ~240 records of the 64 KiB sample onto it.
+        assert!(
+            builder.open_block_len() < 16,
+            "probe kept appending after refusal: {} records in open block",
+            builder.open_block_len()
+        );
+        assert!(builder.finish_checked().is_err());
+        assert!(budget.used.load(Relaxed) <= budget.limit());
+        drop(budget);
+        assert_eq!(counters.current.load(Relaxed), 0);
+    }
 }

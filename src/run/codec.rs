@@ -98,24 +98,15 @@ impl Compressor {
     }
 
     pub(super) fn compress(&mut self, block: &[u8], out: &mut Vec<u8>) {
-        let start = out.len();
-        let bound = if self.codec == Codec::None {
-            block.len()
-        } else {
-            zstd_safe::compress_bound(block.len())
-        };
-        out.resize(start + bound, 0);
-        let output = &mut out[start..];
-        let written = match &mut self.zstd {
-            Some(ctx) => ctx
-                .compress2(output, block)
-                .expect("codec worst-case output bound"),
-            None => {
-                output.copy_from_slice(block);
-                block.len()
+        out.clear();
+        match &mut self.zstd {
+            Some(ctx) => {
+                out.reserve(zstd_safe::compress_bound(block.len()));
+                ctx.compress2(out, block)
+                    .expect("codec worst-case output bound");
             }
-        };
-        out.truncate(start + written);
+            None => out.extend_from_slice(block),
+        }
     }
 }
 

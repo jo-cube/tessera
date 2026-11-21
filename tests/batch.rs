@@ -160,6 +160,31 @@ fn a_sorted_batch_above_the_ingestion_threshold_is_ingested() {
 }
 
 #[test]
+fn a_small_batch_keeps_snapshot_history_when_the_active_table_is_nearly_full() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 1024,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let old = [7; 750];
+    ks.put(b"a", &old).unwrap();
+    let snapshot = engine.snapshot();
+
+    // The batch itself fits in the remaining budget, but copying the
+    // snapshot's page would not. It must still apply as a single batch.
+    let mut batch = WriteBatch::new();
+    batch.put(&ks, b"a", b"new");
+    batch.put(&ks, b"b", b"added");
+    assert_eq!(engine.write_seq(&batch), Ok(3));
+    assert_eq!(ks.get(b"a").unwrap().as_deref(), Some(&b"new"[..]));
+    assert_eq!(ks.get(b"b").unwrap().as_deref(), Some(&b"added"[..]));
+    let mut reader = snapshot.reader();
+    assert_eq!(reader.get(&ks, b"a").unwrap(), Some(old.as_slice()));
+    assert_eq!(reader.get(&ks, b"b").unwrap(), None);
+}
+
+#[test]
 fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
     let engine = Engine::in_memory(Options {
         memtable_size: 256,
@@ -167,16 +192,37 @@ fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
     })
     .unwrap();
     let ks = engine.ks();
+    for index in 1..129 {
+        engine.keyspace(&format!("unused-{index}")).unwrap();
+    }
+    let other = engine.keyspace("other").unwrap();
+    for index in 130..256 {
+        engine.keyspace(&format!("unused-{index}")).unwrap();
+    }
+    let third = engine.keyspace("third").unwrap();
+    assert_eq!((ks.id(), other.id(), third.id()), (0, 129, 256));
+    // ID 256 sorts before 129 by prefix. Its overlapping memtable key
+    // must be found and drained before the new runs are published.
+    third.put(&7u64.to_be_bytes(), b"before").unwrap();
     let mut batch = WriteBatch::new();
     for index in (0..40u64).rev() {
         batch.put(&ks, &index.to_be_bytes(), &index.to_le_bytes());
     }
+    batch.put(&other, &7u64.to_be_bytes(), b"first");
+    batch.put(&other, &3u64.to_be_bytes(), b"deleted");
+    batch.put(&third, &7u64.to_be_bytes(), b"after");
+    batch.delete(&other, &7u64.to_be_bytes());
+    batch.delete(&other, &3u64.to_be_bytes());
+    batch.put(&other, &7u64.to_be_bytes(), b"other");
     batch.delete(&ks, &7u64.to_be_bytes());
     batch.put(&ks, &3u64.to_be_bytes(), b"last");
-    assert_eq!(engine.write_seq(&batch), Ok(1));
+    assert_eq!(engine.write_seq(&batch), Ok(2));
     assert_eq!(engine.engine_stats().active.charged, 0);
     assert!(ks.get(&7u64.to_be_bytes()).unwrap().is_none());
     assert_eq!(ks.get(&3u64.to_be_bytes()).unwrap().unwrap(), b"last");
+    assert_eq!(other.get(&7u64.to_be_bytes()).unwrap().unwrap(), b"other");
+    assert!(other.get(&3u64.to_be_bytes()).unwrap().is_none());
+    assert_eq!(third.get(&7u64.to_be_bytes()).unwrap().unwrap(), b"after");
 }
 
 #[test]

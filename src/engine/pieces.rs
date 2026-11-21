@@ -221,7 +221,7 @@ impl<'e> BuiltCompaction<'e> {
             .runs
             .extend(sources.iter().filter_map(|(_, r)| r.clone()));
         space.runs.extend(outputs.iter().cloned());
-        state.published(job.keyspace);
+        state.published([job.keyspace]);
         let removed: Vec<_> = bottom
             .iter()
             .chain(sources.iter().map(|(r, _)| r))
@@ -229,14 +229,29 @@ impl<'e> BuiltCompaction<'e> {
             .collect();
         state.retire_runs(job.keyspace, &removed);
         #[cfg(feature = "diagnostics")]
-        #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
-        if let Dest::Level(level) = job.dest {
-            job.engine.chunks.work(
-                crate::chunk::work_slot(Some(level), true),
-                job.inputs.iter().map(|r| r.run.merged_raw_len()).sum(),
-                outputs.iter().map(|r| r.run.raw_len()).sum(),
-                report.output_bytes,
-            );
+        {
+            let (mut blocks, mut raw, mut segments) = (0, 0, 0);
+            for run in bottom {
+                let view = run.run.view();
+                blocks += view.block_count() as u64;
+                raw += run.run.merged_raw_len() as u64;
+                segments += view.segment_count() as u64;
+            }
+            job.engine.chunks.bottom_inputs(blocks, raw, segments);
+            let copied_raw = output.copied.raw as usize;
+            #[allow(irrefutable_let_patterns, reason = "test-only destinations")]
+            if let Dest::Level(level) = job.dest {
+                job.engine.chunks.work(
+                    crate::chunk::work_slot(Some(level), true),
+                    job.inputs
+                        .iter()
+                        .map(|r| r.run.merged_raw_len())
+                        .sum::<usize>()
+                        - copied_raw,
+                    outputs.iter().map(|r| r.run.raw_len()).sum::<usize>() - copied_raw,
+                    report.output_bytes,
+                );
+            }
         }
         drop(charge);
         drop(state);

@@ -58,7 +58,6 @@ use super::keyspaces::{KeyspaceState, MAX_KEYSPACES};
 use super::levels::Levels;
 use super::{
     Core, FlushJob, MAX_KEYSPACE_NAME_LEN, MAX_METADATA_LEN, Options, Published, SharedRun,
-    directory,
 };
 
 mod errors;
@@ -586,9 +585,9 @@ mod tests {
             let new = state(&engine);
 
             CRASH_AT.with(|at| at.set(Some(crash)));
-            let error = engine.checkpoint_to(&dir);
+            let error = engine.checkpoint_to(&dir).unwrap_err();
             CRASH_AT.with(|at| at.set(None));
-            assert!(error.is_err(), "{crash:?}");
+            assert_eq!(error.checkpoint_committed(), committed, "{crash:?}");
             let recovered = Engine::open(&dir, manual()).unwrap();
             let expected = if committed { &new } else { &old };
             assert_eq!(&state(&recovered), expected, "{crash:?}");

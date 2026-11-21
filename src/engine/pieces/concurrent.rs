@@ -183,7 +183,7 @@ impl CompactionJob<'_> {
             space
                 .runs
                 .extend(split.iter().flat_map(|(_, views)| views.iter().cloned()));
-            state.published(self.keyspace);
+            state.published([self.keyspace]);
         }
         drop(split);
         drop(starts);

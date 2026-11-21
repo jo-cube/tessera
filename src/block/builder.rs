@@ -91,6 +91,31 @@ impl BlockBuilder {
         } else {
             common_prefix_len(&self.last_key, key)
         };
+        self.project_with_shared(key, seq, value, restart, shared)
+    }
+
+    /// [`project`](Self::project) when the caller has already computed the
+    /// common prefix length with [`last_key`](Self::last_key).
+    pub(crate) fn project_with_common(
+        &self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+        common: usize,
+    ) -> Projection {
+        let restart = self.record_count.is_multiple_of(RESTART_INTERVAL);
+        let shared = if restart { 0 } else { common };
+        self.project_with_shared(key, seq, value, restart, shared)
+    }
+
+    fn project_with_shared(
+        &self,
+        key: &[u8],
+        seq: u64,
+        value: Value<'_>,
+        restart: bool,
+        shared: usize,
+    ) -> Projection {
         let (tag, len) = match value {
             Value::Bytes(v) => (v.len() as u64 + 1, v.len()),
             Value::Tombstone => (0, 0),
@@ -144,10 +169,13 @@ impl BlockBuilder {
             // Offsets are below MAX_BLOCK_LEN, which fits in u32.
             self.restarts.push((self.entries.len() - self.start) as u32);
         }
-        varint::write(&mut self.entries, shared as u64);
-        varint::write(&mut self.entries, suffix.len() as u64);
-        varint::write(&mut self.entries, value_tag);
-        varint::write(&mut self.entries, seq);
+        let mut header = [0u8; 4 * varint::MAX_LEN];
+        let mut header_len = 0;
+        varint::write_into(&mut header, &mut header_len, shared as u64);
+        varint::write_into(&mut header, &mut header_len, suffix.len() as u64);
+        varint::write_into(&mut header, &mut header_len, value_tag);
+        varint::write_into(&mut header, &mut header_len, seq);
+        self.entries.extend_from_slice(&header[..header_len]);
         self.entries.extend_from_slice(suffix);
         self.entries.extend_from_slice(value_bytes);
 

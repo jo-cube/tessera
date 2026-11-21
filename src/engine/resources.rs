@@ -109,16 +109,17 @@ pub(super) struct BuildCharge<'a> {
 }
 
 impl BuildCharge<'_> {
-    pub(super) fn finished(&mut self, output: usize) {
+    /// Replaces the build estimates with the output and workspace still held.
+    pub(super) fn finished(&mut self, output: usize, workspace: usize) {
         let mut estimates = self
             .progress
             .event
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         estimates.output = estimates.output - self.output + output;
-        estimates.workspace -= self.workspace;
+        estimates.workspace = estimates.workspace - self.workspace + workspace;
         self.output = output;
-        self.workspace = 0;
+        self.workspace = workspace;
     }
 }
 
@@ -132,7 +133,7 @@ impl Drop for BuildCharge<'_> {
         estimates.output -= self.output;
         estimates.workspace -= self.workspace;
         drop(estimates);
-        self.progress.changed();
+        self.progress.changed.notify_all();
     }
 }
 

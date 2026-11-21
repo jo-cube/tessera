@@ -8,7 +8,7 @@
 //!
 //! Full validation costs O(block length), so it is separated from access:
 //!
-//! - [`RecordWalk::validate_block`] validates bytes of unknown origin.
+//! - [`RecordWalk::validate_block_with`] validates bytes of unknown origin.
 //! - [`BlockView::open`] costs O(1) and suits bytes already known to be valid,
 //!   such as a validated block decompressed again into a scratch buffer. Its
 //!   reads stay panic free and report what they touch; its documentation
@@ -64,9 +64,8 @@ use std::cmp::Ordering;
 pub use builder::{BlockBuilder, BuildError};
 #[cfg(test)]
 pub use reader::Block;
-pub(crate) use reader::Corruption;
-pub(crate) use reader::RecordWalk;
 pub use reader::{BlockPosition, BlockView, CorruptBlock, Record, Version};
+pub(crate) use reader::{Corruption, RecordWalk};
 
 /// Number of records between restart points written by [`BlockBuilder`].
 pub const RESTART_INTERVAL: usize = 16;
@@ -110,6 +109,43 @@ pub(crate) fn cmp_internal(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -
     a_key.cmp(b_key).then(b_seq.cmp(&a_seq))
 }
 
-fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let len = a.len().min(b.len());
+    let mut offset = 0;
+    let (a_chunks, _) = a[..len].as_chunks::<8>();
+    let (b_chunks, _) = b[..len].as_chunks::<8>();
+    for (&ac, &bc) in a_chunks.iter().zip(b_chunks) {
+        let diff = u64::from_le_bytes(ac) ^ u64::from_le_bytes(bc);
+        if diff != 0 {
+            return offset + (diff.trailing_zeros() / 8) as usize;
+        }
+        offset += 8;
+    }
+    while offset < len && a[offset] == b[offset] {
+        offset += 1;
+    }
+    offset
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::common_prefix_len;
+
+    #[test]
+    fn common_prefix_len_matches_bytewise_across_word_boundaries() {
+        let base: Vec<u8> = (0..33u8).collect();
+        for len_a in 0..=base.len() {
+            for len_b in 0..=base.len() {
+                assert_eq!(
+                    common_prefix_len(&base[..len_a], &base[..len_b]),
+                    len_a.min(len_b)
+                );
+            }
+            for diff_at in 0..len_a {
+                let mut other = base[..len_a].to_vec();
+                other[diff_at] ^= 0x80;
+                assert_eq!(common_prefix_len(&base[..len_a], &other), diff_at);
+            }
+        }
+    }
 }

@@ -17,6 +17,26 @@ pub const MAX_KEYSPACE_NAME_LEN: usize = 64;
 /// Engines in this process, numbered so that a handle can tell its own.
 static ENGINE_IDS: AtomicU64 = AtomicU64::new(1);
 
+/// Number of cache-line-isolated open-state stripes so concurrent operations do
+/// not bounce a single `RwLock<bool>` cache line across CPU clusters.
+const OPEN_STRIPES: usize = 16;
+
+static NEXT_OPEN_STRIPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_OPEN_STRIPE: usize =
+        NEXT_OPEN_STRIPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % OPEN_STRIPES;
+}
+
+fn open_stripe() -> usize {
+    THREAD_OPEN_STRIPE.with(|&stripe| stripe)
+}
+
+/// 128-byte aligned to avoid false sharing on both 64-byte and 128-byte cache
+/// line architectures (such as Apple Silicon).
+#[repr(align(128))]
+struct OpenStripe(RwLock<bool>);
+
 /// Everything the handles of one engine share. Dropping it, when the last
 /// [`Engine`] and [`Keyspace`] handle is dropped, stops the workers and
 /// releases the directory lock.
@@ -27,9 +47,13 @@ pub(super) struct Shared {
     /// Holds `dir/LOCK` until the engine closes.
     lock: Mutex<Option<File>>,
     workers: Mutex<Workers>,
-    /// Whether the engine is open. Operations hold it shared for their
-    /// duration, so closing waits for them and later ones see it closed.
-    open: RwLock<bool>,
+    /// Whether the engine is open. Operations hold their thread's stripe
+    /// shared for their duration; closing locks every stripe exclusively to
+    /// wait for in-flight operations and mark the engine closed.
+    open: Box<[OpenStripe; OPEN_STRIPES]>,
+    /// Set once every stripe is locked exclusively during [`Engine::close`],
+    /// allowing cheap lock-free pre-checks before running caller callbacks.
+    closed: std::sync::atomic::AtomicBool,
     pub(super) pool: Arc<read::Pool>,
     /// The metadata of the latest committed checkpoint.
     metadata: Mutex<Option<Vec<u8>>>,
@@ -44,9 +68,17 @@ struct Workers {
 }
 
 impl Shared {
+    /// Reports whether [`Engine::close`] has already committed the closed state.
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Admits an operation while the engine is open, until the guard drops.
     pub(super) fn enter(&self) -> Result<RwLockReadGuard<'_, bool>> {
-        let open = self.open.read().unwrap_or_else(PoisonError::into_inner);
+        let open = self.open[open_stripe()]
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         if *open {
             Ok(open)
         } else {
@@ -177,7 +209,8 @@ impl Engine {
                 compaction,
                 flush: None,
             }),
-            open: RwLock::new(true),
+            open: Box::new(std::array::from_fn(|_| OpenStripe(RwLock::new(true)))),
+            closed: std::sync::atomic::AtomicBool::new(false),
             pool: Arc::new(read::Pool::new()),
             metadata: Mutex::new(metadata),
             #[cfg(feature = "diagnostics")]
@@ -464,16 +497,27 @@ impl Engine {
     /// [`ErrorKind::Background`] if a worker panicked at any time; the
     /// engine is closed all the same.
     pub fn close(self) -> Result<()> {
+        self.close_with(|_| {})
+    }
+
+    fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
         {
-            let mut open = self
-                .shared
-                .open
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !*open {
+            let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
+                on_stripe(i);
+                self.shared.open[i]
+                    .0
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+            });
+            if !*guards[0] {
                 return Ok(());
             }
-            *open = false;
+            self.shared
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            for guard in &mut guards {
+                **guard = false;
+            }
         }
         let stopped = self.shared.stop_workers();
         drop(
@@ -489,10 +533,25 @@ impl Engine {
 
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Engine")
-            .field("path", &self.shared.dir)
-            .field("keyspaces", &self.keyspaces())
-            .finish_non_exhaustive()
+        let mut out = f.debug_struct("Engine");
+        out.field("path", &self.shared.dir);
+        match self.core.state.try_read() {
+            Ok(state) => {
+                let names: Vec<&str> = state
+                    .keyspaces
+                    .values()
+                    .map(|space| space.name.as_ref())
+                    .collect();
+                out.field("keyspaces", &names);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                out.field("keyspaces", &"<locked>");
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                out.field("keyspaces", &"<poisoned>");
+            }
+        }
+        out.finish_non_exhaustive()
     }
 }
 
@@ -690,8 +749,8 @@ impl Engine {
         if batch.is_empty() {
             return Ok(self.core.read_state().last_seq);
         }
-        batch.validate(self.core.memtable_budget)?;
-        self.core.ingest_batch(batch, true)
+        let size = batch.validate(self.core.memtable_budget)?;
+        self.core.ingest_batch(batch, true, size)
     }
 
     /// Opens or creates the keyspace the crate's tests write to.
@@ -753,5 +812,156 @@ impl Keyspace {
 
     pub(crate) fn delete_seq(&self, key: &[u8]) -> Result<u64, UpdateError> {
         self.shared.core.update(self.id, key, Value::Tombstone)
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn close_holds_every_stripe_before_exposing_stopped() {
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let in_flight = engine.shared.open[2].0.read().unwrap();
+        let (at_stripe_2_tx, at_stripe_2_rx) = mpsc::channel();
+        let closer_engine = engine.clone();
+        let closer = std::thread::spawn(move || {
+            closer_engine.close_with(|stripe| {
+                if stripe == 2 {
+                    at_stripe_2_tx.send(()).unwrap();
+                }
+            })
+        });
+
+        at_stripe_2_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close should reach stripe 2");
+        // Stripes 0 and 1 must still be held exclusively (blocking callers
+        // instead of exposing Stopped early), while stripe 3 is still open.
+        assert!(matches!(
+            engine.shared.open[0].0.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            engine.shared.open[1].0.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(*engine.shared.open[3].0.try_read().unwrap());
+        assert!(!engine.shared.is_closed());
+
+        drop(in_flight);
+        closer.join().unwrap().unwrap();
+        assert!(engine.shared.is_closed());
+        for stripe in engine.shared.open.iter() {
+            assert!(!*stripe.0.read().unwrap());
+        }
+        assert_eq!(
+            engine.shared.enter().unwrap_err().kind(),
+            ErrorKind::Stopped
+        );
+    }
+
+    #[test]
+    fn multi_get_resolves_keys_before_taking_open_stripe() {
+        struct ClosingKey<'a> {
+            bytes: &'a [u8],
+            entered: mpsc::Sender<()>,
+            closed: mpsc::Receiver<()>,
+        }
+        impl AsRef<[u8]> for ClosingKey<'_> {
+            fn as_ref(&self) -> &[u8] {
+                self.entered.send(()).unwrap();
+                self.closed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("close must not deadlock on multi_get key resolution");
+                self.bytes
+            }
+        }
+
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let ks = engine.keyspace("test").unwrap();
+        ks.put(b"k", b"v").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer_engine = engine.clone();
+        let closer = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("multi_get should invoke AsRef before taking an open stripe");
+            closer_engine.close().unwrap();
+            closed_tx.send(()).unwrap();
+        });
+
+        let keys = [ClosingKey {
+            bytes: b"k",
+            entered: entered_tx,
+            closed: closed_rx,
+        }];
+        let mut reader = engine.reader();
+        let err = reader.multi_get(&ks, &keys).unwrap_err();
+        drop(keys);
+        assert_eq!(err.kind(), ErrorKind::Stopped);
+        closer.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_multi_get_skips_key_conversion() {
+        struct PanicKey;
+        impl AsRef<[u8]> for PanicKey {
+            fn as_ref(&self) -> &[u8] {
+                panic!("key conversion should not run for a rejected multi_get");
+            }
+        }
+
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let other = Engine::in_memory(Options::default()).unwrap();
+        let ks = engine.keyspace("test").unwrap();
+        let foreign = other.keyspace("test").unwrap();
+        let snap = engine.snapshot();
+        engine.drop_keyspace("test").unwrap();
+        let after_drop = engine.snapshot();
+        let later_ks = engine.keyspace("later").unwrap();
+
+        let mut reader = engine.reader();
+        assert_eq!(
+            reader.multi_get(&foreign, &[PanicKey]).unwrap_err().kind(),
+            ErrorKind::UnknownKeyspace
+        );
+
+        let mut snap_reader = snap.reader();
+        assert_eq!(
+            snap_reader
+                .multi_get(&foreign, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnknownKeyspace
+        );
+        assert_eq!(
+            snap_reader.multi_get(&later_ks, &[PanicKey]).unwrap().len(),
+            1
+        );
+
+        let mut dropped_reader = after_drop.reader();
+        assert_eq!(
+            dropped_reader
+                .multi_get(&ks, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::KeyspaceDropped
+        );
+
+        drop(reader);
+        engine.clone().close().unwrap();
+        let mut closed_reader = engine.reader();
+        assert_eq!(
+            closed_reader
+                .multi_get(&foreign, &[PanicKey])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Stopped
+        );
     }
 }

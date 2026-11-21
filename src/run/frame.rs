@@ -15,15 +15,21 @@ pub(super) const HEADER_LEN: usize = 12;
 /// The header bytes covered by the checksum.
 const CHECKSUMMED_LEN: usize = 8;
 
-/// Writes the header of `frame`, whose stored bytes follow a zeroed header.
-pub(super) fn seal(frame: &mut [u8], codec: Codec, decoded_len: usize, dictionary_ref: u32) {
-    let (header, stored) = frame.split_at_mut(HEADER_LEN);
+/// Builds the sealed header for `stored` with `codec`, `decoded_len` and `dictionary_ref`.
+pub(super) fn header(
+    codec: Codec,
+    decoded_len: usize,
+    dictionary_ref: u32,
+    stored: &[u8],
+) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
     header[0] = codec.to_byte();
     header[1..4].copy_from_slice(&dictionary_ref.to_le_bytes()[..3]);
     // Blocks are at most MAX_BLOCK_LEN, which fits in u32.
     header[4..CHECKSUMMED_LEN].copy_from_slice(&(decoded_len as u32).to_le_bytes());
     let checksum = checksum(&header[..CHECKSUMMED_LEN], stored);
     header[CHECKSUMMED_LEN..].copy_from_slice(&checksum.to_le_bytes());
+    header
 }
 
 fn checksum(header: &[u8], stored: &[u8]) -> u32 {
@@ -76,25 +82,36 @@ impl<'a> Frame<'a> {
         })
     }
 
-    /// Appends the frame to `out`, which must be empty, under a new
-    /// dictionary reference. The copied stored bytes are verified against
-    /// the original checksum before the copy is sealed with its own, so a
-    /// damaged frame is reported rather than carried forward.
-    pub(super) fn copy_resealed(
+    /// Verifies the stored bytes against this frame's checksum and returns the
+    /// header re-sealed under `dictionary_ref`, hashing `stored` only once.
+    pub(super) fn verify_and_reseal(
         &self,
-        out: &mut Vec<u8>,
         dictionary_ref: u32,
-    ) -> Result<(), CorruptRun> {
-        debug_assert!(out.is_empty());
-        out.resize(HEADER_LEN, 0);
-        out.extend_from_slice(self.stored);
-        if checksum(&self.header[..CHECKSUMMED_LEN], &out[HEADER_LEN..]) != read_u32(self.header, 8)
-        {
-            out.clear();
+    ) -> Result<[u8; HEADER_LEN], CorruptRun> {
+        let expected = read_u32(self.header, 8);
+        if self.dictionary_ref == dictionary_ref {
+            if checksum(&self.header[..CHECKSUMMED_LEN], self.stored) != expected {
+                return Err(self.error(RunCorruption::ChecksumMismatch));
+            }
+            return Ok(*self.header);
+        }
+        let mut payload = Hasher::new();
+        payload.update(self.stored);
+        let mut old = Hasher::new();
+        old.update(&self.header[..CHECKSUMMED_LEN]);
+        old.combine(&payload);
+        if old.finalize() != expected {
             return Err(self.error(RunCorruption::ChecksumMismatch));
         }
-        seal(out, self.codec, self.decoded_len, dictionary_ref);
-        Ok(())
+        let mut header = [0u8; HEADER_LEN];
+        header[0] = self.codec.to_byte();
+        header[1..4].copy_from_slice(&dictionary_ref.to_le_bytes()[..3]);
+        header[4..CHECKSUMMED_LEN].copy_from_slice(&(self.decoded_len as u32).to_le_bytes());
+        let mut sealed = Hasher::new();
+        sealed.update(&header[..CHECKSUMMED_LEN]);
+        sealed.combine(&payload);
+        header[CHECKSUMMED_LEN..].copy_from_slice(&sealed.finalize().to_le_bytes());
+        Ok(header)
     }
 
     pub(super) fn verify_checksum(&self) -> Result<(), CorruptRun> {
@@ -124,5 +141,39 @@ impl<'a> Frame<'a> {
             offset,
             kind: RunCorruption::Block(error.kind),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_and_reseal_matches_fresh_header_and_rejects_damage() {
+        let payload = b"compressed block payload spanning multiple words for crc combine";
+        let raw_len = 256usize;
+        let orig = header(Codec::Zstd, raw_len, 3, payload);
+
+        let frame = Frame::parse(0, &orig, payload).expect("valid frame");
+        assert_eq!(
+            frame.verify_and_reseal(3).expect("same dictionary ref"),
+            orig
+        );
+        assert_eq!(
+            frame.verify_and_reseal(17).expect("new dictionary ref"),
+            header(Codec::Zstd, raw_len, 17, payload)
+        );
+        assert_eq!(
+            frame.verify_and_reseal(0).expect("cleared dictionary ref"),
+            header(Codec::Zstd, raw_len, 0, payload)
+        );
+
+        let mut damaged = payload.to_vec();
+        damaged[5] ^= 1;
+        let bad = Frame::parse(0, &orig, &damaged).expect("header still parses");
+        assert_eq!(
+            bad.verify_and_reseal(17).unwrap_err().kind,
+            RunCorruption::ChecksumMismatch
+        );
     }
 }

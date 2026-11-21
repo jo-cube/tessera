@@ -199,8 +199,8 @@ pub(crate) enum OpenError {
         /// How.
         damage: Damage,
     },
-    /// The operating system could not create the background compaction
-    /// worker's thread. Recovery changed nothing on disk.
+    /// The operating system could not create a background worker thread.
+    /// Recovery changed nothing on disk.
     Worker(io::Error),
 }
 
@@ -217,7 +217,7 @@ impl fmt::Display for OpenError {
                 write!(f, "checkpoint file {} is damaged: {damage}", path.display())
             }
             Self::Worker(error) => {
-                write!(f, "cannot start the background compaction worker: {error}")
+                write!(f, "cannot start a background worker: {error}")
             }
         }
     }

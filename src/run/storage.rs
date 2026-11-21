@@ -41,26 +41,32 @@ impl Packing {
         }
     }
 
-    fn append(&mut self, bytes: &[u8], dictionary: bool) {
-        if bytes.is_empty() {
+    fn append_parts(&mut self, parts: &[&[u8]], dictionary: bool) {
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        if total == 0 {
             return;
         }
-        let (allocation, range) = if bytes.len() > CHUNK_BYTES {
+        let (allocation, range) = if total > CHUNK_BYTES {
             let at = self.allocations.len();
-            self.allocations.push(Chunk::exact(bytes));
-            (at, 0..bytes.len())
+            self.allocations.push(Chunk::exact_parts(parts));
+            (at, 0..total)
         } else {
             let (at, used) = match self.active {
-                Some((at, used)) if used + bytes.len() <= CHUNK_BYTES => (at, used),
+                Some((at, used)) if used + total <= CHUNK_BYTES => (at, used),
                 _ => {
                     let at = self.allocations.len();
                     self.allocations.push(self.pool.take());
                     (at, 0)
                 }
             };
-            let range = used..used + bytes.len();
-            self.allocations[at].bytes_mut()[range.clone()].copy_from_slice(bytes);
-            self.allocations[at].set_used(range.end);
+            let range = used..used + total;
+            let dst = self.allocations[at].bytes_mut();
+            let mut cursor = used;
+            for part in parts {
+                dst[cursor..cursor + part.len()].copy_from_slice(part);
+                cursor += part.len();
+            }
+            self.allocations[at].set_used_in(&self.pool, range.end);
             self.active = Some((at, range.end));
             (at, range)
         };
@@ -81,7 +87,7 @@ impl Packing {
                 range,
             });
         }
-        *len += bytes.len();
+        *len += total;
     }
 
     pub fn compressed(&self, raw: usize, stored: usize, compressed: bool) {
@@ -91,10 +97,13 @@ impl Packing {
         self.pool.reused(stored);
     }
     pub fn frame(&mut self, bytes: &[u8]) {
-        self.append(bytes, false);
+        self.append_parts(&[bytes], false);
+    }
+    pub fn frame_parts(&mut self, header: &[u8], payload: &[u8]) {
+        self.append_parts(&[header, payload], false);
     }
     pub fn dictionary(&mut self, bytes: &[u8]) {
-        self.append(bytes, true);
+        self.append_parts(&[bytes], true);
     }
 
     pub fn finish(mut self, tail: Box<[u8]>) -> Segmented {
@@ -241,19 +250,6 @@ impl<'a> Region<'a> {
                 data.bytes(piece).get(
                     range.start.checked_sub(piece.start)?..range.end.checked_sub(piece.start)?,
                 )
-            }
-        }
-    }
-    pub fn stored_subslice(self, value: &[u8]) -> Option<&'a [u8]> {
-        let within = |bytes: &'a [u8]| {
-            let start = value.as_ptr().addr().checked_sub(bytes.as_ptr().addr())?;
-            bytes.get(start..start.checked_add(value.len())?)
-        };
-        match self {
-            Self::Contiguous(bytes) => within(bytes),
-            Self::Frames(data) => data.frames.iter().find_map(|p| within(data.bytes(p))),
-            Self::Dictionaries(data) => {
-                data.dictionaries.iter().find_map(|p| within(data.bytes(p)))
             }
         }
     }

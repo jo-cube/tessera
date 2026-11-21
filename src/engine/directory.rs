@@ -148,7 +148,6 @@ impl RunDirectory {
 
     /// The number of groups: the largest number of runs whose key ranges
     /// share a key.
-    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(super) fn group_count(&self) -> usize {
         self.groups.len()
     }
@@ -171,6 +170,18 @@ impl RunDirectory {
     /// Each group as one input of a merge: the positions of its runs.
     pub(super) fn groups(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
         self.groups.iter().map(|group| group.start..group.end)
+    }
+
+    /// Each group's sequence bound, first run position, and runs in ascending
+    /// key order, ordered by descending sequence bound.
+    pub(super) fn group_slices(&self) -> impl Iterator<Item = (u64, usize, &[SharedRun])> {
+        self.groups.iter().map(|group| {
+            (
+                group.max_seq,
+                group.start,
+                &self.runs[group.start..group.end],
+            )
+        })
     }
 }
 

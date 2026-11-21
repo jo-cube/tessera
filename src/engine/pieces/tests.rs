@@ -43,7 +43,7 @@ fn fixture_with_threads(background_threads: usize) -> Engine {
         space.runs = published(runs).collect();
         let recovered: Vec<_> = space.runs.iter().map(|r| (1, 0, r.clone())).collect();
         space.levels = Levels::recovered(&recovered, 1, 10);
-        state.published(id);
+        state.published([id]);
         state.split_flushes = false;
     }
     for key in 0..KEYS {
@@ -368,7 +368,7 @@ fn corruption_in_a_middle_piece_preserves_completed_publications() {
             .unwrap();
         let at = space.runs.iter().position(|r| Arc::ptr_eq(r, old)).unwrap();
         space.runs[at] = new.clone();
-        state.published(id);
+        state.published([id]);
     };
     replace(&clean, &damaged);
     assert!(matches!(
@@ -534,4 +534,41 @@ fn one_builder_publishes_small_bottom_ranges_before_building_the_next() {
     engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
     assert!(builds.load(Ordering::Relaxed) > 1);
     check(&engine.snapshot(), &engine.ks(), ones);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn piecewise_compaction_and_ingestion_record_diagnostics() {
+    let engine = fixture_with_threads(1);
+    let bottom_runs = engine.core.read_state().only().levels.runs()[1].clone();
+    let expected_blocks: u64 = bottom_runs
+        .iter()
+        .map(|r| r.run.view().block_count() as u64)
+        .sum();
+    let expected_raw: u64 = bottom_runs
+        .iter()
+        .map(|r| r.run.merged_raw_len() as u64)
+        .sum();
+    let expected_segments: u64 = bottom_runs
+        .iter()
+        .map(|r| r.run.view().segment_count() as u64)
+        .sum();
+
+    engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+    let copy = engine.core.chunks.copy_counters();
+    assert_eq!(copy.input_blocks, expected_blocks);
+    assert_eq!(copy.input_raw, expected_raw);
+    assert_eq!(copy.input_segments, expected_segments);
+
+    let before = engine.core.chunks.work_counters()[0];
+    let mut batch = WriteBatch::new();
+    batch.put(&engine.ks(), b"ingest-a", b"value-a");
+    batch.put(&engine.ks(), b"ingest-b", b"value-b");
+    engine.ingest_sorted(&batch).unwrap();
+    let after = engine.core.chunks.work_counters()[0];
+    assert!(after[1] > before[1], "ingestion should record raw output");
+    assert!(
+        after[2] > before[2],
+        "ingestion should record stored output"
+    );
 }

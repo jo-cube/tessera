@@ -192,6 +192,8 @@ pub(super) struct Buffers {
     value: Vec<u8>,
     pub(super) multi: multi::Workspace,
     /// Always empty outside a multi-get; keeps only the allocation.
+    keys: Vec<&'static [u8]>,
+    /// Always empty outside a multi-get; keeps only the allocation.
     results: Vec<Option<&'static [u8]>>,
     /// Always empty outside a scan; keeps only the allocation.
     pub(super) scan_tables: Vec<TableCursor<'static>>,
@@ -210,7 +212,47 @@ impl Buffers {
                 *buffer = Vec::new();
             }
         }
+        if self.keys.capacity() * size_of::<&'static [u8]>() > RETAINED_BYTES {
+            self.keys = Vec::new();
+        }
+        if self.results.capacity() * size_of::<Option<&'static [u8]>>() > RETAINED_BYTES {
+            self.results = Vec::new();
+        }
+        self.logical.trim(RETAINED_BYTES);
         self.multi.trim(RETAINED_BYTES);
+    }
+}
+
+/// Temporarily borrows `Buffers::keys` with the caller's key lifetime and
+/// returns its allocation on drop, even on early return or panic.
+struct ResolvedKeys<'k, 'b> {
+    keys: Vec<&'k [u8]>,
+    spare: &'b mut Vec<&'static [u8]>,
+}
+
+impl<'k, 'b> ResolvedKeys<'k, 'b> {
+    fn new<K: AsRef<[u8]>>(keys: &'k [K], spare: &'b mut Vec<&'static [u8]>) -> Self {
+        let resolved: Vec<&'k [u8]> = std::mem::take(spare)
+            .into_iter()
+            .map(|_| unreachable!("resolved keys are cleared"))
+            .collect();
+        let mut out = Self {
+            keys: resolved,
+            spare,
+        };
+        out.keys.reserve(keys.len());
+        out.keys.extend(keys.iter().map(AsRef::as_ref));
+        out
+    }
+}
+
+impl Drop for ResolvedKeys<'_, '_> {
+    fn drop(&mut self) {
+        self.keys.clear();
+        *self.spare = std::mem::take(&mut self.keys)
+            .into_iter()
+            .map(|_| unreachable!("resolved keys are cleared"))
+            .collect();
     }
 }
 
@@ -394,26 +436,41 @@ impl<'a> Reader<'a> {
         keys: &[K],
     ) -> Result<MultiGet<'_>> {
         self.pinned = None;
-        let Buffers { multi, results, .. } = &mut self.buffers;
+        let Buffers {
+            multi,
+            keys: spare_keys,
+            results,
+            ..
+        } = &mut self.buffers;
+        // Validate engine/keyspace ownership before resolving keys so rejected
+        // calls neither allocate scratch nor invoke caller `AsRef` code, while
+        // still resolving keys outside the admission stripe.
         match self.source {
             Source::Latest(shared) => {
-                let _open = shared.enter()?;
+                if shared.is_closed() {
+                    return Err(Error::stopped());
+                }
                 own(shared.id, keyspace)?;
+                let resolved = ResolvedKeys::new(keys, spare_keys);
+                let _open = shared.enter()?;
                 shared
                     .core
-                    .multi_get(keyspace.id(), keys, multi)
+                    .multi_get(keyspace.id(), &resolved.keys, multi)
                     .map_err(|error| keyspace.named(error))?;
             }
             Source::Snapshot(snapshot) => {
                 own(snapshot.engine, keyspace)?;
                 match snapshot.view.visible(keyspace.id()) {
-                    Visible::Live(runs) => multi.lookup_view(
-                        keys,
-                        &snapshot.view.tables,
-                        KeyPrefix::new(keyspace.id()),
-                        runs,
-                    )?,
-                    Visible::Later => multi.prepare(keys),
+                    Visible::Live(runs) => {
+                        let resolved = ResolvedKeys::new(keys, spare_keys);
+                        multi.lookup_view(
+                            &resolved.keys,
+                            &snapshot.view.tables,
+                            KeyPrefix::new(keyspace.id()),
+                            runs,
+                        )?;
+                    }
+                    Visible::Later => multi.prepare_empty(keys.len()),
                     Visible::Dropped => return Err(Error::keyspace_dropped(keyspace.name())),
                 }
             }

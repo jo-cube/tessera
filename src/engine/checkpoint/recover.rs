@@ -1,6 +1,8 @@
 //! Opening and validating a committed checkpoint.
 
 use super::*;
+use crate::engine::directory::RunDirectory;
+use crate::run::{MergeCursor, MergeWorkspace, ReadError};
 
 /// A recovered engine core and the checkpoint's metadata.
 pub(in crate::engine) type Recovered = (Core, Option<Vec<u8>>);
@@ -47,6 +49,7 @@ struct LoadedKeyspace {
     name: String,
     depth: usize,
     runs: Vec<(usize, u64, SharedRun)>,
+    directory: Arc<RunDirectory>,
 }
 
 /// A committed checkpoint, checked in full before starting any worker.
@@ -86,10 +89,13 @@ impl Loaded {
                     .collect();
                 space.levels =
                     Levels::recovered(&keyspace.runs, keyspace.depth, options.level_ratio);
+                space.directory = keyspace.directory;
                 state.names.insert(name, keyspace.id);
                 state.keyspaces.insert(keyspace.id, space);
-                state.published(keyspace.id);
+                state.account_runs(keyspace.id);
             }
+            state.refresh_directories();
+            state.levels_changed();
         }
         core
     }
@@ -192,22 +198,15 @@ pub(super) fn committed_manifest(dir: &Path) -> Result<(PathBuf, PathBuf, Manife
 pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
     let (_, manifest_path, manifest) = committed_manifest(dir)?;
     let pool = ChunkPool::new(RESERVE_BYTES);
-    let mut keyspaces: Vec<LoadedKeyspace> = manifest
-        .keyspaces
-        .iter()
-        .map(|keyspace| LoadedKeyspace {
-            id: keyspace.id,
-            name: keyspace.name.clone(),
-            depth: keyspace.depth,
-            runs: Vec::new(),
-        })
-        .collect();
+    let mut runs_by_keyspace =
+        vec![Vec::<(usize, u64, SharedRun)>::new(); manifest.keyspaces.len()];
     let mut records = 0u64;
     let mut backings: HashMap<u128, Run<Vec<u8>>> = HashMap::new();
     for entry in &manifest.runs {
         let file = dir.join(RUNS).join(run_name(entry.id));
         // Decoding checked that the keyspace is listed.
-        let at = keyspaces
+        let at = manifest
+            .keyspaces
             .binary_search_by_key(&entry.keyspace, |keyspace| keyspace.id)
             .map_err(|_| {
                 corrupt(
@@ -215,7 +214,7 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
                     Damage::UnknownKeyspace { id: entry.keyspace },
                 )
             })?;
-        let runs = &mut keyspaces[at].runs;
+        let runs = &mut runs_by_keyspace[at];
         let (mut run, max_seq) = if let Some(backing) = backings.get(&entry.id) {
             (backing.clone(), backing.max_seq())
         } else {
@@ -300,33 +299,19 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
             },
         ));
     }
-    // Per-run checks cannot detect disagreeing copies in different runs. Check
-    // each keyspace's grouped merge before exposing an engine, including
-    // older versions that compaction will eventually visit.
-    // This holds one decoded block per overlapping group, with no value copies.
-    for keyspace in &keyspaces {
-        let published: Vec<_> = keyspace
-            .runs
-            .iter()
-            .map(|(_, _, run)| Arc::clone(run))
-            .collect();
-        let directory = super::directory::RunDirectory::build(&published);
-        let mut workspace = crate::run::MergeWorkspace::new();
-        let mut cursor =
-            crate::run::MergeCursor::grouped(&directory, directory.groups(), &mut workspace);
-        while cursor
-            .next_record()
-            .map_err(|error| corrupt(&manifest_path, Damage::Run(error)))?
-            .is_some()
-        {
-            cursor.collapse_copies().map_err(|error| {
-                let damage = match error {
-                    crate::run::ReadError::Corrupt(error) => Damage::Run(error),
-                    crate::run::ReadError::ConflictingCopies(_) => Damage::Order,
-                };
-                corrupt(&manifest_path, damage)
-            })?;
-        }
+    let mut keyspaces = Vec::with_capacity(manifest.keyspaces.len());
+    let mut workspace = MergeWorkspace::new();
+    for (keyspace, runs) in manifest.keyspaces.into_iter().zip(runs_by_keyspace) {
+        let published: Vec<_> = runs.iter().map(|(_, _, run)| Arc::clone(run)).collect();
+        let directory = Arc::new(RunDirectory::build(&published));
+        validate_copies(&directory, &mut workspace, &manifest_path)?;
+        keyspaces.push(LoadedKeyspace {
+            id: keyspace.id,
+            name: keyspace.name,
+            depth: keyspace.depth,
+            runs,
+            directory,
+        });
     }
     Ok(Loaded {
         ceiling: manifest.last_seq,
@@ -336,4 +321,32 @@ pub(super) fn load(dir: &Path) -> Result<Loaded, OpenError> {
         keyspaces,
         pool,
     })
+}
+
+/// Each run has already been validated. A single directory group has
+/// disjoint key ranges, so only overlapping groups can disagree. Check
+/// all versions in the merge, including older ones that compaction may visit.
+fn validate_copies(
+    directory: &RunDirectory,
+    workspace: &mut MergeWorkspace,
+    path: &Path,
+) -> Result<(), OpenError> {
+    if directory.group_count() <= 1 {
+        return Ok(());
+    }
+    let mut cursor = MergeCursor::grouped(directory, directory.groups(), workspace);
+    while cursor
+        .next_record()
+        .map_err(|error| corrupt(path, Damage::Run(error)))?
+        .is_some()
+    {
+        cursor.collapse_copies().map_err(|error| {
+            let damage = match error {
+                ReadError::Corrupt(error) => Damage::Run(error),
+                ReadError::ConflictingCopies(_) => Damage::Order,
+            };
+            corrupt(path, damage)
+        })?;
+    }
+    Ok(())
 }

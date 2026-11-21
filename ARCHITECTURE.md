@@ -36,7 +36,9 @@ large write ─▶ private runs ────────────▶ level 0 
   and whose keys ascend, or that is larger than a memtable, is built into
   runs outside the lock with placeholder sequences. The runs are published
   at one overridden sequence after draining only the tables that share one
-  of the batch's keys, so the batch stays atomic.
+  of the batch's keys, so the batch stays atomic. Oversized unsorted batches
+  sort operation positions by key and retain the last operation per key. Run
+  builders borrow those operations from the batch.
 - **Levels.** Level 0 holds flushes in publication order and may overlap.
   Deeper levels are sorted and strictly disjoint, with targets set by
   `level_ratio` (default 10) and dynamic level sizing. Level 0 is compacted at
@@ -79,7 +81,8 @@ pool.
   only its keyspace's directory. A scan merges the memtables, bounded by the
   prefix, with its keyspace's groups. A snapshot holds one shared list of
   every keyspace's directory, taken with one reference count; a keyspace not
-  in the list reads as empty.
+  in the list reads as empty. A publication spanning several keyspaces
+  rebuilds this shared list once.
 - **Drop and recreate.** Dropping takes the flush and compaction locks,
   removes the keyspace from the catalog and retires its runs; snapshots that
   hold them keep reading. Handles and batches carry the ID, so after a drop
@@ -145,8 +148,9 @@ flush groups, bounded views, sequence overrides, the ceiling and application
 metadata. The
 commit is the rename of `CURRENT` after every file and directory is synced; GC
 then keeps the files of the last two generations. Recovery reads exactly the
-generation `CURRENT` names and validates every frame, dictionary, record,
-filter and cross-run copy before any worker starts.
+generation `CURRENT` names and validates every frame, dictionary, record and
+filter before any worker starts. A separate merge checks for conflicting
+copies in keyspaces whose run ranges overlap.
 
 Manifest version 1, all integers little-endian, closed by a CRC-32:
 
