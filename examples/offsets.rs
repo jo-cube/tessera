@@ -66,7 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     engine.close()?;
 
     let engine = Engine::open(&dir, Options::default())?;
-    let offsets = engine.keyspace("offsets")?;
+    // The recovered checkpoint holds the offsets; a missing keyspace here
+    // would mean the directory is not this consumer's.
+    let offsets = engine
+        .existing_keyspace("offsets")?
+        .expect("the checkpoint holds the offsets");
     for partition in 0..PARTITIONS {
         assert_eq!(next_offset(&offsets, partition)?, 1000);
     }
@@ -78,7 +82,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The state equals one pass over the whole log in poll order.
     let engine = Engine::open(&dir, Options::default())?;
-    let state = engine.keyspace("state")?;
+    let state = engine
+        .existing_keyspace("state")?
+        .expect("the checkpoint holds the state");
     let mut expected = std::collections::BTreeMap::new();
     for start in (0..LOG_LEN).step_by(100) {
         for partition in 0..PARTITIONS {

@@ -454,6 +454,85 @@ fn a_dropped_keyspace_refuses_its_handles_and_its_name_can_be_reused() {
 }
 
 #[test]
+fn existing_keyspace_finds_a_keyspace_and_never_creates_one() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    assert!(engine.existing_keyspace("users").unwrap().is_none());
+    assert!(engine.keyspaces().is_empty());
+
+    let users = engine.keyspace("users").unwrap();
+    users.put(b"k", b"v").unwrap();
+    let found = engine.existing_keyspace("users").unwrap().unwrap();
+    assert_eq!(found.name(), "users");
+    assert_eq!(found.get(b"k").unwrap(), Some(b"v".to_vec()));
+    found.put(b"j", b"w").unwrap();
+    assert_eq!(users.get(b"j").unwrap(), Some(b"w".to_vec()));
+
+    // Names compare exactly, and a bad name is refused rather than missing.
+    assert!(engine.existing_keyspace("Users").unwrap().is_none());
+    let long = "n".repeat(crate::MAX_KEYSPACE_NAME_LEN + 1);
+    for name in ["", "a b", "ü", &long] {
+        assert_eq!(
+            engine.existing_keyspace(name).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(engine.keyspaces(), ["users"]);
+}
+
+#[test]
+fn existing_keyspace_misses_a_dropped_keyspace_until_it_is_recreated() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    let users = engine.keyspace("users").unwrap();
+    users.put(b"k", b"v1").unwrap();
+    assert!(engine.drop_keyspace("users").unwrap());
+    assert!(engine.existing_keyspace("users").unwrap().is_none());
+    assert!(engine.keyspaces().is_empty());
+
+    engine.keyspace("users").unwrap();
+    let again = engine.existing_keyspace("users").unwrap().unwrap();
+    assert_eq!(again.get(b"k").unwrap(), None);
+    assert_eq!(
+        users.get(b"k").unwrap_err().kind(),
+        ErrorKind::KeyspaceDropped
+    );
+}
+
+#[test]
+fn existing_keyspace_finds_checkpointed_keyspaces_after_reopening() {
+    let scratch = Scratch::new("existing");
+    let engine = Engine::open(&scratch.0, manual()).unwrap();
+    engine.keyspace("kept").unwrap().put(b"k", b"v").unwrap();
+    engine.keyspace("empty").unwrap();
+    engine.checkpoint().unwrap();
+    engine.keyspace("unsaved").unwrap();
+    engine.close().unwrap();
+
+    let engine = Engine::open(&scratch.0, manual()).unwrap();
+    let kept = engine.existing_keyspace("kept").unwrap().unwrap();
+    assert_eq!(kept.get(b"k").unwrap(), Some(b"v".to_vec()));
+    assert!(engine.existing_keyspace("empty").unwrap().is_some());
+    assert!(engine.existing_keyspace("unsaved").unwrap().is_none());
+    assert_eq!(engine.keyspaces(), ["empty", "kept"]);
+    engine.close().unwrap();
+}
+
+#[test]
+fn existing_keyspace_returns_a_keyspace_an_older_snapshot_reads_as_empty() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    let before = engine.snapshot();
+    engine.keyspace("late").unwrap().put(b"k", b"v").unwrap();
+
+    let late = engine.existing_keyspace("late").unwrap().unwrap();
+    assert_eq!(late.get(b"k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(before.reader().get(&late, b"k").unwrap(), None);
+    assert!(collect(before.reader().range(&late, ..)).is_empty());
+    assert_eq!(
+        engine.snapshot().reader().get(&late, b"k").unwrap(),
+        Some(&b"v"[..])
+    );
+}
+
+#[test]
 fn stats_cover_each_live_keyspace() {
     let (engine, ks, _) = layered();
     let stats = engine.stats();
@@ -550,6 +629,10 @@ fn close_stops_every_handle_but_snapshots_keep_reading() {
     );
     assert_eq!(
         other.drop_keyspace("data").unwrap_err().kind(),
+        ErrorKind::Stopped
+    );
+    assert_eq!(
+        other.existing_keyspace("data").unwrap_err().kind(),
         ErrorKind::Stopped
     );
     assert_eq!(stopped(other.checkpoint()), ErrorKind::Stopped);

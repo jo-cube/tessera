@@ -220,6 +220,35 @@ impl Engine {
         Ok(self.handle(id, &state.keyspaces[&id].name))
     }
 
+    /// Returns the keyspace `name` if it exists, and `None` otherwise; unlike
+    /// [`Engine::keyspace`], it never creates one. A keyspace exists from its
+    /// creation until it is dropped, and after a reopen if the recovered
+    /// checkpoint holds it. Names follow the rules of [`Engine::keyspace`].
+    ///
+    /// ```
+    /// # use tessera::{Engine, Options};
+    /// let engine = Engine::in_memory(Options::default())?;
+    /// assert!(engine.existing_keyspace("users")?.is_none());
+    /// engine.keyspace("users")?;
+    /// assert!(engine.existing_keyspace("users")?.is_some());
+    /// # Ok::<(), tessera::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// [`ErrorKind::InvalidInput`] for a name outside the rules;
+    /// [`ErrorKind::Stopped`] after [`Engine::close`].
+    pub fn existing_keyspace(&self, name: &str) -> Result<Option<Keyspace>> {
+        let _open = self.shared.enter()?;
+        if !valid_name(name) {
+            return Err(invalid_name(name));
+        }
+        let state = self.core.read_state();
+        Ok(state
+            .names
+            .get_key_value(name)
+            .map(|(name, &id)| self.handle(id, name)))
+    }
+
     fn handle(&self, id: u32, name: &Arc<str>) -> Keyspace {
         Keyspace {
             shared: Arc::clone(&self.shared),

@@ -84,8 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let engine = Engine::open(&dir, Options::default())?;
     assert_eq!(engine.keyspaces(), ["orders", "orders.by-customer"]);
-    let orders = engine.keyspace("orders")?;
-    let by_customer = engine.keyspace("orders.by-customer")?;
+    // After a reopen, look the keyspaces up rather than create them, so a
+    // misspelt name fails instead of reading an empty keyspace.
+    let orders = engine.existing_keyspace("orders")?.expect("recovered");
+    let by_customer = engine
+        .existing_keyspace("orders.by-customer")?
+        .expect("recovered");
+    assert!(engine.existing_keyspace("orders.by-region")?.is_none());
     let snapshot = engine.snapshot();
     // Order 0 had a total of 0, so only the counts move.
     assert_eq!(

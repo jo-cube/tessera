@@ -110,8 +110,9 @@ in `dir`, or starts empty, and holds `dir/LOCK` until the engine closes.
 are cheap, cloneable, thread-safe handles. Closing writes nothing.
 
 **Keyspaces.** A keyspace is a named, independent set of keys:
-`engine.keyspace("orders")` opens or creates one, and `drop_keyspace` removes
-it with its data. Keyspaces share one memory budget and one memtable, so a
+`engine.keyspace("orders")` opens or creates one,
+`engine.existing_keyspace("orders")` opens it only if it exists, and
+`drop_keyspace` removes it with its data. Keyspaces share one memory budget and one memtable, so a
 batch spanning several is atomic, and a snapshot sees all of them at one
 moment. An engine holds up to 4096.
 

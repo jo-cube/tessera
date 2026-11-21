@@ -37,8 +37,11 @@ in two keyspaces is two records.
 
 ## Keyspaces
 
-`Engine::keyspace(name)` opens a keyspace, creating it if it is missing. Names
-are 1 to 64 bytes of ASCII letters, digits, `_`, `.` and `-`, compared
+`Engine::keyspace(name)` opens a keyspace, creating it if it is missing.
+`Engine::existing_keyspace(name)` opens it only if it exists and returns
+`None` otherwise, which suits code that reopens a directory and expects its
+keyspaces: a misspelt name is reported instead of creating an empty keyspace.
+Names are 1 to 64 bytes of ASCII letters, digits, `_`, `.` and `-`, compared
 exactly. `Engine::keyspaces` lists the live ones in bytewise order.
 
 `Engine::drop_keyspace(name)` removes a keyspace and its data and returns
