@@ -801,6 +801,8 @@ impl Keyspace {
 #[cfg(test)]
 mod close_tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn close_holds_every_stripe_before_exposing_stopped() {
@@ -809,14 +811,21 @@ mod close_tests {
         let closer_engine = engine.clone();
         let closer = std::thread::spawn(move || closer_engine.close());
 
-        // Wait until close has acquired stripe 0 and is blocked on stripe 2.
-        while engine.shared.open[0].0.try_read().is_ok() {
+        // Wait until close has acquired stripe 1 (after stripe 0) and moved on
+        // to wait on stripe 2.
+        while engine.shared.open[1].0.try_read().is_ok_and(|open| *open) {
             std::thread::yield_now();
         }
-        // Stripe 0 is held exclusively (callers block rather than observing
-        // Stopped early), while stripe 3 has not been marked closed yet.
+        // Give close time to reach stripe 2 if it had released stripe 1 early.
+        std::thread::sleep(Duration::from_millis(5));
+        // Stripes 0 and 1 must still be held exclusively (blocking callers
+        // instead of exposing Stopped early), while stripe 3 is still open.
         assert!(matches!(
             engine.shared.open[0].0.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            engine.shared.open[1].0.try_read(),
             Err(std::sync::TryLockError::WouldBlock)
         ));
         assert!(*engine.shared.open[3].0.try_read().unwrap());
@@ -830,5 +839,44 @@ mod close_tests {
             engine.shared.enter().unwrap_err().kind(),
             ErrorKind::Stopped
         );
+    }
+
+    #[test]
+    fn multi_get_resolves_keys_before_taking_open_stripe() {
+        struct ClosingKey<'a> {
+            bytes: &'a [u8],
+            entered: mpsc::Sender<()>,
+            closed: mpsc::Receiver<()>,
+        }
+        impl AsRef<[u8]> for ClosingKey<'_> {
+            fn as_ref(&self) -> &[u8] {
+                self.entered.send(()).unwrap();
+                self.closed.recv().unwrap();
+                self.bytes
+            }
+        }
+
+        let engine = Engine::in_memory(Options::default()).unwrap();
+        let ks = engine.keyspace("test").unwrap();
+        ks.put(b"k", b"v").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer_engine = engine.clone();
+        let closer = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            closer_engine.close().unwrap();
+            closed_tx.send(()).unwrap();
+        });
+
+        let keys = [ClosingKey {
+            bytes: b"k",
+            entered: entered_tx,
+            closed: closed_rx,
+        }];
+        let mut reader = engine.reader();
+        let err = reader.multi_get(&ks, &keys).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Stopped);
+        closer.join().unwrap();
     }
 }
