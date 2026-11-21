@@ -444,50 +444,94 @@ pub(crate) fn compact_parallel_in<'a>(
     let estimated_run_bytes = estimated_run_bytes.max(1);
     let full_runs = stored / estimated_run_bytes;
     let threads = threads.min(full_runs).min(stored / (256 << 10)).max(1);
-    if threads == 1 || cuts.single {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+    if let Some(compacted) = try_compact_parallel_in(
+        inputs,
+        &keep_tombstone,
+        limits,
+        needed,
+        cuts,
+        threads,
+        estimated_run_bytes,
+        (pool, floors),
+    )? {
+        return Ok(compacted);
     }
-    // Reconstruct sparse-index keys sequentially into one flat buffer,
-    // weighted by compressed input bytes. Equal user keys stay together even
-    // when their versions span several input blocks.
+    compact_with_in(
+        inputs,
+        keep_tombstone,
+        limits,
+        cuts,
+        workspace,
+        (pool, floors),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_compact_parallel_in<'a>(
+    inputs: &[RunView<'a>],
+    keep_tombstone: &(impl Fn(&[u8]) -> bool + Sync),
+    limits: CompactLimits,
+    needed: usize,
+    cuts: &OutputCuts,
+    threads: usize,
+    estimated_run_bytes: usize,
+    (pool, floors): (&ChunkPool, &[SeqFloor<'_>]),
+) -> Result<Option<Compacted>, ReadError> {
+    if threads == 1 || cuts.single {
+        return Ok(None);
+    }
+    // Size the sparse-index key buffer before allocating partition scratch so
+    // Vec growth cannot exceed max_workspace_bytes and any serial fallback
+    // starts only after every partition buffer has been dropped.
     let count: usize = inputs.iter().map(|input| input.block_count()).sum();
     let max_metadata = limits.max_workspace_bytes.saturating_sub(needed);
-    let mut metadata = count
+    let fixed_metadata = count
         .saturating_mul(size_of::<(std::ops::Range<usize>, usize)>() + size_of::<(&[u8], usize)>());
-    if metadata > max_metadata {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+    if fixed_metadata > max_metadata {
+        return Ok(None);
     }
-    let mut boundary_bytes = Vec::new();
-    let mut boundaries = Vec::with_capacity(count);
+    let mut key_bytes = 0usize;
     for input in inputs {
         let mut key = super::index::IndexKey::new();
         for block in 0..input.block_count() {
             input.append_index_key(block, &mut key)?;
-            metadata = metadata.saturating_add(key.len());
-            if metadata > max_metadata {
-                return compact_with_in(
-                    inputs,
-                    keep_tombstone,
-                    limits,
-                    cuts,
-                    workspace,
-                    (pool, floors),
-                );
+            key_bytes = key_bytes.saturating_add(key.len());
+            if fixed_metadata.saturating_add(key_bytes) > max_metadata {
+                return Ok(None);
             }
+        }
+    }
+    let mut threads = threads.min(count);
+    if threads <= 1 {
+        return Ok(None);
+    }
+    let largest = inputs
+        .iter()
+        .map(|input| input.largest_block_len())
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = fixed_metadata + key_bytes;
+    // Keep selection's workspace limit. Divide the segment allowance rather
+    // than multiplying a full-size builder by N; reduce N for high fan-in.
+    let (segment_len, builder_workspace) = loop {
+        let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
+        let builder = workspace_for_segment(largest.iter().copied(), segment);
+        let allowance = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+        if builder <= allowance {
+            break (segment, builder);
+        }
+        threads -= 1;
+        if threads == 1 {
+            return Ok(None);
+        }
+    };
+    let mut boundary_bytes = Vec::new();
+    boundary_bytes.reserve_exact(key_bytes);
+    let mut boundaries = Vec::new();
+    boundaries.reserve_exact(count);
+    for input in inputs {
+        let mut key = super::index::IndexKey::new();
+        for block in 0..input.block_count() {
+            input.append_index_key(block, &mut key)?;
             let start = boundary_bytes.len();
             key.extend_into(&mut boundary_bytes);
             boundaries.push((start..boundary_bytes.len(), input.block_bytes(block)));
@@ -496,55 +540,32 @@ pub(crate) fn compact_parallel_in<'a>(
     let slices: Vec<(&[u8], usize)> = {
         boundaries
             .sort_unstable_by(|a, b| boundary_bytes[a.0.clone()].cmp(&boundary_bytes[b.0.clone()]));
-        boundaries
-            .iter()
-            .map(|(span, bytes)| (&boundary_bytes[span.clone()], *bytes))
-            .collect()
+        let mut slices = Vec::new();
+        slices.reserve_exact(boundaries.len());
+        slices.extend(
+            boundaries
+                .iter()
+                .map(|(span, bytes)| (&boundary_bytes[span.clone()], *bytes)),
+        );
+        slices
     };
-    let largest = inputs
-        .iter()
-        .map(|input| input.largest_block_len())
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut threads = threads.min(slices.len());
-    // Keep selection's workspace limit. Divide the segment allowance rather
-    // than multiplying a full-size builder by N; reduce N for high fan-in.
-    let (segment_len, per_builder) = loop {
-        let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
-        let builder = workspace_for_segment(largest.iter().copied(), segment);
-        let allowance = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
-        if builder <= allowance {
-            break (segment, allowance);
-        }
-        threads -= 1;
-        if threads == 1 {
-            return compact_with_in(
-                inputs,
-                keep_tombstone,
-                limits,
-                cuts,
-                workspace,
-                (pool, floors),
-            );
-        }
-    };
+    let metadata = boundary_bytes
+        .capacity()
+        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>())
+        .saturating_add(slices.capacity() * size_of::<(&[u8], usize)>());
+    let per_builder = limits.max_workspace_bytes.saturating_sub(metadata) / threads;
+    if metadata > max_metadata || builder_workspace > per_builder {
+        return Ok(None);
+    }
     let starts = partition_starts(&slices, estimated_run_bytes, threads);
     if starts.is_empty() {
-        return compact_with_in(
-            inputs,
-            keep_tombstone,
-            limits,
-            cuts,
-            workspace,
-            (pool, floors),
-        );
+        return Ok(None);
     }
-    let builder_workspace = workspace_for_segment(largest.iter().copied(), segment_len);
     let parts = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..=starts.len())
             .map(|at| {
                 let start = at.checked_sub(1).map(|i| starts[i]);
                 let end = starts.get(at).copied();
-                let keep = &keep_tombstone;
                 #[cfg(feature = "diagnostics")]
                 let bottom = super::copy_audit::bottom_inputs();
                 scope.spawn(move || {
@@ -552,7 +573,7 @@ pub(crate) fn compact_parallel_in<'a>(
                     super::copy_audit::set_bottom_inputs(bottom);
                     compact_range(
                         inputs,
-                        keep,
+                        keep_tombstone,
                         CompactLimits {
                             max_workspace_bytes: per_builder,
                             ..limits
@@ -600,7 +621,7 @@ pub(crate) fn compact_parallel_in<'a>(
         out.stats.tombstones_dropped += part.stats.tombstones_dropped;
         out.copied.add(part.copied);
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Approximate serial run boundaries with the same size estimate as planning.
