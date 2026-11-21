@@ -368,6 +368,8 @@ struct Table {
     views: VecDeque<View>,
     /// Held by the table and by every tree taken from it, so that a source
     /// handed to others can be followed until the last of them is dropped.
+    /// Keep this after `arena` and `root` so a snapshot drops both before
+    /// releasing the family reference used by batch admission.
     family: Arc<()>,
 }
 
@@ -806,9 +808,11 @@ impl Memtable {
         self.0.memory()
     }
 
-    /// Whether another view can still share this table's nodes or pages.
-    pub(crate) fn has_shared_storage(&self) -> bool {
-        Arc::strong_count(&self.0.family) > 1
+    /// Whether batch admission must allow for copy-on-write storage.
+    pub(crate) fn has_shared_storage(&mut self) -> bool {
+        // The uniqueness check synchronizes with snapshot teardown. Its
+        // family reference is released after its nodes and pages.
+        Arc::get_mut(&mut self.0.family).is_none()
     }
 
     /// A conservative upper bound on the charge of one additional update,
