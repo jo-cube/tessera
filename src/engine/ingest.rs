@@ -2,13 +2,18 @@
 //! assigns one effective sequence to the whole batch, after draining only
 //! tables that share an actual batch key. Compaction materializes it;
 //! checkpoints preserve the override.
+use super::batch::BatchSize;
 use super::*;
 use crate::run::RunBuilder;
+use std::ops::Range;
 
 /// Whether an ordered table shares any key with the sorted, unique batch keys.
 /// Starting the table at the first batch key bounds the walk to their range.
-fn overlaps<'a>(records: impl Iterator<Item = Record<'a>>, keys: &[&[u8]]) -> bool {
-    let mut keys = keys.iter().copied().peekable();
+fn overlaps<'a, 'k>(
+    records: impl Iterator<Item = Record<'a>>,
+    keys: impl Iterator<Item = &'k [u8]>,
+) -> bool {
+    let mut keys = keys.peekable();
     for record in records {
         while keys.peek().is_some_and(|key| *key < record.key) {
             keys.next();
@@ -20,6 +25,12 @@ fn overlaps<'a>(records: impl Iterator<Item = Record<'a>>, keys: &[&[u8]]) -> bo
         }
     }
     false
+}
+
+/// An operation's position in the batch and its prefixed key in scratch.
+struct IndexedKey {
+    operation: usize,
+    span: Range<usize>,
 }
 
 /// One keyspace's part of an ingested batch: its runs and their input.
@@ -74,46 +85,52 @@ impl Core {
         &self,
         batch: &WriteBatch,
         sorted: bool,
-        input: usize,
+        size: BatchSize,
     ) -> Result<u64, UpdateError> {
         let state = self.admit(self.write_state())?;
         batch.check_keyspaces(&state)?;
+        let key_workspace = size
+            .key_bytes
+            .saturating_add(batch.len().saturating_mul(size_of::<IndexedKey>()));
         let mut charge = self.resources.build(
-            input.saturating_mul(3),
-            crate::run::workspace_estimate([]).saturating_add(if sorted { 0 } else { input }),
+            size.charge.saturating_mul(3),
+            crate::run::workspace_estimate([]).saturating_add(key_workspace),
         );
         drop(state);
         // Sort the keys once for both run building and memtable overlap
         // checks. Keep the position of the last operation for each key so
         // the builder can borrow values directly from the batch.
-        let mut stored = Vec::new();
+        let mut stored = Vec::with_capacity(size.key_bytes);
         let mut indexed_keys = Vec::with_capacity(batch.len());
         let mut logical: BTreeMap<u32, usize> = BTreeMap::new();
         for (index, (keyspace, key, value)) in batch.records().enumerate() {
             let start = stored.len();
             stored.extend_from_slice(KeyPrefix::new(keyspace).as_bytes());
             stored.extend_from_slice(key);
-            indexed_keys.push((index, start..stored.len()));
+            indexed_keys.push(IndexedKey {
+                operation: index,
+                span: start..stored.len(),
+            });
             *logical.entry(keyspace).or_default() += crate::run::input_len(key, value);
         }
-        let stored_key = |span: &std::ops::Range<usize>| &stored[span.clone()];
+        let stored_key = |entry: &IndexedKey| &stored[entry.span.clone()];
         if !sorted {
-            indexed_keys.sort_unstable_by(|(a, a_key), (b, b_key)| {
-                stored_key(a_key)
-                    .cmp(stored_key(b_key))
-                    .then_with(|| b.cmp(a))
+            indexed_keys.sort_unstable_by(|a, b| {
+                stored_key(a)
+                    .cmp(stored_key(b))
+                    .then_with(|| b.operation.cmp(&a.operation))
             });
-            indexed_keys.dedup_by(|(_, a), (_, b)| stored_key(a) == stored_key(b));
+            indexed_keys.dedup_by(|a, b| stored_key(a) == stored_key(b));
         }
-        let mut built =
-            self.build_ingestion(indexed_keys.iter().map(|&(index, _)| batch.record(index)));
-        let keys: Vec<_> = indexed_keys
-            .into_iter()
-            .map(|(_, span)| stored_key(&span))
-            .collect();
+        let mut built = self.build_ingestion(
+            indexed_keys
+                .iter()
+                .map(|entry| batch.record(entry.operation)),
+        );
         for space in &mut built {
             space.logical = logical.get(&space.keyspace).copied().unwrap_or(0);
         }
+        drop(logical);
         #[cfg(test)]
         {
             let hook = self.after_ingest_build.lock().unwrap().take();
@@ -126,7 +143,8 @@ impl Core {
         let held: usize = runs().map(Run::held_bytes).sum();
         #[cfg(feature = "diagnostics")]
         let raw: usize = runs().map(Run::raw_len).sum();
-        charge.finished(bytes + held);
+        // Overlap checks still use the key scratch after the builders finish.
+        charge.finished(bytes + held, key_workspace);
         let mut built: Vec<(u32, usize, Vec<SharedRun>)> = built
             .into_iter()
             .map(|space| {
@@ -137,7 +155,9 @@ impl Core {
                 )
             })
             .collect();
-        let (lo, hi) = (keys[0], keys[keys.len() - 1]);
+        let keys = || indexed_keys.iter().map(stored_key);
+        let lo = stored_key(indexed_keys.first().expect("a nonempty batch"));
+        let hi = stored_key(indexed_keys.last().expect("a nonempty batch"));
         let mut state = self.write_state();
         batch.check_keyspaces(&state)?;
         // Freeze a potentially large table cheaply, then inspect it unlocked.
@@ -169,7 +189,7 @@ impl Core {
                 drop(state);
                 let target = tables
                     .iter()
-                    .filter(|table| overlaps(table.iter_from_in(Key::plain(lo)), &keys))
+                    .filter(|table| overlaps(table.iter_from_in(Key::plain(lo)), keys()))
                     .filter_map(|table| table.last_seq())
                     .max();
                 drop(tables);
@@ -186,12 +206,14 @@ impl Core {
                 // Include tables frozen by writers while state was released.
                 continue;
             }
-            if overlaps(state.active.iter_from_in(Key::plain(lo)), &keys) {
+            if overlaps(state.active.iter_from_in(Key::plain(lo)), keys()) {
                 state = self.make_room(state);
                 continue;
             }
             break;
         }
+        drop(indexed_keys);
+        drop(stored);
         // A keyspace dropped while the runs were built fails the batch.
         batch.check_keyspaces(&state)?;
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
@@ -265,6 +287,54 @@ mod tests {
             }
         }
         assert!(scan.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn ingestion_charges_key_scratch_through_overlap_checks() {
+        for keys in [[b"a", b"b"], [b"b", b"a"]] {
+            let engine = Engine::in_memory(Options {
+                memtable_size: 4 << 10,
+                background_compaction: None,
+                ..Options::default()
+            })
+            .unwrap();
+            let ks = engine.ks();
+            ks.put(b"a", b"old").unwrap();
+
+            let (sample, observed) = std::sync::mpsc::channel();
+            let building = engine.clone();
+            let build_sample = sample.clone();
+            *engine.core.after_ingest_build.lock().unwrap() = Some(Arc::new(move || {
+                build_sample
+                    .send(building.engine_stats().build_workspace_bytes)
+                    .unwrap();
+            }));
+            let flushing = engine.clone();
+            // This flush only starts when ingestion tries to publish over
+            // the old key. Sample before the flush itself reserves memory.
+            *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
+                sample
+                    .send(flushing.engine_stats().build_workspace_bytes)
+                    .unwrap();
+            }));
+
+            let mut batch = WriteBatch::new();
+            let value = [7; 3 << 10];
+            for key in keys {
+                batch.put(&ks, key, &value);
+            }
+            assert_eq!(engine.write_seq(&batch), Ok(2));
+            let prefix_len = KeyPrefix::new(ks.id()).as_bytes().len();
+            let key_workspace = keys.len() * (prefix_len + 1 + size_of::<IndexedKey>());
+            assert_eq!(
+                observed.try_iter().collect::<Vec<_>>(),
+                [
+                    crate::run::workspace_estimate([]) + key_workspace,
+                    key_workspace
+                ]
+            );
+            assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
+        }
     }
 
     #[test]

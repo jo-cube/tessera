@@ -74,6 +74,7 @@ impl<'e> FlushJob<'e> {
                 .flat_map(|(_, space)| &space.runs)
                 .map(|run| run.stored_len() + run.held_bytes())
                 .sum(),
+            0,
         );
         BuiltFlush {
             job: self,

@@ -705,8 +705,8 @@ impl Engine {
         if batch.is_empty() {
             return Ok(self.core.read_state().last_seq);
         }
-        let charge = batch.validate(self.core.memtable_budget)?;
-        self.core.ingest_batch(batch, true, charge)
+        let size = batch.validate(self.core.memtable_budget)?;
+        self.core.ingest_batch(batch, true, size)
     }
 
     /// Opens or creates the keyspace the crate's tests write to.

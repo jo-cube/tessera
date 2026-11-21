@@ -162,6 +162,12 @@ impl WriteBatch {
     }
 }
 
+/// The batch's memtable charge and the bytes needed to stage its prefixed keys.
+pub(super) struct BatchSize {
+    pub(super) charge: usize,
+    pub(super) key_bytes: usize,
+}
+
 impl WriteBatch {
     /// Whether the operations are strictly ascending in the memtables'
     /// order: by keyspace prefix, then key.
@@ -173,8 +179,9 @@ impl WriteBatch {
         })
     }
 
-    pub(super) fn validate(&self, budget: usize) -> Result<usize, UpdateError> {
+    pub(super) fn validate(&self, budget: usize) -> Result<BatchSize, UpdateError> {
         let mut charge = 0usize;
+        let mut key_bytes = 0;
         for (keyspace, key, value) in self.records() {
             let len = match value {
                 Value::Bytes(bytes) => bytes.len(),
@@ -189,8 +196,8 @@ impl WriteBatch {
                 return Err(UpdateError::Rejected(WriteError::ValueTooLong { len }));
             }
             // As the memtable charges it: the key behind its keyspace prefix.
-            let record =
-                KeyPrefix::new(keyspace).as_bytes().len() + key.len() + len + ENTRY_OVERHEAD;
+            let key_len = KeyPrefix::new(keyspace).as_bytes().len() + key.len();
+            let record = key_len + len + ENTRY_OVERHEAD;
             if record > budget {
                 return Err(UpdateError::Rejected(WriteError::RecordExceedsBudget {
                     charge: record,
@@ -198,8 +205,9 @@ impl WriteBatch {
                 }));
             }
             charge = charge.saturating_add(record);
+            key_bytes += key_len;
         }
-        Ok(charge)
+        Ok(BatchSize { charge, key_bytes })
     }
 }
 
@@ -210,11 +218,12 @@ impl Core {
         if batch.is_empty() {
             return Ok(self.read_state().last_seq);
         }
-        let charge = batch.validate(self.memtable_budget)?;
+        let size = batch.validate(self.memtable_budget)?;
+        let charge = size.charge;
         if charge >= self.bulk_ingest_min || charge > self.memtable_budget {
             let sorted = batch.is_sorted();
             if sorted || charge > self.memtable_budget {
-                return self.ingest_batch(batch, sorted, charge);
+                return self.ingest_batch(batch, sorted, size);
             }
         }
         if batch.len() == 1 {
