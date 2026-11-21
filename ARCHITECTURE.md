@@ -81,7 +81,8 @@ pool.
   only its keyspace's directory. A scan merges the memtables, bounded by the
   prefix, with its keyspace's groups. A snapshot holds one shared list of
   every keyspace's directory, taken with one reference count; a keyspace not
-  in the list reads as empty.
+  in the list reads as empty. A publication spanning several keyspaces
+  rebuilds this shared list once.
 - **Drop and recreate.** Dropping takes the flush and compaction locks,
   removes the keyspace from the catalog and retires its runs; snapshots that
   hold them keep reading. Handles and batches carry the ID, so after a drop

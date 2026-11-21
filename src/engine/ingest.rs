@@ -205,8 +205,8 @@ impl Core {
             let space = state.space_mut(*keyspace);
             space.levels.push_flush(runs, *logical);
             space.runs.append(runs);
-            state.published(*keyspace);
         }
+        state.published(built.iter().map(|(keyspace, _, _)| *keyspace));
         state.last_seq = seq;
         #[cfg(feature = "diagnostics")]
         self.chunks.work(0, 0, raw, bytes);

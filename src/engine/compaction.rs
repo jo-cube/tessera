@@ -491,7 +491,7 @@ impl<'e> CompactionJob<'e> {
         let space = state.space_mut(self.keyspace);
         space.runs.retain(|run| !is_input(run));
         space.runs.extend(outputs);
-        state.published(self.keyspace);
+        state.published([self.keyspace]);
         state.retire_runs(self.keyspace, inputs);
         drop(charge);
         drop(state);

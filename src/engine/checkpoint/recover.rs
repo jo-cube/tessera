@@ -88,7 +88,7 @@ impl Loaded {
                     Levels::recovered(&keyspace.runs, keyspace.depth, options.level_ratio);
                 state.names.insert(name, keyspace.id);
                 state.keyspaces.insert(keyspace.id, space);
-                state.published(keyspace.id);
+                state.published([keyspace.id]);
             }
         }
         core

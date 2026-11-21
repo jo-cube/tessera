@@ -145,24 +145,32 @@ impl State {
         Ok(id)
     }
 
-    /// Rebuilds keyspace `id`'s directory and byte counts after its runs
-    /// or levels changed, and what the engine keeps over all keyspaces.
-    /// Publication is rare, so this builds a fresh directory rather than
-    /// maintaining one, in O(n log n) for n runs, and readers holding the
-    /// previous directory keep it.
-    pub(super) fn published(&mut self, id: u32) {
-        let space = self.keyspaces.get_mut(&id).expect("a live keyspace");
-        space.directory = Arc::new(RunDirectory::build(&space.runs));
+    /// Rebuilds the directories and byte counts of the changed keyspaces,
+    /// then publishes the shared directory and level-0 count once.
+    pub(super) fn published(&mut self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            let space = self.space_mut(id);
+            space.directory = Arc::new(RunDirectory::build(&space.runs));
+            self.account_runs(id);
+        }
+        self.refresh_directories();
+        self.levels_changed();
+    }
+
+    /// Updates the byte counts after changing a keyspace's runs.
+    pub(super) fn account_runs(&mut self, id: u32) {
+        let space = self.space_mut(id);
         if cfg!(any(test, debug_assertions)) {
             space.levels.check(&space.runs);
         }
         let (run_bytes, held_bytes) = (space.run_bytes, space.held_bytes);
-        space.run_bytes = physical_runs(&space.runs).map(|r| r.run.stored_len()).sum();
-        space.held_bytes = physical_runs(&space.runs).map(|r| r.run.held_bytes()).sum();
-        self.run_bytes = self.run_bytes - run_bytes + space.run_bytes;
-        self.held_bytes = self.held_bytes - held_bytes + space.held_bytes;
-        self.refresh_directories();
-        self.levels_changed();
+        let (stored, held) = physical_runs(&space.runs).fold((0, 0), |(stored, held), run| {
+            (stored + run.run.stored_len(), held + run.run.held_bytes())
+        });
+        space.run_bytes = stored;
+        space.held_bytes = held;
+        self.run_bytes = self.run_bytes - run_bytes + stored;
+        self.held_bytes = self.held_bytes - held_bytes + held;
     }
 
     /// Recomputes the deepest level 0 after levels changed.

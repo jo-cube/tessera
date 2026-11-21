@@ -164,12 +164,14 @@ impl BuiltFlush<'_> {
             let flush = target.levels.next_flush();
             target.levels.push_flush(&runs, space.logical);
             target.runs.extend(runs.iter().cloned());
-            state.published(keyspace);
             kept.push(Kept {
                 keyspace,
                 flush,
                 runs,
             });
+        }
+        if !kept.is_empty() {
+            state.published(kept.iter().map(|space| space.keyspace));
         }
         #[cfg(feature = "diagnostics")]
         job.engine.chunks.work(0, 0, raw, report.run_bytes);

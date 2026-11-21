@@ -221,7 +221,7 @@ impl<'e> BuiltCompaction<'e> {
             .runs
             .extend(sources.iter().filter_map(|(_, r)| r.clone()));
         space.runs.extend(outputs.iter().cloned());
-        state.published(job.keyspace);
+        state.published([job.keyspace]);
         let removed: Vec<_> = bottom
             .iter()
             .chain(sources.iter().map(|(r, _)| r))

@@ -43,7 +43,7 @@ fn fixture_with_threads(background_threads: usize) -> Engine {
         space.runs = published(runs).collect();
         let recovered: Vec<_> = space.runs.iter().map(|r| (1, 0, r.clone())).collect();
         space.levels = Levels::recovered(&recovered, 1, 10);
-        state.published(id);
+        state.published([id]);
         state.split_flushes = false;
     }
     for key in 0..KEYS {
@@ -368,7 +368,7 @@ fn corruption_in_a_middle_piece_preserves_completed_publications() {
             .unwrap();
         let at = space.runs.iter().position(|r| Arc::ptr_eq(r, old)).unwrap();
         space.runs[at] = new.clone();
-        state.published(id);
+        state.published([id]);
     };
     replace(&clean, &damaged);
     assert!(matches!(
