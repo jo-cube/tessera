@@ -777,7 +777,9 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
 }
 
 fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
-    let picks: Vec<usize> = (0..20_000)
+    let count: usize =
+        std::env::var("TESSERA_BENCH_SCAN_COUNT").map_or(20_000, |s| s.parse().unwrap());
+    let picks: Vec<usize> = (0..count)
         .map(|_| data.scan_groups[rng.n(data.scan_groups.len())])
         .collect();
     let want: Vec<usize> = picks
