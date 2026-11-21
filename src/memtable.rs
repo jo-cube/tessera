@@ -805,6 +805,11 @@ impl Memtable {
         self.0.memory()
     }
 
+    /// Whether another view can still share this table's nodes or pages.
+    pub(crate) fn has_shared_storage(&self) -> bool {
+        Arc::strong_count(&self.0.family) > 1
+    }
+
     /// A conservative upper bound on the charge of one additional update,
     /// including nodes and records a live snapshot could pin.
     pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> usize {

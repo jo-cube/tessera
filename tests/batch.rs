@@ -160,6 +160,31 @@ fn a_sorted_batch_above_the_ingestion_threshold_is_ingested() {
 }
 
 #[test]
+fn a_small_batch_keeps_snapshot_history_when_the_active_table_is_nearly_full() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 1024,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let old = [7; 750];
+    ks.put(b"a", &old).unwrap();
+    let snapshot = engine.snapshot();
+
+    // The batch itself fits in the remaining budget, but copying the
+    // snapshot's page would not. It must still apply as a single batch.
+    let mut batch = WriteBatch::new();
+    batch.put(&ks, b"a", b"new");
+    batch.put(&ks, b"b", b"added");
+    assert_eq!(engine.write_seq(&batch), Ok(3));
+    assert_eq!(ks.get(b"a").unwrap().as_deref(), Some(&b"new"[..]));
+    assert_eq!(ks.get(b"b").unwrap().as_deref(), Some(&b"added"[..]));
+    let mut reader = snapshot.reader();
+    assert_eq!(reader.get(&ks, b"a").unwrap(), Some(old.as_slice()));
+    assert_eq!(reader.get(&ks, b"b").unwrap(), None);
+}
+
+#[test]
 fn oversized_unsorted_batches_keep_the_last_duplicate_and_publish_atomically() {
     let engine = Engine::in_memory(Options {
         memtable_size: 256,

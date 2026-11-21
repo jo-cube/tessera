@@ -204,9 +204,11 @@ impl Core {
             return Ok(self.read_state().last_seq);
         }
         let charge = batch.validate(self.memtable_budget)?;
-        let sorted = batch.is_sorted();
-        if sorted && charge >= self.bulk_ingest_min || charge > self.memtable_budget {
-            return self.ingest_batch(batch, sorted, charge);
+        if charge >= self.bulk_ingest_min || charge > self.memtable_budget {
+            let sorted = batch.is_sorted();
+            if sorted || charge > self.memtable_budget {
+                return self.ingest_batch(batch, sorted, charge);
+            }
         }
         if batch.len() == 1 {
             let (keyspace, key, value) = batch.records().next().unwrap();
@@ -219,10 +221,17 @@ impl Core {
                 .last_seq
                 .checked_add(batch.len() as u64)
                 .expect(SEQUENCES);
-            let needed = batch.records().fold(0usize, |sum, (keyspace, key, value)| {
-                let prefix = KeyPrefix::new(keyspace);
-                sum.saturating_add(state.active.write_charge(prefix.key(key), value))
-            });
+            // Without shared storage, the validated charge already bounds the
+            // append and a new slot for every operation. Only snapshots can
+            // add copy-on-write costs, and none can start under the state lock.
+            let needed = if state.active.has_shared_storage() {
+                batch.records().fold(0usize, |sum, (keyspace, key, value)| {
+                    let prefix = KeyPrefix::new(keyspace);
+                    sum.saturating_add(state.active.write_charge(prefix.key(key), value))
+                })
+            } else {
+                charge
+            };
             let memory = state.active.memory();
             if needed <= memory.budget.saturating_sub(memory.charged) {
                 for (keyspace, key, value) in batch.records() {
