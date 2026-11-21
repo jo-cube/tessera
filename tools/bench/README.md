@@ -3,7 +3,7 @@
 This macOS-specific tool compares Tessera with RocksDB using APFS RAM disks,
 Mach memory counters, Homebrew libraries and a C++ adapter. It measures load,
 updates, point reads, multi-get, scans, mixed reader/writer work and sorted
-bulk ingestion. It also checks sampled reads and scans against an input oracle.
+bulk loading. It also checks sampled reads and scans against an input oracle.
 
 ## Build and run
 
@@ -39,11 +39,14 @@ Dataset A is 1 GiB of grouped JSON; B is 512 MiB of weak-locality JSON. Both
 are generated before timing. Regular workloads use shuffled 256-record write
 batches, 50% updates and 2% deletes, 220k point reads with 10% misses, 1 or 4
 readers, multi-get batches of 100 random or adjacent keys, 20k prefix scans,
-and 64 MiB sorted ingestion batches. Mixed work offers writes at 70% of
+and 64 MiB sorted bulk batches: Tessera writes each as one `WriteBatch`,
+which it builds into runs outside its lock, and RocksDB ingests each as an
+SST file. Mixed work offers writes at 70% of
 Tessera's update rate (or the selected engine's rate when Tessera is absent).
 Write measurements include maintenance drains. `r-large` skips bulk and mixed.
 
-Tessera uses default options. RocksDB disables WAL and syncs, uses four
+Tessera uses default options and one keyspace, and reads through one
+`Reader` per thread. RocksDB disables WAL and syncs, uses four
 background jobs, dynamic leveled compaction, two 64 MiB write buffers, LZ4
 upper levels, Zstandard at the bottom, 16 KiB blocks and Bloom filters.
 `r-small` has a 128 MiB block cache; `r-large` uses 1.25 times the raw dataset.

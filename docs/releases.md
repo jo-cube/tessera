@@ -29,11 +29,24 @@ Versions follow [semantic versioning](https://semver.org). Before 1.0:
   minimum Rust version, and its changelog says which;
 - a patch version (0.1.0 → 0.1.1) keeps all three.
 
-The checkpoint format is run format 1 with manifest version 1. Recovery
-rejects versions it does not support, and there is no converter: to cross a
-format change, an application recovers with the old version and writes its
-data into an engine of the new one. The `diagnostics` and `tools-memory`
-features and their counters are not part of the stable API.
+### Checkpoint format
+
+Tessera 0.1 writes **format version 1**: run files, the manifest (with its
+keyspace table) and `CURRENT` are each at version 1;
+[the guide](guide.md#recovery-and-the-on-disk-layout) describes the layout.
+
+- A patch release reads and writes exactly the format of its minor version.
+- A minor release that changes the format bumps the version of each file it
+  changes and says so in its changelog. Recovery rejects any version it does
+  not support with a `Corruption` error naming it ("unsupported manifest
+  version N") and never rewrites the directory.
+- There is no converter. To cross a format change, open the directory with
+  the release that wrote it, read every keyspace and write it into an
+  engine of the target release, then checkpoint that engine into a fresh
+  directory.
+
+The `diagnostics` and `tools-memory` features and their counters are not part
+of the stable API.
 
 ## Supported platforms
 
@@ -60,10 +73,12 @@ systems may work and are untested.
 - Checkpoints depend on file and directory fsync, advisory locks and atomic
   rename on a local filesystem; tests cannot establish real power-loss
   behaviour. Network filesystems are unsupported.
-- Multi-key atomic batches are supported. Read/write transactions,
+- Atomic batches across keyspaces are supported. Read/write transactions,
   replication and disk tiering are outside the API.
-- A `ReadGuard` blocks writers for its lifetime; snapshots retain their sources.
-- A worker panic stops that worker; callers can inspect its failure.
+- Snapshots, and scans of the latest state, retain the sources they read
+  until dropped, and that memory counts against writer admission.
+- An engine holds at most 4096 live keyspaces.
+- A worker panic stops that worker; `Engine::close` reports it.
 
 ## Releasing
 

@@ -34,8 +34,8 @@ same records over N keyspaces, record `i` in keyspace `i % N`, and checks
 every read in its keyspace; the probe rows and `--worst` need one keyspace.
 
 The hidden `diagnostics` feature provides the counters. It is not part of the
-stable API. The [basic example](../examples/basic.rs) demonstrates the public
-API.
+stable API. The programs in [`examples/`](../examples) demonstrate the public
+API: `basic`, `keyspaces`, `offsets` and `hot_reads`.
 
 The macOS [comparison harness](bench/README.md) measures Tessera and RocksDB.
 

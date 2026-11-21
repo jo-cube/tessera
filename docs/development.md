@@ -18,20 +18,23 @@ The `justfile` is the one list of checks. CI runs its recipes, and so does
 | `just clippy` | Clippy on every target and feature, warnings denied |
 | `just test` | the default tests, then the integration tests that need `diagnostics` |
 | `just doc` | rustdoc with warnings and missing docs denied |
+| `just examples` | runs each program in `examples/`; each checks its own results |
 | `just long` | the ignored long correctness campaigns, one at a time |
 | `just build` | a release build of the library |
 | `just package` | `cargo package --locked`, then a check that the `.crate` holds only `src`, `tests`, `examples`, the README, license, changelog and architecture notes |
 | `just msrv` | `cargo check` and Clippy on every target on Rust 1.89 |
 | `just scripts-test` | the unit tests of `scripts/release.py` |
-| `just all` | fmt, clippy, test, doc, long, package and scripts-test: CI's `checks` job |
+| `just all` | fmt, clippy, test, doc, examples, long, package and scripts-test: CI's `checks` job |
 | `just validate [STEP]` | `scripts/validate.sh STEP` |
 | `just bench [ARGS]` | the macOS comparison harness, `tools/bench/run.sh ARGS` |
 | `just release-prep X.Y.Z` | release preparation; see [releases](releases.md#releasing) |
 
 `just package` packages the committed tree, so commit before running it.
-The default suite includes bounded mutation tests and a concurrent sequence
-model with a 20-second process deadline. The long campaigns are longer
-variants of these. The large-allocation boundary tests are also ignored and
+The default suite includes bounded mutation tests, a concurrent sequence
+model with a 20-second process deadline and a model of five keyspaces with
+drops, snapshots and reopening. The long campaigns are longer variants of
+these; together they take about two and a half minutes in the container,
+half the `long` step's bound. The large-allocation boundary tests are also ignored and
 run only in the container (`scripts/validate.sh limits`).
 
 ## Container validation
@@ -86,7 +89,7 @@ source into `~/.cache/tessera-bench/rocksdb-11.13.2/`, a cache kept outside the
 repository so it survives clean checkouts. `just bench` builds and runs the
 suite and writes results under `.work/bench/`. It is not a release gate.
 [tools/bench/README.md](../tools/bench/README.md) covers the build, workloads
-and accounting.
+and accounting, and [performance](performance.md) the published results.
 
 ## Commits
 
