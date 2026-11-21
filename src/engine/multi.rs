@@ -1,7 +1,7 @@
 //! Batched lookups: one index sort, table passes, then one ordered pass per
 //! run group. Values and metadata use reusable arenas; no per-key allocation.
 use super::*;
-use crate::run::{ReadWorkspace, RunList};
+use crate::run::ReadWorkspace;
 use std::ops::Range;
 
 #[derive(Debug, Default, Clone)]
@@ -20,6 +20,7 @@ pub(super) struct Workspace {
     probes: Vec<usize>,
     hits: Vec<Hit>,
     values: Vec<u8>,
+    unresolved: usize,
     read: ReadWorkspace,
 }
 
@@ -56,6 +57,7 @@ impl Workspace {
         self.hits.clear();
         self.hits.resize_with(keys.len(), Hit::default);
         self.values.clear();
+        self.unresolved = keys.len();
     }
 
     fn table<'a, K: AsRef<[u8]>>(
@@ -63,6 +65,9 @@ impl Workspace {
         keys: &[K],
         get: impl Fn(&[u8]) -> Option<Version<'a>>,
     ) {
+        if self.unresolved == 0 {
+            return;
+        }
         for &index in &self.order {
             if self.hits[index].memory {
                 continue;
@@ -70,6 +75,7 @@ impl Workspace {
             if let Some(version) = get(keys[index].as_ref()) {
                 self.hits[index].set(version, 0, &mut self.values);
                 self.hits[index].memory = true;
+                self.unresolved -= 1;
             }
         }
     }
@@ -79,13 +85,52 @@ impl Workspace {
         keys: &[K],
         directory: &RunDirectory,
     ) -> Result<(), ReadError> {
-        for group in directory.groups() {
+        if self.unresolved == 0 {
+            return Ok(());
+        }
+        let mut any_found = false;
+        for (group_max_seq, base, runs) in directory.group_slices() {
+            if any_found {
+                let min_seq = self
+                    .hits
+                    .iter()
+                    .filter(|hit| !hit.memory)
+                    .map(|hit| hit.seq)
+                    .try_fold(u64::MAX, |min, seq| seq.map(|s| min.min(s)));
+                if min_seq.is_some_and(|seq| seq > group_max_seq) {
+                    break;
+                }
+            }
             let mut next = 0;
-            for input in group {
-                let run = directory.run(input);
-                let Some(range) = run.key_range() else {
-                    continue;
+            let mut run_idx = 0;
+            while next < self.order.len() && run_idx < runs.len() {
+                while next < self.order.len() {
+                    let hit = &self.hits[self.order[next]];
+                    if hit.memory || hit.seq.is_some_and(|seq| seq > group_max_seq) {
+                        next += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if next >= self.order.len() {
+                    break;
+                }
+                let key = keys[self.order[next]].as_ref();
+                let rest = &runs[run_idx..];
+                let first_range = rest[0].run.key_range().expect(NOT_EMPTY);
+                let range = if first_range.max < key {
+                    run_idx += 1 + rest[1..]
+                        .partition_point(|r| r.run.key_range().expect(NOT_EMPTY).max < key);
+                    if run_idx >= runs.len() {
+                        break;
+                    }
+                    runs[run_idx].run.key_range().expect(NOT_EMPTY)
+                } else {
+                    first_range
                 };
+                let input = base + run_idx;
+                let run = &runs[run_idx].run;
+                run_idx += 1;
                 while next < self.order.len() && keys[self.order[next]].as_ref() < range.min {
                     next += 1;
                 }
@@ -114,6 +159,7 @@ impl Workspace {
                 run.view().get_many(keys, probes, read, |index, version| {
                     if let Some(version) = version {
                         hits[index].consider(version, input, values);
+                        any_found = true;
                     }
                 })?;
             }
@@ -197,8 +243,11 @@ impl Workspace {
         }
         if self.order.capacity() * size_of::<usize>() > bytes {
             self.order = Vec::new();
+        }
+        if self.probes.capacity() * size_of::<usize>() > bytes {
             self.probes = Vec::new();
         }
+        self.read.trim(bytes);
     }
 }
 
@@ -297,5 +346,67 @@ mod tests {
         for value in workspace.found() {
             assert_eq!(value, Some(&b"a moderately sized value"[..]));
         }
+    }
+
+    #[test]
+    fn sparse_multi_get_prunes_disjoint_runs_and_older_groups() {
+        let mut group0 = Vec::new();
+        for i in 0..128u32 {
+            let key = (i * 2).to_be_bytes();
+            let val = format!("v{i:03}");
+            group0.push(run(&[(&key, 10, Value::Bytes(val.as_bytes()))]));
+        }
+        // An older overlapping damaged run for keys already decided by group 0.
+        let older_source = run(&[(&0u32.to_be_bytes(), 5, Value::Bytes(b"old"))]);
+        let older_damaged = Arc::new(Published {
+            id: crate::engine::checkpoint::new_run_id(),
+            checkpoint_crc: std::sync::OnceLock::new(),
+            run: older_source.run.damaged_at(16),
+            largest_block: 0,
+        });
+        let mut all = group0;
+        all.push(older_damaged);
+        let directory = RunDirectory::build(&all);
+        assert_eq!(directory.group_count(), 2);
+
+        // Sparse probes: hits in group 0 (which prune the older damaged group)
+        // plus misses between runs, unsorted and with duplicates.
+        let probes = [
+            250u32.to_be_bytes(),
+            0u32.to_be_bytes(),
+            129u32.to_be_bytes(), // miss between runs
+            0u32.to_be_bytes(),   // duplicate
+            256u32.to_be_bytes(), // above all runs
+        ];
+        let mut workspace = Workspace::default();
+        workspace.prepare(&probes);
+        workspace.runs(&probes, &directory).unwrap();
+        let found: Vec<Option<Vec<u8>>> =
+            workspace.found().map(|v| v.map(<[u8]>::to_vec)).collect();
+        assert_eq!(
+            found,
+            vec![
+                Some(b"v125".to_vec()),
+                Some(b"v000".to_vec()),
+                None,
+                Some(b"v000".to_vec()),
+                None,
+            ]
+        );
+        // Only the two touched runs (0 and 125) decoded one block each.
+        assert_eq!(workspace.blocks_loaded(), 2);
+
+        // When every key is decided in memory, runs are never touched at all.
+        let mut workspace = Workspace::default();
+        workspace.prepare(&[0u32.to_be_bytes()]);
+        workspace.table(&[0u32.to_be_bytes()], |_| {
+            Some(Version {
+                seq: 20,
+                value: Value::Bytes(b"mem"),
+            })
+        });
+        workspace.runs(&[0u32.to_be_bytes()], &directory).unwrap();
+        assert_eq!(workspace.blocks_loaded(), 0);
+        assert_eq!(workspace.found().next(), Some(Some(&b"mem"[..])));
     }
 }

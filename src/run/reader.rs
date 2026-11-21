@@ -691,6 +691,13 @@ impl ReadWorkspace {
         self.decoded_bytes += frame.decoded_len as u64;
         decode(frame, &mut self.scratch, &mut self.decompressor)
     }
+
+    /// Releases a decoding buffer larger than `bytes`.
+    pub(crate) fn trim(&mut self, bytes: usize) {
+        if self.scratch.capacity() > bytes {
+            self.scratch = Vec::new();
+        }
+    }
 }
 
 /// Where a cursor's range ends.
@@ -876,6 +883,15 @@ impl LookupWorkspace {
             Located::Tombstone => Value::Tombstone,
             Located::Stored(value) => Value::Bytes(value),
             Located::Decoded(start, end) => Value::Bytes(&self.buffers[found.buffer][start..end]),
+        }
+    }
+
+    /// Releases decoding buffers larger than `bytes`.
+    pub(crate) fn trim(&mut self, bytes: usize) {
+        for buffer in &mut self.buffers {
+            if buffer.capacity() > bytes {
+                *buffer = Vec::new();
+            }
         }
     }
 }

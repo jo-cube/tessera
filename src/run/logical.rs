@@ -157,6 +157,12 @@ impl LogicalWorkspace {
     pub fn decoded_bytes(&self) -> u64 {
         self.merge.decoded_bytes() + self.lookup.decoded_bytes()
     }
+
+    /// Releases decoding buffers larger than `bytes`.
+    pub(crate) fn trim(&mut self, bytes: usize) {
+        self.merge.trim(bytes);
+        self.lookup.trim(bytes);
+    }
 }
 
 #[cfg(test)]

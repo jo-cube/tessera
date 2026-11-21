@@ -59,6 +59,13 @@ impl MergeWorkspace {
         }
         &mut self.runs[..inputs]
     }
+
+    /// Releases decoding buffers larger than `bytes`.
+    pub(crate) fn trim(&mut self, bytes: usize) {
+        for run in &mut self.runs {
+            run.trim(bytes);
+        }
+    }
 }
 
 /// An ordered stream over several runs, which may overlap and may use

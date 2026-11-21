@@ -172,6 +172,18 @@ impl RunDirectory {
     pub(super) fn groups(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
         self.groups.iter().map(|group| group.start..group.end)
     }
+
+    /// Each group's sequence bound, first run position, and runs in ascending
+    /// key order, ordered by descending sequence bound.
+    pub(super) fn group_slices(&self) -> impl Iterator<Item = (u64, usize, &[SharedRun])> {
+        self.groups.iter().map(|group| {
+            (
+                group.max_seq,
+                group.start,
+                &self.runs[group.start..group.end],
+            )
+        })
+    }
 }
 
 impl RunList for RunDirectory {

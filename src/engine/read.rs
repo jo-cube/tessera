@@ -210,6 +210,10 @@ impl Buffers {
                 *buffer = Vec::new();
             }
         }
+        if self.results.capacity() * size_of::<Option<&'static [u8]>>() > RETAINED_BYTES {
+            self.results = Vec::new();
+        }
+        self.logical.trim(RETAINED_BYTES);
         self.multi.trim(RETAINED_BYTES);
     }
 }
