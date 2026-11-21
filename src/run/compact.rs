@@ -514,9 +514,10 @@ fn try_compact_parallel_in<'a>(
     let (segment_len, builder_workspace) = loop {
         let segment = SEGMENT_RAW_LEN.div_ceil(threads).max(super::RAW_BLOCK_CAP);
         let builder = workspace_for_segment(largest.iter().copied(), segment);
-        let live = key_bytes.saturating_add(threads.saturating_sub(1) * size_of::<&[u8]>());
+        let starts_bytes = threads.saturating_sub(1) * size_of::<&[u8]>();
+        let live = key_bytes.saturating_add(starts_bytes);
         let allowance = limits.max_workspace_bytes.saturating_sub(live) / threads;
-        if builder <= allowance {
+        if fixed_metadata.saturating_add(live) <= max_metadata && builder <= allowance {
             break (segment, builder);
         }
         threads -= 1;
@@ -537,9 +538,11 @@ fn try_compact_parallel_in<'a>(
             boundaries.push((start..boundary_bytes.len(), input.block_bytes(block)));
         }
     }
+    let starts_bytes = threads.saturating_sub(1) * size_of::<&[u8]>();
     let peak_metadata = boundary_bytes
         .capacity()
-        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>());
+        .saturating_add(boundaries.capacity() * size_of::<(std::ops::Range<usize>, usize)>())
+        .saturating_add(starts_bytes);
     if peak_metadata > max_metadata {
         return Ok(None);
     }
@@ -652,7 +655,8 @@ fn partition_with<'a>(
     threads: usize,
 ) -> Vec<&'a [u8]> {
     let full_runs = (0..len).map(&bytes_at).sum::<usize>() / target;
-    let mut starts = Vec::with_capacity(threads - 1);
+    let mut starts = Vec::new();
+    starts.reserve_exact(threads - 1);
     let mut seen = 0;
     let mut at = 0;
     while at < len && starts.len() < threads - 1 {
