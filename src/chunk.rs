@@ -3,7 +3,7 @@
 //! Shared ownership returns an allocation only after its last user releases it,
 //! bounding idle capacity without constraining live data.
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) const CHUNK_BYTES: usize = 1 << 20;
@@ -13,13 +13,15 @@ pub(crate) const RESERVE_BYTES: usize = 32 << 20;
 struct State {
     free: Vec<Box<[u8]>>,
     in_use: usize,
-    used: usize,
     limit: usize,
 }
 
 #[derive(Debug)]
 struct Pool {
     state: Mutex<State>,
+    /// Logically charged bytes across checked-out chunks. Updated atomically
+    /// on writes without taking `state`.
+    used: AtomicUsize,
     counters: Counters,
 }
 
@@ -132,6 +134,7 @@ impl ChunkPool {
                 limit: reserve_bytes / CHUNK_BYTES,
                 ..State::default()
             }),
+            used: AtomicUsize::new(0),
             counters: Counters::default(),
         }))
     }
@@ -293,20 +296,24 @@ impl ChunkPool {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let used = self.0.used.load(Ordering::Relaxed);
         (
             state.free.len() * CHUNK_BYTES,
             state.in_use * CHUNK_BYTES,
             state.limit * CHUNK_BYTES,
-            (state.in_use * CHUNK_BYTES).saturating_sub(state.used),
+            (state.in_use * CHUNK_BYTES).saturating_sub(used),
         )
     }
     pub(crate) fn trim(&self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .free
-            .clear();
+        let dropped = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut state.free)
+        };
+        drop(dropped);
     }
 }
 
@@ -335,9 +342,15 @@ impl Chunk {
     }
 
     pub(crate) fn set_used(&mut self, used: usize) {
+        if used == self.used {
+            return;
+        }
         if let Some(pool) = self.pool.upgrade() {
-            let mut state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
-            state.used = state.used - self.used + used;
+            if used > self.used {
+                pool.used.fetch_add(used - self.used, Ordering::Relaxed);
+            } else {
+                pool.used.fetch_sub(self.used - used, Ordering::Relaxed);
+            }
         }
         self.used = used;
     }
@@ -367,8 +380,8 @@ impl Drop for Chunk {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
             let mut state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
+            pool.used.fetch_sub(self.used, Ordering::Relaxed);
             state.in_use -= 1;
-            state.used -= self.used;
             if state.free.len() < state.limit {
                 state.free.push(std::mem::take(&mut self.bytes));
             }
@@ -424,5 +437,27 @@ mod tests {
         drop(pool);
         assert_eq!(chunk.bytes()[0], 42);
         drop(chunk);
+    }
+
+    #[test]
+    fn accounting_tracks_used_bytes_across_updates_and_drops() {
+        let pool = ChunkPool::new(2 * CHUNK_BYTES);
+        let mut first = pool.take();
+        let mut second = pool.take();
+        assert_eq!(
+            pool.accounting(),
+            (0, 2 * CHUNK_BYTES, 2 * CHUNK_BYTES, 2 * CHUNK_BYTES)
+        );
+        first.set_used(1000);
+        second.set_used(3000);
+        assert_eq!(pool.accounting().3, 2 * CHUNK_BYTES - 4000);
+        first.set_used(400);
+        assert_eq!(pool.accounting().3, 2 * CHUNK_BYTES - 3400);
+        drop(first);
+        assert_eq!(pool.accounting().3, CHUNK_BYTES - 3000);
+        drop(second);
+        assert_eq!(pool.accounting(), (2 * CHUNK_BYTES, 0, 2 * CHUNK_BYTES, 0));
+        pool.trim();
+        assert_eq!(pool.accounting(), (0, 0, 2 * CHUNK_BYTES, 0));
     }
 }
