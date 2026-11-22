@@ -144,6 +144,14 @@ impl State {
         Ok(id)
     }
 
+    /// The commits and flush publications visible under the state lock.
+    pub(super) fn write_activity(&self) -> WriteActivity {
+        WriteActivity {
+            sequence: self.last_seq,
+            flushes: self.flushes,
+        }
+    }
+
     /// Rebuilds the directories and byte counts of the changed keyspaces,
     /// then publishes the shared directory and level-0 count once.
     pub(super) fn published(&mut self, ids: impl IntoIterator<Item = u32>) {

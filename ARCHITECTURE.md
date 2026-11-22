@@ -42,9 +42,17 @@ large write ─▶ private runs ────────────▶ level 0 
 - **Levels.** Level 0 holds flushes in publication order and may overlap.
   Deeper levels are sorted and strictly disjoint, with targets set by
   `level_ratio` (default 10) and dynamic level sizing. Level 0 is compacted at
-  four flush groups; writers wait at twelve.
-- **Compaction.** The worker takes the most overfull level, then level 0, then
-  small neighbours. Nonoverlapping runs move down without a rewrite. Level-0 →
+  four flush groups; writers wait at twelve. A group counts as long as any
+  of its runs remain in level 0, including slices outside the last merge.
+- **Compaction.** The worker takes the most overfull level, then eligible
+  level 0, then small neighbours. Nonoverlapping runs usually move down by
+  relabelling. When ordinary work runs out and level 0 still holds runs, the
+  worker waits for two quiet seconds before promoting those runs. It checks
+  the committed sequence and flush count at selection. If writes resume,
+  the selected job can finish and further idle selections wait for quiet.
+  An isolated idle promotion into the bottom can rewrite the source to
+  remove its filter and elide tombstones under the ordinary erasure rules.
+  Level-0 →
   bottom jobs run as key-range pieces of about one target run of bottom input:
   each piece publishes atomically and frees its inputs, and level-0 sources
   shrink to bounded views of their remaining range. Up to
@@ -75,8 +83,9 @@ pool.
   bottom. The compaction worker scores every keyspace's plan and takes the
   highest; a keyspace whose level 0 is at the writer stop always ranks first,
   and ties go round-robin from a cursor. Under memory pressure it takes the
-  keyspace with the most reclaimable bytes. The piece allowance and builder
-  count are shared, so one keyspace's job never takes more than they allow.
+  keyspace with the most reclaimable bytes. Quiet level-0 runs rank below
+  ordinary work in every keyspace. The piece allowance and builder count are
+  shared, so one keyspace's job never takes more than they allow.
 - **Reads.** A point read probes the memtables with the prefixed key, then
   only its keyspace's directory. A scan merges the memtables, bounded by the
   prefix, with its keyspace's groups. A snapshot holds one shared list of
@@ -144,8 +153,10 @@ build output and workspace. Shared sources count once. Below 90% writers
 proceed; above it they wait briefly on publication; at 100% they request
 reclamation and fail with `MemoryLimit` only when live data and held
 snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
-never refused, so maintenance can always finish and free space. Readers'
-buffers and allocator overhead are outside the budget.
+never refused, so maintenance can always finish and free space. Quiet
+level-0 compaction uses the same estimates and charges for pieces and
+retired sources. Snapshots and checkpoints may retain the inputs after
+publication. Readers' buffers and allocator overhead are outside the budget.
 
 ## Checkpoints
 
@@ -255,6 +266,11 @@ keeps only the newest version of each key.
   grouped data, none on weak-locality data, while point-read work rises
   56–525%, worst-point scans up to 83% and live heap up to 58%; no existing
   option carries the trade.
+- Eagerly scheduling every split slice of a partially merged flush group
+  would spend a rewrite on a range that can still collect other writes.
+  Deferring below-threshold slices until quiet keeps ordinary scoring and
+  piece bounds intact, and the worker stops timing its wait when level 0
+  empties.
 - Range-partitioned shards: no change to write amplification for random writes,
   at the cost of a large rewrite.
 

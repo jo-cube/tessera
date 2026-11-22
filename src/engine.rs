@@ -144,6 +144,12 @@ const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowanc
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
 const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteActivity {
+    sequence: u64,
+    flushes: u64,
+}
+
 struct State {
     last_seq: u64,
     /// The live keyspaces by ID. Created and dropped under this lock, so
@@ -753,7 +759,21 @@ impl Core {
         options: CompactionPolicy,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        match self.begin_compaction(options)? {
+        self.compact_when(options, workspace, None)
+    }
+
+    fn idle_activity(&self) -> Option<WriteActivity> {
+        let state = self.read_state();
+        (state.level0_flushes != 0).then(|| state.write_activity())
+    }
+
+    fn compact_when(
+        &self,
+        options: CompactionPolicy,
+        workspace: &mut MergeWorkspace,
+        quiet: Option<WriteActivity>,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        match self.begin_compaction(options, quiet)? {
             Some(Begun::Job(job)) => job.execute(workspace).map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
@@ -762,13 +782,18 @@ impl Core {
 
     /// The keyspace compaction serves next, after adding the levels each
     /// keyspace's size calls for: the highest [`levels::Score`], or under
-    /// reclaim the most reclaimable bytes among keyspaces with work. Ties go
-    /// to the first keyspace after the one served last, in ID order, so
-    /// that equal keyspaces take turns.
-    fn choose_keyspace(state: &mut State, fit: &Fit, reclaim: bool) -> Option<u32> {
+    /// reclaim the most reclaimable bytes among keyspaces with work. When
+    /// quiet, keyspaces with any level-0 runs are eligible below every
+    /// ordinary score. Ties rotate in keyspace ID order.
+    fn choose_keyspace(
+        state: &mut State,
+        fit: &Fit,
+        reclaim: bool,
+        quiet: bool,
+    ) -> Option<(u32, bool)> {
         let cursor = state.compaction_cursor;
         // IDs after the cursor first, then the rest: a key that wraps.
-        let mut best: Option<((bool, u32), (levels::Score, usize))> = None;
+        let mut best = None;
         for (&id, space) in &mut state.keyspaces {
             let turn = (id <= cursor, id);
             space.levels.insert_levels(fit);
@@ -776,12 +801,16 @@ impl Core {
                 if matches!(space.levels.plan_reclaim(fit), Plan::Idle) {
                     continue;
                 }
-                (levels::Score::default(), space.levels.reclaimable_bytes())
+                (
+                    Some(levels::Score::default()),
+                    space.levels.reclaimable_bytes(),
+                )
             } else {
-                match space.levels.score(fit) {
-                    Some(score) => (score, 0),
-                    None => continue,
+                let score = space.levels.score(fit);
+                if score.is_none() && !(quiet && space.levels.has_level0()) {
+                    continue;
                 }
+                (score, 0)
             };
             let better = best
                 .as_ref()
@@ -790,9 +819,9 @@ impl Core {
                 best = Some((turn, rank));
             }
         }
-        let ((_, id), _) = best?;
+        let ((_, id), (score, _)) = best?;
         state.compaction_cursor = id;
-        Some(id)
+        Some((id, score.is_none()))
     }
 
     /// Chooses the next step from the levels, under the exclusive lock
@@ -802,6 +831,7 @@ impl Core {
     fn begin_compaction(
         &self,
         options: CompactionPolicy,
+        quiet: Option<WriteActivity>,
     ) -> Result<Option<Begun<'_>>, CompactionError> {
         // As for flushing, this mutex guards no data.
         let serial = self
@@ -816,13 +846,20 @@ impl Core {
             panic!("injected compaction failure");
         }
         let mut state = self.write_state();
+        if quiet.is_some_and(|activity| activity != state.write_activity()) {
+            return Ok(None);
+        }
         let fit = options.fit(self.target_run_len, state.level0_stop);
-        let Some(keyspace) = Self::choose_keyspace(&mut state, &fit, options.reclaim) else {
+        let Some((keyspace, residue)) =
+            Self::choose_keyspace(&mut state, &fit, options.reclaim, quiet.is_some())
+        else {
             return Ok(None);
         };
         let space = state.space_mut(keyspace);
         let plan = if options.reclaim {
             space.levels.plan_reclaim(&fit)
+        } else if residue {
+            space.levels.plan_idle(&fit)
         } else {
             space.levels.plan(&fit)
         };
@@ -941,7 +978,7 @@ impl Core {
         options: CompactionPolicy,
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         loop {
-            match self.begin_compaction(options)? {
+            match self.begin_compaction(options, None)? {
                 Some(Begun::Job(job)) => return Ok(Some(job)),
                 Some(Begun::Done(_)) => {}
                 None => return Ok(None),

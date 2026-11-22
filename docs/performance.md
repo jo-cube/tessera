@@ -33,9 +33,10 @@ detail, with the alternatives that were rejected.
   including overwritten payloads, plus 80 bytes per live entry.
 - **Transient memory.** Compaction holds its inputs until each piece
   publishes, so a rewrite briefly needs its output beside its inputs; pieces
-  and a shared output allowance bound that peak. Snapshots keep alive the
-  runs and memtables they see, so a long-lived snapshot holds data that
-  compaction has already replaced.
+  and a shared output allowance bound that peak. Compaction after writes
+  go quiet uses the same piece bounds. Snapshots keep alive the runs and
+  memtables they see, so a long-lived snapshot holds data that compaction
+  has already replaced.
 - **Across keyspaces.** Keyspaces share one budget, one memtable and one
   chunk pool. Each has its own runs, so a flush touching *k* keyspaces
   writes at least *k* runs, each with an index, filters and dictionaries.
@@ -54,7 +55,11 @@ buffers and allocator overhead are outside the budget.
   A record is rewritten, and so recompressed, as it descends the levels, and
   again when newer writes to nearby keys merge into the bottom level. Write
   amplification, and with it write CPU, therefore grows with the number of
-  levels and with how widely updates spread over the key space.
+  levels and with how widely updates spread over the key space. A quiet
+  period lets the worker promote leftover level-0 runs and reclaim their
+  obsolete data. The worker sleeps once level 0 empties. Active memtables
+  still rotate at their normal size or when a checkpoint or memory pressure
+  calls for it.
 - **Bottom-level erasure and copy-forward.** At the bottom level a record's
   sequence number is erased once no other run can hold an older version of
   its key. Blocks whose records are all erased and that hold no deletions are
