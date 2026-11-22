@@ -517,6 +517,7 @@ pub fn zipf_workloads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
         dec: u64,
     }
     for &(case, write_pct) in &[("zipf_mix_95_5", 5usize), ("zipf_mix_50_50", 50)] {
+        let before = store.counters();
         let stop = AtomicBool::new(false);
         let m0 = store.maintenance();
         let span = Span::new();
@@ -622,6 +623,7 @@ pub fn zipf_workloads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
             out.emit(case, "write_locks", a.write_locks - b.write_locks);
         }
         store.drain();
+        super::amplification(out, case, before, store.counters());
         let mut r = store.reader();
         let mut gate_bad = 0usize;
         for _ in 0..10_000 {

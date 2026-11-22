@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use store::Store;
+use tessera::diagnostics::EngineDiagnostics;
 
 const MOUNT: &str = "/Volumes/tessbench";
 /// Process RSS plus RAM-disk bytes beyond which a child aborts.
@@ -100,6 +101,75 @@ impl MemoryReference {
             format!("{:.2}", self.footprint as f64 / MIB as f64),
         );
     }
+    /// Samples the ordinary drain and, if requested, the subsequent quiet state.
+    fn report_end_state(
+        &self,
+        store: &Store,
+        out: &Out,
+        case: &str,
+        live: usize,
+        live_keys: usize,
+    ) {
+        self.report(store, out, case, live);
+        store.emit_levels(case, || live_keys, out);
+        let Store::T(engine, _) = store else {
+            return;
+        };
+        let Some(delay) = sample_duration("TESSERA_BENCH_QUIET_MS") else {
+            return;
+        };
+        let phase = format!("{case}_quiet");
+        let (user, system) = cpu();
+        let started = Instant::now();
+        let before = engine.background_status().unwrap();
+        thread::sleep(delay);
+        let after = loop {
+            let status = engine.background_status().unwrap();
+            assert!(status.running && status.failures == 0, "{status:?}");
+            if !status.busy {
+                break status;
+            }
+            assert!(started.elapsed() < delay + Duration::from_secs(60));
+            thread::sleep(Duration::from_millis(10));
+        };
+        let (end_user, end_system) = cpu();
+        let work_cpu = end_user - user + end_system - system;
+        out.emit(
+            &phase,
+            "wall_s",
+            format!("{:.3}", started.elapsed().as_secs_f64()),
+        );
+        out.emit(&phase, "cpu_total_s", format!("{work_cpu:.6}"));
+        out.emit(
+            &phase,
+            "compaction_bytes",
+            after.output_bytes - before.output_bytes,
+        );
+        out.emit(&phase, "stored_bytes", store.counters()[2]);
+        self.report(store, out, &phase, live);
+        store.emit_levels(&phase, || live_keys, out);
+
+        if case == "update"
+            && let Some(window) = sample_duration("TESSERA_BENCH_IDLE_SAMPLE_MS")
+        {
+            let phase = "update_idle";
+            let (user, system) = cpu();
+            let started = Instant::now();
+            thread::sleep(window);
+            let status = engine.background_status().unwrap();
+            let (end_user, end_system) = cpu();
+            let idle_cpu = end_user - user + end_system - system;
+            out.emit(
+                phase,
+                "wall_s",
+                format!("{:.3}", started.elapsed().as_secs_f64()),
+            );
+            out.emit(phase, "cpu_total_s", format!("{idle_cpu:.6}"));
+            out.emit(phase, "compactions", status.compactions - after.compactions);
+            out.emit(phase, "passes", status.passes - after.passes);
+        }
+    }
+
     fn report(&self, store: &Store, out: &Out, case: &str, live: usize) {
         let disk = if matches!(store, Store::R(_)) {
             disk_used().saturating_sub(self.disk)
@@ -154,6 +224,11 @@ impl MemoryReference {
             );
         }
     }
+}
+
+fn sample_duration(variable: &str) -> Option<Duration> {
+    let millis = std::env::var(variable).ok()?.parse().expect("milliseconds");
+    Some(Duration::from_millis(millis))
 }
 
 fn disk_used() -> u64 {
@@ -238,6 +313,11 @@ impl Span {
         }
         out.emit(case, "cpu_user_s", format!("{:.2}", u - self.cpu.0));
         out.emit(case, "cpu_sys_s", format!("{:.2}", s - self.cpu.1));
+        out.emit(
+            case,
+            "cpu_total_s",
+            format!("{:.3}", u - self.cpu.0 + s - self.cpu.1),
+        );
         ops as f64 / wall
     }
 }
@@ -527,18 +607,22 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         let span = Span::new();
         trace_phase("load");
         let mut b = store.batch();
+        let mut writer = hist();
         for chunk in perm.chunks(256) {
             for &i in chunk {
                 b.push(data.recs[i as usize].key(), Some(data.value(i as usize)));
             }
+            let started = Instant::now();
             store.write(&mut b);
+            rec(&mut writer, started);
         }
+        store.emit_memtables("load_before_drain", &out);
         store.drain();
         span.finish(&out, "load", n, data.raw);
+        out.lat("load_writer", &writer);
         let c = store.counters();
         amplification(&out, "load", [0; 3], c);
-        memory.report(&store, &out, "load", data.live_bytes());
-        store.emit_levels("load", || data.recs.len(), &out);
+        memory.report_end_state(&store, &out, "load", data.live_bytes(), n);
         gate(&store, &data, &mut rng, &out, "load");
 
         if update {
@@ -547,23 +631,30 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             let span = Span::new();
             trace_phase("update");
             let mut bytes = 0;
+            writer.reset();
             for chunk in data.updates.chunks(256) {
                 for &i in chunk {
                     let v = data.update(i as usize);
                     bytes += data.key_len + v.len();
                     b.push(data.recs[i as usize].key(), Some(v));
                 }
+                let started = Instant::now();
                 store.write(&mut b);
+                rec(&mut writer, started);
             }
             for chunk in data.deletes.chunks(256) {
                 for &i in chunk {
                     b.push(data.recs[i as usize].key(), None);
                 }
+                let started = Instant::now();
                 store.write(&mut b);
+                rec(&mut writer, started);
             }
+            store.emit_memtables("update_before_drain", &out);
             store.drain();
             let ops = data.updates.len() + data.deletes.len();
             let update_rate = span.finish(&out, "update", ops, bytes);
+            out.lat("update_writer", &writer);
             amplification(&out, "update", c0, store.counters());
             for &i in &data.updates {
                 data.state[i as usize] = UPDATED;
@@ -571,16 +662,8 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             for &i in &data.deletes {
                 data.state[i as usize] = DELETED;
             }
-            memory.report(&store, &out, "update", data.live_bytes());
-            store.emit_levels(
-                "update",
-                || {
-                    (0..data.recs.len())
-                        .filter(|&i| data.live(i).is_some())
-                        .count()
-                },
-                &out,
-            );
+            let live_keys = data.state.iter().filter(|&&state| state != DELETED).count();
+            memory.report_end_state(&store, &out, "update", data.live_bytes(), live_keys);
             gate(&store, &data, &mut rng, &out, "update");
 
             // 4–6. Reads, scans, scaling, zipf and the mixed workload on the updated DB.
@@ -597,7 +680,15 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
                 scaling::zipf_workloads(&store, &data, &mut rng, &out);
             }
             if engine != "r-large" && wants(cases, "mixed") {
-                let rate = if rate > 0.0 { rate } else { 0.7 * update_rate };
+                let rate = match std::env::var("TESSERA_BENCH_MIXED_RATE") {
+                    Ok(rate) => {
+                        let rate = rate.parse::<f64>().expect("records per second");
+                        assert!(rate.is_finite() && rate > 0.0);
+                        rate
+                    }
+                    Err(_) if rate > 0.0 => rate,
+                    Err(_) => 0.7 * update_rate,
+                };
                 mixed(&store, &data, &mut rng, &out, rate);
             }
         }
@@ -887,6 +978,8 @@ fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
 fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
     let (keys, _) = read_keys(data, rng);
     let stop = AtomicBool::new(false);
+    let before = store.counters();
+    let span = Span::new();
     let (readers, writer) = thread::scope(|s| {
         let readers: Vec<_> = (0..4u64)
             .map(|t| {
@@ -958,6 +1051,9 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
     let mut h = hist();
     readers.iter().for_each(|r| h.add(&r.0).unwrap());
     let (p99_ns, max, lag, written, wall) = writer;
+    span.finish(out, "mixed", written, 0);
+    store.drain();
+    amplification(out, "mixed", before, store.counters());
     out.emit("mixed", "offered_rec_s", format!("{rate:.0}"));
     out.emit("mixed", "written_records", written);
     out.emit(

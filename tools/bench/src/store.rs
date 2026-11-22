@@ -156,6 +156,16 @@ impl Batch {
     }
 }
 
+fn memtable_metrics(phase: &str, out: &super::Out, stats: tessera::diagnostics::EngineStats) {
+    out.emit(phase, "memtable_bytes", stats.memtable_bytes);
+    out.emit(phase, "active_memtable_bytes", stats.active.charged);
+    out.emit(
+        phase,
+        "frozen_memtable_bytes",
+        stats.frozen.map_or(0, |m| m.charged),
+    );
+}
+
 impl Store {
     pub fn tessera() -> Self {
         let mut options = Options::default();
@@ -350,6 +360,14 @@ impl Store {
             Self::R(p) => unsafe { tb_drain(*p) },
         }
     }
+    pub fn emit_memtables(&self, phase: &str, out: &super::Out) {
+        if std::env::var_os("TESSERA_BENCH_LEVEL_DIAG").is_some()
+            && let Self::T(engine, _) = self
+        {
+            memtable_metrics(phase, out, engine.engine_stats());
+        }
+    }
+
     pub fn emit_levels(&self, phase: &str, live_keys: impl FnOnce() -> usize, out: &super::Out) {
         if std::env::var_os("TESSERA_BENCH_LEVEL_DIAG").is_none() {
             return;
@@ -401,6 +419,7 @@ impl Store {
             );
             let stats = engine.engine_stats();
             let bg = engine.background_status().unwrap();
+            memtable_metrics(phase, out, stats);
             out.emit(phase, "flushes_total", stats.flushes);
             out.emit(phase, "compactions_total", bg.compactions);
             let copy = tessera::diagnostics::copy_forward(engine);

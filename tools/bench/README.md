@@ -53,8 +53,23 @@ reads and random multi-get cycle through the query set in 1.5 s windows,
 starting after all readers warm up. Mixed work reports p99 and maximum
 writer batch latency and offers
 writes at 70% of Tessera's update rate (or the selected engine's rate when
-Tessera is absent). Write measurements include maintenance drains. `r-large`
-skips bulk and mixed.
+Tessera is absent). Set `TESSERA_BENCH_MIXED_RATE` to a common rate in
+records per second when comparing builds at the same writer load. Write
+amplification includes maintenance drains. `r-large`
+skips bulk and mixed. Load and update report batch latency separately from
+the maintenance drain.
+
+For Tessera steady-state comparisons, set `TESSERA_BENCH_QUIET_MS` to delay
+the samples after each regular load and update drain. Use a delay longer
+than the engine's quiet period, and use the same delay on both sides of a
+comparison. The `load_quiet` and `update_quiet` rows include stored bytes,
+heap, and CPU and compaction bytes spent after the ordinary drain. The timed
+load and update rows exclude the delay and its extra maintenance. Leave the
+variable unset to run without these pauses. With quiet sampling enabled,
+`TESSERA_BENCH_IDLE_SAMPLE_MS` adds a post-update window that records CPU,
+worker passes, and compaction steps. `TESSERA_BENCH_LEVEL_DIAG=1` adds level
+and memtable accounting, including charged active and frozen bytes at the
+end of writes and after each sample.
 
 Additional selectable cases:
 
