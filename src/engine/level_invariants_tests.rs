@@ -800,3 +800,89 @@ fn bottom_seqs_of(run: &Run<Vec<u8>>) -> Vec<u64> {
     }
     out
 }
+
+/// Level-0 compaction expands from the earliest level-0 run to other runs that
+/// overlap its key span. When every flush in level 0 is split at level-1
+/// boundaries, one step merges only one key-range slice and leaves the other
+/// slices in level 0; when the earliest flush spans both slices without a cut,
+/// one step sweeps every overlapping level-0 run across both slices.
+#[test]
+fn split_level0_flushes_compact_by_overlapping_slice_unlike_unsplit() {
+    let run_case = |split_first_flush: bool| {
+        let engine = Engine::in_memory(Options {
+            compression: Compression::Uncompressed,
+            ..options()
+        })
+        .unwrap();
+        let eager = CompactionPolicy {
+            max_overlap: 1,
+            ..compaction()
+        };
+        // Seed two disjoint bottom runs so later flushes split between them.
+        for key in [b"a", b"b", b"c", b"d", b"e", b"f"] {
+            engine.ks().put(key, &[b'1'; 400]).unwrap();
+        }
+        engine.flush().unwrap();
+        settle_with(&engine, eager, &mut Steps::default());
+        for key in [b"p", b"q", b"r", b"s", b"t", b"z"] {
+            engine.ks().put(key, &[b'2'; 400]).unwrap();
+        }
+        engine.flush().unwrap();
+        settle_with(&engine, eager, &mut Steps::default());
+        assert_eq!(
+            engine
+                .core
+                .read_state()
+                .only()
+                .levels
+                .runs()
+                .last()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Publish four flushes spanning both bottom runs.
+        for round in 0..4u8 {
+            engine.core.write_state().split_flushes = split_first_flush || round > 0;
+            for key in [b"b", b"c", b"d", b"q", b"r", b"s"] {
+                engine.ks().put(key, &[round; 200]).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        let before_l0_runs = engine.core.read_state().only().levels.runs()[0].len();
+        let trigger_four = CompactionPolicy {
+            max_overlap: 4,
+            ..compaction()
+        };
+        let mut workspace = MergeWorkspace::new();
+        let report = engine
+            .core
+            .compact(trigger_four, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.kind, CompactionKind::Merge);
+        let state = engine.core.read_state();
+        let after_l0_runs = state.only().levels.runs()[0].len();
+        let after_l0_flushes = state.only().levels.level0_flushes();
+        (
+            before_l0_runs,
+            report.inputs,
+            after_l0_runs,
+            after_l0_flushes,
+        )
+    };
+
+    let (split_before, split_inputs, split_after_runs, split_after_flushes) = run_case(true);
+    assert_eq!(split_before, 8);
+    assert_eq!(split_inputs, 5); // 4 lower-slice L0 runs + 1 lower bottom run
+    assert_eq!(split_after_runs, 4);
+    assert_eq!(split_after_flushes, 4);
+
+    let (unsplit_before, unsplit_inputs, unsplit_after_runs, unsplit_after_flushes) =
+        run_case(false);
+    assert_eq!(unsplit_before, 7); // 1 full-span L0 run + 3 split flushes (6 runs)
+    assert_eq!(unsplit_inputs, 9); // all 7 L0 runs + both bottom runs
+    assert_eq!(unsplit_after_runs, 0);
+    assert_eq!(unsplit_after_flushes, 0);
+}
