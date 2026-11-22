@@ -383,6 +383,15 @@ pub fn writer_scale(engine: &str, data: &Data, dir: &str, out: &Out) {
                 out.lat(&case, &h);
                 if let Some(m) = store.maintenance() {
                     out.emit(&case, "write_locks", m.write_locks);
+                    out.emit(&case, "write_groups", m.write_groups);
+                    out.emit(&case, "grouped_writes", m.grouped_writes);
+                    let dist = m
+                        .write_group_sizes
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    out.emit(&case, "write_group_sizes", dist);
                     out.emit(
                         &case,
                         "level0_wait_s",
@@ -621,6 +630,8 @@ pub fn zipf_workloads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
             );
             out.emit(case, "gate_waits", a.gate_waits - b.gate_waits);
             out.emit(case, "write_locks", a.write_locks - b.write_locks);
+            out.emit(case, "write_groups", a.write_groups - b.write_groups);
+            out.emit(case, "grouped_writes", a.grouped_writes - b.grouped_writes);
         }
         store.drain();
         super::amplification(out, case, before, store.counters());
