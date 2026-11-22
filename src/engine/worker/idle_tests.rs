@@ -196,18 +196,14 @@ fn dropping_a_keyspace_during_idle_compaction_retires_its_runs() {
     dropped.put(b"key", b"value").unwrap();
     drain(&engine);
     let snapshot = engine.snapshot();
+    drop(engine.core.serialize_flush());
     let (built, release) = pause_build(&engine);
     advance_clock(signal_for(&engine), QUIET_PERIOD);
     built.recv_timeout(TEST_TIMEOUT).unwrap();
     thread::scope(|scope| {
-        let (started, entering) = mpsc::channel();
-        let shared = &engine;
-        let dropper = scope.spawn(move || {
-            started.send(()).unwrap();
-            shared.drop_keyspace("discard")
-        });
-        entering.recv_timeout(TEST_TIMEOUT).unwrap();
-        assert!(engine.core.compacting.try_lock().is_err());
+        let dropper = scope.spawn(|| engine.drop_keyspace("discard"));
+        // Drop holds the flush lock while waiting for the selected job.
+        crate::test_support::wait_until(|| engine.core.flushing.try_lock().is_err());
         release.send(()).unwrap();
         assert!(dropper.join().unwrap().unwrap());
     });
@@ -285,7 +281,7 @@ fn a_checkpoint_during_idle_compaction_recovers_its_captured_runs() {
     assert_eq!(recovered.engine_stats().level0_runs, 2);
     assert_eq!(ks.get(b"key").unwrap().unwrap(), b"value");
     assert_eq!(ks.get(b"tail").unwrap().unwrap(), b"checkpointed");
-    recovered.wait_for_compaction().unwrap();
+    crate::test_support::wait_until(|| signal_for(&recovered).lock().quiet.is_some());
     settle(&recovered);
     recovered.close().unwrap();
 }
