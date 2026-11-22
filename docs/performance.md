@@ -49,9 +49,13 @@ buffers and allocator overhead are outside the budget.
 
 ## Where CPU goes
 
-- **Writes** insert into a copy-on-write memtable. A background worker
-  flushes full memtables into compressed runs, and compaction merges runs
-  down a leveled tree with a size ratio of `level_ratio` between levels.
+- **Writes** insert into a copy-on-write memtable. Uncontended small writes
+  take the exclusive state lock directly without copying; concurrent small
+  writes combine across sharded queues so one leader acquires the state lock
+  for up to 64 requests (or 1 MiB of payload), amortizing lock handoffs. A
+  background worker flushes full memtables into compressed runs, and compaction
+  merges runs down a leveled tree with a size ratio of `level_ratio` between
+  levels.
   A record is rewritten, and so recompressed, as it descends the levels, and
   again when newer writes to nearby keys merge into the bottom level. Write
   amplification, and with it write CPU, therefore grows with the number of

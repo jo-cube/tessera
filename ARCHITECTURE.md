@@ -200,11 +200,17 @@ format and `CURRENT` are also version 1.
 
 One reader–writer lock guards the state; a writer-priority gate keeps new
 readers from overtaking a waiting writer. Publication and writes take it
-exclusively and briefly. Reads take immutable references under the shared lock
-and decode after releasing it. Builds, compression and checkpoint I/O hold no
-lock. A flush worker and a compaction worker run per engine; compaction can use
-several builders. Snapshots hold no lock and own their sources, so maintenance
-keeps only the newest version of each key.
+exclusively and briefly. Uncontended small writes take the state lock directly
+with one atomic check and no copy; when writers overlap, a combiner gathers
+requests across cache-line-isolated thread shards so one leader takes the state
+lock once, applies up to 64 requests (capped at 1 MiB of payload) in order,
+releases the lock, wakes its followers and hands leadership to a waiting writer.
+Bulk ingestion and larger batches keep their direct path. Reads take immutable
+references under the shared lock and decode after releasing it. Builds,
+compression and checkpoint I/O hold no lock. A flush worker and a compaction
+worker run per engine; compaction can use several builders. Snapshots hold no
+lock and own their sources, so maintenance keeps only the newest version of
+each key.
 
 ## Design decisions
 
@@ -329,3 +335,19 @@ the scheduler ranks a keyspace at the stop first so the stall is short.
 - A snapshot holding one reference per keyspace: taking it would cost one
   reference count per keyspace; the engine keeps one shared list of the
   keyspaces' directories instead.
+
+**Sharded write-group combining with bounded follower spinning.** An uncontended
+writer bypasses the queue with a single atomic compare-and-swap and copies
+nothing. Under contention, writers publish owned requests into 16
+cache-line-isolated shards tracked by an atomic bitmask, and one leader drains
+up to 64 requests or 1 MiB of payload per exclusive state-lock acquisition,
+re-draining shards that fill while the group applies. Followers spin briefly
+before parking on a per-request condition variable, avoiding kernel wake
+handoffs for short memtable groups while parking during flushes, large batches
+and level-0 stops.
+- One global submission mutex with immediate condvar parking: every writer
+  still serialized on the queue mutex and paid kernel park/wake latency per
+  group, capping multi-writer scaling for small writes.
+- A fairer lock alone: still costs one exclusive handoff per operation.
+- A concurrent memtable: deferred; requires replacing the copy-on-write
+  single-writer B+ tree.
