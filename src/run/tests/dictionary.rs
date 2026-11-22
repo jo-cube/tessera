@@ -448,3 +448,31 @@ fn corruption_in_continuation_frame_is_rejected() {
         assert!(damaged.get(&0u32.to_be_bytes(), &mut w).unwrap().is_some());
     }
 }
+
+#[test]
+fn weakly_compressible_segments_stay_at_one_sampled_prefix() {
+    // High-entropy payloads whose sampled prefix already reaches 16 * dict_len
+    // stored bytes do not continue past the sampled prefix length.
+    let seg_len = 512 << 10;
+    let mut b = RunBuilder::new(Codec::Zstd);
+    b.limit_segment_len(seg_len);
+    for i in 0..2_400u32 {
+        b.add(&i.to_be_bytes(), 1, Value::Bytes(&noisy_value(i, 600)))
+            .unwrap();
+    }
+    let run = b.finish();
+    let totals = segment_totals(&run);
+    assert!(totals.len() >= 2, "{totals:?}");
+    let dict_len = run.view().frame(0).unwrap().dictionary.len();
+    for &(raw, stored) in &totals[..totals.len() - 1] {
+        assert!(
+            stored >= 16 * dict_len,
+            "sampled prefix should already reach stored cap: raw={raw}, stored={stored}"
+        );
+        assert!(
+            raw <= seg_len + RAW_BLOCK_CAP,
+            "weakly compressible segment must not continue past one prefix: raw={raw}"
+        );
+    }
+    Run::new(run.as_bytes()).unwrap();
+}
