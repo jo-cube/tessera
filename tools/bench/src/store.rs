@@ -350,6 +350,64 @@ impl Store {
             Self::R(p) => unsafe { tb_drain(*p) },
         }
     }
+    pub fn emit_levels(&self, phase: &str, live_keys: impl FnOnce() -> usize, out: &super::Out) {
+        if std::env::var_os("TESSERA_BENCH_LEVEL_DIAG").is_none() {
+            return;
+        }
+        let live_keys = live_keys();
+        if let Self::T(engine, _) = self {
+            let levels = tessera::diagnostics::levels(engine);
+            let bottom = levels.len().saturating_sub(1);
+            let mut total_records = 0usize;
+            let mut non_bottom_runs = 0usize;
+            let mut non_bottom_records = 0usize;
+            let mut non_bottom_stored = 0usize;
+            for (idx, l) in levels.iter().enumerate() {
+                let stored = l.frames + l.dictionaries + l.segment_table + l.index + l.footer;
+                total_records += l.records;
+                if idx < bottom {
+                    non_bottom_runs += l.runs;
+                    non_bottom_records += l.records;
+                    non_bottom_stored += stored;
+                }
+                out.emit(phase, &format!("level_{idx}_runs"), l.runs);
+                out.emit(phase, &format!("level_{idx}_records"), l.records);
+                out.emit(phase, &format!("level_{idx}_raw_bytes"), l.raw);
+                out.emit(phase, &format!("level_{idx}_frames_bytes"), l.frames);
+                out.emit(phase, &format!("level_{idx}_dict_bytes"), l.dictionaries);
+                out.emit(phase, &format!("level_{idx}_stored_bytes"), stored);
+                out.emit(phase, &format!("level_{idx}_filter_bytes"), l.filters);
+            }
+            out.emit(phase, "bottom_level_index", bottom);
+            out.emit(
+                phase,
+                "level0_flushes",
+                tessera::diagnostics::level0_flushes(engine),
+            );
+            out.emit(phase, "non_bottom_runs", non_bottom_runs);
+            out.emit(phase, "non_bottom_records", non_bottom_records);
+            out.emit(phase, "non_bottom_stored_bytes", non_bottom_stored);
+            out.emit(
+                phase,
+                "non_bottom_has_data",
+                usize::from(non_bottom_runs > 0),
+            );
+            out.emit(phase, "distinct_live_keys", live_keys);
+            out.emit(phase, "total_stored_records", total_records);
+            out.emit(
+                phase,
+                "obsolete_records",
+                total_records.saturating_sub(live_keys),
+            );
+            let stats = engine.engine_stats();
+            let bg = engine.background_status().unwrap();
+            out.emit(phase, "flushes_total", stats.flushes);
+            out.emit(phase, "compactions_total", bg.compactions);
+            let copy = tessera::diagnostics::copy_forward(engine);
+            out.emit(phase, "copy_forward_blocks", copy.blocks);
+            out.emit(phase, "copy_forward_raw", copy.raw);
+        }
+    }
     pub fn emit_shape(&self, phase: &str, out: &super::Out) {
         if let Self::T(engine, _) = self {
             let shape = tessera::diagnostics::streaming_shape(engine);

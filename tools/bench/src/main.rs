@@ -538,6 +538,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         let c = store.counters();
         amplification(&out, "load", [0; 3], c);
         memory.report(&store, &out, "load", data.live_bytes());
+        store.emit_levels("load", || data.recs.len(), &out);
         gate(&store, &data, &mut rng, &out, "load");
 
         if update {
@@ -571,6 +572,15 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
                 data.state[i as usize] = DELETED;
             }
             memory.report(&store, &out, "update", data.live_bytes());
+            store.emit_levels(
+                "update",
+                || {
+                    (0..data.recs.len())
+                        .filter(|&i| data.live(i).is_some())
+                        .count()
+                },
+                &out,
+            );
             gate(&store, &data, &mut rng, &out, "update");
 
             // 4–6. Reads, scans, scaling, zipf and the mixed workload on the updated DB.
