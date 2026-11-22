@@ -110,6 +110,7 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
+        self.core.combiner.close();
         let _ = self.stop_workers();
     }
 }
@@ -519,6 +520,7 @@ impl Engine {
                 **guard = false;
             }
         }
+        self.core.combiner.close();
         let stopped = self.shared.stop_workers();
         drop(
             self.shared

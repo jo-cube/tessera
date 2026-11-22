@@ -395,6 +395,12 @@ pub struct Maintenance {
     pub gate_waits: u64,
     /// Exclusive state-lock acquisitions.
     pub write_locks: u64,
+    /// Write groups executed through the combiner.
+    pub write_groups: u64,
+    /// Write requests applied through the combiner (leaders and followers).
+    pub grouped_writes: u64,
+    /// Combined group-size counts: sizes 1..=8, then 9..=16 and 17+.
+    pub write_group_sizes: [u64; super::combiner::GROUP_SIZE_BUCKETS],
 }
 /// Read counters without acquiring the engine state lock.
 pub fn maintenance(engine: &Engine) -> Maintenance {
@@ -415,6 +421,9 @@ pub fn maintenance(engine: &Engine) -> Maintenance {
         memory_wait_ns: p.memory_wait_ns.load(Relaxed),
         gate_waits: p.gate_waits.load(Relaxed),
         write_locks: p.write_locks.load(Relaxed),
+        write_groups: p.write_groups.load(Relaxed),
+        grouped_writes: p.grouped_writes.load(Relaxed),
+        write_group_sizes: std::array::from_fn(|i| p.write_group_sizes[i].load(Relaxed)),
     }
 }
 

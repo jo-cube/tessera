@@ -25,6 +25,12 @@ pub(super) struct Progress {
     pub(super) gate_waits: std::sync::atomic::AtomicU64,
     #[cfg(feature = "diagnostics")]
     pub(super) write_locks: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) write_groups: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) grouped_writes: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) write_group_sizes: [std::sync::atomic::AtomicU64; combiner::GROUP_SIZE_BUCKETS],
     #[cfg(feature = "diagnostics")]
     pub(super) output_limit: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "diagnostics")]
@@ -86,6 +92,14 @@ impl Drop for AtomicWaitCharge<'_> {
 }
 
 impl Progress {
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) fn record_write_group(&self, size: usize) {
+        self.write_groups.fetch_add(1, Ordering::Relaxed);
+        self.grouped_writes
+            .fetch_add(size as u64, Ordering::Relaxed);
+        self.write_group_sizes[combiner::group_size_bucket(size)].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Charges one writer wait at the level-0 stop, counted and timed.
     #[cfg(feature = "diagnostics")]
     pub(super) fn level0_waiting(&self) -> Level0Charge<'_> {

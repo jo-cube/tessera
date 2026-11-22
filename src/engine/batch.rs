@@ -109,6 +109,11 @@ impl WriteBatch {
         start..self.bytes.len()
     }
 
+    /// Total key and value payload bytes held by the batch.
+    pub(super) fn payload_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// Each operation's keyspace, key and value, in insertion order.
     pub(super) fn records(&self) -> impl ExactSizeIterator<Item = (u32, &[u8], Value<'_>)> + Clone {
         self.operations.iter().map(|op| self.operation_record(op))
@@ -230,9 +235,31 @@ impl Core {
             let (keyspace, key, value) = batch.records().next().unwrap();
             return self.update(keyspace, key, value);
         }
-        let mut state = self.admit(self.write_state())?;
+        self.combine_batch(batch, charge)
+    }
+
+    pub(super) fn write_batch_direct(
+        &self,
+        batch: &WriteBatch,
+        charge: usize,
+    ) -> Result<u64, UpdateError> {
+        let state = self.admit(self.write_state())?;
+        self.apply_batch(state, batch, charge).0
+    }
+
+    pub(super) fn apply_batch<'s>(
+        &'s self,
+        mut state: RwLockWriteGuard<'s, State>,
+        batch: &WriteBatch,
+        charge: usize,
+    ) -> (
+        Result<u64, UpdateError>,
+        Option<RwLockWriteGuard<'s, State>>,
+    ) {
         loop {
-            batch.check_keyspaces(&state)?;
+            if let Err(error) = batch.check_keyspaces(&state) {
+                return (Err(error), Some(state));
+            }
             let end = state
                 .last_seq
                 .checked_add(batch.len() as u64)
@@ -268,9 +295,12 @@ impl Core {
                     state.last_seq = seq;
                 }
                 self.chunks.ingested(batch.bytes.len());
-                return Ok(end);
+                return (Ok(end), Some(state));
             }
-            state = self.admit(self.make_room(state))?;
+            match self.admit(self.make_room(state)) {
+                Ok(next) => state = next,
+                Err(error) => return (Err(error), None),
+            }
         }
     }
 }

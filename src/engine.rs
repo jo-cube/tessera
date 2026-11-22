@@ -15,6 +15,7 @@
 
 mod batch;
 mod checkpoint;
+mod combiner;
 mod compaction;
 #[cfg(feature = "diagnostics")]
 #[doc(hidden)]
@@ -275,6 +276,8 @@ struct Core {
     gate: Mutex<()>,
     /// Number of writers currently waiting to acquire `state` exclusively.
     waiting_writers: std::sync::atomic::AtomicUsize,
+    /// Combines concurrent small writes so one lock acquisition serves a group.
+    combiner: combiner::WriteCombiner,
     /// Held by a flush from start to end, so that flushes run one at a time.
     flushing: Mutex<()>,
     /// Held by a compaction from selection to publication, so that runs are
@@ -333,6 +336,8 @@ struct Core {
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_combine: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Core {
@@ -391,6 +396,7 @@ impl Core {
             }),
             gate: Mutex::new(()),
             waiting_writers: std::sync::atomic::AtomicUsize::new(0),
+            combiner: combiner::WriteCombiner::default(),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             background_threads: options.background_threads,
@@ -433,6 +439,8 @@ impl Core {
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
+            #[cfg(test)]
+            before_combine: Mutex::new(None),
         }
     }
 
@@ -462,12 +470,40 @@ impl Core {
     /// number.
     fn update(&self, keyspace: u32, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
         self.validate_record(KeyPrefix::new(keyspace), key, value)?;
-        let mut state = self.admit(self.write_state())?;
+        self.combine_single(keyspace, key, value)
+    }
+
+    fn update_direct(
+        &self,
+        keyspace: u32,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> Result<u64, UpdateError> {
+        let state = self.admit(self.write_state())?;
+        self.apply_single(state, keyspace, key, value).0
+    }
+
+    fn apply_single<'s>(
+        &'s self,
+        mut state: RwLockWriteGuard<'s, State>,
+        keyspace: u32,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> (
+        Result<u64, UpdateError>,
+        Option<RwLockWriteGuard<'s, State>>,
+    ) {
         loop {
-            let prefix = state.keyspace(keyspace)?.prefix;
+            let prefix = match state.keyspace(keyspace) {
+                Ok(space) => space.prefix,
+                Err(error) => return (Err(error), Some(state)),
+            };
             match self.write(&mut state, prefix.key(key), value) {
-                Err(Refusal::Full) => state = self.admit(self.make_room(state))?,
-                written => return written.map_err(Refusal::into_error),
+                Err(Refusal::Full) => match self.admit(self.make_room(state)) {
+                    Ok(next) => state = next,
+                    Err(error) => return (Err(error), None),
+                },
+                written => return (written.map_err(Refusal::into_error), Some(state)),
             }
         }
     }
