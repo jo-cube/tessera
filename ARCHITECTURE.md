@@ -47,8 +47,9 @@ large write ─▶ private runs ────────────▶ level 0 
 - **Compaction.** The worker takes the most overfull level, then eligible
   level 0, then small neighbours. Nonoverlapping runs usually move down by
   relabelling. When ordinary work runs out and level 0 still holds runs, the
-  worker waits for two quiet seconds before promoting those runs. It checks
-  the committed sequence and flush count at selection. If writes resume,
+  worker waits for five quiet seconds before promoting those runs. It waits
+  for frozen tables to publish and checks the committed sequence and flush
+  count at selection. If writes resume,
   the selected job can finish and further idle selections wait for quiet.
   An isolated idle promotion into the bottom can rewrite the source to
   remove its filter and elide tombstones under the ordinary erasure rules.

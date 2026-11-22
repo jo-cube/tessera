@@ -16,9 +16,9 @@ use crate::run::MergeWorkspace;
 
 use super::{CompactionError, CompactionPolicy, Core, WriteActivity};
 
-/// Leaves room for short pauses between write bursts to fill flush groups
-/// before level 0 is eligible for idle compaction.
-const QUIET_PERIOD: Duration = Duration::from_secs(2);
+/// Allow short read-only intervals between write phases to pass while
+/// their pending runs can still collect more updates.
+const QUIET_PERIOD: Duration = Duration::from_secs(5);
 
 /// What the background worker has done since the engine was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

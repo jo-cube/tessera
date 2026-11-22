@@ -125,6 +125,29 @@ fn successful_writes_defer_level_0_settling_without_a_flush() {
 }
 
 #[test]
+fn frozen_tables_defer_idle_compaction_until_they_publish() {
+    let engine = Engine::in_memory(Options::default()).unwrap();
+    let ks = engine.ks();
+    ks.put(b"key", b"base").unwrap();
+    drain(&engine);
+    ks.put(b"key", b"tail").unwrap();
+    engine.wait_for_compaction().unwrap();
+
+    let signal = signal_for(&engine);
+    let flush = engine.core.begin_flush().unwrap();
+    let before = signal.status();
+    advance_clock(signal, QUIET_PERIOD);
+    wait_for(signal, |progress| progress.status.passes > before.passes);
+    assert!(signal.lock().quiet.is_none());
+    assert_eq!(signal.status().compactions, before.compactions);
+
+    flush.build().publish();
+    engine.wait_for_compaction().unwrap();
+    settle(&engine);
+    assert_eq!(ks.get(b"key").unwrap().unwrap(), b"tail");
+}
+
+#[test]
 fn close_wakes_a_worker_waiting_for_quiet() {
     let engine = Engine::in_memory(Options::default()).unwrap();
     engine.ks().put(b"key", b"value").unwrap();

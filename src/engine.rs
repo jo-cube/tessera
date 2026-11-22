@@ -764,7 +764,7 @@ impl Core {
 
     fn idle_activity(&self) -> Option<WriteActivity> {
         let state = self.read_state();
-        (state.level0_flushes != 0).then(|| state.write_activity())
+        (state.level0_flushes != 0 && state.frozen.is_empty()).then(|| state.write_activity())
     }
 
     fn compact_when(
@@ -846,7 +846,10 @@ impl Core {
             panic!("injected compaction failure");
         }
         let mut state = self.write_state();
-        if quiet.is_some_and(|activity| activity != state.write_activity()) {
+        // Pending flushes can join the same ranges when they publish.
+        if quiet
+            .is_some_and(|activity| !state.frozen.is_empty() || activity != state.write_activity())
+        {
             return Ok(None);
         }
         let fit = options.fit(self.target_run_len, state.level0_stop);
