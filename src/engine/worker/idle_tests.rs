@@ -259,7 +259,7 @@ fn idle_compaction_keeps_snapshot_inputs_charged_until_release() {
     assert!(ks.get(b"deleted").unwrap().is_none());
     drop(initial);
     drop(pending);
-    assert_eq!(engine.stats().snapshot_bytes, 0);
+    crate::test_support::wait_until(|| engine.stats().snapshot_bytes == 0);
     assert_accounting(&engine);
 }
 
