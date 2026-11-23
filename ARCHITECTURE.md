@@ -46,7 +46,12 @@ large write ─▶ private runs ────────────▶ level 0 
   of its runs remain in level 0, including slices outside the last merge.
 - **Compaction.** The worker takes the most overfull level, then eligible
   level 0, then small neighbours. Nonoverlapping runs usually move down by
-  relabelling. When ordinary work runs out and either level 0 holds runs or
+  relabelling. Overlapping level-0 runs join a merge oldest first, charging
+  only their source bytes against the optional fan-in byte bound. Destination
+  overlaps count toward the input-count and workspace bounds, so several
+  flushes can share one destination rewrite even when it exceeds the source
+  byte bound. The same accounting applies with `memory_limit`.
+  When ordinary work runs out and either level 0 holds runs or
   the active memtable is charged at least one eighth of its budget, the
   worker waits for five quiet seconds before settling. It waits for frozen
   tables to publish and checks the committed sequence and flush count before
@@ -278,6 +283,10 @@ each key.
   grouped data, none on weak-locality data, while point-read work rises
   56–525%, worst-point scans up to 83% and live heap up to 58%; no existing
   option carries the trade.
+- Charging destination bytes against optional level-0 fan-in prevents
+  overlapping flushes from sharing a rewrite once the destination exceeds
+  that byte bound. Charging source bytes lets them coalesce while the
+  input-count, workspace and piece-output bounds still limit the work.
 - Eagerly scheduling every split slice of a partially merged flush group
   would spend a rewrite on a range that can still collect other writes.
   Deferring below-threshold slices until quiet keeps ordinary scoring and

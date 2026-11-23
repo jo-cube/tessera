@@ -62,8 +62,13 @@ buffers and allocator overhead are outside the budget.
   A record is rewritten, and so recompressed, as it descends the levels, and
   again when newer writes to nearby keys merge into the bottom level. Write
   amplification, and with it write CPU, therefore grows with the number of
-  levels and with how widely updates spread over the key space. A quiet
-  period lets the worker flush an active memtable charged at least one eighth
+  levels and with how widely updates spread over the key space. Overlapping
+  level-0 flushes can share one destination rewrite: the optional fan-in byte
+  bound counts their source bytes, while all inputs count toward the input
+  count and workspace bounds. This also applies with `memory_limit`; pieces
+  and the shared output allowance bound transient output.
+  A quiet period lets the worker flush an active memtable charged at least
+  one eighth
   of `memtable_size` and promote leftover level-0 runs in the same settle to
   reclaim obsolete data and uncompressed tail memory. Smaller tails stay in
   the active table until normal rotation, a checkpoint or memory pressure
