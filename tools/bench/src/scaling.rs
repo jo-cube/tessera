@@ -286,12 +286,18 @@ fn run_reader_point(
 
 /// Writer scaling across 1, 2, 4, 8 writer threads, batch sizes {1, 16, 256},
 /// and disjoint vs overlapping key sets, each on a fresh store with oracle gate.
+/// Batch 1 adds 32 writers to measure more writers than cores.
 pub fn writer_scale(engine: &str, data: &Data, dir: &str, out: &Out) {
     let n = data.recs.len();
     let pool = 4_096usize.min(n);
     for key_mode in ["disjoint", "overlap"] {
         for batch_size in [1usize, 16, 256] {
-            for threads in [1usize, 2, 4, 8] {
+            let thread_counts: &[usize] = if batch_size == 1 {
+                &[1, 2, 4, 8, 32]
+            } else {
+                &[1, 2, 4, 8]
+            };
+            for &threads in thread_counts {
                 let case = format!("wscale_{key_mode}_b{batch_size}_{threads}t");
                 let sub = format!("{dir}/{case}");
                 fs::create_dir_all(&sub).unwrap();
