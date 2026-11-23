@@ -353,7 +353,7 @@ fn concurrent_writers_flush_full_tables_once_and_snapshots_stay_coherent() {
             .collect();
         let reader = scope.spawn(|| {
             let mut checked = 0;
-            while !done.load(Ordering::Acquire) {
+            while !done.load(Ordering::Acquire) || checked == 0 {
                 let snapshot = engine.snapshot();
                 let mut reader = snapshot.reader();
                 let ks = engine.ks();
