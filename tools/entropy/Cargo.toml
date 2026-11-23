@@ -1,0 +1,21 @@
+[package]
+name = "tessera-entropy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "tessera-entropy"
+path = "main.rs"
+
+[features]
+tools-memory = ["tessera/tools-memory"]
+
+[dependencies]
+tessera = { path = "../..", features = ["diagnostics"] }
+libc = "=0.2.191"
+zstd-safe = { version = "=8.2.0", default-features = false, features = ["std", "vendored", "experimental"] }
+zstd-sys = { version = "=2.1.2", default-features = false, features = ["zdict_builder"] }

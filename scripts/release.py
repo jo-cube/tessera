@@ -5,7 +5,7 @@
   check-tag --tag vX.Y.Z                validate a release tag against the tree
   notes --version X.Y.Z                 print a version's changelog section
   check-package                         check the .crate holds only consumer files
-  publish --tag --revision --crate      create the GitHub Release (CI only)
+  publish --tag --revision --crate      attach GitHub Release assets (CI only)
 """
 import argparse
 import datetime
@@ -84,7 +84,6 @@ def changelog_section(text, version):
 def check_tag(root, tag, revision=None, main_ref='origin/main'):
     version = validate_version(root, tag)
     ref = f'refs/tags/{tag}'
-    require(git(root, 'cat-file', '-t', ref) == 'tag', f'{tag} must be an annotated tag')
     commit = git(root, 'rev-parse', '--verify', ref + '^{commit}')
     require(git(root, 'rev-parse', 'HEAD') == commit, f'checkout is not the commit {tag} names')
     if revision:
@@ -193,19 +192,14 @@ def release_prep(root, version, dry_run=None, date=None, out=sys.stdout):
               f'section written to {dry_run}', file=out)
         return section
     require(not git(root, 'status', '--porcelain'), 'the working tree must be clean')
-    branch = git(root, 'rev-parse', '--abbrev-ref', 'HEAD')
-    require(branch == 'main', f'release from main after fast-forwarding it to dev, not {branch}')
     if version != current:
         bump(root, current, version)
     (root / 'CHANGELOG.md').write_text(prepend_section(changelog, version, section))
     validate_version(root, tag)
     git(root, 'add', 'Cargo.toml', *LOCKFILES, 'CHANGELOG.md')
     git(root, 'commit', '--quiet', '-m', f'chore: release {version}')
-    print(f'Committed "chore: release {version}". Review it, then run:\n\n'
-          f'  git tag -a {tag} -m "{NAME} {version}"\n'
-          f'  git push origin main\n'
-          f'  git push origin refs/tags/{tag}\n'
-          f'  git checkout dev && git merge --ff-only main && git push origin dev', file=out)
+    print(f'Committed "chore: release {version}". Review it and merge it to main through the usual pull request.\n'
+          f'Then create the {tag} release in the GitHub Releases UI targeting main.', file=out)
     return section
 
 
@@ -222,12 +216,12 @@ def api(method, url, data=None, content_type='application/json'):
 
 
 def check_remote_tag(repository, tag, revision):
-    """The tag on GitHub is still annotated and still names `revision`."""
+    """The lightweight or annotated tag on GitHub still names `revision`."""
     base = f'https://api.github.com/repos/{repository}/git'
     ref = api('GET', f'{base}/ref/tags/{quote(tag)}')['object']
-    require(ref['type'] == 'tag', f'remote {tag} is not an annotated tag')
-    target = api('GET', f"{base}/tags/{ref['sha']}")['object']
-    require(target['sha'] == revision, f'remote {tag} moved from {revision}')
+    while ref['type'] == 'tag':
+        ref = api('GET', f"{base}/tags/{ref['sha']}")['object']
+    require(ref['type'] == 'commit' and ref['sha'] == revision, f'remote {tag} moved from {revision}')
 
 
 def publish(root, tag, revision, crate, repository):
@@ -243,31 +237,44 @@ def publish(root, tag, revision, crate, repository):
     check_remote_tag(repository, tag, commit)
     base = f'https://api.github.com/repos/{repository}/releases'
     # Listing with the publisher's token includes drafts.
+    existing = []
     page = 1
     while True:
         releases = api('GET', f'{base}?per_page=100&page={page}')
-        require(not any(release['tag_name'] == tag for release in releases),
-                f'release {tag} already exists; inspect it before retrying')
+        existing.extend(release for release in releases if release['tag_name'] == tag)
         if len(releases) < 100:
             break
         page += 1
-    draft = api('POST', base, {'tag_name': tag, 'target_commitish': commit, 'name': f'{NAME} {version}',
-                               'body': f'{notes}\n\nSource revision: `{commit}`.', 'draft': True})
-    require(draft['draft'] and draft['tag_name'] == tag, 'unexpected draft release identity')
-    uploads = f"https://uploads.github.com/repos/{repository}/releases/{draft['id']}/assets?"
+    require(len(existing) <= 1, f'multiple releases exist for {tag}; inspect them before retrying')
+    if existing:
+        release = existing[0]
+        require(not release.get('assets'), f'release {tag} already has assets; inspect it before retrying')
+        was_draft = bool(release['draft'])
+        if not release.get('body'):
+            api('PATCH', f"{base}/{release['id']}", {'body': notes})
+    else:
+        release = api('POST', base, {'tag_name': tag, 'target_commitish': commit, 'name': f'{NAME} {version}',
+                                    'body': f'{notes}\n\nSource revision: `{commit}`.', 'draft': True})
+        require(release['draft'] and release['tag_name'] == tag, 'unexpected draft release identity')
+        was_draft = True
+    release_url = f"{base}/{release['id']}"
+    uploads = f"https://uploads.github.com/repos/{repository}/releases/{release['id']}/assets?"
     for name, body in assets.items():
         api('POST', uploads + urlencode({'name': name}), body, 'application/octet-stream')
-    draft = api('GET', f"{base}/{draft['id']}")
-    uploaded = {asset['name']: asset for asset in draft['assets']}
-    require(set(uploaded) == set(assets), 'uploaded release assets are incomplete or unexpected')
+    release = api('GET', release_url)
+    require(release['tag_name'] == tag and bool(release['draft']) == was_draft, 'release identity changed')
+    uploaded = {asset['name']: asset for asset in release['assets']}
+    require(len(release['assets']) == len(assets) and set(uploaded) == set(assets),
+            'uploaded release assets are incomplete or unexpected')
     for name, body in assets.items():
         asset = uploaded[name]
         require(asset['state'] == 'uploaded' and asset['size'] == len(body)
-                and asset.get('digest') in (None, 'sha256:' + hashlib.sha256(body).hexdigest()),
+                and asset.get('digest') == 'sha256:' + hashlib.sha256(body).hexdigest(),
                 f'uploaded asset verification failed: {name}')
     check_remote_tag(repository, tag, commit)
-    result = api('PATCH', f"{base}/{draft['id']}", {'draft': False, 'make_latest': 'legacy'})
-    require(not result['draft'], 'release publication was not confirmed')
+    if was_draft:
+        result = api('PATCH', release_url, {'draft': False})
+        require(not result['draft'] and result['tag_name'] == tag, 'release publication was not confirmed')
     return f'https://github.com/{repository}/releases/tag/{tag}'
 
 

@@ -1,10 +1,11 @@
 # Installation and releases
 
-Tessera is a library. A release is an annotated `vX.Y.Z` Git tag with a
+Tessera is a library. A release is a `vX.Y.Z` Git tag with a
 [GitHub Release](https://github.com/jo-cube/tessera/releases) whose notes are
-that version's [changelog](../CHANGELOG.md) section. The `.crate` source
-package and its `SHA256SUMS` are attached for archiving. Nothing is published
-to crates.io (`publish = false`), and there are no binaries.
+written by the maintainer, with the version's [changelog](../CHANGELOG.md)
+section as a fallback. The `.crate` source package and its `SHA256SUMS` are
+attached for archiving. Nothing is published to crates.io (`publish = false`),
+and there are no binaries.
 
 ## Install
 
@@ -82,57 +83,68 @@ systems may work and are untested.
 
 ## Releasing
 
-Releases come from `main`, which only ever fast-forwards to `dev`.
-
-1. With `dev` green in CI, run the local gates in the container:
-   `scripts/validate.sh verify`, `scripts/validate.sh full` and
-   `scripts/validate.sh msrv` (see [development](development.md)).
-2. Fast-forward `main`: `git checkout main && git merge --ff-only dev`.
-3. Run `just release-prep X.Y.Z`. It refuses a dirty tree, a branch other
-   than `main`, an older version, or a tag or changelog section that already
-   exists. It sets the version in `Cargo.toml`, `Cargo.lock` and
-   `tools/bench/Cargo.lock`. It then prepends a `CHANGELOG.md` section built
-   from the conventional commits since the previous tag, moving anything under
+1. With `dev` green in CI and a clean working tree, run `just release-prep X.Y.Z`
+   on `dev`. It refuses an older version, or a tag or changelog section that
+   already exists. It sets the version in `Cargo.toml`, `Cargo.lock` and
+   `tools/bench/Cargo.lock`, prepends a `CHANGELOG.md` section built from the
+   conventional commits since the previous tag, moves anything under
    `## Unreleased` into it, and commits `chore: release X.Y.Z`. Review the
-   section and amend the commit if the wording needs it.
+   section and commit any wording changes. Preparation works on any branch.
    `just release-prep X.Y.Z --dry-run FILE` writes the section to `FILE` and
-   changes nothing.
-4. Run the commands it prints: `git tag -a vX.Y.Z`, `git push origin main`,
-   `git push origin refs/tags/vX.Y.Z`, then fast-forward `dev` to `main`.
-   Push `main` before the tag, since the tag must be reachable from it.
+   changes nothing else.
+2. Run the local gates in the container: `scripts/validate.sh verify`,
+   `scripts/validate.sh full` and `scripts/validate.sh msrv`
+   (see [development](development.md)). Merge the reviewed release commit to
+   `main` through the usual pull request.
+3. In the [GitHub Releases UI](https://github.com/jo-cube/tessera/releases/new),
+   create the `vX.Y.Z` release targeting `main`. Write its title and notes, then
+   publish it. Creating the tag starts the **release** workflow; inspect the
+   run and wait for both assets before using the release.
 
-Pushing the tag starts the **release** workflow:
+The workflow keeps the same commit through all three jobs:
 
-- **prepare** checks that the tag is `vX.Y.Z` and annotated, names the
-  checked-out commit, matches `Cargo.toml` and both lockfiles, is reachable
-  from `main`, and has a changelog section. It resolves that commit once.
+- **prepare** accepts lightweight and annotated `vX.Y.Z` tags. It checks that
+  the tag names the checked-out and triggering commit, matches `Cargo.toml`
+  and both lockfiles, is reachable from `origin/main`, and has a changelog
+  section. It resolves that commit once.
 - **verify** runs **ci** on the commit through `workflow_call`, with
   `package: true`: `just all`, the four platform jobs and the MSRV job. It
   uploads the `.crate` that `just package` built and checked.
-- **publish**, the only job with write access, checks the tag again on GitHub,
-  refuses if a release or draft for it exists, creates a draft with the notes,
-  uploads `tessera-X.Y.Z.crate` and `SHA256SUMS`, checks their sizes and
-  digests, and publishes the draft.
+- **publish**, the only job with write access, checks the tag again on GitHub
+  and adopts the existing release if it has no assets. It preserves its title
+  and notes, filling an empty body from the changelog. If no release exists,
+  it creates a draft with changelog notes. It uploads `tessera-X.Y.Z.crate`
+  and `SHA256SUMS`, verifies their names, sizes, completed state and server
+  SHA-256 digests, rechecks the remote tag, and publishes only if it was a
+  draft. Multiple releases for the tag or any existing assets stop publication;
+  assets are never overwritten.
 
-Running **release** by hand with a `ref` does prepare and verify, so a
-candidate can be checked before tagging; it never publishes.
+GitHub's automatic policy selects Latest. Avoid concurrent edits to the tag,
+release or assets while the workflow runs.
+
+Running **release** by hand with a `ref` only prepares and verifies that
+candidate; it never publishes or attaches assets, even when the ref is a tag.
 
 ### If a release fails midway
 
-Look at the run and at the Releases page before changing anything.
+Inspect the run and the Releases page before retrying. A release created in
+the UI can already be public even when verification or upload fails.
 
-- **prepare failed:** nothing was built or published. The message names the
-  check. If the tag itself is wrong (lightweight, wrong commit, missing
-  changelog) and nobody can have used it, delete it locally and on GitHub
-  (`git push origin :refs/tags/vX.Y.Z`), fix the cause and tag again.
-  Otherwise release the fix as the next patch version.
-- **verify failed:** nothing was published. Re-run the failed jobs if the
-  failure was a runner problem. A real failure is fixed on `dev` and released
-  as the next patch version; the failed tag stays and gets no release.
-- **publish failed:** an incomplete draft may exist. Delete the draft, keep
-  the tag and re-run the failed jobs; the uploaded `.crate` artifact lasts 14
-  days. A published release is never replaced; a bad one is followed by a new
-  version.
+- **prepare failed:** no assets were built or attached. Fix the named cause.
+  If the tag identifies bad source, fix it on `dev` and use a new version.
+  Keep the existing tag in place.
+- **verify failed:** no assets were attached. Re-run the failed jobs for a
+  runner problem. Fix a source failure on `dev` and release a new version.
+- **publish failed, release has no assets:** keep the release and tag and
+  re-run the failed jobs. The publisher can adopt a draft or published release
+  with no assets. Verified workflow artifacts are retained for 14 days.
+- **publish failed, release has partial assets:** retries refuse it. Inspect
+  the assets first. For an incomplete draft, delete the draft explicitly,
+  keep its tag and re-run the failed jobs. A published release is never
+  replaced; use a new version for an incomplete or bad published release.
+- **publish timed out with both assets present:** it may have succeeded.
+  Check the names, sizes and checksums and whether the release is still a
+  draft before taking action. A retry will refuse the existing assets.
 
 Protect `v*` tags with a repository rule so that published tags cannot be
 moved or deleted.

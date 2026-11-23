@@ -7,6 +7,14 @@ use crate::block::{BlockPosition, BlockView, RESTART_INTERVAL, Record, Value};
 pub(super) const SEGMENT_RAW_LEN: usize = 4 << 20;
 pub(super) const DICTIONARY_LEN: usize = 16 << 10;
 pub(super) const SAMPLE_LEN: usize = 64 << 10;
+/// Stored frame bytes per sampled segment before closing its dictionary scope,
+/// as a multiple of the dictionary length. Bounds dictionary overhead on
+/// compressible data while leaving weakly compressible segments at one sampled
+/// prefix.
+pub(super) const SCOPE_STORED_MULTIPLE: usize = 16;
+/// Maximum raw bytes a sampled segment and its streaming continuation may span,
+/// as a multiple of the builder's segment length.
+pub(super) const SCOPE_MAX_RAW_MULTIPLE: usize = 8;
 
 /// Finished raw blocks of one segment, concatenated, with each block's end
 /// and the number of records up to and including it.

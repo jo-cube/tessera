@@ -42,9 +42,28 @@ large write ─▶ private runs ────────────▶ level 0 
 - **Levels.** Level 0 holds flushes in publication order and may overlap.
   Deeper levels are sorted and strictly disjoint, with targets set by
   `level_ratio` (default 10) and dynamic level sizing. Level 0 is compacted at
-  four flush groups; writers wait at twelve.
-- **Compaction.** The worker takes the most overfull level, then level 0, then
-  small neighbours. Nonoverlapping runs move down without a rewrite. Level-0 →
+  four flush groups; writers wait at twelve. A group counts as long as any
+  of its runs remain in level 0, including slices outside the last merge.
+- **Compaction.** The worker takes the most overfull level, then eligible
+  level 0, then small neighbours. Nonoverlapping runs usually move down by
+  relabelling. Overlapping level-0 runs join a merge oldest first, charging
+  only their source bytes against the optional fan-in byte bound. Destination
+  overlaps count toward the input-count and workspace bounds, so several
+  flushes can share one destination rewrite even when it exceeds the source
+  byte bound. The same accounting applies with `memory_limit`.
+  When ordinary work runs out and either level 0 holds runs or
+  the active memtable is charged at least one eighth of its budget, the
+  worker waits for five quiet seconds before settling. It waits for frozen
+  tables to publish and checks the committed sequence and flush count before
+  acting. When the active table meets the eighth-budget threshold, the worker
+  freezes and flushes it outside the state lock through the normal flush
+  serialization—aligned to the oldest level-0 flush group's level-1
+  boundaries when level 0 is nonempty—before promoting level 0 in the same
+  quiet pass; a smaller tail stays in the active table. If writes resume
+  during the quiet flush or an idle job, the in-flight step finishes and
+  further idle selections wait for quiet. An isolated idle promotion into
+  the bottom can rewrite the source to remove its filter and elide tombstones
+  under the ordinary erasure rules. Level-0 →
   bottom jobs run as key-range pieces of about one target run of bottom input:
   each piece publishes atomically and frees its inputs, and level-0 sources
   shrink to bounded views of their remaining range. Up to
@@ -75,8 +94,9 @@ pool.
   bottom. The compaction worker scores every keyspace's plan and takes the
   highest; a keyspace whose level 0 is at the writer stop always ranks first,
   and ties go round-robin from a cursor. Under memory pressure it takes the
-  keyspace with the most reclaimable bytes. The piece allowance and builder
-  count are shared, so one keyspace's job never takes more than they allow.
+  keyspace with the most reclaimable bytes. Quiet level-0 runs rank below
+  ordinary work in every keyspace. The piece allowance and builder count are
+  shared, so one keyspace's job never takes more than they allow.
 - **Reads.** A point read probes the memtables with the prefixed key, then
   only its keyspace's directory. A scan merges the memtables, bounded by the
   prefix, with its keyspace's groups. A snapshot holds one shared list of
@@ -93,16 +113,25 @@ pool.
 ## Runs
 
 A run is an immutable, self-contained sorted file image held in pooled 1 MiB
-chunks. It is built in one pass: blocks are cut as records arrive, and each
-segment of about 4 MiB raw is compressed once complete.
+chunks. It is built in one pass: blocks are cut as records arrive, each sampled
+segment buffers its first 4 MiB raw to build a dictionary, and compressible
+segments continue streaming following blocks against that dictionary until a
+stopping rule closes the scope.
 
 - **Blocks.** Prefix-compressed records with restart keys every sixteen
   records. Block length adapts: each segment compresses its first 64 KiB at
   zstd level 1 without a dictionary, and that ratio sets the raw length
   expected to compress to the target (1 KiB by default), capped at 64 KiB raw.
 - **Segments.** Each segment stores a raw-content zstd dictionary of at most
-  16 KiB, sampled from evenly spaced records; blocks decode independently with
-  it, by reference, through one reusable context.
+  16 KiB, sampled from evenly spaced records of its buffered 4 MiB raw prefix;
+  blocks decode independently with it, by reference, through one reusable
+  context. After compressing the buffered prefix, a Zstandard segment streams
+  subsequent blocks directly against the same prepared context until stored
+  frames reach 16 times the dictionary length (256 KiB for a full dictionary),
+  raw bytes reach 8 times the segment length (32 MiB), or a 64 KiB check
+  window's stored-to-raw ratio exceeds the prefix's by more than a quarter of
+  the pro-rated dictionary cost. High-entropy segments already exceed the stored
+  target in their 4 MiB prefix and close at once.
 - **Frames.** Magicless zstd frames with a header binding codec, dictionary
   reference and decoded length, and a CRC-32 checked before every decode.
 - **Index.** A sparse index of each block's last key, prefix-compressed, with
@@ -135,8 +164,10 @@ build output and workspace. Shared sources count once. Below 90% writers
 proceed; above it they wait briefly on publication; at 100% they request
 reclamation and fail with `MemoryLimit` only when live data and held
 snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
-never refused, so maintenance can always finish and free space. Readers'
-buffers and allocator overhead are outside the budget.
+never refused, so maintenance can always finish and free space. Quiet
+level-0 compaction uses the same estimates and charges for pieces and
+retired sources. Snapshots and checkpoints may retain the inputs after
+publication. Readers' buffers and allocator overhead are outside the budget.
 
 ## Checkpoints
 
@@ -179,11 +210,17 @@ format and `CURRENT` are also version 1.
 
 One reader–writer lock guards the state; a writer-priority gate keeps new
 readers from overtaking a waiting writer. Publication and writes take it
-exclusively and briefly. Reads take immutable references under the shared lock
-and decode after releasing it. Builds, compression and checkpoint I/O hold no
-lock. A flush worker and a compaction worker run per engine; compaction can use
-several builders. Snapshots hold no lock and own their sources, so maintenance
-keeps only the newest version of each key.
+exclusively and briefly. Uncontended small writes take the state lock directly
+with one atomic check and no copy; when writers overlap, a combiner gathers
+requests across cache-line-isolated thread shards so one leader takes the state
+lock once, applies up to 64 requests (capped at 1 MiB of payload) in order,
+releases the lock, wakes its followers and hands leadership to a waiting writer.
+Bulk ingestion and larger batches keep their direct path. Reads take immutable
+references under the shared lock and decode after releasing it. Builds,
+compression and checkpoint I/O hold no lock. A flush worker and a compaction
+worker run per engine; compaction can use several builders. Snapshots hold no
+lock and own their sources, so maintenance keeps only the newest version of
+each key.
 
 ## Design decisions
 
@@ -195,8 +232,26 @@ keeps only the newest version of each key.
   frame anyway.
 - A raw block floor: no measured benefit.
 
-**Per-segment raw-content dictionaries of 16 KiB, sampled.**
+**Per-segment raw-content dictionaries of 16 KiB, sampled and amortized.**
+- Fixed 4 MiB raw scope: on globally redundant grouped data, 4 MiB raw
+  compresses to about 38 KiB of frames, making the 16 KiB dictionary nearly a
+  third of stored bytes. Continuing a segment against the same prepared
+  dictionary up to 16 times the dictionary length in stored frames (capped at
+  8 times the segment length raw, with a cost-based drift guard over 64 KiB
+  windows) reduces bottom-level stored bytes per record by about 23% on
+  globally redundant grouped data and 15% on clustered data while leaving
+  weakly compressible workloads at one sampled prefix.
+- Scope widening without a cost-based drift guard (fixed multipliers or a
+  coarse 25% relative drift guard over 1 MiB windows): on workloads where
+  consecutive key groups carry disjoint random payloads, frame growth from
+  stale group strings exceeds the saved dictionary bytes and increases stored
+  bytes by over 10%. Checking drift against a quarter of the pro-rated
+  dictionary cost over 64 KiB windows closes early at group boundaries and
+  keeps those workloads smaller as well.
 - Trained dictionaries: slow to build and to load.
+- Digested entropy tables reduce decode CPU. Their residency and less
+  adaptive sequence coding increase memory on grouped data. Loading the
+  serialized tables on every decode increases CPU.
 - A 4 KiB dictionary: grouped JSON 16–20% larger. Revisit with real datasets.
 
 **Zstd level 1 only, with uncompressed as the other codec.**
@@ -228,6 +283,22 @@ keeps only the newest version of each key.
   grouped data, none on weak-locality data, while point-read work rises
   56–525%, worst-point scans up to 83% and live heap up to 58%; no existing
   option carries the trade.
+- Charging destination bytes against optional level-0 fan-in prevents
+  overlapping flushes from sharing a rewrite once the destination exceeds
+  that byte bound. Charging source bytes lets them coalesce while the
+  input-count, workspace and piece-output bounds still limit the work.
+- Eagerly scheduling every split slice of a partially merged flush group
+  would spend a rewrite on a range that can still collect other writes.
+  Deferring below-threshold slices until quiet keeps ordinary scoring and
+  piece bounds intact, and the worker stops timing its wait once level 0
+  empties and the active memtable sits below its quiet-flush threshold.
+- Flushing any nonempty active memtable on quiet would trigger bottom-run
+  rewrites on a trickle of small writes; requiring at least one eighth of
+  the memtable budget bounds idle uncompressed residue while keeping small
+  trickles in memory. Aligning that quiet tail flush to the oldest pending
+  level-0 flush group's level-1 cuts lets each tail slice coalesce with the
+  matching level-0 slice in one settle instead of spanning all of level 1
+  and forcing a second bottom rewrite.
 - Range-partitioned shards: no change to write amplification for random writes,
   at the cost of a large rewrite.
 
@@ -285,3 +356,23 @@ the scheduler ranks a keyspace at the stop first so the stall is short.
 - A snapshot holding one reference per keyspace: taking it would cost one
   reference count per keyspace; the engine keeps one shared list of the
   keyspaces' directories instead.
+
+**Sharded write-group combining with bounded follower spinning.** An uncontended
+writer bypasses the queue with a single atomic compare-and-swap and copies
+nothing. Under contention, writers publish owned requests into 16
+cache-line-isolated shards tracked by an atomic bitmask, and one leader drains
+up to 64 requests or 1 MiB of payload per exclusive state-lock acquisition,
+re-draining shards that fill while the group applies. Followers spin for at
+most 20 µs of elapsed time, about one kernel park-and-wake round trip, before
+parking on a per-request condition variable. Short memtable groups avoid
+kernel wake handoffs; large batches, flushes and level-0 stops park after
+spinning no longer than parking costs. The bound does not depend on the cost
+of one spin hint, and a follower descheduled while spinning parks once it runs
+again, leaving cores to the leader when writers outnumber cores.
+- One global submission mutex with immediate condvar parking: every writer
+  still serialized on the queue mutex and paid kernel park/wake latency per
+  group, capping multi-writer scaling for small writes.
+- A fairer lock alone: still costs one exclusive handoff per operation.
+- A concurrent memtable: would require replacing the copy-on-write
+  single-writer B+ tree; combining already amortizes the exclusive lock over a
+  group of writes.

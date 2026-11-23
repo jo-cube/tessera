@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-23
+
+### Features
+
+- engine: add diagnostics block-decode observer and lock counters (8b3ffc1)
+- tools: add small scenario, Zipfian reuse curve and read-shape counters (d6ea4d4)
+- bench: add dataset C, reader/writer scaling and Zipfian workloads (8ef689d)
+- bench: sample footprint after allocator relief (dd80791)
+- bench: measure sustained shuffled updates (2a0e141)
+- tools: add memtable size overrides (2d2950c)
+
+### Fixes
+
+- compaction: settle level zero after writes go quiet (d6f44d0)
+- compaction: wait through short read intervals (6e0e705)
+- bench: drop bulk-ingest batch before measuring bursts (3c455b5)
+
+### Performance
+
+- bench: stabilize read timing windows (2465982)
+- tools: measure shared zstd entropy tables (2df3366)
+- tools: add offline dictionary scope measurement (efafb23)
+- run: amortize segment dictionaries over stored frame bytes (fae6775)
+- bench: measure quiet and sustained states (526e740)
+- engine: combine concurrent writes across sharded queues (d69dd95)
+- bench: emit write-combiner counters in scaling cases (88c738c)
+- bench: add 32-writer batch-1 cases to writer scaling (1c7c7a4)
+- engine: bound follower spinning by elapsed time (535667c)
+- bench: add bursts case and quiet-phase peak heap tracking (b8ac976)
+- engine: flush large active memtables on quiet (b4eba27)
+- compaction: count source bytes for level-0 fan-in (c9f1294)
+
 ## 0.1.0 - 2026-11-21
 
 ### Features

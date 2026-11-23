@@ -9,7 +9,7 @@ pub use super::worker::BackgroundStatus;
 use super::{CheckpointReport as Report, Engine, Reader};
 pub use crate::chunk::{BuildCounters, Erasure};
 pub use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
-pub use crate::run::MergeWorkspace;
+pub use crate::run::{BlockDecode, MergeWorkspace, with_block_observer};
 
 /// Engine operations for tools and tests.
 pub trait EngineDiagnostics {
@@ -188,6 +188,22 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
             level
         })
         .collect()
+}
+
+/// Maps each physical run's storage identity to its aligned level index
+/// (`0` for level 0 through `depth` for the bottom level), returning
+/// `(depth, map)`.
+pub fn run_levels(engine: &Engine) -> (usize, std::collections::HashMap<usize, usize>) {
+    let state = engine.core.read_state();
+    let levels = aligned_levels(&state);
+    let depth = levels.len().saturating_sub(1);
+    let mut map = std::collections::HashMap::new();
+    for (level, runs) in levels.iter().enumerate() {
+        for run in super::physical_runs(runs) {
+            map.insert(run.run.storage_id(), level);
+        }
+    }
+    (depth, map)
 }
 
 /// Drained run shape for the streaming comparison harness.
@@ -371,6 +387,20 @@ pub struct Maintenance {
     pub level0_waits: u64,
     /// Writer nanoseconds waiting at the level-0 stop.
     pub level0_wait_ns: u64,
+    /// Writer nanoseconds waiting on frozen memtable flushes.
+    pub flush_wait_ns: u64,
+    /// Writer nanoseconds waiting on memory-limit admission or reclamation.
+    pub memory_wait_ns: u64,
+    /// Reader acquisitions that entered the writer-priority gate.
+    pub gate_waits: u64,
+    /// Exclusive state-lock acquisitions.
+    pub write_locks: u64,
+    /// Write groups executed through the combiner.
+    pub write_groups: u64,
+    /// Write requests applied through the combiner (leaders and followers).
+    pub grouped_writes: u64,
+    /// Combined group-size counts: sizes 1..=8, then 9..=16 and 17+.
+    pub write_group_sizes: [u64; super::combiner::GROUP_SIZE_BUCKETS],
 }
 /// Read counters without acquiring the engine state lock.
 pub fn maintenance(engine: &Engine) -> Maintenance {
@@ -387,6 +417,13 @@ pub fn maintenance(engine: &Engine) -> Maintenance {
         writer_wait_ns: p.writer_wait_ns.load(Relaxed),
         level0_waits: p.level0_waits.load(Relaxed),
         level0_wait_ns: p.level0_wait_ns.load(Relaxed),
+        flush_wait_ns: p.flush_wait_ns.load(Relaxed),
+        memory_wait_ns: p.memory_wait_ns.load(Relaxed),
+        gate_waits: p.gate_waits.load(Relaxed),
+        write_locks: p.write_locks.load(Relaxed),
+        write_groups: p.write_groups.load(Relaxed),
+        grouped_writes: p.grouped_writes.load(Relaxed),
+        write_group_sizes: std::array::from_fn(|i| p.write_group_sizes[i].load(Relaxed)),
     }
 }
 
@@ -451,5 +488,50 @@ mod streaming_tests {
         );
         assert_eq!(shape.stored_bytes, engine.engine_stats().run_bytes);
         assert_eq!(shape.bounded_views, 0);
+    }
+
+    #[test]
+    fn block_observer_reports_run_levels_crc_and_false_positives() {
+        let engine = Engine::in_memory(Options {
+            background_compaction: None,
+            ..Options::default()
+        })
+        .unwrap();
+        let ks = engine.test_keyspace();
+        for i in 0..2_000u32 {
+            let k = (i * 2).to_be_bytes();
+            ks.put(&k, b"value payload for compression test").unwrap();
+        }
+        engine.flush().unwrap();
+        let (depth, map) = run_levels(&engine);
+        assert!(depth >= 1);
+        assert_eq!(map.len(), 1);
+        let (&run_id, &level) = map.iter().next().unwrap();
+        assert_eq!(level, 0);
+
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = std::rc::Rc::clone(&seen);
+        let mut reader = engine.reader();
+        with_block_observer(Box::new(move |ev| sink.borrow_mut().push(ev)), || {
+            assert!(reader.get(&ks, &20u32.to_be_bytes()).unwrap().is_some());
+            assert!(reader.get(&ks, &20u32.to_be_bytes()).unwrap().is_some());
+            for i in 0..2_000u32 {
+                let odd = (i * 2 + 1).to_be_bytes();
+                assert!(reader.get(&ks, &odd).unwrap().is_none());
+            }
+        });
+        let events = seen.borrow();
+        assert!(events.len() >= 2);
+        assert_eq!(events[0].run_id, run_id);
+        assert_eq!(events[0].block, events[1].block);
+        assert!(events[0].compressed);
+        assert!(events[0].decoded_bytes > 0);
+        let counters = reader.counters();
+        assert_eq!(counters.blocks_loaded as usize, events.len());
+        assert!(counters.crc_bytes > 0);
+        assert!(counters.filter_probes >= 2_000);
+        assert!(counters.filter_false_positives > 0);
+        assert!(counters.filter_false_positives < 100);
+        assert!(maintenance(&engine).write_locks >= 2_000);
     }
 }

@@ -5,18 +5,24 @@
 //! long-format CSV rows. See tools/README.md.
 //!
 //! `counters [--variant LABEL] [--settle] [--scale SHIFT] [--copy-audit]
-//! [--c2] [--write-only] [--memtable VALUE_LEN] [--worst] [--keyspaces N]
+//! [--c2] [--dict-scope] [--write-only] [--memtable VALUE_LEN]
+//! [--memtable-key KEY_LEN] [--worst] [--zipf] [--read-shapes] [--keyspaces N]
 //! [SCENARIO...]`
 //!
 //! With `--keyspaces N`, record `i` goes to keyspace `i % N`, so the same
 //! records spread over N keyspaces; every read is checked in its keyspace.
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
-use tessera::diagnostics::{self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics};
+use tessera::diagnostics::{
+    self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics, SegmentSample,
+};
 use tessera::{Engine, Keyspace, Options};
 
-mod c2;
+pub(crate) mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
 mod memory;
+mod zipf;
 
 const MEMBERS: usize = 64;
 struct Rng(u64);
@@ -27,44 +33,88 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+    }
     fn shuffle<T>(&mut self, values: &mut [T]) {
         for i in (1..values.len()).rev() {
             values.swap(i, self.next() as usize % (i + 1));
         }
     }
 }
-fn key(i: usize) -> [u8; 16] {
-    let mut key = [0; 16];
-    key[..8].copy_from_slice(&(i as u64 / MEMBERS as u64).to_be_bytes());
-    key[8..].copy_from_slice(&(i as u64 % MEMBERS as u64).to_be_bytes());
-    key
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Grouped,
+    Weak,
+    Small,
 }
-fn value(i: usize, version: u8, weak: bool, len: usize) -> Vec<u8> {
-    let mut out = if weak {
-        let mut rng =
-            Rng((i as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15) ^ (u64::from(version) << 40));
-        (0..600)
-            .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[rng.next() as usize % 36])
-            .collect()
-    } else {
-        let prefix = format!(
-            "{{\"entity\":{},\"member\":{},\"version\":{},\"status\":\"active\",\"region\":\"north\",\"description\":\"",
-            i / MEMBERS,
-            i % MEMBERS,
-            version
-        );
-        let mut out = prefix.into_bytes();
-        while out.len() < 598 {
-            out.extend_from_slice(
-                b"stable member profile with shared field names and repeated content ",
-            );
+
+fn key_bytes(i: usize, kind: Kind) -> Vec<u8> {
+    match kind {
+        Kind::Small => {
+            // 20-byte structured key: 8B entity + 8B member + 4B attribute (64 keys/entity).
+            let mut key = vec![0u8; 20];
+            key[..8].copy_from_slice(&(i as u64 / MEMBERS as u64).to_be_bytes());
+            key[8..16].copy_from_slice(&((i % MEMBERS) as u64 / 4).to_be_bytes());
+            key[16..20].copy_from_slice(&((i % 4) as u32).to_be_bytes());
+            key
         }
-        out.truncate(598);
-        out.extend_from_slice(b"\"}");
-        out
-    };
-    out.truncate(len);
-    out
+        Kind::Grouped | Kind::Weak => {
+            let mut key = vec![0u8; 16];
+            key[..8].copy_from_slice(&(i as u64 / MEMBERS as u64).to_be_bytes());
+            key[8..16].copy_from_slice(&(i as u64 % MEMBERS as u64).to_be_bytes());
+            key
+        }
+    }
+}
+
+fn value(i: usize, version: u8, kind: Kind, len: usize) -> Vec<u8> {
+    match kind {
+        Kind::Small => {
+            const STATUS: [&str; 3] = ["active", "idle", "warm"];
+            const REGION: [&str; 4] = ["us-e1", "us-w2", "eu-w1", "ap-s1"];
+            let mut rng = Rng(
+                (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (u64::from(version) << 40)
+            );
+            let count = rng.next() % 10_000;
+            let sum = rng.next() % 1_000_000;
+            format!(
+                r#"{{"v":{version},"c":{count},"s":{sum},"st":"{}","r":"{}"}}"#,
+                STATUS[(i + usize::from(version)) % STATUS.len()],
+                REGION[(i / MEMBERS) % REGION.len()],
+            )
+            .into_bytes()
+        }
+        Kind::Weak => {
+            let mut rng = Rng(
+                (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (u64::from(version) << 40)
+            );
+            let mut out: Vec<u8> = (0..600)
+                .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[rng.next() as usize % 36])
+                .collect();
+            out.truncate(len);
+            out
+        }
+        Kind::Grouped => {
+            let prefix = format!(
+                "{{\"entity\":{},\"member\":{},\"version\":{},\"status\":\"active\",\"region\":\"north\",\"description\":\"",
+                i / MEMBERS,
+                i % MEMBERS,
+                version
+            );
+            let mut out = prefix.into_bytes();
+            while out.len() < 598 {
+                out.extend_from_slice(
+                    b"stable member profile with shared field names and repeated content ",
+                );
+            }
+            out.truncate(598);
+            out.extend_from_slice(b"\"}");
+            out.truncate(len);
+            out
+        }
+    }
 }
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
@@ -79,18 +129,24 @@ fn slot_name(slot: usize) -> String {
 
 struct Scenario {
     name: &'static str,
-    weak: bool,
+    kind: Kind,
     records: usize,
     value_len: usize,
     /// Time-ordered load, then updates to the newest 10% of entities in order.
     clustered: bool,
 }
 
+type SampleProbe = fn(&str, &[SegmentSample]);
+
 struct Flags {
     copy_audit: bool,
     c2: bool,
+    dict_scope: bool,
+    sample_probe: Option<SampleProbe>,
     write_only: bool,
     worst: bool,
+    zipf: bool,
+    read_shapes: bool,
     keyspaces: usize,
 }
 
@@ -99,8 +155,12 @@ impl Default for Flags {
         Self {
             copy_audit: false,
             c2: false,
+            dict_scope: false,
+            sample_probe: None,
             write_only: false,
             worst: false,
+            zipf: false,
+            read_shapes: false,
             keyspaces: 1,
         }
     }
@@ -108,28 +168,88 @@ impl Default for Flags {
 
 static BOTTOM_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn level_label(level: usize, depth: usize) -> String {
+    if level == depth {
+        format!("L{level}-bottom")
+    } else {
+        format!("L{level}")
+    }
+}
+
+fn emit_per_record(name: &str, variant: &str, levels: &[diagnostics::LevelMemory]) {
+    let mut records = 0usize;
+    let (
+        mut raw,
+        mut frames,
+        mut dicts,
+        mut seg_table,
+        mut index,
+        mut filters,
+        mut footer,
+        mut phys,
+    ) = (
+        0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
+    );
+    for m in levels {
+        records += m.records;
+        raw += m.raw;
+        frames += m.frames;
+        dicts += m.dictionaries;
+        seg_table += m.segment_table;
+        index += m.index;
+        filters += m.filters;
+        footer += m.footer;
+        phys += m.physical;
+    }
+    let stored = frames + dicts + seg_table + index + filters + footer;
+    let total = stored + phys;
+    let per = |n: usize| {
+        if records == 0 {
+            0.0
+        } else {
+            n as f64 / records as f64
+        }
+    };
+    println!(
+        "per_record,{name},{variant},{records},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+        per(raw),
+        per(stored),
+        per(frames),
+        per(dicts),
+        per(seg_table),
+        per(index),
+        per(filters),
+        per(footer),
+        per(phys),
+        per(total),
+    );
+}
+
 /// Point and scan work per operation: hits and misses on spread keys, then
 /// short scans from spread 7-byte prefixes (one seek, then 100 records).
 fn probe_reads(
     engine: &Engine,
     ks: &Keyspace,
-    name: &str,
+    s: &Scenario,
     variant: &str,
     point: &str,
-    records: usize,
     expect: &dyn Fn(usize) -> Vec<u8>,
 ) {
+    let (name, kind, records) = (s.name, s.kind, s.records);
     const GETS: usize = 10_000;
     const SEEKS: usize = 200;
     let mut hits = engine.reader();
     for at in 0..GETS {
         let i = at * 7919 % records;
-        assert_eq!(hits.get(ks, &key(i)).unwrap().unwrap(), expect(i));
+        assert_eq!(
+            hits.get(ks, &key_bytes(i, kind)).unwrap().unwrap(),
+            expect(i)
+        );
     }
     let mut misses = engine.reader();
     for at in 0..GETS {
         let i = at * 7919 % (records - 1);
-        let mut missing = key(i).to_vec();
+        let mut missing = key_bytes(i, kind);
         missing.push(0);
         assert!(misses.get(ks, &missing).unwrap().is_none());
     }
@@ -138,7 +258,8 @@ fn probe_reads(
     for at in 0..SEEKS {
         // Prefixes of 256 entities (16,384 keys); start well before the end.
         let i = (at * 104_729) % (records - 20_000);
-        let prefix = &key(i)[..7];
+        let k = key_bytes(i, kind);
+        let prefix = &k[..7];
         // One seek alone, then a fresh scan of 100 records from it.
         let before = ws.counters().blocks_loaded;
         assert!(ws.prefix(ks, prefix).next().unwrap().is_some());
@@ -187,6 +308,239 @@ fn probe_reads(
     );
 }
 
+/// Miss-heavy point gets (0%, 50%, 100% misses) and scan shapes (absent prefix
+/// and short scans of 1, 5, 10 records), with per-level decode breakdowns.
+fn probe_read_shapes(
+    engine: &Engine,
+    ks: &Keyspace,
+    s: &Scenario,
+    variant: &str,
+    expect: &dyn Fn(usize) -> Vec<u8>,
+) {
+    let (name, kind, records) = (s.name, s.kind, s.records);
+    const GETS: usize = 10_000;
+    const SCANS: usize = 500;
+    let (depth, run_map) = diagnostics::run_levels(engine);
+    let levels = depth + 1;
+
+    for (mix_name, miss_pct) in [("miss_0", 0usize), ("miss_50", 50), ("miss_100", 100)] {
+        let per_level = Rc::new(RefCell::new(vec![(0u64, 0u64); levels]));
+        let miss_decoded = Rc::new(RefCell::new(0u64));
+        let in_miss = Rc::new(RefCell::new(false));
+        let map_ref = Rc::new(run_map.clone());
+        let lvl_sink = Rc::clone(&per_level);
+        let miss_sink = Rc::clone(&miss_decoded);
+        let flag_sink = Rc::clone(&in_miss);
+        let map_sink = Rc::clone(&map_ref);
+
+        let mut reader = engine.reader();
+        let mut misses = 0usize;
+        diagnostics::with_block_observer(
+            Box::new(move |ev| {
+                let lvl = map_sink.get(&ev.run_id).copied().unwrap_or(depth);
+                let mut counts = lvl_sink.borrow_mut();
+                if lvl < counts.len() {
+                    counts[lvl].0 += 1;
+                    counts[lvl].1 += ev.decoded_bytes as u64;
+                }
+                if *flag_sink.borrow() {
+                    *miss_sink.borrow_mut() += ev.decoded_bytes as u64;
+                }
+            }),
+            || {
+                for at in 0..GETS {
+                    let is_miss = (at % 100) < miss_pct;
+                    *in_miss.borrow_mut() = is_miss;
+                    if is_miss {
+                        misses += 1;
+                        let i = at * 7919 % (records - 1);
+                        let mut missing = key_bytes(i, kind);
+                        missing.push(0);
+                        assert!(reader.get(ks, &missing).unwrap().is_none());
+                    } else {
+                        let i = at * 7919 % records;
+                        assert_eq!(
+                            reader.get(ks, &key_bytes(i, kind)).unwrap().unwrap(),
+                            expect(i)
+                        );
+                    }
+                }
+            },
+        );
+        let c = reader.counters();
+        let fp_rate = if c.filter_probes == 0 {
+            0.0
+        } else {
+            c.filter_false_positives as f64 / c.filter_probes as f64
+        };
+        let dec_per_miss = if misses == 0 {
+            0.0
+        } else {
+            *miss_decoded.borrow() as f64 / misses as f64
+        };
+        println!(
+            "miss_get,{name},{variant},{mix_name},{GETS},{misses},{:.3},{:.4},{:.5},{:.3},{:.1},{:.1},{:.1}",
+            c.filter_probes as f64 / GETS as f64,
+            c.filter_false_positives as f64 / GETS as f64,
+            fp_rate,
+            c.blocks_loaded as f64 / GETS as f64,
+            c.decoded_bytes as f64 / GETS as f64,
+            dec_per_miss,
+            c.crc_bytes as f64 / GETS as f64,
+        );
+        for (lvl, &(blocks, bytes)) in per_level.borrow().iter().enumerate() {
+            println!(
+                "miss_get_level,{name},{variant},{mix_name},{},{:.4},{:.1}",
+                level_label(lvl, depth),
+                blocks as f64 / GETS as f64,
+                bytes as f64 / GETS as f64,
+            );
+        }
+    }
+
+    let shapes: &[(&str, usize)] = &[
+        ("prefix_absent", 0),
+        ("short_1", 1),
+        ("short_5", 5),
+        ("short_10", 10),
+        ("prefix_10", 10),
+    ];
+    for &(shape, take_n) in shapes {
+        let per_level = Rc::new(RefCell::new(vec![(0u64, 0u64); levels]));
+        let lvl_sink = Rc::clone(&per_level);
+        let map_sink = run_map.clone();
+        let mut reader = engine.reader();
+        let mut yielded = 0usize;
+        diagnostics::with_block_observer(
+            Box::new(move |ev| {
+                let lvl = map_sink.get(&ev.run_id).copied().unwrap_or(depth);
+                let mut counts = lvl_sink.borrow_mut();
+                if lvl < counts.len() {
+                    counts[lvl].0 += 1;
+                    counts[lvl].1 += ev.decoded_bytes as u64;
+                }
+            }),
+            || {
+                let entities = (records / MEMBERS).max(2);
+                for at in 0..SCANS {
+                    match shape {
+                        "prefix_absent" => {
+                            // 12-byte prefix with bytes[8..12] = 1 sorts strictly
+                            // between entity e's members and entity e+1, so 0 hits.
+                            let e = (at * 7919) % (entities - 1);
+                            let mut prefix = [0u8; 12];
+                            prefix[..8].copy_from_slice(&(e as u64).to_be_bytes());
+                            prefix[11] = 1;
+                            let mut scan = reader.prefix(ks, &prefix);
+                            assert!(scan.next().unwrap().is_none());
+                        }
+                        "prefix_10" => {
+                            let e = (at * 7919) % entities;
+                            let prefix = (e as u64).to_be_bytes();
+                            let mut scan = reader.prefix(ks, &prefix);
+                            for step in 0..take_n {
+                                let i = e * MEMBERS + step;
+                                let (k, v) = scan.next().unwrap().unwrap();
+                                assert_eq!(k, key_bytes(i, kind));
+                                assert_eq!(v, expect(i));
+                                yielded += 1;
+                            }
+                        }
+                        _ => {
+                            let start = (at * 104_729) % (records - take_n - 1);
+                            let start_key = key_bytes(start, kind);
+                            let mut scan = reader.range(ks, start_key.as_slice()..);
+                            for step in 0..take_n {
+                                let i = start + step;
+                                let (k, v) = scan.next().unwrap().unwrap();
+                                assert_eq!(k, key_bytes(i, kind));
+                                assert_eq!(v, expect(i));
+                                yielded += 1;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let c = reader.counters();
+        println!(
+            "scan_shape,{name},{variant},{shape},{SCANS},{:.2},{:.3},{:.1},{:.1}",
+            yielded as f64 / SCANS as f64,
+            c.blocks_loaded as f64 / SCANS as f64,
+            c.decoded_bytes as f64 / SCANS as f64,
+            c.crc_bytes as f64 / SCANS as f64,
+        );
+        for (lvl, &(blocks, bytes)) in per_level.borrow().iter().enumerate() {
+            println!(
+                "scan_shape_level,{name},{variant},{shape},{},{:.4},{:.1}",
+                level_label(lvl, depth),
+                blocks as f64 / SCANS as f64,
+                bytes as f64 / SCANS as f64,
+            );
+        }
+    }
+}
+
+/// Scrambled Zipfian gets at theta = 0.99 and 0.80, computing the exact
+/// block-reuse curve and S3-FIFO hit rate from decoded (run, block) identities.
+fn probe_zipf_reads(
+    engine: &Engine,
+    ks: &Keyspace,
+    s: &Scenario,
+    variant: &str,
+    phase: &str,
+    expect: &dyn Fn(usize) -> Vec<u8>,
+) {
+    let (name, kind, records) = (s.name, s.kind, s.records);
+    const ZIPF_GETS: usize = 50_000;
+    for theta in [0.99_f64, 0.80_f64] {
+        let zipf_gen = zipf::ScrambledZipfian::new(records, theta, 0x5a69_7066_0001);
+        let mut rng = Rng(0x7a69_7066_1234 ^ theta.to_bits());
+        let tracker = Rc::new(RefCell::new(zipf::ReuseTracker::new(ZIPF_GETS * 2)));
+        let sink = Rc::clone(&tracker);
+        let mut reader = engine.reader();
+        diagnostics::with_block_observer(
+            Box::new(move |ev| {
+                sink.borrow_mut()
+                    .record_block(ev.run_id, ev.block, ev.decoded_bytes);
+            }),
+            || {
+                for _ in 0..ZIPF_GETS {
+                    let i = zipf_gen.sample(rng.unit());
+                    tracker.borrow_mut().begin_get();
+                    assert_eq!(
+                        reader.get(ks, &key_bytes(i, kind)).unwrap().unwrap(),
+                        expect(i)
+                    );
+                    tracker.borrow_mut().end_get();
+                }
+            },
+        );
+        let c = reader.counters();
+        let t = tracker.borrow();
+        println!(
+            "zipf_get,{name},{variant},{phase},{theta:.2},{ZIPF_GETS},{:.3},{:.1},{:.1},{:.3},{:.4},{}",
+            c.blocks_loaded as f64 / ZIPF_GETS as f64,
+            c.decoded_bytes as f64 / ZIPF_GETS as f64,
+            c.crc_bytes as f64 / ZIPF_GETS as f64,
+            c.filter_probes as f64 / ZIPF_GETS as f64,
+            c.filter_false_positives as f64 / ZIPF_GETS as f64,
+            t.distinct_blocks(),
+        );
+        for p in t.curve() {
+            println!(
+                "zipf_reuse,{name},{variant},{phase},{theta:.2},{},{:.4},{:.4},{:.4},{},{}",
+                p.n_blocks,
+                p.get_hit_rate,
+                p.block_hit_rate,
+                p.s3fifo_hit_rate,
+                p.lru_bytes,
+                p.mean_n_bytes,
+            );
+        }
+    }
+}
+
 /// One row per audited bottom input segment, then the bottom work totals.
 fn print_copy_audit(name: &str, variant: &str) {
     let (segments, other_raw) = diagnostics::take_copy_audit();
@@ -209,12 +563,38 @@ fn print_copy_audit(name: &str, variant: &str) {
     }
 }
 
+fn sample_bottom(engine: &Engine) -> Vec<SegmentSample> {
+    const RAW_TARGET: usize = 64 << 20;
+    let raw = diagnostics::bottom_raw(engine);
+    let every = (raw / RAW_TARGET).max(1);
+    let samples = diagnostics::bottom_segments(engine, every);
+    let sampled: usize = samples.iter().flat_map(|s| &s.blocks).map(Vec::len).sum();
+    if every > 1 && sampled < RAW_TARGET {
+        diagnostics::bottom_segments(engine, every - 1)
+    } else {
+        samples
+    }
+}
+
+fn settle_bottom(engine: &Engine) {
+    let mut merge = MergeWorkspace::new();
+    while diagnostics::compact_step(engine, &mut merge).unwrap() {}
+    engine.wait_for_compaction().unwrap();
+}
+
 fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags) {
     let started = Instant::now();
-    let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
+    let (name, kind, records, len) = (s.name, s.kind, s.records, s.value_len);
     let engine = std::sync::Arc::new(
         Engine::in_memory({
             let mut options = Options::default();
+            if let Ok(mib) = std::env::var("TESSERA_COUNTERS_MEMTABLE_MIB") {
+                options.memtable_size = mib
+                    .parse::<usize>()
+                    .expect("integer memtable MiB")
+                    .checked_mul(1 << 20)
+                    .expect("memtable size fits usize");
+            }
             options.background_threads = threads;
             options
         })
@@ -234,31 +614,37 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     diagnostics::set_memory_observer(memory::sample_stats);
     let mut ingested = 0u64;
-    let mut order: Vec<_> = (0..records).collect();
+    let mut order: Vec<u32> = (0..records as u32).collect();
     let mut rng = Rng(0x123456789abcdef);
     if !s.clustered {
         rng.shuffle(&mut order);
     }
     for &i in &order {
-        let v = value(i, 0, weak, len);
-        owner(i).put(&key(i), &v).unwrap();
-        ingested += (16 + v.len()) as u64;
+        let i = i as usize;
+        let k = key_bytes(i, kind);
+        let v = value(i, 0, kind, len);
+        owner(i).put(&k, &v).unwrap();
+        ingested += (k.len() + v.len()) as u64;
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     memory::phase_end(&engine, "load_end", 1);
-    let mut updated = vec![false; records];
+    let mut version = vec![0u8; records];
     let mut updates = order;
     if s.clustered {
-        updates = (records / MEMBERS * 9 / 10 * MEMBERS..records).collect();
+        updates = (records / MEMBERS * 9 / 10 * MEMBERS..records)
+            .map(|i| i as u32)
+            .collect();
     } else {
         rng.shuffle(&mut updates);
         updates.truncate(records / 2);
     }
     for &i in &updates {
-        let v = value(i, 1, weak, len);
-        owner(i).put(&key(i), &v).unwrap();
-        ingested += (16 + v.len()) as u64;
-        updated[i] = true;
+        let i = i as usize;
+        let k = key_bytes(i, kind);
+        let v = value(i, 1, kind, len);
+        owner(i).put(&k, &v).unwrap();
+        ingested += (k.len() + v.len()) as u64;
+        version[i] = 1;
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     memory::phase_end(&engine, "update_end", 2);
@@ -276,7 +662,27 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         return;
     }
 
-    let expect = |i: usize| value(i, u8::from(updated[i]), weak, len);
+    if flags.dict_scope {
+        settle_bottom(&engine);
+        let samples = diagnostics::bottom_segments(&engine, 1);
+        #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+        sampler.stop();
+        std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        c2::run_dict_scope(name, &samples);
+        return;
+    }
+
+    if let Some(probe) = flags.sample_probe {
+        settle_bottom(&engine);
+        let samples = sample_bottom(&engine);
+        #[cfg(all(feature = "tools-memory", target_os = "linux"))]
+        sampler.stop();
+        std::sync::Arc::try_unwrap(engine).unwrap().close().unwrap();
+        probe(name, &samples);
+        return;
+    }
+
+    let expect = |i: usize| value(i, version[i], kind, len);
     let mut scans = engine.reader();
     for _ in 0..100 {
         let mut scan = scans.range(ks, ..);
@@ -288,7 +694,10 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     // and a full scan over every record.
     let mut ws = engine.reader();
     for i in (0..records).step_by(61) {
-        assert_eq!(ws.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
+        assert_eq!(
+            ws.get(owner(i), &key_bytes(i, kind)).unwrap().unwrap(),
+            expect(i)
+        );
     }
     let n = spaces.len();
     for start in (0..records).step_by(128 * n) {
@@ -297,7 +706,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                 .filter(|i| i % n == j)
                 .rev()
                 .collect();
-            let bytes: Vec<_> = keys.iter().map(|&i| key(i)).collect();
+            let bytes: Vec<_> = keys.iter().map(|&i| key_bytes(i, kind)).collect();
             for (at, got) in ws.multi_get(space, &bytes).unwrap().iter().enumerate() {
                 assert_eq!(got.unwrap(), expect(keys[at]));
             }
@@ -307,7 +716,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         let mut scan = ws.range(space, ..);
         for i in (j..records).step_by(n) {
             let (found, value) = scan.next().unwrap().unwrap();
-            assert_eq!(found, key(i));
+            assert_eq!(found, key_bytes(i, kind));
             assert_eq!(value, expect(i));
         }
         assert!(scan.next().unwrap().is_none());
@@ -315,12 +724,15 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let mut hits = engine.reader();
     for at in 0..10_000 {
         let i = at * 7919 % records;
-        assert_eq!(hits.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
+        assert_eq!(
+            hits.get(owner(i), &key_bytes(i, kind)).unwrap().unwrap(),
+            expect(i)
+        );
     }
     let mut misses = engine.reader();
     for at in 0..1_000 {
         let i = at * 7919 % (records - 1);
-        let mut missing = key(i).to_vec();
+        let mut missing = key_bytes(i, kind);
         missing.push(0);
         assert!(misses.get(owner(i), &missing).unwrap().is_none());
     }
@@ -377,14 +789,12 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
             m.physical
         );
     }
+    emit_per_record(name, variant, &levels);
     if flags.copy_audit {
         print_copy_audit(name, variant);
     }
     if flags.c2 {
-        // At least 64 MiB raw of evenly spaced bottom segments, or all.
-        let every = (diagnostics::bottom_raw(&engine) / (64 << 20)).max(1);
-        let samples = diagnostics::bottom_segments(&engine, every);
-        c2::run(name, &samples);
+        c2::run(name, &sample_bottom(&engine));
     }
     let flush_raw = work[0].raw_out;
     let raw: u64 = work.iter().map(|w| w.raw_out).sum();
@@ -404,27 +814,91 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     );
     let m = diagnostics::maintenance(&engine);
     println!(
-        "waits,{name},{variant},{},{:.3},{:.3},{},{}",
+        "waits,{name},{variant},{},{:.3},{:.3},{},{},{:.3},{:.3},{},{}",
         m.level0_waits,
         m.level0_wait_ns as f64 / 1e9,
         m.writer_wait_ns as f64 / 1e9,
         background.compactions,
-        BOTTOM_JOBS.load(std::sync::atomic::Ordering::Relaxed)
+        BOTTOM_JOBS.load(std::sync::atomic::Ordering::Relaxed),
+        m.flush_wait_ns as f64 / 1e9,
+        m.memory_wait_ns as f64 / 1e9,
+        m.gate_waits,
+        m.write_locks,
     );
-    // The probes and the worst point read one keyspace's key layout.
+    // The probes, read shapes, zipf and worst point read one keyspace's key layout.
     if single {
-        probe_reads(&engine, ks, name, variant, "end", records, &expect);
+        probe_reads(&engine, ks, s, variant, "end", &expect);
+        if flags.read_shapes {
+            probe_read_shapes(&engine, ks, s, variant, &expect);
+        }
+        if flags.zipf {
+            probe_zipf_reads(&engine, ks, s, variant, "post_update", &expect);
+        }
     }
+    if flags.zipf && single {
+        let work_before = diagnostics::work(&engine);
+        let copy_before = diagnostics::copy_forward(&engine);
+        let zipf_updates = (records / 4).max(1_024);
+        let zipf_gen = zipf::ScrambledZipfian::new(records, 0.99, 0x5a69_7066_0002);
+        let mut zrng = Rng(0x7a69_7066_9999);
+        for _ in 0..zipf_updates {
+            let i = zipf_gen.sample(zrng.unit());
+            let k = key_bytes(i, kind);
+            let v = value(i, 2, kind, len);
+            ks.put(&k, &v).unwrap();
+            version[i] = 2;
+        }
+        engine.flush().unwrap();
+        engine.wait_for_compaction().unwrap();
+        let work_after = diagnostics::work(&engine);
+        let copy_after = diagnostics::copy_forward(&engine);
+        let raw_in_delta: u64 = work_after
+            .iter()
+            .zip(&work_before)
+            .map(|(a, b)| a.raw_in - b.raw_in)
+            .sum();
+        let raw_out_delta: u64 = work_after
+            .iter()
+            .zip(&work_before)
+            .map(|(a, b)| a.raw_out - b.raw_out)
+            .sum();
+        let stored_delta: u64 = work_after
+            .iter()
+            .zip(&work_before)
+            .map(|(a, b)| a.stored - b.stored)
+            .sum();
+        let expect_after = |i: usize| value(i, version[i], kind, len);
+        let mut check_r = engine.reader();
+        for at in 0..10_000 {
+            let i = at * 7919 % records;
+            assert_eq!(
+                check_r.get(ks, &key_bytes(i, kind)).unwrap().unwrap(),
+                expect_after(i)
+            );
+        }
+        let zstats = engine.engine_stats();
+        println!(
+            "zipf_update,{name},{variant},0.99,{zipf_updates},{raw_in_delta},{raw_out_delta},{stored_delta},{},{},{},{},{:.1}",
+            copy_after.blocks - copy_before.blocks,
+            copy_after.input_blocks - copy_before.input_blocks,
+            zstats.run_bytes,
+            zstats.held_bytes,
+            ratio(check_r.counters().decoded_bytes, 10_000),
+        );
+        probe_zipf_reads(&engine, ks, s, variant, "post_zipf_update", &expect_after);
+    }
+    let expect = |i: usize| value(i, version[i], kind, len);
     if settle {
         // A control without timing effects: rewrite everything into the
         // bottom level, where sequences are erased, then measure again.
-        let mut merge = MergeWorkspace::new();
-        while diagnostics::compact_step(&engine, &mut merge).unwrap() {}
-        engine.wait_for_compaction().unwrap();
+        settle_bottom(&engine);
         let mut hits = engine.reader();
         for at in 0..10_000 {
             let i = at * 7919 % records;
-            assert_eq!(hits.get(owner(i), &key(i)).unwrap().unwrap(), expect(i));
+            assert_eq!(
+                hits.get(owner(i), &key_bytes(i, kind)).unwrap().unwrap(),
+                expect(i)
+            );
         }
         let mut scans = engine.reader();
         for _ in 0..100 {
@@ -451,6 +925,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                 m.physical
             );
         }
+        emit_per_record(name, &format!("{variant}+settled"), &levels);
         if flags.copy_audit {
             print_copy_audit(name, &format!("{variant}+settled"));
             for (slot, w) in diagnostics::work(&engine).iter().enumerate() {
@@ -474,7 +949,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         );
     }
     if flags.worst && single {
-        worst_point(&engine, ks, s, variant, &updated);
+        worst_point(&engine, ks, s, variant, &version);
     }
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     {
@@ -503,10 +978,16 @@ const LEVEL0_STOP: usize = 12;
 /// random keys until level 0 holds `LEVEL0_STOP` flush groups, staying below
 /// the stop (a writer at the stop would wait for the held compaction), then
 /// measure reads and memory.
-fn worst_point(engine: &Engine, ks: &Keyspace, s: &Scenario, variant: &str, updated: &[bool]) {
+fn worst_point(
+    engine: &Engine,
+    ks: &Keyspace,
+    s: &Scenario,
+    variant: &str,
+    initial_version: &[u8],
+) {
     let stop = LEVEL0_STOP;
-    let (name, weak, records, len) = (s.name, s.weak, s.records, s.value_len);
-    let mut version: Vec<u8> = updated.iter().map(|&u| u8::from(u)).collect();
+    let (name, kind, records, len) = (s.name, s.kind, s.records, s.value_len);
+    let mut version: Vec<u8> = initial_version.to_vec();
     let held = diagnostics::hold_compaction(engine);
     let mut rng = Rng(0xfeed_face_cafe_f00d);
     let mut written = 0usize;
@@ -524,13 +1005,14 @@ fn worst_point(engine: &Engine, ks: &Keyspace, s: &Scenario, variant: &str, upda
         // At most one rotation between checks: a memtable holds far more.
         for _ in 0..256 {
             let i = rng.next() as usize % records;
-            ks.put(&key(i), &value(i, 2, weak, len)).unwrap();
-            version[i] = 2;
+            ks.put(&key_bytes(i, kind), &value(i, 3, kind, len))
+                .unwrap();
+            version[i] = 3;
             written += 1;
         }
     }
-    let expect = |i: usize| value(i, version[i], weak, len);
-    probe_reads(engine, ks, name, variant, "worst", records, &expect);
+    let expect = |i: usize| value(i, version[i], kind, len);
+    probe_reads(engine, ks, s, variant, "worst", &expect);
     eprintln!("worst,{name},{variant},written={written}");
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     memory::sample_stats("worst", engine.engine_stats());
@@ -538,6 +1020,10 @@ fn worst_point(engine: &Engine, ks: &Keyspace, s: &Scenario, variant: &str, upda
 }
 
 fn main() {
+    entry(None);
+}
+
+pub fn entry(sample_probe: Option<SampleProbe>) {
     diagnostics::set_bottom_job_observer(|job| {
         BOTTOM_JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
@@ -550,8 +1036,12 @@ fn main() {
     let mut settle = false;
     let mut threads = 1;
     let mut scale = 0;
-    let mut flags = Flags::default();
+    let mut flags = Flags {
+        sample_probe,
+        ..Flags::default()
+    };
     let mut memtable = None;
+    let mut memtable_key = 16usize;
     let mut names = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -569,48 +1059,59 @@ fn main() {
             "--scale" => scale = args.next().expect("SHIFT").parse().unwrap(),
             "--copy-audit" => flags.copy_audit = true,
             "--c2" => flags.c2 = true,
+            "--dict-scope" => flags.dict_scope = true,
             "--write-only" => flags.write_only = true,
             "--worst" => flags.worst = true,
+            "--zipf" => flags.zipf = true,
+            "--read-shapes" => flags.read_shapes = true,
             "--keyspaces" => {
                 flags.keyspaces = args.next().expect("N").parse().expect("positive N");
                 assert!(flags.keyspaces > 0, "--keyspaces needs at least 1");
             }
             "--memtable" => memtable = Some(args.next().expect("VALUE_LEN").parse().unwrap()),
+            "--memtable-key" => memtable_key = args.next().expect("KEY_LEN").parse().unwrap(),
             _ => names.push(arg),
         }
     }
     let scenarios = [
         Scenario {
             name: "A",
-            weak: false,
+            kind: Kind::Grouped,
             records: 2_097_152 >> scale,
             value_len: 600,
             clustered: false,
         },
         Scenario {
             name: "B",
-            weak: true,
+            kind: Kind::Weak,
             records: 2_097_152 >> scale,
             value_len: 600,
             clustered: false,
         },
         Scenario {
             name: "A-large",
-            weak: false,
+            kind: Kind::Grouped,
             records: 4_194_304 >> scale,
             value_len: 48,
             clustered: false,
         },
         Scenario {
+            name: "small",
+            kind: Kind::Small,
+            records: 16_777_216 >> scale,
+            value_len: 54,
+            clustered: false,
+        },
+        Scenario {
             name: "clustered",
-            weak: false,
+            kind: Kind::Grouped,
             records: 2_097_152 >> scale,
             value_len: 600,
             clustered: true,
         },
     ];
     if let Some(len) = memtable {
-        memtable_overhead(len);
+        memtable_overhead(memtable_key, len);
         return;
     }
     if flags.copy_audit {
@@ -624,6 +1125,14 @@ fn main() {
             "c2,scenario,setting,stored,stored_ratio,decoded_per_record,zstd_blocks_per_frame,decompress_time_ratio,raw_per_record"
         );
     }
+    if flags.dict_scope {
+        println!(
+            "scope_offset,scenario,offset,segs_measured,base_payload,recomp_payload,drift_pct"
+        );
+        println!(
+            "scope_spike,scenario,rule,segments,blocks,records,raw_bytes,scopes,mean_segs,max_segs,frames_payload,frames_hdr,dicts,total_bytes,b_per_rec,delta_pct,frame_drift_pct,decode_ns_per_frame"
+        );
+    }
     println!("work,scenario,variant,destination,raw_in,raw_out,stored");
     println!(
         "copy,scenario,variant,blocks,raw,stored,segments,inherited,input_blocks,input_raw,input_segments"
@@ -633,14 +1142,38 @@ fn main() {
         "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"
     );
     println!(
+        "per_record,scenario,variant,records,raw_per_rec,stored_per_rec,frames_per_rec,dicts_per_rec,seg_table_per_rec,index_per_rec,filters_per_rec,footer_per_rec,physical_per_rec,total_per_rec"
+    );
+    println!(
         "reads,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,miss_decoded_per_get,blocks_per_100_record_scan,stored_wa,raw_wa,flushes,runs,depth,load_seconds,total_seconds"
     );
     println!(
-        "waits,scenario,variant,level0_waits,level0_wait_s,writer_wait_s,compactions,bottom_jobs"
+        "waits,scenario,variant,level0_waits,level0_wait_s,writer_wait_s,compactions,bottom_jobs,flush_wait_s,memory_wait_s,gate_waits,write_locks"
     );
     println!(
         "probe,scenario,variant,point,hit_probes,hit_blocks,hit_raw,miss_probes,miss_blocks,miss_raw,cursors,seek_blocks,blocks_per_100,level0_flushes,level0_runs,run_bytes,level0_stored,stored_records,superseded_record_share"
     );
+    if flags.read_shapes {
+        println!(
+            "miss_get,scenario,variant,mix,gets,misses,filter_probes_per_get,filter_fp_per_get,fp_rate,blocks_per_get,decoded_per_get,decoded_per_miss,crc_per_get"
+        );
+        println!("miss_get_level,scenario,variant,mix,level,blocks_per_get,decoded_per_get");
+        println!(
+            "scan_shape,scenario,variant,shape,scans,records_per_scan,blocks_per_scan,decoded_per_scan,crc_per_scan"
+        );
+        println!("scan_shape_level,scenario,variant,shape,level,blocks_per_scan,decoded_per_scan");
+    }
+    if flags.zipf {
+        println!(
+            "zipf_get,scenario,variant,phase,theta,gets,blocks_per_get,decoded_per_get,crc_per_get,filter_probes_per_get,filter_fp_per_get,distinct_blocks"
+        );
+        println!(
+            "zipf_reuse,scenario,variant,phase,theta,n_blocks,get_hit_rate,block_hit_rate,s3fifo_hit_rate,lru_bytes,mean_n_bytes"
+        );
+        println!(
+            "zipf_update,scenario,variant,theta,updates,raw_in_delta,raw_out_delta,stored_out_delta,copy_blocks_delta,copy_input_blocks_delta,run_bytes,held_bytes,hit_decoded_per_get"
+        );
+    }
     if settle {
         println!(
             "settled,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,blocks_per_100_record_scan"
@@ -660,35 +1193,42 @@ fn main() {
 /// Live Rust heap of one memtable filled to its budget, per entry beyond its
 /// key and value, with random keys and no snapshots. Needs the counting
 /// allocator (`tools-memory`, Linux).
-fn memtable_overhead(value_len: usize) {
+fn memtable_overhead(key_len: usize, value_len: usize) {
     #[cfg(all(feature = "tools-memory", target_os = "linux"))]
     {
+        assert!(key_len >= 16, "--memtable-key must be at least 16");
         let budget = Options::default().memtable_size;
-        let charge = 16 + value_len + diagnostics::ENTRY_OVERHEAD;
+        let charge = 1 + key_len + value_len + diagnostics::ENTRY_OVERHEAD;
         // Stay just inside one table: a full table rotates before flushing.
         let entries = budget / charge - 64;
-        let mut order: Vec<_> = (0..entries).collect();
+        let mut order: Vec<u32> = (0..entries as u32).collect();
         Rng(0x123456789abcdef).shuffle(&mut order);
         let engine = Engine::in_memory(Options::default()).unwrap();
         let ks = engine.keyspace("data").unwrap();
+        let mut k = vec![0u8; key_len];
         let mut v = vec![0u8; value_len];
         let before = memory::live();
         for &i in &order {
-            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            ks.put(&key(i * 7 + 3), &v).unwrap();
+            let id = i as usize * 7 + 3;
+            k[..8].copy_from_slice(&(id as u64 / MEMBERS as u64).to_be_bytes());
+            k[8..16].copy_from_slice(&(id as u64 % MEMBERS as u64).to_be_bytes());
+            if value_len >= 8 {
+                v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            }
+            ks.put(&k, &v).unwrap();
         }
         let after = memory::live();
         let stats = engine.engine_stats();
         assert_eq!(stats.flushes, 0);
         assert_eq!(stats.frozen_tables, 0);
-        let payload = entries * (16 + value_len);
+        let payload = entries * (key_len + value_len);
         let heap = after - before;
         let arena = stats.active.arena_bytes;
         println!(
-            "memtable,value_len,entries,heap,payload,arena_used,chunk_bytes_held,charged,budget,overhead_per_entry,charged_overhead"
+            "memtable,key_len,value_len,entries,heap,payload,arena_used,chunk_bytes_held,charged,budget,overhead_per_entry,charged_overhead"
         );
         println!(
-            "memtable,{value_len},{entries},{heap},{payload},{arena},{},{},{budget},{:.2},{}",
+            "memtable,{key_len},{value_len},{entries},{heap},{payload},{arena},{},{},{budget},{:.2},{}",
             stats.chunk_bytes_held,
             stats.active.charged,
             (heap - payload) as f64 / entries as f64,
@@ -697,7 +1237,7 @@ fn memtable_overhead(value_len: usize) {
     }
     #[cfg(not(all(feature = "tools-memory", target_os = "linux")))]
     {
-        let _ = value_len;
+        let _ = (key_len, value_len);
         panic!("--memtable needs the tools-memory feature on Linux");
     }
 }

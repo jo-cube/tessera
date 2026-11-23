@@ -21,6 +21,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 using namespace ROCKSDB_NAMESPACE;
 
 static void check(const Status& s) {
@@ -78,6 +81,17 @@ uint64_t tb_footprint() {
     perror("proc_pid_rusage"); abort();
   }
   return info.ri_phys_footprint;
+}
+bool tb_relieve_allocator() {
+#if defined(__APPLE__)
+  malloc_zone_pressure_relief(nullptr, 0);
+  return true;
+#elif defined(__linux__) && defined(__GLIBC__)
+  malloc_trim(0);
+  return true;
+#else
+  return false;
+#endif
 }
 const char* tb_version() { static std::string v = GetRocksVersionAsString(true); return v.c_str(); }
 

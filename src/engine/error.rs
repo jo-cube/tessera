@@ -184,6 +184,8 @@ impl From<UpdateError> for Error {
             UpdateError::MemoryLimit { .. } => ErrorKind::MemoryLimit,
             UpdateError::KeyspaceDropped => ErrorKind::KeyspaceDropped,
             UpdateError::Keyspaces => ErrorKind::InvalidInput,
+            UpdateError::Stopped => ErrorKind::Stopped,
+            UpdateError::LeaderPanicked => ErrorKind::Background,
         };
         Self::new(kind, error.to_string())
     }

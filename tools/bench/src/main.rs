@@ -2,8 +2,10 @@
 //! each dataset and engine in a child process with a deadline and memory guard.
 //! Results and oracle checks share deterministic inputs; see README.md.
 mod data;
+mod scaling;
 mod store;
 mod streaming;
+mod zipf;
 use data::*;
 use hdrhistogram::Histogram;
 use std::{
@@ -13,11 +15,15 @@ use std::{
     hint::black_box,
     io::{BufRead, BufReader, Write},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Barrier, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 use store::Store;
+use tessera::diagnostics::EngineDiagnostics;
 
 const MOUNT: &str = "/Volumes/tessbench";
 /// Process RSS plus RAM-disk bytes beyond which a child aborts.
@@ -30,8 +36,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("all") => all(&args[2], &Filter::parse(&args[3..])),
-        Some("case") if args.get(7).is_some_and(|s| s == "streaming") => streaming::run(args[2].chars().next().unwrap(), &args[3], &args[4], &args[6]),
-        Some("case") => case(args[2].chars().next().unwrap(), &args[3], &args[4], args[5].parse().unwrap(), &args[6]),
+        Some("case") if args.get(7).is_some_and(|s| s == "streaming") => streaming::run(
+            args[2].chars().next().unwrap(),
+            &args[3],
+            &args[4],
+            &args[6],
+        ),
+        Some("case") => case(
+            args[2].chars().next().unwrap(),
+            &args[3],
+            &args[4],
+            args[5].parse().unwrap(),
+            &args[6],
+        ),
         _ => panic!("usage: bench all OUTDIR [--dataset A,B] [--engine E,..] [--case C,..]"),
     }
 }
@@ -60,26 +77,151 @@ struct MemoryReference {
 impl MemoryReference {
     /// Capture with input/oracle allocated, before opening the engine.
     fn capture() -> Self {
-        Self { rss: rss(), heap: live_heap(), footprint: footprint(), disk: disk_used() }
+        Self {
+            rss: rss(),
+            heap: live_heap(),
+            footprint: footprint(),
+            disk: disk_used(),
+        }
     }
     fn emit(&self, out: &Out) {
-        out.emit("setup", "baseline_rss_mib", format!("{:.2}", self.rss as f64 / MIB as f64));
-        out.emit("setup", "baseline_heap_mib", format!("{:.2}", self.heap as f64 / MIB as f64));
-        out.emit("setup", "baseline_footprint_mib", format!("{:.2}", self.footprint as f64 / MIB as f64));
+        out.emit(
+            "setup",
+            "baseline_rss_mib",
+            format!("{:.2}", self.rss as f64 / MIB as f64),
+        );
+        out.emit(
+            "setup",
+            "baseline_heap_mib",
+            format!("{:.2}", self.heap as f64 / MIB as f64),
+        );
+        out.emit(
+            "setup",
+            "baseline_footprint_mib",
+            format!("{:.2}", self.footprint as f64 / MIB as f64),
+        );
     }
+    /// Samples the ordinary drain and, if requested, the subsequent quiet state.
+    fn report_end_state(
+        &self,
+        store: &Store,
+        out: &Out,
+        case: &str,
+        live: usize,
+        live_keys: usize,
+    ) {
+        self.report(store, out, case, live);
+        store.emit_levels(case, || live_keys, out);
+        let Store::T(engine, _) = store else {
+            return;
+        };
+        let Some(delay) = sample_duration("TESSERA_BENCH_QUIET_MS") else {
+            return;
+        };
+        let phase = format!("{case}_quiet");
+        let (user, system) = cpu();
+        let started = Instant::now();
+        let before = engine.background_status().unwrap();
+        let (after, peak_heap) = wait_quiet(engine, delay, self.heap);
+        let (end_user, end_system) = cpu();
+        let work_cpu = end_user - user + end_system - system;
+        out.emit(
+            &phase,
+            "wall_s",
+            format!("{:.3}", started.elapsed().as_secs_f64()),
+        );
+        out.emit(&phase, "cpu_total_s", format!("{work_cpu:.6}"));
+        out.emit(
+            &phase,
+            "compaction_input_bytes",
+            after.input_bytes - before.input_bytes,
+        );
+        out.emit(
+            &phase,
+            "compaction_bytes",
+            after.output_bytes - before.output_bytes,
+        );
+        out.emit(&phase, "stored_bytes", store.counters()[2]);
+        out.emit(&phase, "peak_heap_bytes", peak_heap);
+        out.emit(
+            &phase,
+            "peak_heap_mib",
+            format!("{:.2}", peak_heap as f64 / MIB as f64),
+        );
+        self.report(store, out, &phase, live);
+        store.emit_levels(&phase, || live_keys, out);
+
+        if case == "update"
+            && let Some(window) = sample_duration("TESSERA_BENCH_IDLE_SAMPLE_MS")
+        {
+            let phase = "update_idle";
+            let (user, system) = cpu();
+            let started = Instant::now();
+            thread::sleep(window);
+            let status = engine.background_status().unwrap();
+            let (end_user, end_system) = cpu();
+            let idle_cpu = end_user - user + end_system - system;
+            out.emit(
+                phase,
+                "wall_s",
+                format!("{:.3}", started.elapsed().as_secs_f64()),
+            );
+            out.emit(phase, "cpu_total_s", format!("{idle_cpu:.6}"));
+            out.emit(phase, "compactions", status.compactions - after.compactions);
+            out.emit(phase, "passes", status.passes - after.passes);
+        }
+    }
+
     fn report(&self, store: &Store, out: &Out, case: &str, live: usize) {
-        let disk = if matches!(store, Store::R(_)) { disk_used().saturating_sub(self.disk) } else { 0 };
+        let disk = if matches!(store, Store::R(_)) {
+            disk_used().saturating_sub(self.disk)
+        } else {
+            0
+        };
         let heap = live_heap().saturating_sub(self.heap) + disk;
         let ram = rss().saturating_sub(self.rss) + disk;
         let physical = footprint().saturating_sub(self.footprint) + disk;
+        let relieved = unsafe { store::tb_relieve_allocator() }.then(footprint);
         out.emit(case, "engine_heap_bytes", heap);
-        out.emit(case, "engine_heap_mib", format!("{:.2}", heap as f64 / MIB as f64));
-        out.emit(case, "engine_ram_mib", format!("{:.2}", ram as f64 / MIB as f64));
-        out.emit(case, "engine_footprint_mib", format!("{:.2}", physical as f64 / MIB as f64));
-        out.emit(case, "ram_disk_mib", format!("{:.2}", disk as f64 / MIB as f64));
+        out.emit(
+            case,
+            "engine_heap_mib",
+            format!("{:.2}", heap as f64 / MIB as f64),
+        );
+        out.emit(
+            case,
+            "engine_ram_mib",
+            format!("{:.2}", ram as f64 / MIB as f64),
+        );
+        out.emit(
+            case,
+            "engine_footprint_mib",
+            format!("{:.2}", physical as f64 / MIB as f64),
+        );
+        if let Some(relieved) = relieved {
+            let physical = relieved.saturating_sub(self.footprint) + disk;
+            out.emit(
+                case,
+                "engine_footprint_relieved_mib",
+                format!("{:.2}", physical as f64 / MIB as f64),
+            );
+        }
+        out.emit(
+            case,
+            "ram_disk_mib",
+            format!("{:.2}", disk as f64 / MIB as f64),
+        );
         out.emit(case, "live_mib", format!("{:.2}", live as f64 / MIB as f64));
-        out.emit(case, "live_per_heap", format!("{:.2}", live as f64 / heap as f64));
-        out.emit(case, "live_per_rss", format!("{:.2}", live as f64 / ram as f64));
+        out.emit(
+            case,
+            "live_per_heap",
+            format!("{:.2}", live as f64 / heap as f64),
+        );
+        out.emit(
+            case,
+            "live_per_rss",
+            format!("{:.2}", live as f64 / ram as f64),
+        );
         if let Some((reserve, used, limit)) = store.pool_stats() {
             out.emit(case, "pool_reserve_bytes", reserve);
             out.emit(case, "pool_in_use_bytes", used);
@@ -87,8 +229,38 @@ impl MemoryReference {
         }
         if let Some(accounted) = store.accounted_run_bytes() {
             out.emit(case, "accounted_run_bytes", accounted);
-            assert!(heap >= accounted, "live heap {heap} below run_bytes + held_bytes {accounted} after {case}");
+            assert!(
+                heap >= accounted,
+                "live heap {heap} below run_bytes + held_bytes {accounted} after {case}"
+            );
         }
+    }
+}
+
+fn sample_duration(variable: &str) -> Option<Duration> {
+    let millis = std::env::var(variable).ok()?.parse().expect("milliseconds");
+    Some(Duration::from_millis(millis))
+}
+
+fn wait_quiet(
+    engine: &tessera::Engine,
+    delay: Duration,
+    base_heap: u64,
+) -> (tessera::diagnostics::BackgroundStatus, u64) {
+    let started = Instant::now();
+    let mut peak_heap = live_heap().saturating_sub(base_heap);
+    loop {
+        peak_heap = peak_heap.max(live_heap().saturating_sub(base_heap));
+        let elapsed = started.elapsed();
+        if elapsed >= delay {
+            let status = engine.background_status().unwrap();
+            assert!(status.running && status.failures == 0, "{status:?}");
+            if !status.busy && engine.engine_stats().frozen_tables == 0 {
+                return (status, peak_heap);
+            }
+            assert!(elapsed < delay + Duration::from_secs(60));
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -98,7 +270,11 @@ fn disk_used() -> u64 {
     }
     let p = std::ffi::CString::new(MOUNT).unwrap();
     let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    assert_eq!(unsafe { libc::statfs(p.as_ptr(), s.as_mut_ptr()) }, 0, "RAM disk missing");
+    assert_eq!(
+        unsafe { libc::statfs(p.as_ptr(), s.as_mut_ptr()) },
+        0,
+        "RAM disk missing"
+    );
     let s = unsafe { s.assume_init() };
     (s.f_blocks - s.f_bfree) * s.f_bsize as u64
 }
@@ -119,6 +295,12 @@ fn rec(h: &mut Histogram<u64>, t: Instant) {
     h.saturating_record(t.elapsed().as_nanos() as u64)
 }
 
+pub(crate) fn trace_phase(name: &str) {
+    if std::env::var_os("TESSERA_BENCH_TRACE_PHASES").is_some() {
+        eprintln!("[phase] {name} pid={}", std::process::id());
+    }
+}
+
 struct Out {
     prefix: String,
 }
@@ -128,7 +310,11 @@ impl Out {
     }
     fn lat(&self, case: &str, h: &Histogram<u64>) {
         for (m, q) in [("p50_us", 0.5), ("p99_us", 0.99), ("p999_us", 0.999)] {
-            self.emit(case, m, format!("{:.2}", h.value_at_quantile(q) as f64 / 1e3));
+            self.emit(
+                case,
+                m,
+                format!("{:.2}", h.value_at_quantile(q) as f64 / 1e3),
+            );
         }
         self.emit(case, "max_us", format!("{:.1}", h.max() as f64 / 1e3));
     }
@@ -140,7 +326,10 @@ struct Span {
 }
 impl Span {
     fn new() -> Self {
-        Self { t: Instant::now(), cpu: cpu() }
+        Self {
+            t: Instant::now(),
+            cpu: cpu(),
+        }
     }
     /// Emits wall time, rate and CPU; returns operations per second.
     fn finish(&self, out: &Out, case: &str, ops: usize, bytes: usize) -> f64 {
@@ -149,10 +338,19 @@ impl Span {
         out.emit(case, "wall_s", format!("{wall:.2}"));
         out.emit(case, "ops_s", format!("{:.0}", ops as f64 / wall));
         if bytes > 0 {
-            out.emit(case, "mib_s", format!("{:.1}", bytes as f64 / MIB as f64 / wall));
+            out.emit(
+                case,
+                "mib_s",
+                format!("{:.1}", bytes as f64 / MIB as f64 / wall),
+            );
         }
         out.emit(case, "cpu_user_s", format!("{:.2}", u - self.cpu.0));
         out.emit(case, "cpu_sys_s", format!("{:.2}", s - self.cpu.1));
+        out.emit(
+            case,
+            "cpu_total_s",
+            format!("{:.3}", u - self.cpu.0 + s - self.cpu.1),
+        );
         ops as f64 / wall
     }
 }
@@ -160,6 +358,8 @@ impl Span {
 // ---- orchestrator ----
 
 const CASES: &str = "load,update,reads,scan,mixed,bulk";
+const ALL_CASES: &str =
+    "load,update,update_heavy,reads,scan,mixed,bulk,bursts,reader_scale,writer_scale,zipf";
 
 /// Comma-separated selections; each defaults to everything.
 struct Filter {
@@ -170,11 +370,19 @@ struct Filter {
 }
 impl Filter {
     fn parse(args: &[String]) -> Self {
-        let mut f = Self { datasets: "A,B".into(), engines: ENGINES.join(","), cases: CASES.into(), streaming: false };
+        let mut f = Self {
+            datasets: "A,B".into(),
+            engines: ENGINES.join(","),
+            cases: CASES.into(),
+            streaming: false,
+        };
         for pair in args.chunks(2) {
             let value = pair.get(1).cloned().expect("a filter needs a value");
             match pair[0].as_str() {
-                "--mode" => { assert!(value == "memory" || value == "streaming"); f.streaming = value == "streaming"; },
+                "--mode" => {
+                    assert!(value == "memory" || value == "streaming");
+                    f.streaming = value == "streaming";
+                }
                 "--dataset" => f.datasets = value,
                 "--engine" => f.engines = value,
                 "--case" => f.cases = value,
@@ -182,15 +390,45 @@ impl Filter {
             }
         }
         if f.streaming {
-            if !args.iter().any(|a| a == "--engine") { f.engines = SCALE_ENGINES.join(","); }
-            if !args.iter().any(|a| a == "--case") { f.cases = "load,update,reads".into(); }
-            assert!(f.engines.split(',').all(|e| SCALE_ENGINES.contains(&e)), "streaming engines: tessera,r-small,r-mid");
-            assert!(f.cases.split(',').all(|c| ["load", "update", "reads"].contains(&c)), "streaming cases: load,update,reads");
+            if !args.iter().any(|a| a == "--engine") {
+                f.engines = SCALE_ENGINES.join(",");
+            }
+            if !args.iter().any(|a| a == "--case") {
+                f.cases = "load,update,reads".into();
+            }
+            assert!(
+                f.engines.split(',').all(|e| SCALE_ENGINES.contains(&e)),
+                "streaming engines: tessera,r-small,r-mid"
+            );
+            assert!(
+                f.cases
+                    .split(',')
+                    .all(|c| ["load", "update", "reads"].contains(&c)),
+                "streaming cases: load,update,reads"
+            );
+            assert!(
+                f.datasets.split(',').all(|d| ["A", "B"].contains(&d)),
+                "streaming datasets: A,B"
+            );
+        } else {
+            assert!(
+                f.datasets.split(',').all(|d| ["A", "B", "C"].contains(&d)),
+                "unknown dataset; datasets are A,B,C"
+            );
         }
-        assert!(f.datasets.split(',').all(|d| ["A", "B"].contains(&d)), "unknown dataset");
-        assert!(f.engines.split(',').all(|e| if f.streaming { SCALE_ENGINES.contains(&e) } else { ENGINES.contains(&e) }), "unknown engine");
+        assert!(
+            f.engines.split(',').all(|e| if f.streaming {
+                SCALE_ENGINES.contains(&e)
+            } else {
+                ENGINES.contains(&e)
+            }),
+            "unknown engine"
+        );
         for c in f.cases.split(',') {
-            assert!(wants(CASES, c), "unknown case {c}; cases are {CASES}");
+            assert!(
+                wants(ALL_CASES, c),
+                "unknown case {c}; cases are {ALL_CASES}"
+            );
         }
         f
     }
@@ -207,18 +445,46 @@ fn all(outdir: &str, filter: &Filter) {
     writeln!(csv, "dataset,engine,case,metric,value").unwrap();
     let mut rows: Vec<[String; 5]> = Vec::new();
     let mut failed = false;
-    let engines = if filter.streaming { &SCALE_ENGINES } else { &ENGINES };
-    for ds in ["A", "B"].into_iter().filter(|d| wants(&filter.datasets, d)) {
+    let engines = if filter.streaming {
+        &SCALE_ENGINES
+    } else {
+        &ENGINES
+    };
+    for ds in ["A", "B", "C"]
+        .into_iter()
+        .filter(|d| wants(&filter.datasets, d))
+    {
         let mut rate = 0.0;
-        for engine in engines.iter().copied().filter(|e| wants(&filter.engines, e)) {
+        for engine in engines
+            .iter()
+            .copied()
+            .filter(|e| wants(&filter.engines, e))
+        {
             eprintln!("[{:>5.0}s] {ds} {engine}", started.elapsed().as_secs_f64());
             let mut child = Command::new(&exe)
-                .args(["case", ds, engine, outdir, &rate.to_string(), &filter.cases, if filter.streaming { "streaming" } else { "memory" }])
+                .args([
+                    "case",
+                    ds,
+                    engine,
+                    outdir,
+                    &rate.to_string(),
+                    &filter.cases,
+                    if filter.streaming {
+                        "streaming"
+                    } else {
+                        "memory"
+                    },
+                ])
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
             let stdout = child.stdout.take().unwrap();
-            let lines = thread::spawn(move || BufReader::new(stdout).lines().map(Result::unwrap).collect::<Vec<_>>());
+            let lines = thread::spawn(move || {
+                BufReader::new(stdout)
+                    .lines()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+            });
             let deadline = Instant::now() + Duration::from_secs(300);
             let status = loop {
                 if let Some(s) = child.try_wait().unwrap() {
@@ -234,7 +500,10 @@ fn all(outdir: &str, filter: &Filter) {
             let mut lines = lines.join().unwrap();
             if status != "exit status: 0" {
                 failed = true;
-                lines.push(format!("{ds},{engine},process,status,{}", status.replace(',', ";")));
+                lines.push(format!(
+                    "{ds},{engine},process,status,{}",
+                    status.replace(',', ";")
+                ));
             }
             for l in lines {
                 writeln!(csv, "{l}").unwrap();
@@ -251,26 +520,51 @@ fn all(outdir: &str, filter: &Filter) {
     }
     let total = started.elapsed().as_secs_f64();
     writeln!(csv, "all,all,run,wall_s,{total:.1}").unwrap();
-    fs::write(format!("{outdir}/summary.md"), summary(&rows, total, engines)).unwrap();
+    fs::write(
+        format!("{outdir}/summary.md"),
+        summary(&rows, total, engines),
+    )
+    .unwrap();
     eprintln!("total {total:.1} s; results in {outdir}");
     assert!(!failed, "benchmark child failed; see {outdir}/results.csv");
 }
 
 fn summary(rows: &[[String; 5]], total: f64, engines: &[&str; 3]) -> String {
-    let mut s = format!("# Tessera vs RocksDB {}\n\nTotal runtime {total:.0} s.\n", store::rocksdb_version());
-    for ds in ["A", "B"] {
+    let mut s = format!(
+        "# Tessera vs RocksDB {}\n\nTotal runtime {total:.0} s.\n",
+        store::rocksdb_version()
+    );
+    for ds in ["A", "B", "C"] {
         let mut order = Vec::new();
         let mut cells = HashMap::new();
-        for r in rows.iter().filter(|r| r[0] == ds && !r[3].contains("footprint")) {
+        for r in rows
+            .iter()
+            .filter(|r| r[0] == ds && !r[3].contains("footprint"))
+        {
             let key = (r[2].clone(), r[3].clone());
             if !order.contains(&key) {
                 order.push(key.clone());
             }
             cells.insert((key, r[1].clone()), r[4].clone());
         }
-        let _ = write!(s, "\n## Dataset {ds}\n\n| case | metric | {} |\n|---|---|{}\n", engines.join(" | "), "---|".repeat(3));
+        if order.is_empty() {
+            continue;
+        }
+        let _ = write!(
+            s,
+            "\n## Dataset {ds}\n\n| case | metric | {} |\n|---|---|{}\n",
+            engines.join(" | "),
+            "---|".repeat(3)
+        );
         for key in order {
-            let v: Vec<&str> = engines.iter().map(|e| cells.get(&(key.clone(), e.to_string())).map_or("–", String::as_str)).collect();
+            let v: Vec<&str> = engines
+                .iter()
+                .map(|e| {
+                    cells
+                        .get(&(key.clone(), e.to_string()))
+                        .map_or("–", String::as_str)
+                })
+                .collect();
             let _ = writeln!(s, "| {} | {} | {} |", key.0, key.1, v.join(" | "));
         }
     }
@@ -283,10 +577,14 @@ fn summary(rows: &[[String; 5]], total: f64, engines: &[&str; 3]) -> String {
 /// updated DB, so they also run the update, which runs the load. Without
 /// Tessera's update rate, the mixed case offers 70% of the engine's own.
 fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
-    let on_updated = ["reads", "scan", "mixed"].iter().any(|c| wants(cases, c));
+    let on_updated = ["reads", "scan", "mixed", "reader_scale", "zipf"]
+        .iter()
+        .any(|c| wants(cases, c));
     let update = on_updated || wants(cases, "update");
-    let load = update || wants(cases, "load");
-    let out = Out { prefix: format!("{ds},{engine}") };
+    let load = update || wants(cases, "load") || wants(cases, "update_heavy");
+    let out = Out {
+        prefix: format!("{ds},{engine}"),
+    };
     let t = Instant::now();
     let mut data = generate(ds);
     let n = data.recs.len();
@@ -294,8 +592,16 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     let mut perm: Vec<u32> = (0..n as u32).collect();
     rng.shuffle(&mut perm);
     out.emit("setup", "records", n);
-    out.emit("setup", "raw_mib", format!("{:.0}", data.raw as f64 / MIB as f64));
-    out.emit("setup", "generate_s", format!("{:.1}", t.elapsed().as_secs_f64()));
+    out.emit(
+        "setup",
+        "raw_mib",
+        format!("{:.0}", data.raw as f64 / MIB as f64),
+    );
+    out.emit(
+        "setup",
+        "generate_s",
+        format!("{:.1}", t.elapsed().as_secs_f64()),
+    );
     let memory = MemoryReference::capture();
     memory.emit(&out);
     thread::spawn(|| {
@@ -308,14 +614,19 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             thread::sleep(Duration::from_millis(100));
         }
     });
-    let dir = if engine == "tessera" { format!("{outdir}/{ds}-{engine}") } else { format!("{MOUNT}/{ds}-{engine}") };
+    let dir = if engine == "tessera" {
+        format!("{outdir}/{ds}-{engine}")
+    } else {
+        format!("{MOUNT}/{ds}-{engine}")
+    };
+    let raw = data.raw as u64;
     let open = |name: &str| {
         let path = format!("{dir}/{name}");
         fs::create_dir_all(&dir).unwrap();
         match engine {
             "tessera" => Store::tessera(),
             "r-small" => Store::rocks(&path, 128 << 20),
-            _ => Store::rocks(&path, data.raw as u64 * 5 / 4),
+            _ => Store::rocks(&path, raw * 5 / 4),
         }
     };
 
@@ -323,45 +634,75 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     if load {
         let store = open("db");
         if engine != "tessera" {
-            copy_options(&format!("{dir}/db"), &format!("{outdir}/OPTIONS-{ds}-{engine}"));
+            copy_options(
+                &format!("{dir}/db"),
+                &format!("{outdir}/OPTIONS-{ds}-{engine}"),
+            );
         }
         let span = Span::new();
+        trace_phase("load");
         let mut b = store.batch();
+        let mut writer = hist();
         for chunk in perm.chunks(256) {
             for &i in chunk {
-                b.push(&data.recs[i as usize].key, Some(data.value(i as usize)));
+                b.push(data.recs[i as usize].key(), Some(data.value(i as usize)));
             }
+            let started = Instant::now();
             store.write(&mut b);
+            rec(&mut writer, started);
         }
-        store.drain();
+        store.emit_memtables("load_before_drain", &out);
+        let quiet_end = engine == "tessera" && std::env::var_os("TESSERA_BENCH_QUIET_MS").is_some();
+        if quiet_end {
+            store.drain_frozen();
+        } else {
+            store.drain();
+        }
         span.finish(&out, "load", n, data.raw);
+        out.lat("load_writer", &writer);
         let c = store.counters();
         amplification(&out, "load", [0; 3], c);
-        memory.report(&store, &out, "load", data.live_bytes());
+        memory.report_end_state(&store, &out, "load", data.live_bytes(), n);
         gate(&store, &data, &mut rng, &out, "load");
+
+        if wants(cases, "update_heavy") {
+            update_heavy(&store, &mut data, &mut rng, &mut perm, &memory, &out);
+        }
 
         if update {
             // 3. Update half the keys, then delete 2%, drained.
             let c0 = store.counters();
             let span = Span::new();
+            trace_phase("update");
             let mut bytes = 0;
+            writer.reset();
             for chunk in data.updates.chunks(256) {
                 for &i in chunk {
                     let v = data.update(i as usize);
-                    bytes += 16 + v.len();
-                    b.push(&data.recs[i as usize].key, Some(v));
+                    bytes += data.key_len + v.len();
+                    b.push(data.recs[i as usize].key(), Some(v));
                 }
+                let started = Instant::now();
                 store.write(&mut b);
+                rec(&mut writer, started);
             }
             for chunk in data.deletes.chunks(256) {
                 for &i in chunk {
-                    b.push(&data.recs[i as usize].key, None);
+                    b.push(data.recs[i as usize].key(), None);
                 }
+                let started = Instant::now();
                 store.write(&mut b);
+                rec(&mut writer, started);
             }
-            store.drain();
+            store.emit_memtables("update_before_drain", &out);
+            if quiet_end {
+                store.drain_frozen();
+            } else {
+                store.drain();
+            }
             let ops = data.updates.len() + data.deletes.len();
             let update_rate = span.finish(&out, "update", ops, bytes);
+            out.lat("update_writer", &writer);
             amplification(&out, "update", c0, store.counters());
             for &i in &data.updates {
                 data.state[i as usize] = UPDATED;
@@ -369,22 +710,50 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             for &i in &data.deletes {
                 data.state[i as usize] = DELETED;
             }
-            memory.report(&store, &out, "update", data.live_bytes());
+            let live_keys = data.state.iter().filter(|&&state| state != DELETED).count();
+            memory.report_end_state(&store, &out, "update", data.live_bytes(), live_keys);
             gate(&store, &data, &mut rng, &out, "update");
 
-            // 4–6. Reads, scans and the mixed workload on the updated DB.
+            // 4–6. Reads, scans, scaling, zipf and the mixed workload on the updated DB.
             if wants(cases, "reads") {
                 reads(&store, &data, &mut rng, &out);
             }
             if wants(cases, "scan") {
                 scans(&store, &data, &mut rng, &out);
             }
+            if wants(cases, "reader_scale") {
+                scaling::reader_scale(&store, &data, &mut rng, &out);
+            }
+            if wants(cases, "zipf") {
+                scaling::zipf_workloads(&store, &data, &mut rng, &out);
+            }
             if engine != "r-large" && wants(cases, "mixed") {
-                let rate = if rate > 0.0 { rate } else { 0.7 * update_rate };
+                let rate = match std::env::var("TESSERA_BENCH_MIXED_RATE") {
+                    Ok(rate) => {
+                        let rate = rate.parse::<f64>().expect("records per second");
+                        assert!(rate.is_finite() && rate > 0.0);
+                        rate
+                    }
+                    Err(_) if rate > 0.0 => rate,
+                    Err(_) => 0.7 * update_rate,
+                };
                 mixed(&store, &data, &mut rng, &out, rate);
             }
         }
         drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    if engine == "tessera" && wants(cases, "bursts") {
+        data.state.fill(ORIGINAL);
+        let store = open("bursts");
+        bursts(&store, &mut data, &mut rng, &memory, &out);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    if wants(cases, "writer_scale") {
+        scaling::writer_scale(engine, &data, &dir, &out);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -394,12 +763,13 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         let store = open("bulk");
         fs::create_dir_all(format!("{dir}/sst")).unwrap();
         let span = Span::new();
+        trace_phase("bulk");
         let mut b = store.batch();
         let (mut bytes, mut files) = (0, 0);
         for i in 0..n {
             let v = data.value(i);
-            bytes += 16 + v.len();
-            b.push(&data.recs[i].key, Some(v));
+            bytes += data.key_len + v.len();
+            b.push(data.recs[i].key(), Some(v));
             if bytes >= 64 * MIB || i + 1 == n {
                 store.ingest(&mut b, &format!("{dir}/sst/{files}.sst"));
                 (bytes, files) = (0, files + 1);
@@ -430,7 +800,11 @@ fn amplification(out: &Out, case: &str, before: [u64; 3], after: [u64; 3]) {
     let (flush, compact) = (after[0] - before[0], after[1] - before[1]);
     out.emit(case, "flush_mib", flush >> 20);
     out.emit(case, "compaction_mib", compact >> 20);
-    out.emit(case, "write_amp", format!("{:.2}", (flush + compact) as f64 / flush as f64));
+    out.emit(
+        case,
+        "write_amp",
+        format!("{:.2}", (flush + compact) as f64 / flush as f64),
+    );
     out.emit(case, "stored_mib", after[2] >> 20);
     out.emit(case, "stored_bytes", after[2]);
 }
@@ -441,31 +815,41 @@ fn gate(store: &Store, data: &Data, rng: &mut Rng, out: &Out, case: &str) {
     let mut bad = 0;
     for _ in 0..20_000 {
         let i = rng.n(data.recs.len());
-        bad += store.get(&data.recs[i].key, &mut r, |v| v != data.live(i)) as usize;
+        bad += store.get(data.recs[i].key(), &mut r, |v| v != data.live(i)) as usize;
     }
     for _ in 0..200 {
         let (s, e) = data.groups[rng.n(data.groups.len())];
-        let mut want = (s..e).filter_map(|i| data.live(i).map(|v| (&data.recs[i].key, v)));
+        let mut want = (s..e).filter_map(|i| data.live(i).map(|v| (data.recs[i].key(), v)));
         let mut ok = true;
-        store.scan(&data.recs[s].key[..8], &mut r, |k, v| {
+        store.scan(&data.recs[s].key()[..8], &mut r, |k, v| {
             ok &= want.next().is_some_and(|(wk, wv)| k == wk && v == wv);
         });
         bad += (!ok || want.next().is_some()) as usize;
     }
-    out.emit(case, "gate", if bad == 0 { "pass".to_string() } else { format!("FAIL({bad})") });
+    out.emit(
+        case,
+        "gate",
+        if bad == 0 {
+            "pass".to_string()
+        } else {
+            format!("FAIL({bad})")
+        },
+    );
 }
 
 fn expect(data: &Data, i: u32) -> Option<usize> {
-    (i != MISS).then(|| data.live(i as usize).map(<[u8]>::len)).flatten()
+    (i != MISS)
+        .then(|| data.live(i as usize).map(<[u8]>::len))
+        .flatten()
 }
 
 /// 200k random live keys plus 10% misses, in random order.
-fn read_keys(data: &Data, rng: &mut Rng) -> (Vec<[u8; 16]>, Vec<u32>) {
+fn read_keys(data: &Data, rng: &mut Rng) -> (Vec<KeyBuf>, Vec<u32>) {
     let mut v = Vec::with_capacity(220_000);
     while v.len() < 200_000 {
         let i = rng.n(data.recs.len());
         if data.state[i] != DELETED {
-            v.push((data.recs[i].key, i as u32));
+            v.push((data.recs[i].key_buf(), i as u32));
         }
     }
     for _ in 0..20_000 {
@@ -473,6 +857,68 @@ fn read_keys(data: &Data, rng: &mut Rng) -> (Vec<[u8; 16]>, Vec<u32>) {
     }
     rng.shuffle(&mut v);
     v.into_iter().unzip()
+}
+
+fn timed_reads(
+    store: &Store,
+    queries: (&[KeyBuf], &[u32]),
+    threads: usize,
+    batch_size: usize,
+    case: &str,
+    out: &Out,
+    op: impl Fn(&mut store::Reader<'_>, &[KeyBuf], &[u32], &mut Histogram<u64>) -> usize + Sync,
+) {
+    let (keys, want) = queries;
+    let chunk = keys.len().div_ceil(threads);
+    let ready = Barrier::new(threads);
+    let start = OnceLock::new();
+    let parts = thread::scope(|scope| {
+        let handles: Vec<_> = keys
+            .chunks(chunk)
+            .zip(want.chunks(chunk))
+            .map(|(keys, want)| {
+                let (ready, start, op) = (&ready, &start, &op);
+                scope.spawn(move || {
+                    let mut reader = store.reader();
+                    let mut h = hist();
+                    let mut batches = keys.chunks(batch_size).zip(want.chunks(batch_size)).cycle();
+                    let warm_until = Instant::now() + Duration::from_millis(150);
+                    while Instant::now() < warm_until {
+                        let (keys, want) = batches.next().unwrap();
+                        op(&mut reader, keys, want, &mut h);
+                    }
+                    h.reset();
+                    ready.wait();
+                    let span = start.get_or_init(|| {
+                        trace_phase(case);
+                        Span::new()
+                    });
+                    let until = span.t + Duration::from_millis(1500);
+                    let (mut ops, mut bad) = (0, 0);
+                    while Instant::now() < until {
+                        let (keys, want) = batches.next().unwrap();
+                        bad += op(&mut reader, keys, want, &mut h);
+                        ops += keys.len();
+                    }
+                    (h, ops, bad)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    start
+        .get()
+        .unwrap()
+        .finish(out, case, parts.iter().map(|p| p.1).sum(), 0);
+    let mut h = hist();
+    for (part, _, _) in &parts {
+        h.add(part).unwrap();
+    }
+    out.lat(case, &h);
+    out.emit(case, "errors", parts.iter().map(|p| p.2).sum::<usize>());
 }
 
 fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
@@ -484,7 +930,7 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     let span = Span::new();
     for (k, &i) in keys.iter().zip(&want) {
         let t = Instant::now();
-        let got = store.get(k, &mut r, |v| v.map(<[u8]>::len));
+        let got = store.get(k.as_slice(), &mut r, |v| v.map(<[u8]>::len));
         rec(&mut h, t);
         bad += (got != expect(data, i)) as usize;
     }
@@ -492,52 +938,51 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
     out.lat("get_1t", &h);
     check(bad, "get_1t");
     // (b) four threads, get, the same keys split four ways.
-    let span = Span::new();
-    let parts: Vec<(Histogram<u64>, usize)> = thread::scope(|s| {
-        let q = keys.len().div_ceil(4);
-        let handles: Vec<_> = keys
-            .chunks(q)
-            .zip(want.chunks(q))
-            .map(|(ks, ws)| {
-                s.spawn(move || {
-                    let mut r = store.reader();
-                    let (mut h, mut bad) = (hist(), 0);
-                    for (k, &i) in ks.iter().zip(ws) {
-                        let t = Instant::now();
-                        let got = store.get(k, &mut r, |v| v.map(<[u8]>::len));
-                        rec(&mut h, t);
-                        bad += (got != expect(data, i)) as usize;
-                    }
-                    (h, bad)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    span.finish(out, "get_4t", keys.len(), 0);
-    let mut h = hist();
-    parts.iter().for_each(|p| h.add(&p.0).unwrap());
-    out.lat("get_4t", &h);
-    check(parts.iter().map(|p| p.1).sum(), "get_4t");
+    timed_reads(
+        store,
+        (&keys, &want),
+        4,
+        1,
+        "get_4t",
+        out,
+        |r, keys, want, h| {
+            let t = Instant::now();
+            let got = store.get(keys[0].as_slice(), r, |v| v.map(<[u8]>::len));
+            rec(h, t);
+            usize::from(got != expect(data, want[0]))
+        },
+    );
     // (c) multi_get, 100 random keys per batch.
-    let (mut h, mut bad) = (hist(), 0);
-    let span = Span::new();
-    for (ks, ws) in keys.chunks(100).zip(want.chunks(100)) {
-        let t = Instant::now();
-        store.multi_get(ks, false, &mut r, |j, v| bad += (v.map(<[u8]>::len) != expect(data, ws[j])) as usize);
-        rec(&mut h, t);
-    }
-    span.finish(out, "mget_random", keys.len(), 0);
-    out.lat("mget_random", &h);
-    check(bad, "mget_random");
+    timed_reads(
+        store,
+        (&keys, &want),
+        1,
+        100,
+        "mget_random",
+        out,
+        |r, keys, want, h| {
+            let mut bad = 0;
+            let t = Instant::now();
+            store.multi_get(keys, false, r, |j, v| {
+                bad += usize::from(v.map(<[u8]>::len) != expect(data, want[j]));
+            });
+            rec(h, t);
+            bad
+        },
+    );
     // (d) multi_get, 100 adjacent keys per batch, sorted.
     let starts: Vec<usize> = (0..2000).map(|_| rng.n(data.recs.len() - 100)).collect();
-    let sorted: Vec<[u8; 16]> = starts.iter().flat_map(|&s| (s..s + 100).map(|i| data.recs[i].key)).collect();
+    let sorted: Vec<KeyBuf> = starts
+        .iter()
+        .flat_map(|&s| (s..s + 100).map(|i| data.recs[i].key_buf()))
+        .collect();
     let (mut h, mut bad) = (hist(), 0);
     let span = Span::new();
     for (ks, &s) in sorted.chunks(100).zip(&starts) {
         let t = Instant::now();
-        store.multi_get(ks, true, &mut r, |j, v| bad += (v.map(<[u8]>::len) != expect(data, (s + j) as u32)) as usize);
+        store.multi_get(ks, true, &mut r, |j, v| {
+            bad += (v.map(<[u8]>::len) != expect(data, (s + j) as u32)) as usize
+        });
         rec(&mut h, t);
     }
     span.finish(out, "mget_sorted", sorted.len(), 0);
@@ -546,18 +991,27 @@ fn reads(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
 }
 
 fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
-    let picks: Vec<usize> = (0..20_000).map(|_| data.scan_groups[rng.n(data.scan_groups.len())]).collect();
+    let count: usize =
+        std::env::var("TESSERA_BENCH_SCAN_COUNT").map_or(20_000, |s| s.parse().unwrap());
+    let picks: Vec<usize> = (0..count)
+        .map(|_| data.scan_groups[rng.n(data.scan_groups.len())])
+        .collect();
     let want: Vec<usize> = picks
         .iter()
-        .map(|&g| (data.groups[g].0..data.groups[g].1).filter(|&i| data.state[i] != DELETED).count())
+        .map(|&g| {
+            (data.groups[g].0..data.groups[g].1)
+                .filter(|&i| data.state[i] != DELETED)
+                .count()
+        })
         .collect();
     let mut r = store.reader();
     let (mut h, mut bad, mut total) = (hist(), 0, 0);
     let span = Span::new();
+    trace_phase("scan");
     for (&g, &w) in picks.iter().zip(&want) {
         let mut count = 0;
         let t = Instant::now();
-        store.scan(&data.recs[data.groups[g].0].key[..8], &mut r, |_, v| {
+        store.scan(&data.recs[data.groups[g].0].key()[..8], &mut r, |_, v| {
             black_box(v);
             count += 1;
         });
@@ -566,7 +1020,11 @@ fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
         total += count;
     }
     span.finish(out, "scan", picks.len(), 0);
-    out.emit("scan", "records_per_scan", format!("{:.1}", total as f64 / picks.len() as f64));
+    out.emit(
+        "scan",
+        "records_per_scan",
+        format!("{:.1}", total as f64 / picks.len() as f64),
+    );
     out.lat("scan", &h);
     out.emit("scan", "errors", bad);
 }
@@ -576,6 +1034,8 @@ fn scans(store: &Store, data: &Data, rng: &mut Rng, out: &Out) {
 fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
     let (keys, _) = read_keys(data, rng);
     let stop = AtomicBool::new(false);
+    let before = store.counters();
+    let span = Span::new();
     let (readers, writer) = thread::scope(|s| {
         let readers: Vec<_> = (0..4u64)
             .map(|t| {
@@ -586,7 +1046,9 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
                     let (mut h, mut n) = (hist(), 0u64);
                     while !stop.load(Ordering::Relaxed) {
                         let t = Instant::now();
-                        store.get(&keys[rng.n(keys.len())], &mut r, |v| black_box(v.is_some()));
+                        store.get(keys[rng.n(keys.len())].as_slice(), &mut r, |v| {
+                            black_box(v.is_some())
+                        });
                         rec(&mut h, t);
                         n += 1;
                     }
@@ -596,7 +1058,9 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
             .collect();
         let interval = Duration::from_secs_f64(256.0 / rate);
         let start = Instant::now();
-        let (mut max, mut lag, mut written, mut next) = (Duration::ZERO, Duration::ZERO, 0usize, 0usize);
+        let (mut max, mut lag, mut written, mut next) =
+            (Duration::ZERO, Duration::ZERO, 0usize, 0usize);
+        let mut batch_latencies = hist();
         let mut b = store.batch();
         for burst in (0..20).step_by(2) {
             let burst = start + Duration::from_secs(burst);
@@ -610,12 +1074,14 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
                 }
                 for _ in 0..256 {
                     let i = data.updates[next % data.updates.len()] as usize;
-                    b.push(&data.recs[i].key, Some(data.update(i)));
+                    b.push(data.recs[i].key(), Some(data.update(i)));
                     next += 1;
                 }
                 let t = Instant::now();
                 store.write(&mut b);
-                max = max.max(t.elapsed());
+                let elapsed = t.elapsed();
+                max = max.max(elapsed);
+                batch_latencies.saturating_record(elapsed.as_nanos() as u64);
                 written += 256;
                 due += interval;
             }
@@ -627,17 +1093,198 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
         stop.store(true, Ordering::Relaxed);
         let wall = start.elapsed().as_secs_f64();
         let readers: Vec<_> = readers.into_iter().map(|h| h.join().unwrap()).collect();
-        (readers, (max, lag, written, wall))
+        (
+            readers,
+            (
+                batch_latencies.value_at_quantile(0.99),
+                max,
+                lag,
+                written,
+                wall,
+            ),
+        )
     });
     let mut h = hist();
     readers.iter().for_each(|r| h.add(&r.0).unwrap());
-    let (max, lag, written, wall) = writer;
+    let (p99_ns, max, lag, written, wall) = writer;
+    span.finish(out, "mixed", written, 0);
+    store.drain();
+    amplification(out, "mixed", before, store.counters());
     out.emit("mixed", "offered_rec_s", format!("{rate:.0}"));
     out.emit("mixed", "written_records", written);
-    out.emit("mixed", "writer_max_batch_ms", format!("{:.2}", max.as_secs_f64() * 1e3));
-    out.emit("mixed", "writer_max_lag_ms", format!("{:.1}", lag.as_secs_f64() * 1e3));
-    out.emit("mixed", "reader_ops_s", format!("{:.0}", readers.iter().map(|r| r.1).sum::<u64>() as f64 / wall));
+    out.emit(
+        "mixed",
+        "writer_p99_batch_ms",
+        format!("{:.2}", p99_ns as f64 / 1e6),
+    );
+    out.emit(
+        "mixed",
+        "writer_max_batch_ms",
+        format!("{:.2}", max.as_secs_f64() * 1e3),
+    );
+    out.emit(
+        "mixed",
+        "writer_max_lag_ms",
+        format!("{:.1}", lag.as_secs_f64() * 1e3),
+    );
+    out.emit(
+        "mixed",
+        "reader_ops_s",
+        format!(
+            "{:.0}",
+            readers.iter().map(|r| r.1).sum::<u64>() as f64 / wall
+        ),
+    );
     out.lat("mixed", &h);
+}
+
+/// Three shuffled full-key update passes without intervening drains.
+fn update_heavy(
+    store: &Store,
+    data: &mut Data,
+    rng: &mut Rng,
+    perm: &mut [u32],
+    memory: &MemoryReference,
+    out: &Out,
+) {
+    let stop = AtomicBool::new(false);
+    let peak = thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let mut peak = live_heap();
+            while !stop.load(Ordering::Relaxed) {
+                peak = peak.max(live_heap());
+                thread::sleep(Duration::from_millis(10));
+            }
+            peak.max(live_heap()).saturating_sub(memory.heap)
+        });
+        let before = store.counters();
+        let wait_before = store.maintenance();
+        let span = Span::new();
+        trace_phase("update_heavy");
+        let mut batch = store.batch();
+        let mut bytes = 0;
+        for pass in 0..3 {
+            rng.shuffle(perm);
+            for chunk in perm.chunks(256) {
+                for &i in chunk {
+                    let i = i as usize;
+                    let value = if pass != 1 && data.recs[i].has_update() {
+                        data.update(i)
+                    } else {
+                        data.value(i)
+                    };
+                    bytes += data.key_len + value.len();
+                    batch.push(data.recs[i].key(), Some(value));
+                }
+                store.write(&mut batch);
+            }
+        }
+        let ops = 3 * perm.len();
+        let finish = |phase: &str| {
+            let (u, s) = cpu();
+            span.finish(out, phase, ops, bytes);
+            out.emit(phase, "written_records", ops);
+            let per_record = (u - span.cpu.0 + s - span.cpu.1) * 1e6 / ops as f64;
+            out.emit(phase, "cpu_per_record_us", format!("{per_record:.6}"));
+            let after = store.counters();
+            amplification(out, phase, before, after);
+            out.emit(phase, "flush_bytes", after[0] - before[0]);
+            out.emit(phase, "compaction_bytes", after[1] - before[1]);
+        };
+        finish("update_heavy");
+        if let (Some(before), Some(after)) = (wait_before, store.maintenance()) {
+            let level0 = (after.level0_wait_ns - before.level0_wait_ns) as f64 / 1e9;
+            let flush = (after.flush_wait_ns - before.flush_wait_ns) as f64 / 1e9;
+            out.emit("update_heavy", "level0_wait_s", format!("{level0:.6}"));
+            out.emit("update_heavy", "flush_wait_s", format!("{flush:.6}"));
+        }
+        if matches!(store, Store::T(_, _)) && std::env::var_os("TESSERA_BENCH_QUIET_MS").is_some() {
+            store.drain_frozen();
+        } else {
+            store.drain();
+        }
+        finish("update_heavy_drained");
+        for (state, rec) in data.state.iter_mut().zip(&data.recs) {
+            *state = if rec.has_update() { UPDATED } else { ORIGINAL };
+        }
+        memory.report_end_state(store, out, "update_heavy", data.live_bytes(), perm.len());
+        amplification(out, "update_heavy_settled", before, store.counters());
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap()
+    });
+    out.emit("update_heavy", "peak_heap_bytes", peak);
+    out.emit(
+        "update_heavy",
+        "peak_heap_mib",
+        format!("{:.2}", peak as f64 / MIB as f64),
+    );
+    gate(store, data, rng, out, "update_heavy");
+}
+
+/// Four update bursts (each ~1.2 memtables) separated by 6 s quiet gaps on a
+/// settled database, reporting total compaction work, CPU and final memory.
+fn bursts(store: &Store, data: &mut Data, rng: &mut Rng, memory: &MemoryReference, out: &Out) {
+    let Store::T(engine, _) = store else { return };
+    {
+        let mut b = store.batch();
+        let mut bytes = 0;
+        for i in 0..data.recs.len() {
+            let v = data.value(i);
+            bytes += data.key_len + v.len();
+            b.push(data.recs[i].key(), Some(v));
+            if bytes >= 64 * MIB || i + 1 == data.recs.len() {
+                store.ingest(&mut b, "");
+                bytes = 0;
+            }
+        }
+    }
+    store.drain();
+    let mut b = store.batch();
+    let before = store.counters();
+    let before_bg = engine.background_status().unwrap();
+    let span = Span::new();
+    trace_phase("bursts");
+    let (mut next, mut ops, mut written) = (0usize, 0usize, 0usize);
+    let mut after_bg = before_bg.clone();
+    for _ in 0..4 {
+        let mut charge = 0usize;
+        while charge < 76 * MIB {
+            for _ in 0..256 {
+                let i = data.updates[next % data.updates.len()] as usize;
+                let v = data.update(i);
+                let vlen = v.len();
+                b.push(data.recs[i].key(), Some(v));
+                data.state[i] = UPDATED;
+                written += data.key_len + vlen;
+                charge += 1 + data.key_len + vlen + tessera::diagnostics::ENTRY_OVERHEAD;
+                ops += 1;
+                next += 1;
+            }
+            store.write(&mut b);
+        }
+        store.drain_frozen();
+        after_bg = wait_quiet(engine, Duration::from_secs(6), memory.heap).0;
+    }
+    span.finish(out, "bursts", ops, written);
+    out.emit(
+        "bursts",
+        "compaction_input_bytes",
+        after_bg.input_bytes - before_bg.input_bytes,
+    );
+    out.emit(
+        "bursts",
+        "compaction_output_bytes",
+        after_bg.output_bytes - before_bg.output_bytes,
+    );
+    out.emit(
+        "bursts",
+        "compactions",
+        after_bg.compactions - before_bg.compactions,
+    );
+    amplification(out, "bursts", before, store.counters());
+    memory.report(store, out, "bursts", data.live_bytes());
+    store.emit_levels("bursts", || data.recs.len(), out);
+    gate(store, data, rng, out, "bursts");
 }
 
 #[cfg(test)]
@@ -658,10 +1305,29 @@ mod memory_tests {
 
     #[test]
     fn summaries_use_heap_and_rss_and_leave_footprint_in_csv_only() {
-        let rows = ["engine_heap_mib", "engine_ram_mib", "engine_footprint_mib", "baseline_footprint_mib", "live_per_heap", "live_per_rss"]
-            .map(|metric| ["A".into(), "tessera".into(), "update".into(), metric.into(), "1".into()]);
+        let rows = [
+            "engine_heap_mib",
+            "engine_ram_mib",
+            "engine_footprint_mib",
+            "baseline_footprint_mib",
+            "live_per_heap",
+            "live_per_rss",
+        ]
+        .map(|metric| {
+            [
+                "A".into(),
+                "tessera".into(),
+                "update".into(),
+                metric.into(),
+                "1".into(),
+            ]
+        });
         let text = summary(&rows, 0.0, &SCALE_ENGINES);
-        assert!(text.contains("engine_heap_mib") && text.contains("live_per_heap") && text.contains("live_per_rss"));
+        assert!(
+            text.contains("engine_heap_mib")
+                && text.contains("live_per_heap")
+                && text.contains("live_per_rss")
+        );
         assert!(!text.contains("footprint"));
     }
 }

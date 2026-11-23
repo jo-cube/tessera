@@ -73,6 +73,10 @@ pub(crate) enum UpdateError {
     /// Creating a keyspace would exceed the live keyspace limit, or the IDs are
     /// used up.
     Keyspaces,
+    /// The engine closed while the write waited to execute.
+    Stopped,
+    /// The write-group leader panicked before completing this request.
+    LeaderPanicked,
 }
 
 impl fmt::Display for UpdateError {
@@ -88,6 +92,8 @@ impl fmt::Display for UpdateError {
                 "an engine holds at most {} live keyspaces and 2^32 over its life",
                 keyspaces::MAX_KEYSPACES
             ),
+            Self::Stopped => f.write_str("the engine was closed"),
+            Self::LeaderPanicked => f.write_str("a write group leader panicked"),
         }
     }
 }

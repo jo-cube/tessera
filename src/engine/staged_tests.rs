@@ -541,16 +541,18 @@ mod compaction {
                             ..CompactionPolicy::default()
                         };
                         stage = match stage {
-                            Stage::Idle => match engine.core.begin_compaction(options).unwrap() {
-                                Some(Begun::Job(job)) => {
-                                    if !background && !job.seq_floors().is_empty() {
-                                        contested += 1;
+                            Stage::Idle => {
+                                match engine.core.begin_compaction(options, None).unwrap() {
+                                    Some(Begun::Job(job)) => {
+                                        if !background && !job.seq_floors().is_empty() {
+                                            contested += 1;
+                                        }
+                                        Stage::Begun(job)
                                     }
-                                    Stage::Begun(job)
+                                    // A move publishes as it is chosen.
+                                    Some(Begun::Done(_)) | None => Stage::Idle,
                                 }
-                                // A move publishes as it is chosen.
-                                Some(Begun::Done(_)) | None => Stage::Idle,
-                            },
+                            }
                             Stage::Begun(job) => Stage::Built(job.build(&mut workspace).unwrap()),
                             Stage::Built(built) => {
                                 let ranges: Vec<_> = built

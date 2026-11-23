@@ -95,10 +95,9 @@ class Tags(Repository):
         self.git('tag', '-a', 'v0.1.0', '-m', 'tessera 0.1.0')
         self.assertEqual(release.check_tag(self.root, 'v0.1.0', self.head, 'main'), ('0.1.0', self.head))
 
-    def test_a_lightweight_tag_fails(self):
+    def test_a_lightweight_tag_on_main_with_notes_passes(self):
         self.git('tag', 'v0.1.0')
-        with self.assertRaisesRegex(ValueError, 'annotated'):
-            release.check_tag(self.root, 'v0.1.0', main_ref='main')
+        self.assertEqual(release.check_tag(self.root, 'v0.1.0', self.head, 'main'), ('0.1.0', self.head))
 
     def test_a_mismatched_version_fails(self):
         self.git('tag', '-a', 'v0.2.0', '-m', 'tessera 0.2.0')
@@ -188,9 +187,20 @@ class Preparation(Repository):
         self.assertEqual(self.git('log', '-1', '--format=%s'), 'chore: release 0.2.0')
         self.assertEqual(self.git('status', '--porcelain'), '')
         self.assertEqual(self.git('tag', '--list', 'v0.2.0'), '')
-        for command in ['git tag -a v0.2.0 -m "tessera 0.2.0"', 'git push origin main',
-                        'git push origin refs/tags/v0.2.0']:
-            self.assertIn(command, out)
+        self.assertIn('merge it to main through the usual pull request', out)
+        self.assertIn('create the v0.2.0 release in the GitHub Releases UI targeting main', out)
+        self.assertNotIn('git tag', out)
+        self.assertNotIn('git push', out)
+
+    def test_prep_commits_on_a_non_main_branch(self):
+        self.git('checkout', '--quiet', '-b', 'dev')
+        self.commit('feat(engine): add a thing')
+        _, out = self.prep('0.2.0')
+        self.assertEqual(self.git('branch', '--show-current'), 'dev')
+        self.assertEqual(self.git('log', '-1', '--format=%s'), 'chore: release 0.2.0')
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertIn('usual pull request', out)
+        self.assertIn('GitHub Releases UI targeting main', out)
 
     def test_the_first_release_keeps_the_version_and_reads_all_history(self):
         self.commit('fix(engine): one')
@@ -217,10 +227,6 @@ class Preparation(Repository):
             self.prep('0.0.9')
         with self.assertRaisesRegex(ValueError, 'X.Y.Z'):
             self.prep('v0.2.0')
-        self.git('checkout', '--quiet', '-b', 'dev')
-        with self.assertRaisesRegex(ValueError, 'main'):
-            self.prep('0.2.0')
-        self.git('checkout', '--quiet', 'main')
         self.write('scratch.txt', 'dirty')
         with self.assertRaisesRegex(ValueError, 'clean'):
             self.prep('0.2.0')
@@ -262,27 +268,123 @@ class Publication(Repository):
     def remote(self, kind='tag', revision=None):
         def check(method, url, data=None, content_type=None):
             if '/git/ref/tags/' in url:
-                return {'object': {'type': kind, 'sha': 'c' * 40}}
-            return {'object': {'sha': revision or self.revision}}
+                return {'object': {'type': kind, 'sha': (revision or self.revision) if kind == 'commit' else 'c' * 40}}
+            return {'object': {'type': 'commit', 'sha': revision or self.revision}}
         return check
 
-    def test_the_remote_tag_must_be_annotated_and_unmoved(self):
-        with patch.object(release, 'api', side_effect=self.remote()):
-            release.check_remote_tag(self.REPO, 'v0.1.0', self.revision)
-        with patch.object(release, 'api', side_effect=self.remote(kind='commit')), \
-                self.assertRaisesRegex(ValueError, 'annotated'):
-            release.check_remote_tag(self.REPO, 'v0.1.0', self.revision)
-        with patch.object(release, 'api', side_effect=self.remote(revision='d' * 40)), \
+    def test_the_remote_tag_can_be_lightweight_or_annotated_and_must_be_unmoved(self):
+        for kind in ['tag', 'commit']:
+            with self.subTest(kind=kind):
+                with patch.object(release, 'api', side_effect=self.remote(kind=kind)) as api:
+                    release.check_remote_tag(self.REPO, 'v0.1.0', self.revision)
+                    self.assertEqual(api.call_count, 2 if kind == 'tag' else 1)
+                with patch.object(release, 'api', side_effect=self.remote(kind=kind, revision='d' * 40)), \
+                        self.assertRaisesRegex(ValueError, 'moved'):
+                    release.check_remote_tag(self.REPO, 'v0.1.0', self.revision)
+
+    def test_a_remote_tag_must_name_a_commit(self):
+        with patch.object(release, 'api', side_effect=self.remote(kind='tree')), \
                 self.assertRaisesRegex(ValueError, 'moved'):
             release.check_remote_tag(self.REPO, 'v0.1.0', self.revision)
 
-    def test_an_existing_release_or_draft_is_never_changed(self):
+    def test_a_release_with_assets_is_never_changed(self):
         for draft in [False, True]:
-            with patch.object(release, 'check_remote_tag'), \
-                    patch.object(release, 'api', return_value=[{'tag_name': 'v0.1.0', 'draft': draft}]) as api:
-                with self.assertRaisesRegex(ValueError, 'already exists'):
+            existing = {'tag_name': 'v0.1.0', 'draft': draft, 'assets': [{'name': 'existing'}]}
+            with self.subTest(draft=draft), patch.object(release, 'check_remote_tag'), \
+                    patch.object(release, 'api', return_value=[existing]) as api:
+                with self.assertRaisesRegex(ValueError, 'already has assets'):
                     release.publish(self.root, 'v0.1.0', self.revision, self.crate, self.REPO)
                 self.assertEqual([call.args[0] for call in api.call_args_list], ['GET'])
+
+    def test_multiple_releases_for_a_tag_are_refused_across_pages(self):
+        first = [{'tag_name': 'v0.1.0', 'id': 7}] + [{'tag_name': 'v0.2.0'}] * 99
+        second = [{'tag_name': 'v0.1.0', 'id': 8}]
+        with patch.object(release, 'check_remote_tag'), \
+                patch.object(release, 'api', side_effect=[first, second]) as api:
+            with self.assertRaisesRegex(ValueError, 'multiple releases'):
+                release.publish(self.root, 'v0.1.0', self.revision, self.crate, self.REPO)
+            self.assertEqual([call.args[0] for call in api.call_args_list], ['GET', 'GET'])
+            self.assertTrue(api.call_args_list[-1].args[1].endswith('page=2'))
+
+    def publication_api(self, existing=None, failure=None):
+        state = dict(existing) if existing is not None else {
+            'id': 7, 'draft': True, 'tag_name': 'v0.1.0', 'assets': []}
+        calls = []
+
+        def api(method, url, data=None, content_type='application/json'):
+            calls.append((method, url, data))
+            if method == 'GET' and '/releases?' in url:
+                return [dict(existing)] if existing is not None else []
+            if method == 'POST' and url.endswith('/releases'):
+                self.assertIsNone(existing)
+                self.assertTrue(data['draft'])
+                self.assertEqual(data['target_commitish'], self.revision)
+                self.assertEqual(data['name'], 'tessera 0.1.0')
+                self.assertIn('- engine: first', data['body'])
+                self.assertIn(self.revision, data['body'])
+                state.update(data)
+            elif method == 'POST':
+                self.assertEqual(content_type, 'application/octet-stream')
+                name = parse_qs(urlparse(url).query)['name'][0]
+                state['assets'].append({'name': name, 'state': 'uploaded', 'size': len(data),
+                                        'digest': 'sha256:' + hashlib.sha256(data).hexdigest()})
+            elif method == 'GET':
+                if failure == 'missing':
+                    state['assets'].pop()
+                elif failure == 'duplicate':
+                    state['assets'].append(dict(state['assets'][0]))
+                elif failure == 'size':
+                    state['assets'][0]['size'] += 1
+                elif failure == 'digest':
+                    state['assets'][0]['digest'] = 'sha256:' + '0' * 64
+                elif failure == 'no-digest':
+                    state['assets'][0].pop('digest')
+                elif failure == 'state':
+                    state['assets'][0]['state'] = 'new'
+                elif failure == 'name':
+                    state['assets'][0]['name'] = 'unexpected'
+                elif failure == 'tag':
+                    state['tag_name'] = 'v0.2.0'
+                elif failure == 'draft':
+                    state['draft'] = not state['draft']
+            elif method == 'PATCH':
+                self.assertNotIn('make_latest', data)
+                state.update(data)
+            return dict(state)
+
+        return api, calls, state
+
+    def test_an_asset_free_release_is_adopted_and_only_a_draft_is_published(self):
+        for draft in [False, True]:
+            with self.subTest(draft=draft):
+                existing = {'id': 7, 'draft': draft, 'tag_name': 'v0.1.0', 'assets': [],
+                            'name': 'Human title', 'body': 'Human notes'}
+                api, calls, state = self.publication_api(existing)
+                with patch.object(release, 'check_remote_tag') as remote, \
+                        patch.object(release, 'api', side_effect=api):
+                    url = release.publish(self.root, 'v0.1.0', self.revision, self.crate, self.REPO)
+                self.assertEqual(url, 'https://github.com/owner/tessera/releases/tag/v0.1.0')
+                self.assertEqual(state['name'], 'Human title')
+                self.assertEqual(state['body'], 'Human notes')
+                self.assertFalse(state['draft'])
+                self.assertEqual(len(state['assets']), 2)
+                self.assertEqual([d for m, _, d in calls if m == 'PATCH'], [{'draft': False}] if draft else [])
+                self.assertFalse(any(m == 'POST' and u.endswith('/releases') for m, u, _ in calls))
+                self.assertEqual(remote.call_count, 2)
+
+    def test_an_adopted_release_with_an_empty_body_gets_changelog_notes(self):
+        for draft in [False, True]:
+            for body in ['', None]:
+                with self.subTest(draft=draft, body=body):
+                    existing = {'id': 7, 'draft': draft, 'tag_name': 'v0.1.0', 'assets': [],
+                                'name': 'Human title', 'body': body}
+                    api, calls, state = self.publication_api(existing)
+                    with patch.object(release, 'check_remote_tag'), patch.object(release, 'api', side_effect=api):
+                        release.publish(self.root, 'v0.1.0', self.revision, self.crate, self.REPO)
+                    self.assertEqual(state['name'], 'Human title')
+                    self.assertEqual(state['body'], '- engine: first')
+                    patches = [d for m, _, d in calls if m == 'PATCH']
+                    self.assertEqual(patches, [{'body': '- engine: first'}] + ([{'draft': False}] if draft else []))
 
     def test_the_crate_must_be_this_version(self):
         other = self.root / 'dist/tessera-0.2.0.crate'
@@ -292,32 +394,9 @@ class Publication(Repository):
         api.assert_not_called()
 
     def test_publication_uploads_the_crate_and_checksums_with_the_notes(self):
-        for failure in [None, 'missing', 'size']:
+        for failure in [None, 'missing', 'duplicate', 'size', 'digest', 'no-digest', 'state', 'name', 'tag', 'draft']:
             with self.subTest(failure=failure):
-                draft = {'id': 7, 'draft': True, 'tag_name': 'v0.1.0', 'assets': []}
-                calls = []
-
-                def api(method, url, data=None, content_type='application/json'):
-                    calls.append((method, url, data))
-                    if method == 'GET' and '/releases?' in url:
-                        return []
-                    if method == 'POST' and url.endswith('/releases'):
-                        self.assertTrue(data['draft'])
-                        self.assertEqual(data['target_commitish'], self.revision)
-                        self.assertIn('- engine: first', data['body'])
-                    elif method == 'POST':
-                        name = parse_qs(urlparse(url).query)['name'][0]
-                        draft['assets'].append({'name': name, 'state': 'uploaded', 'size': len(data),
-                                                'digest': 'sha256:' + hashlib.sha256(data).hexdigest()})
-                    elif method == 'GET':
-                        if failure == 'missing':
-                            draft['assets'].pop()
-                        elif failure == 'size':
-                            draft['assets'][0]['size'] += 1
-                    elif method == 'PATCH':
-                        draft['draft'] = False
-                    return dict(draft)
-
+                api, calls, _ = self.publication_api(failure=failure)
                 with patch.object(release, 'check_remote_tag'), patch.object(release, 'api', side_effect=api):
                     if failure:
                         with self.assertRaises(ValueError):

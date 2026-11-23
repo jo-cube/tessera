@@ -800,3 +800,172 @@ fn bottom_seqs_of(run: &Run<Vec<u8>>) -> Vec<u64> {
     }
     out
 }
+
+/// Level-0 compaction expands from the earliest level-0 run to other runs that
+/// overlap its key span. When every flush in level 0 is split at level-1
+/// boundaries, one step merges only one key-range slice and leaves the other
+/// slices in level 0; when the earliest flush spans both slices without a cut,
+/// one step sweeps every overlapping level-0 run across both slices.
+#[test]
+fn split_level0_flushes_compact_by_overlapping_slice_unlike_unsplit() {
+    let run_case = |split_first_flush: bool| {
+        let engine = Engine::in_memory(Options {
+            compression: Compression::Uncompressed,
+            ..options()
+        })
+        .unwrap();
+        let eager = CompactionPolicy {
+            max_overlap: 1,
+            ..compaction()
+        };
+        // Seed two disjoint bottom runs so later flushes split between them.
+        for key in [b"a", b"b", b"c", b"d", b"e", b"f"] {
+            engine.ks().put(key, &[b'1'; 400]).unwrap();
+        }
+        engine.flush().unwrap();
+        settle_with(&engine, eager, &mut Steps::default());
+        for key in [b"p", b"q", b"r", b"s", b"t", b"z"] {
+            engine.ks().put(key, &[b'2'; 400]).unwrap();
+        }
+        engine.flush().unwrap();
+        settle_with(&engine, eager, &mut Steps::default());
+        assert_eq!(
+            engine
+                .core
+                .read_state()
+                .only()
+                .levels
+                .runs()
+                .last()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Publish four flushes spanning both bottom runs.
+        for round in 0..4u8 {
+            engine.core.write_state().split_flushes = split_first_flush || round > 0;
+            for key in [b"b", b"c", b"d", b"q", b"r", b"s"] {
+                engine.ks().put(key, &[round; 200]).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        let before_l0_runs = engine.core.read_state().only().levels.runs()[0].len();
+        let trigger_four = CompactionPolicy {
+            max_overlap: 4,
+            ..compaction()
+        };
+        let mut workspace = MergeWorkspace::new();
+        let report = engine
+            .core
+            .compact(trigger_four, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.kind, CompactionKind::Merge);
+        let state = engine.core.read_state();
+        let after_l0_runs = state.only().levels.runs()[0].len();
+        let after_l0_flushes = state.only().levels.level0_flushes();
+        (
+            before_l0_runs,
+            report.inputs,
+            after_l0_runs,
+            after_l0_flushes,
+        )
+    };
+
+    let (split_before, split_inputs, split_after_runs, split_after_flushes) = run_case(true);
+    assert_eq!(split_before, 8);
+    assert_eq!(split_inputs, 5); // 4 lower-slice L0 runs + 1 lower bottom run
+    assert_eq!(split_after_runs, 4);
+    assert_eq!(split_after_flushes, 4);
+
+    let (unsplit_before, unsplit_inputs, unsplit_after_runs, unsplit_after_flushes) =
+        run_case(false);
+    assert_eq!(unsplit_before, 7); // 1 full-span L0 run + 3 split flushes (6 runs)
+    assert_eq!(unsplit_inputs, 9); // all 7 L0 runs + both bottom runs
+    assert_eq!(unsplit_after_runs, 0);
+    assert_eq!(unsplit_after_flushes, 0);
+}
+
+#[test]
+fn level_0_fan_in_charges_sources_and_bounds_all_input_workspace() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 1 << 20,
+        target_run_len: 1 << 20,
+        ..options()
+    })
+    .unwrap();
+    engine.set_split_flushes(false);
+    let mut model = BTreeMap::new();
+    for index in 0..200 {
+        let v = value(index);
+        engine.ks().put(&key(index), &v).unwrap();
+        model.insert(key(index), v);
+    }
+    engine.flush().unwrap();
+    let eager = CompactionPolicy {
+        max_overlap: 1,
+        ..compaction()
+    };
+    settle_with(&engine, eager, &mut Steps::default());
+    for round in 0..4 {
+        for index in [0, 100, 199] {
+            if index == 100 && round % 2 == 0 {
+                engine.ks().delete(&key(index)).unwrap();
+                model.remove(&key(index));
+            } else {
+                let v = value(1_000 + round * 200 + index);
+                engine.ks().put(&key(index), &v).unwrap();
+                model.insert(key(index), v);
+            }
+        }
+        engine.flush().unwrap();
+    }
+    let snapshot = engine.snapshot();
+    {
+        let state = engine.core.read_state();
+        let levels = &state.only().levels;
+        let runs = levels.runs();
+        assert_eq!(runs[0].len(), 4);
+        assert_eq!(runs[1].len(), 1);
+        let bytes = |r: &SharedRun| r.run.stored_len() + r.run.held_bytes();
+        let source_bytes: usize = runs[0].iter().map(bytes).sum();
+        let mut fit = eager.fit(1 << 20, LEVEL0_STOP);
+        assert!(bytes(&runs[1][0]) > source_bytes);
+        let selected = |fit: &levels::Fit| match levels.plan(fit) {
+            levels::Plan::Merge { sources, dests, .. } => {
+                assert_eq!(dests.len(), 1);
+                sources.len()
+            }
+            _ => panic!("overlapping inputs must merge"),
+        };
+        fit.max_bytes = source_bytes;
+        assert_eq!(selected(&fit), 4);
+        fit.max_bytes -= bytes(&runs[0][3]);
+        assert_eq!(selected(&fit), 3);
+        fit.max_bytes = source_bytes;
+        fit.max_inputs = 3;
+        assert_eq!(selected(&fit), 2);
+        fit.max_inputs = MAX_COMPACTION_INPUTS;
+        fit.max_workspace_bytes = crate::run::workspace_estimate(
+            [&runs[0][0], &runs[0][1], &runs[1][0]]
+                .into_iter()
+                .map(|run| run.largest_block),
+        );
+        assert_eq!(selected(&fit), 2);
+        let limited = CompactionPolicy::for_memory(Some(8 * source_bytes));
+        assert_eq!(limited.max_input_bytes, source_bytes);
+        let mut limited_fit = limited.fit(1 << 20, LEVEL0_STOP);
+        limited_fit.max_workspace_bytes = fit.max_workspace_bytes;
+        assert_eq!(selected(&limited_fit), 2);
+    }
+    let mut steps = Steps::default();
+    settle_with(&engine, eager, &mut steps);
+    assert!(steps.refusal.is_none(), "{steps:?}");
+    level_ids(&engine);
+    assert_eq!(scan(&engine.snapshot()), model);
+    assert_eq!(scan(&snapshot), model);
+    for (key, value) in model {
+        assert_eq!(get(&engine, &key), Some(value));
+    }
+}

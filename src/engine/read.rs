@@ -572,6 +572,9 @@ impl<'a> Reader<'a> {
             blocks_loaded: total.blocks_loaded - self.initial.blocks_loaded,
             decoded_bytes: total.decoded_bytes - self.initial.decoded_bytes,
             filter_probes: total.filter_probes - self.initial.filter_probes,
+            filter_false_positives: total.filter_false_positives
+                - self.initial.filter_false_positives,
+            crc_bytes: total.crc_bytes - self.initial.crc_bytes,
             ..total
         }
     }
@@ -587,6 +590,14 @@ impl<'a> Reader<'a> {
             filter_probes: logical.filter_probes(),
             #[cfg(not(feature = "diagnostics"))]
             filter_probes: 0,
+            #[cfg(feature = "diagnostics")]
+            filter_false_positives: logical.filter_false_positives(),
+            #[cfg(not(feature = "diagnostics"))]
+            filter_false_positives: 0,
+            #[cfg(feature = "diagnostics")]
+            crc_bytes: logical.crc_bytes() + multi.crc_bytes(),
+            #[cfg(not(feature = "diagnostics"))]
+            crc_bytes: 0,
             capacity: logical.capacity() + multi.capacity(),
             context_bytes: logical.context_bytes() + multi.context_bytes(),
         }
@@ -665,6 +676,11 @@ pub struct ReaderCounters {
     /// Bloom-filter probes by point reads, including probes that rule a run
     /// out. Scans and multi-gets are excluded.
     pub filter_probes: u64,
+    /// Point-read filter probes that passed the Bloom filter yet found no
+    /// matching key in the run.
+    pub filter_false_positives: u64,
+    /// Bytes hashed by CRC-32 checks while decoding compressed frames.
+    pub crc_bytes: u64,
     /// Decoded-block bytes retained. Point lookups keep two blocks whatever
     /// the number of runs; scans keep one per group of key-disjoint runs.
     pub capacity: usize,

@@ -59,6 +59,6 @@ validate *args:
 bench *args:
     tools/bench/run.sh {{args}}
 
-# Bump the version, prepend the changelog and commit; prints the tag commands.
+# Bump the version, prepend the changelog and commit; prints the release steps.
 release-prep version *args:
     python3 scripts/release.py release-prep {{version}} {{args}}

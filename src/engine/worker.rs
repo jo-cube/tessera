@@ -1,5 +1,5 @@
 //! The background compaction worker: one thread per engine that compacts
-//! whenever it is asked to, and sleeps otherwise.
+//! when requested and promotes level-0 residue after a quiet period.
 //!
 //! Requests are counted, not queued. A request made while a pass is running
 //! causes one more pass after it, however many requests arrive.
@@ -10,10 +10,15 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::run::MergeWorkspace;
 
-use super::{CompactionError, CompactionPolicy, Core};
+use super::{CompactionError, CompactionPolicy, Core, WriteActivity};
+
+/// Allow short read-only intervals between write phases to pass while
+/// their pending runs can still collect more updates.
+const QUIET_PERIOD: Duration = Duration::from_secs(5);
 
 /// What the background worker has done since the engine was created.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -82,12 +87,33 @@ struct Progress {
     finished: u64,
     stop: bool,
     status: BackgroundStatus,
+    quiet: Option<(Instant, WriteActivity)>,
+    quiet_pending: Option<WriteActivity>,
+    #[cfg(test)]
+    clock: Option<Instant>,
+}
+
+impl Progress {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        return self.clock.expect("the worker has a test clock");
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    fn arm_quiet(&mut self, activity: Option<WriteActivity>) {
+        self.quiet = activity.map(|activity| (self.now() + QUIET_PERIOD, activity));
+    }
 }
 
 impl Signal {
     pub(super) fn new() -> Self {
         Self {
-            progress: Mutex::new(Progress::default()),
+            progress: Mutex::new(Progress {
+                #[cfg(test)]
+                clock: Some(Instant::now()),
+                ..Progress::default()
+            }),
             changed: Condvar::new(),
         }
     }
@@ -98,6 +124,21 @@ impl Signal {
         progress.requested += 1;
         self.changed.notify_all();
         progress.requested
+    }
+
+    /// Arms the quiet deadline when the worker is idle with no deadline set,
+    /// or records the crossing for the end of an in-flight pass.
+    pub(super) fn arm_quiet_if_idle(&self, activity: WriteActivity) {
+        let mut progress = self.lock();
+        if progress.stop || progress.quiet.is_some() {
+            return;
+        }
+        if !progress.status.busy && progress.requested == progress.started {
+            progress.arm_quiet(Some(activity));
+            self.changed.notify_all();
+        } else {
+            progress.quiet_pending = Some(activity);
+        }
     }
 
     /// Tells the worker to exit once the compaction it is running, if any,
@@ -188,6 +229,42 @@ impl Signal {
         }
     }
 
+    fn start_pass(&self) -> Option<(u64, Option<WriteActivity>)> {
+        let mut progress = self.lock();
+        let quiet = loop {
+            if progress.stop {
+                return None;
+            }
+            if progress.requested != progress.started {
+                break None;
+            }
+            let Some((deadline, activity)) = progress.quiet else {
+                progress = self.wait_on(progress);
+                continue;
+            };
+            let remaining = deadline.saturating_duration_since(progress.now());
+            if remaining.is_zero() {
+                break Some(activity);
+            }
+            #[cfg(not(test))]
+            {
+                progress = self
+                    .changed
+                    .wait_timeout(progress, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            #[cfg(test)]
+            {
+                progress = self.wait_on(progress);
+            }
+        };
+        progress.started = progress.requested;
+        progress.quiet = None;
+        progress.status.busy = true;
+        Some((progress.started, quiet))
+    }
+
     fn lock(&self) -> MutexGuard<'_, Progress> {
         // Every update to the progress is a few assignments that cannot panic
         // part way, so a poisoned lock still holds consistent counters.
@@ -257,21 +334,29 @@ fn signal(core: &Core) -> &Signal {
 
 fn run(core: &Core) {
     let signal = signal(core);
-    loop {
-        let generation = {
-            let mut progress = signal.lock();
-            while !progress.stop && progress.requested == progress.started {
-                progress = signal.wait_on(progress);
-            }
-            if progress.stop {
-                return;
-            }
-            progress.started = progress.requested;
-            progress.status.busy = true;
-            progress.started
-        };
-        let failure = pass(core, signal).err();
+    // Recovered engines can start with published level-0 runs.
+    let activity = core.idle_activity();
+    {
         let mut progress = signal.lock();
+        if progress.quiet.is_none() {
+            progress.arm_quiet(activity);
+        }
+    }
+    while let Some((generation, quiet)) = signal.start_pass() {
+        let failure = pass(core, signal, quiet).err();
+        signal.lock().quiet_pending = None;
+        let activity = if failure.is_none() {
+            core.idle_activity()
+        } else {
+            None
+        };
+        let mut progress = signal.lock();
+        let activity = activity.or(if failure.is_none() {
+            progress.quiet_pending.take()
+        } else {
+            None
+        });
+        progress.arm_quiet(activity);
         progress.finished = generation;
         progress.status.busy = false;
         progress.status.passes += 1;
@@ -289,20 +374,41 @@ fn run(core: &Core) {
 /// ends; with them it ends once flushes stop, which the level-0 stop forces
 /// if compaction falls behind. A read failure ends the pass and is retried
 /// only after another publication or request.
-fn pass(core: &Core, signal: &Signal) -> Result<(), CompactionError> {
+fn pass(
+    core: &Core,
+    signal: &Signal,
+    mut quiet: Option<WriteActivity>,
+) -> Result<(), CompactionError> {
     #[cfg(test)]
     tests::fault_point(core);
-    let reclaim = core
-        .reclaim
-        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    if let Some(activity) = quiet {
+        let progress = signal.lock();
+        if progress.stop || progress.requested != progress.started {
+            return Ok(());
+        }
+        drop(progress);
+        let Some(next) = core.flush_quiet_tail(activity) else {
+            return Ok(());
+        };
+        quiet = Some(next);
+    }
+    let reclaim = quiet.is_none()
+        && core
+            .reclaim
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
     let options = CompactionPolicy {
         reclaim,
         ..core.policy
     };
-    while !signal.lock().stop {
+    loop {
+        let progress = signal.lock();
+        if progress.stop || quiet.is_some() && progress.requested != progress.started {
+            break;
+        }
+        drop(progress);
         // Keep no uncharged decode buffers or native contexts while idle.
         let mut workspace = MergeWorkspace::new();
-        let result = core.compact(options, &mut workspace);
+        let result = core.compact_when(options, &mut workspace, quiet);
         drop(workspace);
         let Some(report) = result? else {
             break;
@@ -339,3 +445,6 @@ pub(super) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod idle_tests;

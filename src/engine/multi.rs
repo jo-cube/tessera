@@ -44,6 +44,11 @@ impl Workspace {
         self.read.decoded_bytes()
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn crc_bytes(&self) -> u64 {
+        self.read.crc_bytes()
+    }
+
     pub(super) fn prepare_empty(&mut self, len: usize) {
         self.order.clear();
         self.hits.clear();

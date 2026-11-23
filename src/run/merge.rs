@@ -45,6 +45,12 @@ impl MergeWorkspace {
         self.runs.iter().map(ReadWorkspace::decoded_bytes).sum()
     }
 
+    /// Bytes verified by CRC-32 across compressed blocks loaded through this workspace.
+    #[cfg(feature = "diagnostics")]
+    pub fn crc_bytes(&self) -> u64 {
+        self.runs.iter().map(ReadWorkspace::crc_bytes).sum()
+    }
+
     /// Returns the bytes held by decompression contexts, which Zstandard
     /// allocates outside the Rust heap.
     #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]

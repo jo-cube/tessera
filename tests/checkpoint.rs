@@ -981,3 +981,48 @@ fn checkpoints_preserve_bottom_runs_without_filters() {
         assert!(recovered.engine_stats().filter_bytes > 0);
     }
 }
+
+#[test]
+fn checkpoint_recovers_and_validates_widened_segment() {
+    let dir = Scratch::new("widened-segment");
+    let options = manual();
+    let engine = Engine::in_memory(options).unwrap();
+    let ks = engine.ks();
+    let payload = "shared-structured-payload-content-".repeat(16);
+    let count = 18_000u32;
+    assert!(count as usize * payload.len() > 9 << 20);
+    for i in 0..count {
+        let key = format!("k{:06}", i);
+        let value = format!("{{\"id\":{i},\"body\":\"{payload}\"}}");
+        ks.put(key.as_bytes(), value.as_bytes()).unwrap();
+    }
+    engine.flush().unwrap();
+    let mut ws = MergeWorkspace::new();
+    while engine
+        .core
+        .compact(CompactionPolicy::default(), &mut ws)
+        .unwrap()
+        .is_some()
+    {}
+    {
+        let state = engine.core.read_state();
+        let runs = &state.only().runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run.view().segment_count(), 1);
+    }
+    engine.checkpoint_to(&dir.0).unwrap();
+    let recovered = Engine::open(&dir.0, options).unwrap();
+    for i in (0..count).step_by(97) {
+        let key = format!("k{:06}", i);
+        let expected = format!("{{\"id\":{i},\"body\":\"{payload}\"}}");
+        assert_eq!(get(&recovered, key.as_bytes()), Some(expected.into_bytes()));
+    }
+    let mut reader = recovered.reader();
+    let mut scan = reader.range(&recovered.ks(), ..);
+    let mut seen = 0u32;
+    while let Some((k, _)) = scan.next().unwrap() {
+        assert_eq!(k, format!("k{:06}", seen).as_bytes());
+        seen += 1;
+    }
+    assert_eq!(seen, count);
+}

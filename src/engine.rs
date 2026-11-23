@@ -15,6 +15,7 @@
 
 mod batch;
 mod checkpoint;
+mod combiner;
 mod compaction;
 #[cfg(feature = "diagnostics")]
 #[doc(hidden)]
@@ -139,10 +140,21 @@ const _: () = assert!(
 const BULK_INGEST_DIVISOR: usize = 2; // Sorted ingestion at half a memtable.
 const MAX_FROZEN_MEMTABLES: usize = 2; // Bound the flush backlog.
 const MAX_COMPACTION_INPUTS: usize = 32; // Optional level-0 fan-in.
-const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 input.
+const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 source bytes.
 const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowance.
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
+/// Fraction of the memtable budget the active table must reach before a quiet
+/// period flushes it. Below one eighth, the saving is under an eighth of one
+/// memtable while promoting the flushed run can rewrite a full bottom run, so
+/// a trickle of small writes never causes a rewrite every quiet period.
+const QUIET_TAIL_DIVISOR: usize = 8;
 const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteActivity {
+    sequence: u64,
+    flushes: u64,
+}
 
 struct State {
     last_seq: u64,
@@ -269,6 +281,8 @@ struct Core {
     gate: Mutex<()>,
     /// Number of writers currently waiting to acquire `state` exclusively.
     waiting_writers: std::sync::atomic::AtomicUsize,
+    /// Combines concurrent small writes so one lock acquisition serves a group.
+    combiner: combiner::WriteCombiner,
     /// Held by a flush from start to end, so that flushes run one at a time.
     flushing: Mutex<()>,
     /// Held by a compaction from selection to publication, so that runs are
@@ -327,6 +341,8 @@ struct Core {
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_combine: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Core {
@@ -385,6 +401,7 @@ impl Core {
             }),
             gate: Mutex::new(()),
             waiting_writers: std::sync::atomic::AtomicUsize::new(0),
+            combiner: combiner::WriteCombiner::default(),
             flushing: Mutex::new(()),
             compacting: Mutex::new(()),
             background_threads: options.background_threads,
@@ -427,6 +444,8 @@ impl Core {
             before_flush_build: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
+            #[cfg(test)]
+            before_combine: Mutex::new(None),
         }
     }
 
@@ -456,12 +475,40 @@ impl Core {
     /// number.
     fn update(&self, keyspace: u32, key: &[u8], value: Value<'_>) -> Result<u64, UpdateError> {
         self.validate_record(KeyPrefix::new(keyspace), key, value)?;
-        let mut state = self.admit(self.write_state())?;
+        self.combine_single(keyspace, key, value)
+    }
+
+    fn update_direct(
+        &self,
+        keyspace: u32,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> Result<u64, UpdateError> {
+        let state = self.admit(self.write_state())?;
+        self.apply_single(state, keyspace, key, value).0
+    }
+
+    fn apply_single<'s>(
+        &'s self,
+        mut state: RwLockWriteGuard<'s, State>,
+        keyspace: u32,
+        key: &[u8],
+        value: Value<'_>,
+    ) -> (
+        Result<u64, UpdateError>,
+        Option<RwLockWriteGuard<'s, State>>,
+    ) {
         loop {
-            let prefix = state.keyspace(keyspace)?.prefix;
+            let prefix = match state.keyspace(keyspace) {
+                Ok(space) => space.prefix,
+                Err(error) => return (Err(error), Some(state)),
+            };
             match self.write(&mut state, prefix.key(key), value) {
-                Err(Refusal::Full) => state = self.admit(self.make_room(state))?,
-                written => return written.map_err(Refusal::into_error),
+                Err(Refusal::Full) => match self.admit(self.make_room(state)) {
+                    Ok(next) => state = next,
+                    Err(error) => return (Err(error), None),
+                },
+                written => return (written.map_err(Refusal::into_error), Some(state)),
             }
         }
     }
@@ -475,6 +522,8 @@ impl Core {
         while state.frozen.len() >= self.max_frozen_memtables {
             #[cfg(feature = "diagnostics")]
             let _waiting = self.resources.waiting();
+            #[cfg(feature = "diagnostics")]
+            let _flush = self.resources.flush_waiting();
             state = self.wait_for_flush(state);
         }
         if !state.active.is_empty() {
@@ -548,6 +597,7 @@ impl Core {
 
     /// Applies a RAM-only write to the active table.
     fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Result<u64, Refusal> {
+        let was_below = !self.quiet_tail_ready(state);
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
         state
             .active
@@ -562,6 +612,9 @@ impl Core {
                     Value::Tombstone => 0,
                 },
         );
+        if was_below && self.quiet_tail_ready(state) {
+            self.arm_quiet_tail(state);
+        }
         Ok(seq)
     }
 
@@ -751,7 +804,74 @@ impl Core {
         options: CompactionPolicy,
         workspace: &mut MergeWorkspace,
     ) -> Result<Option<CompactionReport>, CompactionError> {
-        match self.begin_compaction(options)? {
+        self.compact_when(options, workspace, None)
+    }
+
+    fn quiet_tail_min(&self) -> usize {
+        self.memtable_budget.div_ceil(QUIET_TAIL_DIVISOR)
+    }
+
+    fn quiet_tail_ready(&self, state: &State) -> bool {
+        state.active.memory().charged >= self.quiet_tail_min()
+    }
+
+    fn arm_quiet_tail(&self, state: &State) {
+        if state.frozen.is_empty()
+            && let Some(signal) = &self.background
+        {
+            signal.arm_quiet_if_idle(state.write_activity());
+        }
+    }
+
+    fn idle_activity(&self) -> Option<WriteActivity> {
+        let state = self.read_state();
+        (state.frozen.is_empty() && (state.level0_flushes != 0 || self.quiet_tail_ready(&state)))
+            .then(|| state.write_activity())
+    }
+
+    /// Freezes and flushes a large active-memtable tail before a quiet settle,
+    /// using the normal flush path and serialization outside the state lock.
+    /// Returns the activity for the settle that follows, or `None` if writes
+    /// or frozen tables intervened.
+    fn flush_quiet_tail(&self, activity: WriteActivity) -> Option<WriteActivity> {
+        {
+            let state = self.read_state();
+            if !state.frozen.is_empty() || activity != state.write_activity() {
+                return None;
+            }
+            if !self.quiet_tail_ready(&state) || state.level0_flushes >= state.level0_stop {
+                return Some(activity);
+            }
+        }
+        let serial = self.serialize_flush();
+        let mut state = self.write_state();
+        if !state.frozen.is_empty() || activity != state.write_activity() {
+            return None;
+        }
+        if !self.quiet_tail_ready(&state) || state.level0_flushes >= state.level0_stop {
+            return Some(activity);
+        }
+        self.freeze_active(&mut state);
+        let job = FlushJob::new_quiet(self, serial, &state);
+        drop(state);
+        #[cfg(test)]
+        if let Some(hook) = self.before_flush_build.lock().unwrap().take() {
+            hook();
+        }
+        job.build().publish_quiet();
+        Some(WriteActivity {
+            flushes: activity.flushes + 1,
+            ..activity
+        })
+    }
+
+    fn compact_when(
+        &self,
+        options: CompactionPolicy,
+        workspace: &mut MergeWorkspace,
+        quiet: Option<WriteActivity>,
+    ) -> Result<Option<CompactionReport>, CompactionError> {
+        match self.begin_compaction(options, quiet)? {
             Some(Begun::Job(job)) => job.execute(workspace).map(Some),
             Some(Begun::Done(report)) => Ok(Some(report)),
             None => Ok(None),
@@ -760,13 +880,18 @@ impl Core {
 
     /// The keyspace compaction serves next, after adding the levels each
     /// keyspace's size calls for: the highest [`levels::Score`], or under
-    /// reclaim the most reclaimable bytes among keyspaces with work. Ties go
-    /// to the first keyspace after the one served last, in ID order, so
-    /// that equal keyspaces take turns.
-    fn choose_keyspace(state: &mut State, fit: &Fit, reclaim: bool) -> Option<u32> {
+    /// reclaim the most reclaimable bytes among keyspaces with work. When
+    /// quiet, keyspaces with any level-0 runs are eligible below every
+    /// ordinary score. Ties rotate in keyspace ID order.
+    fn choose_keyspace(
+        state: &mut State,
+        fit: &Fit,
+        reclaim: bool,
+        quiet: bool,
+    ) -> Option<(u32, bool)> {
         let cursor = state.compaction_cursor;
         // IDs after the cursor first, then the rest: a key that wraps.
-        let mut best: Option<((bool, u32), (levels::Score, usize))> = None;
+        let mut best = None;
         for (&id, space) in &mut state.keyspaces {
             let turn = (id <= cursor, id);
             space.levels.insert_levels(fit);
@@ -774,12 +899,16 @@ impl Core {
                 if matches!(space.levels.plan_reclaim(fit), Plan::Idle) {
                     continue;
                 }
-                (levels::Score::default(), space.levels.reclaimable_bytes())
+                (
+                    Some(levels::Score::default()),
+                    space.levels.reclaimable_bytes(),
+                )
             } else {
-                match space.levels.score(fit) {
-                    Some(score) => (score, 0),
-                    None => continue,
+                let score = space.levels.score(fit);
+                if score.is_none() && !(quiet && space.levels.has_level0()) {
+                    continue;
                 }
+                (score, 0)
             };
             let better = best
                 .as_ref()
@@ -788,9 +917,9 @@ impl Core {
                 best = Some((turn, rank));
             }
         }
-        let ((_, id), _) = best?;
+        let ((_, id), (score, _)) = best?;
         state.compaction_cursor = id;
-        Some(id)
+        Some((id, score.is_none()))
     }
 
     /// Chooses the next step from the levels, under the exclusive lock
@@ -800,6 +929,7 @@ impl Core {
     fn begin_compaction(
         &self,
         options: CompactionPolicy,
+        quiet: Option<WriteActivity>,
     ) -> Result<Option<Begun<'_>>, CompactionError> {
         // As for flushing, this mutex guards no data.
         let serial = self
@@ -814,13 +944,23 @@ impl Core {
             panic!("injected compaction failure");
         }
         let mut state = self.write_state();
+        // Pending flushes can join the same ranges when they publish.
+        if quiet
+            .is_some_and(|activity| !state.frozen.is_empty() || activity != state.write_activity())
+        {
+            return Ok(None);
+        }
         let fit = options.fit(self.target_run_len, state.level0_stop);
-        let Some(keyspace) = Self::choose_keyspace(&mut state, &fit, options.reclaim) else {
+        let Some((keyspace, residue)) =
+            Self::choose_keyspace(&mut state, &fit, options.reclaim, quiet.is_some())
+        else {
             return Ok(None);
         };
         let space = state.space_mut(keyspace);
         let plan = if options.reclaim {
             space.levels.plan_reclaim(&fit)
+        } else if residue {
+            space.levels.plan_idle(&fit)
         } else {
             space.levels.plan(&fit)
         };
@@ -939,7 +1079,7 @@ impl Core {
         options: CompactionPolicy,
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         loop {
-            match self.begin_compaction(options)? {
+            match self.begin_compaction(options, None)? {
                 Some(Begun::Job(job)) => return Ok(Some(job)),
                 Some(Begun::Done(_)) => {}
                 None => return Ok(None),
@@ -1114,6 +1254,10 @@ impl Core {
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
+            #[cfg(feature = "diagnostics")]
+            self.resources
+                .gate_waits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.pass_gate());
         }
         self.state.read().expect(LOCK)
@@ -1130,7 +1274,12 @@ impl Core {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let _waiting = WaitingWriter(&self.waiting_writers);
         let _gate = self.pass_gate();
-        self.state.write().expect(LOCK)
+        let guard = self.state.write().expect(LOCK);
+        #[cfg(feature = "diagnostics")]
+        self.resources
+            .write_locks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        guard
     }
 
     fn pass_gate(&self) -> MutexGuard<'_, ()> {

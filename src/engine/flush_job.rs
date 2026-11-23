@@ -25,11 +25,20 @@ pub(super) struct FlushJob<'e> {
 impl<'e> FlushJob<'e> {
     /// A flush of every frozen table in `state`, holding `serial`.
     pub(super) fn new(engine: &'e Core, serial: MutexGuard<'e, ()>, state: &State) -> Self {
+        Self::with_cuts(engine, serial, state, false)
+    }
+
+    /// A quiet tail flush aligned to pending level-0 slice boundaries.
+    pub(super) fn new_quiet(engine: &'e Core, serial: MutexGuard<'e, ()>, state: &State) -> Self {
+        Self::with_cuts(engine, serial, state, true)
+    }
+
+    fn with_cuts(engine: &'e Core, serial: MutexGuard<'e, ()>, state: &State, quiet: bool) -> Self {
         Self {
             engine,
             _serial: serial,
             tables: state.frozen.clone(),
-            spaces: state.flush_spaces(engine.target_run_len),
+            spaces: state.flush_spaces(engine.target_run_len, quiet),
         }
     }
 
@@ -124,11 +133,21 @@ impl BuiltFlush<'_> {
     /// Publishes the runs and removes the frozen tables in one step.
     ///
     pub(super) fn publish(self) -> FlushReport {
-        self.publish_kept().0
+        self.publish_inner(true).0
+    }
+
+    /// Publishes a quiet tail flush run by the compaction worker itself,
+    /// without queuing an ordinary compaction request ahead of its settle.
+    pub(super) fn publish_quiet(self) -> FlushReport {
+        self.publish_inner(false).0
     }
 
     /// The checkpoint keeps the exact outputs even if compaction replaces them.
     pub(super) fn publish_kept(self) -> (FlushReport, Vec<Kept>) {
+        self.publish_inner(true)
+    }
+
+    fn publish_inner(self, notify_compaction: bool) -> (FlushReport, Vec<Kept>) {
         let Self {
             job,
             spaces,
@@ -192,9 +211,13 @@ impl BuiltFlush<'_> {
             state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
         }
         drop(charge);
-        // Requested under the lock, as flushes and admission do, so that a
-        // reader who sees the run also sees the compaction request.
-        job.engine.notify_worker();
+        if notify_compaction {
+            // Requested under the lock, as flushes and admission do, so that a
+            // reader who sees the run also sees the compaction request.
+            job.engine.notify_worker();
+        } else if !state.frozen.is_empty() {
+            job.engine.flush_signal.request();
+        }
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);

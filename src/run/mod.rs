@@ -124,7 +124,7 @@ pub(crate) use logical::{LookupSource, latest_from};
 pub use merge::{MergeCursor, MergeWorkspace};
 pub(crate) use output_budget::{OutputBudget, OutputCounters};
 #[cfg(feature = "diagnostics")]
-pub use reader::SegmentSample;
+pub use reader::{BlockDecode, SegmentSample, with_block_observer};
 pub use reader::{Run, RunView};
 
 // Used beyond this module only by its tests.

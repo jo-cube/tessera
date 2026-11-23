@@ -13,24 +13,33 @@ detail, with the alternatives that were rejected.
   adapts to the data, up to 64 KiB raw, so data that compresses well packs
   many records into one block. Memory therefore follows the compressed size
   of the data, not its raw size.
-- **Dictionaries.** Each segment of about 4 MiB raw carries a dictionary of at
-  most 16 KiB sampled from its own records. Small blocks compress poorly on
-  their own; the dictionary gives each block the segment's common strings, so
-  redundant data such as grouped JSON stays small even in 1 KiB blocks. Data
-  with little in common across records gains little from it and is stored
-  close to its raw size.
+- **Dictionaries.** Each segment samples a dictionary of at most 16 KiB from
+  its first 4 MiB of raw records. Small blocks compress poorly on their own;
+  the dictionary gives each block the segment's common strings, so redundant
+  data such as grouped JSON stays small even in 1 KiB blocks. When a segment's
+  4 MiB prefix compresses well, subsequent blocks continue sharing that
+  dictionary until stored frames reach 16 times the dictionary length, raw
+  bytes reach 32 MiB, or compression drifts enough to eat into the dictionary
+  savings, which bounds dictionary overhead on redundant data without growing
+  the transient build buffer. Data with little in common across records
+  exceeds the stored target within its 4 MiB prefix, closes at once, and is
+  stored close to its raw size.
 - **Indexes and filters.** A sparse, prefix-compressed index holds each
   block's last key. Bloom filters (10 bits per key) exist only above the
   bottom level, which holds most keys, so they cost a small fraction of the
   stored bytes.
 - **Memtables.** Writes are buffered in up to three memtables (one active, two
   frozen) of `memtable_size` each. A memtable is charged its arena bytes,
-  including overwritten payloads, plus 80 bytes per live entry.
+  including overwritten payloads, plus 80 bytes per live entry. After five
+  quiet seconds without writes or pending flushes, an active memtable charged
+  at least one eighth of `memtable_size` is flushed and settled with level 0,
+  while smaller tails stay in the active table.
 - **Transient memory.** Compaction holds its inputs until each piece
   publishes, so a rewrite briefly needs its output beside its inputs; pieces
-  and a shared output allowance bound that peak. Snapshots keep alive the
-  runs and memtables they see, so a long-lived snapshot holds data that
-  compaction has already replaced.
+  and a shared output allowance bound that peak. Compaction after writes
+  go quiet uses the same piece bounds. Snapshots keep alive the runs and
+  memtables they see, so a long-lived snapshot holds data that compaction
+  has already replaced.
 - **Across keyspaces.** Keyspaces share one budget, one memtable and one
   chunk pool. Each has its own runs, so a flush touching *k* keyspaces
   writes at least *k* runs, each with an index, filters and dictionaries.
@@ -43,13 +52,28 @@ buffers and allocator overhead are outside the budget.
 
 ## Where CPU goes
 
-- **Writes** insert into a copy-on-write memtable. A background worker
-  flushes full memtables into compressed runs, and compaction merges runs
-  down a leveled tree with a size ratio of `level_ratio` between levels.
+- **Writes** insert into a copy-on-write memtable. Uncontended small writes
+  take the exclusive state lock directly without copying; concurrent small
+  writes combine across sharded queues so one leader acquires the state lock
+  for up to 64 requests (or 1 MiB of payload), amortizing lock handoffs. A
+  background worker flushes full memtables into compressed runs, and compaction
+  merges runs down a leveled tree with a size ratio of `level_ratio` between
+  levels.
   A record is rewritten, and so recompressed, as it descends the levels, and
   again when newer writes to nearby keys merge into the bottom level. Write
   amplification, and with it write CPU, therefore grows with the number of
-  levels and with how widely updates spread over the key space.
+  levels and with how widely updates spread over the key space. Overlapping
+  level-0 flushes can share one destination rewrite: the optional fan-in byte
+  bound counts their source bytes, while all inputs count toward the input
+  count and workspace bounds. This also applies with `memory_limit`; pieces
+  and the shared output allowance bound transient output.
+  A quiet period lets the worker flush an active memtable charged at least
+  one eighth
+  of `memtable_size` and promote leftover level-0 runs in the same settle to
+  reclaim obsolete data and uncompressed tail memory. Smaller tails stay in
+  the active table until normal rotation, a checkpoint or memory pressure
+  flushes them, and the worker sleeps once level 0 empties and the active
+  table is below that threshold.
 - **Bottom-level erasure and copy-forward.** At the bottom level a record's
   sequence number is erased once no other run can hold an older version of
   its key. Blocks whose records are all erased and that hold no deletions are

@@ -1,5 +1,5 @@
-# A new `vX.Y.Z` tag publishes a GitHub Release once the tagged commit passes
-# every check. Manual dispatch prepares and verifies a ref without publishing.
+# A new `vX.Y.Z` tag attaches assets to its GitHub Release after verification.
+# Manual dispatch prepares and verifies a ref without publishing.
 # See docs/releases.md.
 name: release
 
@@ -68,7 +68,7 @@ jobs:
         with:
           name: crate
           path: dist
-      - name: Publish the release
+      - name: Attach release assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}

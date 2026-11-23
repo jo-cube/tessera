@@ -245,6 +245,10 @@ impl Levels {
         self.levels.len() - 1
     }
 
+    pub(super) fn has_level0(&self) -> bool {
+        !self.flushes.is_empty()
+    }
+
     /// Flushes level 0 holds runs of.
     pub(super) fn level0_flushes(&self) -> usize {
         let mut count = 0;
@@ -297,6 +301,48 @@ impl Levels {
                 .collect(),
             min_piece: (target_run_len / FLUSH_MIN_PIECE).max(1),
             max_pieces: FLUSH_MAX_PIECES,
+        }
+    }
+
+    /// Cuts for a quiet tail flush: when level 0 holds runs and level 1 exists,
+    /// align to the level-1 boundaries of the oldest level-0 flush group so
+    /// each tail slice merges in the same settle job as the overlapping slice
+    /// instead of spanning all of level 1 and forcing a second rewrite.
+    pub(super) fn quiet_flush_cuts(&self, target_run_len: usize) -> FlushCuts {
+        let Some(oldest) = self.flushes.first().copied() else {
+            return self.flush_cuts(target_run_len);
+        };
+        let l1 = &self.levels[1];
+        if l1.is_empty() {
+            return self.flush_cuts(target_run_len);
+        }
+        let mut at = Vec::new();
+        for (run, &flush) in self.levels[0].iter().zip(&self.flushes) {
+            if flush != oldest {
+                break;
+            }
+            let min = min_of(run);
+            let idx = l1.partition_point(|below| min_of(below) <= min);
+            if let Some(pos) = idx.checked_sub(1)
+                && pos > 0
+            {
+                let bound = min_of(&l1[pos]);
+                if at
+                    .last()
+                    .is_none_or(|prev: &Vec<u8>| prev.as_slice() < bound)
+                {
+                    at.push(bound.to_vec());
+                }
+            }
+        }
+        if at.is_empty() {
+            return self.flush_cuts(target_run_len);
+        }
+        let max_pieces = (at.len() + 1).min(FLUSH_MAX_PIECES);
+        FlushCuts {
+            at,
+            min_piece: 1,
+            max_pieces,
         }
     }
 
@@ -580,7 +626,7 @@ impl Levels {
     pub(super) fn plan(&self, fit: &Fit) -> Plan {
         let segment = self.segment(fit);
         if let Some((level, _, _)) = self.due(fit, segment) {
-            return self.plan_level(level, fit);
+            return self.plan_level(level, fit, false);
         }
         self.plan_neighbours(fit, segment).unwrap_or(Plan::Idle)
     }
@@ -664,7 +710,7 @@ impl Levels {
                 {
                     // Use the existing cursor choice; moving other sources out
                     // of its way also makes finite progress towards this run.
-                    return self.plan_level(level, &eager);
+                    return self.plan_level(level, &eager, false);
                 }
             }
         }
@@ -685,7 +731,12 @@ impl Levels {
         Plan::Idle
     }
 
-    fn plan_level(&self, level: usize, fit: &Fit) -> Plan {
+    /// Promotes a level-0 slice below the usual flush threshold.
+    pub(super) fn plan_idle(&self, fit: &Fit) -> Plan {
+        self.plan_level(0, fit, true)
+    }
+
+    fn plan_level(&self, level: usize, fit: &Fit, idle: bool) -> Plan {
         let here = &self.levels[level];
         let at = if level == 0 {
             0
@@ -696,7 +747,12 @@ impl Levels {
         let source = &here[at];
         let below = &self.levels[level + 1];
         let dests = overlapping(below, min_of(source), max_of(source));
-        if dests.is_empty() {
+        // An isolated promotion into the bottom can also discard its filter
+        // and any tombstones that unselected runs cannot contest.
+        let clean = idle
+            && self.depth() == 1
+            && (source.run.reclaimable() || source.run.filter_bytes() != 0);
+        if dests.is_empty() && !clean {
             return Plan::Move {
                 level,
                 run: Arc::clone(source),
@@ -709,7 +765,8 @@ impl Levels {
                 .copied()
                 .chain(&below[dests.clone()])
                 .collect();
-            let bytes: usize = runs.iter().map(|run| bytes_of(run)).sum();
+            // The destination overlap is rewritten once for all selected sources.
+            let bytes: usize = sources.iter().map(|run| bytes_of(run)).sum();
             (runs.len(), bytes, workspace(&runs))
         };
         let (mut lo, mut hi) = (min_of(source), max_of(source));

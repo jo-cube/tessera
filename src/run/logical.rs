@@ -42,6 +42,8 @@ pub struct LogicalWorkspace {
     key: Vec<u8>,
     #[cfg(feature = "diagnostics")]
     filter_probes: u64,
+    #[cfg(feature = "diagnostics")]
+    filter_false_positives: u64,
 }
 
 /// The latest live value of a key.
@@ -150,6 +152,16 @@ impl LogicalWorkspace {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn filter_probes(&self) -> u64 {
         self.filter_probes
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn filter_false_positives(&self) -> u64 {
+        self.filter_false_positives
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn crc_bytes(&self) -> u64 {
+        self.merge.crc_bytes() + self.lookup.crc_bytes()
     }
 
     /// Raw bytes in blocks loaded through this workspace.
@@ -261,7 +273,9 @@ where
             continue;
         }
         #[cfg(feature = "diagnostics")]
-        if run.probes_filter(key) {
+        let probed = run.probes_filter(key);
+        #[cfg(feature = "diagnostics")]
+        if probed {
             workspace.filter_probes += 1;
         }
         if run.excludes(key, &mut hash) {
@@ -270,6 +284,10 @@ where
         // Decodes into the buffer the newest version is not in.
         let buffer = newest.map_or(0, |(_, _, found): (_, _, Found<'_>)| 1 - found.buffer);
         let Some((seq, found)) = lookup.get(run.view(), key, buffer)? else {
+            #[cfg(feature = "diagnostics")]
+            if probed {
+                workspace.filter_false_positives += 1;
+            }
             continue;
         };
         match newest {

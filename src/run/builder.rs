@@ -1,15 +1,19 @@
 //! Sorted-run encoding with bounded segment buffers and adaptive block cuts.
 //! Records arrive in internal-key order and are cut into raw blocks as they
-//! are added; each segment's blocks are compressed with its dictionary once
-//! the segment is complete. Frames and dictionaries are packed atomically so
-//! reads can borrow contiguous bytes from shared chunks. A merge into the
-//! bottom level can instead open a segment that inherits an input segment's
-//! dictionary, copy that segment's settled frames into it, and compress its
-//! other blocks as they are cut.
+//! are added; each sampled segment buffers its prefix up to the segment length,
+//! samples a dictionary, compresses the prefix, and continues compressing
+//! following blocks against that dictionary until its stored-bytes target, raw
+//! cap or drift guard closes the scope. Frames and dictionaries are packed
+//! atomically so reads can borrow contiguous bytes from shared chunks. A merge
+//! into the bottom level can instead open a segment that inherits an input
+//! segment's dictionary, copy that segment's settled frames into it, and
+//! compress its other blocks as they are cut.
 
 use super::OutputBudget;
 use super::codec::{Codec, Compressor};
-use super::dictionary::{self, SAMPLE_LEN, SEGMENT_RAW_LEN, Segment};
+use super::dictionary::{
+    self, SAMPLE_LEN, SCOPE_MAX_RAW_MULTIPLE, SCOPE_STORED_MULTIPLE, SEGMENT_RAW_LEN, Segment,
+};
 use super::filter::KeyHashes;
 use super::frame::Frame;
 use super::settled::SettledCounts;
@@ -74,19 +78,50 @@ pub struct RunBuilder {
     settled: Vec<u32>,
     /// Whether every record of the open block has sequence 0 and a value.
     open_settled: bool,
-    /// The open segment, if it inherits an input segment's dictionary.
-    inherit: Option<Inherited>,
+    /// An open streaming segment compressing (or copying) blocks against a
+    /// fixed dictionary: either inherited from a merge input or continuing a
+    /// sampled segment past its buffered prefix.
+    open: Option<OpenSegment>,
 }
 
-/// A segment whose dictionary came from a merge input. Its blocks are
-/// compressed as they are cut, and settled input frames are copied into it.
+/// A streaming segment with a fixed dictionary and block target. Blocks are
+/// compressed (or copied) as they finish rather than buffered raw.
 #[derive(Debug)]
-struct Inherited {
-    dictionary: Vec<u8>,
-    /// The segment's reference, assigned with its first frame.
+struct OpenSegment {
+    mode: SegmentMode,
+    /// The segment's reference, assigned immediately for a continued segment
+    /// and lazily with the first frame for an inherited segment.
     reference: Option<u32>,
-    /// Raw bytes of the segment's frames so far.
+    /// Raw bytes of the segment's frames so far (including the sampled prefix
+    /// for a continued segment).
     raw: usize,
+    /// Maximum raw bytes allowed in this segment.
+    raw_cap: usize,
+}
+
+#[derive(Debug)]
+enum SegmentMode {
+    Inherited { dictionary: Vec<u8> },
+    Continued(Continuation),
+}
+
+/// Stopping-rule state for a sampled segment's streaming continuation.
+#[derive(Debug)]
+struct Continuation {
+    /// Stored frame bytes (including headers) emitted across the segment so far.
+    stored: usize,
+    /// Stored frame target that closes the scope.
+    stored_cap: usize,
+    /// Dictionary length, used by the cost-based drift guard.
+    dict_len: usize,
+    /// Raw and stored frame bytes of the sampled prefix, for the drift guard.
+    prefix_raw: usize,
+    prefix_stored: usize,
+    /// Current tumbling drift-check window.
+    window_raw: usize,
+    window_stored: usize,
+    /// Minimum raw bytes per drift-check window.
+    drift_window: usize,
 }
 
 impl Default for RunBuilder {
@@ -128,7 +163,7 @@ impl RunBuilder {
             output_refused: false,
             settled: Vec::new(),
             open_settled: true,
-            inherit: None,
+            open: None,
         }
     }
     pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
@@ -215,11 +250,9 @@ impl RunBuilder {
                 projection = projection.in_new_block();
             }
         }
-        if let Some(inherit) = &self.inherit {
-            // An inherited segment holds at most twice the usual raw bytes;
-            // the rest of its input segment starts a sampled one.
-            if inherit.raw + projection.after > 2 * self.segment_len {
-                self.end_inherited();
+        if let Some(open) = &self.open {
+            if open.raw + projection.after > open.raw_cap {
+                self.close_segment();
                 projection = projection.in_new_block();
             }
         } else if !(self.block.is_empty() && self.pending_blocks.is_empty())
@@ -227,6 +260,12 @@ impl RunBuilder {
         {
             self.cut_segment();
             projection = projection.in_new_block();
+            if let Some(open) = &self.open
+                && open.raw + projection.after > open.raw_cap
+            {
+                self.close_segment();
+                projection = projection.in_new_block();
+            }
         }
         if self.output_refused {
             return Ok(());
@@ -303,7 +342,13 @@ impl RunBuilder {
     }
     /// Whether the open segment inherits an input segment's dictionary.
     pub(super) fn inheriting(&self) -> bool {
-        self.inherit.is_some()
+        matches!(
+            self.open,
+            Some(OpenSegment {
+                mode: SegmentMode::Inherited { .. },
+                ..
+            })
+        )
     }
 
     /// Ends the open segment and opens one that compresses with
@@ -311,31 +356,54 @@ impl RunBuilder {
     /// at the raw length expected to compress to the target, from that
     /// segment's `raw` decoded and `stored` payload bytes in its frame
     /// headers. The segment ends with [`end_inherited`](Self::end_inherited),
-    /// when the run finishes, or once it holds twice the usual segment length.
+    /// when the run finishes, or once it reaches its raw cap (sized from the
+    /// input segment's compression ratio up to `SCOPE_MAX_RAW_MULTIPLE + 1`
+    /// times the builder's segment length, and at least twice the segment
+    /// length).
     pub(super) fn begin_inherited(&mut self, dictionary: &[u8], raw: usize, stored: usize) {
         self.cut_segment();
         if self.output_refused || self.compressor.codec() != Codec::Zstd {
             return;
         }
         let target = self.raw_target.unwrap_or(self.target_for(raw, stored));
+        let scope_raw = dictionary
+            .len()
+            .saturating_mul(SCOPE_STORED_MULTIPLE)
+            .saturating_mul(raw)
+            .checked_div(stored)
+            .unwrap_or(self.segment_len);
+        let raw_cap = scope_raw.saturating_add(self.segment_len).clamp(
+            2 * self.segment_len,
+            (SCOPE_MAX_RAW_MULTIPLE + 1) * self.segment_len,
+        );
         self.compressor.begin_segment(dictionary, target);
         self.block_target = Some(target);
-        self.inherit = Some(Inherited {
-            dictionary: dictionary.to_vec(),
+        self.open = Some(OpenSegment {
+            mode: SegmentMode::Inherited {
+                dictionary: dictionary.to_vec(),
+            },
             reference: None,
             raw: 0,
+            raw_cap,
         });
+    }
+
+    /// Closes any open streaming segment; later records start a sampled one.
+    fn close_segment(&mut self) {
+        if self.open.is_none() {
+            return;
+        }
+        self.finish_block();
+        self.open = None;
+        if self.raw_target.is_none() {
+            self.block_target = None;
+        }
     }
 
     /// Closes an inherited segment; later records start a sampled one.
     pub(super) fn end_inherited(&mut self) {
-        if self.inherit.is_none() {
-            return;
-        }
-        self.finish_block();
-        self.inherit = None;
-        if self.raw_target.is_none() {
-            self.block_target = None;
+        if self.inheriting() {
+            self.close_segment();
         }
     }
 
@@ -353,9 +421,12 @@ impl RunBuilder {
         records: usize,
         first_key: Option<&[u8]>,
     ) -> Result<bool, CorruptRun> {
-        let Some(inherit) = &self.inherit else {
+        let Some(open) = &self.open else {
             return Ok(false);
         };
+        if !matches!(open.mode, SegmentMode::Inherited { .. }) {
+            return Ok(false);
+        }
         if self.output_refused
             || !self.key_hashes.disabled()
             || frame.codec != Codec::Zstd
@@ -364,7 +435,7 @@ impl RunBuilder {
         {
             return Ok(false);
         }
-        if inherit.raw + frame.decoded_len > 2 * self.segment_len {
+        if open.raw + frame.decoded_len > open.raw_cap {
             self.end_inherited();
             return Ok(false);
         }
@@ -387,7 +458,7 @@ impl RunBuilder {
         {
             return Ok(false);
         }
-        let Some(reference) = self.inherited_reference() else {
+        let Some(reference) = self.streaming_reference() else {
             return Ok(false);
         };
         if !self.reserve_output(
@@ -425,33 +496,39 @@ impl RunBuilder {
                 .saturating_mul(4)
                 .saturating_add(records.saturating_mul(256)),
         );
-        if let Some(inherit) = &mut self.inherit {
-            inherit.raw += frame.decoded_len;
+        if let Some(open) = &mut self.open {
+            open.raw += frame.decoded_len;
         }
         Ok(true)
     }
 
-    /// The inherited segment's reference, storing its dictionary and
-    /// segment entry with its first frame.
-    fn inherited_reference(&mut self) -> Option<u32> {
-        let inherit = self.inherit.as_ref()?;
-        if let Some(reference) = inherit.reference {
+    /// The open streaming segment's reference, storing an inherited segment's
+    /// dictionary and segment entry with its first frame.
+    fn streaming_reference(&mut self) -> Option<u32> {
+        let open = self.open.as_ref()?;
+        if let Some(reference) = open.reference {
             return Some(reference);
         }
-        let len = inherit.dictionary.len();
+        let SegmentMode::Inherited { dictionary } = &open.mode else {
+            unreachable!("continued segments assign their reference on cut");
+        };
+        let len = dictionary.len();
         if !self.reserve_output(len + SEGMENT_ENTRY_LEN + 32) {
             return None;
         }
-        let inherit = self.inherit.as_mut().expect("checked above");
+        let open = self.open.as_mut().expect("checked above");
+        let SegmentMode::Inherited { dictionary } = &open.mode else {
+            unreachable!("checked above");
+        };
         let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
         assert!(id < 1 << 24, "segment reference fits in 24 bits");
         self.segments
             .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
         self.segments.extend_from_slice(&(len as u32).to_le_bytes());
         self.segments
-            .extend_from_slice(&crc32fast::hash(&inherit.dictionary).to_le_bytes());
-        self.storage.dictionary(&inherit.dictionary);
-        inherit.reference = Some(id as u32);
+            .extend_from_slice(&crc32fast::hash(dictionary).to_le_bytes());
+        self.storage.dictionary(dictionary);
+        open.reference = Some(id as u32);
         Some(id as u32)
     }
     pub(crate) fn limit_filter_build_bytes(&mut self, bytes: usize) {
@@ -635,27 +712,58 @@ impl RunBuilder {
             u32::try_from(records).expect("bounded segment"),
         ));
         self.pending_key_bytes = 0;
-        if self.inherit.is_some() {
-            self.compress_inherited();
+        if self.open.is_some() {
+            self.compress_streaming();
         }
     }
-    /// Compresses the one buffered block of an inherited segment.
-    fn compress_inherited(&mut self) {
-        let Some(reference) = self.inherited_reference() else {
+    /// Compresses the one buffered block of an open streaming segment and
+    /// closes a continued segment once its stopping rule fires.
+    fn compress_streaming(&mut self) {
+        let Some(reference) = self.streaming_reference() else {
             return;
         };
         let len = self.block.sealed().len();
         let number = self.table.len() / TABLE_ENTRY_LEN - 1;
-        self.compress_block(number, 0..len, reference);
-        if let Some(inherit) = &mut self.inherit {
-            inherit.raw += len;
-        }
+        let Some(stored_len) = self.compress_block(number, 0..len, reference) else {
+            return;
+        };
         self.block.clear_sealed();
         self.pending_blocks.clear();
+        let close = if let Some(open) = &mut self.open {
+            open.raw += len;
+            match &mut open.mode {
+                SegmentMode::Inherited { .. } => false,
+                SegmentMode::Continued(c) => {
+                    c.stored += stored_len;
+                    c.window_raw += len;
+                    c.window_stored += stored_len;
+                    let mut stop = c.stored >= c.stored_cap || open.raw >= open.raw_cap;
+                    if !stop && c.window_raw >= c.drift_window {
+                        // Close once drift consumes more than a quarter of the
+                        // pro-rated dictionary savings:
+                        // window_stored / window_raw > (prefix_stored + dict_len / 4) / prefix_raw.
+                        stop = 4u128 * (c.window_stored as u128) * (c.prefix_raw as u128)
+                            > (4u128 * (c.prefix_stored as u128) + (c.dict_len as u128))
+                                * (c.window_raw as u128);
+                        c.window_raw = 0;
+                        c.window_stored = 0;
+                    }
+                    stop
+                }
+            }
+        } else {
+            false
+        };
+        if close {
+            self.open = None;
+            if self.raw_target.is_none() {
+                self.block_target = None;
+            }
+        }
     }
     fn cut_segment(&mut self) {
-        if self.inherit.is_some() {
-            self.end_inherited();
+        if self.open.is_some() {
+            self.close_segment();
             return;
         }
         self.finish_block();
@@ -697,38 +805,66 @@ impl RunBuilder {
         let target = self.block_target.expect("a finished block has a target");
         // The context prepares the dictionary once for every block.
         self.compressor.begin_segment(&dictionary, target);
+        let prefix_raw = self.block.sealed().len();
+        let mut prefix_stored = 0usize;
         let mut start = 0;
         let first = self.table.len() / TABLE_ENTRY_LEN - self.pending_blocks.len();
         for i in 0..self.pending_blocks.len() {
             let end = self.pending_blocks[i].0 as usize;
-            self.compress_block(first + i, start..end, reference);
-            if self.output_refused {
+            let Some(stored_len) = self.compress_block(first + i, start..end, reference) else {
                 return;
-            }
+            };
+            prefix_stored += stored_len;
             start = end;
         }
-        // The next segment measures its own ratio.
-        if codec == Codec::Zstd && self.raw_target.is_none() {
-            self.block_target = None;
-        }
-        if !self.output_refused {
-            self.storage.dictionary(&dictionary);
-        }
+        self.storage.dictionary(&dictionary);
         self.block.clear_sealed();
         self.pending_blocks.clear();
         self.block
             .trim_empty(2 * (self.segment_len + RAW_BLOCK_CAP));
+        let stored_cap = dictionary.len().saturating_mul(SCOPE_STORED_MULTIPLE);
+        let raw_cap = self.segment_len.saturating_mul(SCOPE_MAX_RAW_MULTIPLE);
+        if codec == Codec::Zstd
+            && !dictionary.is_empty()
+            && prefix_stored < stored_cap
+            && prefix_raw < raw_cap
+        {
+            self.open = Some(OpenSegment {
+                mode: SegmentMode::Continued(Continuation {
+                    stored: prefix_stored,
+                    stored_cap,
+                    dict_len: dictionary.len(),
+                    prefix_raw,
+                    prefix_stored,
+                    window_raw: 0,
+                    window_stored: 0,
+                    drift_window: RAW_BLOCK_CAP,
+                }),
+                reference: Some(reference),
+                raw: prefix_raw,
+                raw_cap,
+            });
+        } else if codec == Codec::Zstd && self.raw_target.is_none() {
+            // The next segment measures its own ratio.
+            self.block_target = None;
+        }
     }
     /// Compresses the pending bytes of block `number` into its frame and
-    /// records the frame's offset in the index.
-    fn compress_block(&mut self, number: usize, bytes: Range<usize>, reference: u32) {
+    /// records the frame's offset in the index. Returns the stored frame
+    /// length, or `None` if the output budget refused the frame.
+    fn compress_block(
+        &mut self,
+        number: usize,
+        bytes: Range<usize>,
+        reference: u32,
+    ) -> Option<usize> {
         let offset = self.storage.frames_len;
         let len = bytes.len();
         let codec = self.compressor.codec();
         let stored_len = if codec == Codec::None {
             let frame_len = frame::HEADER_LEN + len;
             if !self.reserve_output(frame_len) {
-                return;
+                return None;
             }
             let block = &self.block.sealed()[bytes];
             let header = frame::header(codec, len, reference, block);
@@ -741,7 +877,7 @@ impl RunBuilder {
             let frame_len = frame::HEADER_LEN + self.frames.len();
             if !self.reserve_output(frame_len) {
                 retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
-                return;
+                return None;
             }
             self.storage.frame_parts(&header, &self.frames);
             retain_scratch(&mut self.frames, 2 * RAW_BLOCK_CAP);
@@ -756,6 +892,7 @@ impl RunBuilder {
                 .expect("bounded run offset")
                 .to_le_bytes(),
         );
+        Some(stored_len)
     }
 }
 
@@ -935,7 +1072,7 @@ mod tests {
         (241484, 1448855163),
         (45296, 1624875384),
         (140, 3947404279),
-        (113980, 1822581774),
+        (114175, 2859231531),
         (1332504, 3380514286),
         (1641128, 3665604200),
         (114, 1424899851),
@@ -943,18 +1080,18 @@ mod tests {
         (1157999, 1390320319),
         (234491, 3451504289),
         (140, 3947404279),
-        (114259, 118046006),
+        (98757, 3687826201),
         (210018, 4127031983),
         (46623, 3819580802),
         (140, 3947404279),
-        (113681, 4041303237),
+        (114098, 3349530276),
         (466540, 3199121472),
         (224799, 1706421485),
         (140, 3947404279),
-        (113387, 933718941),
-        (473901, 346509433),
-        (424337, 3773261508),
+        (114425, 1309638170),
+        (269466, 728559880),
+        (95007, 3236125840),
         (140, 3947404279),
-        (2252776, 3924674338),
+        (749464, 2590986439),
     ];
 }
