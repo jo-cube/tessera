@@ -765,7 +765,8 @@ impl Levels {
                 .copied()
                 .chain(&below[dests.clone()])
                 .collect();
-            let bytes: usize = runs.iter().map(|run| bytes_of(run)).sum();
+            // The destination overlap is rewritten once for all selected sources.
+            let bytes: usize = sources.iter().map(|run| bytes_of(run)).sum();
             (runs.len(), bytes, workspace(&runs))
         };
         let (mut lo, mut hi) = (min_of(source), max_of(source));

@@ -886,3 +886,86 @@ fn split_level0_flushes_compact_by_overlapping_slice_unlike_unsplit() {
     assert_eq!(unsplit_after_runs, 0);
     assert_eq!(unsplit_after_flushes, 0);
 }
+
+#[test]
+fn level_0_fan_in_charges_sources_and_bounds_all_input_workspace() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 1 << 20,
+        target_run_len: 1 << 20,
+        ..options()
+    })
+    .unwrap();
+    engine.set_split_flushes(false);
+    let mut model = BTreeMap::new();
+    for index in 0..200 {
+        let v = value(index);
+        engine.ks().put(&key(index), &v).unwrap();
+        model.insert(key(index), v);
+    }
+    engine.flush().unwrap();
+    let eager = CompactionPolicy {
+        max_overlap: 1,
+        ..compaction()
+    };
+    settle_with(&engine, eager, &mut Steps::default());
+    for round in 0..4 {
+        for index in [0, 100, 199] {
+            if index == 100 && round % 2 == 0 {
+                engine.ks().delete(&key(index)).unwrap();
+                model.remove(&key(index));
+            } else {
+                let v = value(1_000 + round * 200 + index);
+                engine.ks().put(&key(index), &v).unwrap();
+                model.insert(key(index), v);
+            }
+        }
+        engine.flush().unwrap();
+    }
+    let snapshot = engine.snapshot();
+    {
+        let state = engine.core.read_state();
+        let levels = &state.only().levels;
+        let runs = levels.runs();
+        assert_eq!(runs[0].len(), 4);
+        assert_eq!(runs[1].len(), 1);
+        let bytes = |r: &SharedRun| r.run.stored_len() + r.run.held_bytes();
+        let source_bytes: usize = runs[0].iter().map(bytes).sum();
+        let mut fit = eager.fit(1 << 20, LEVEL0_STOP);
+        assert!(bytes(&runs[1][0]) > source_bytes);
+        let selected = |fit: &levels::Fit| match levels.plan(fit) {
+            levels::Plan::Merge { sources, dests, .. } => {
+                assert_eq!(dests.len(), 1);
+                sources.len()
+            }
+            _ => panic!("overlapping inputs must merge"),
+        };
+        fit.max_bytes = source_bytes;
+        assert_eq!(selected(&fit), 4);
+        fit.max_bytes -= bytes(&runs[0][3]);
+        assert_eq!(selected(&fit), 3);
+        fit.max_bytes = source_bytes;
+        fit.max_inputs = 3;
+        assert_eq!(selected(&fit), 2);
+        fit.max_inputs = MAX_COMPACTION_INPUTS;
+        fit.max_workspace_bytes = crate::run::workspace_estimate(
+            [&runs[0][0], &runs[0][1], &runs[1][0]]
+                .into_iter()
+                .map(|run| run.largest_block),
+        );
+        assert_eq!(selected(&fit), 2);
+        let limited = CompactionPolicy::for_memory(Some(8 * source_bytes));
+        assert_eq!(limited.max_input_bytes, source_bytes);
+        let mut limited_fit = limited.fit(1 << 20, LEVEL0_STOP);
+        limited_fit.max_workspace_bytes = fit.max_workspace_bytes;
+        assert_eq!(selected(&limited_fit), 2);
+    }
+    let mut steps = Steps::default();
+    settle_with(&engine, eager, &mut steps);
+    assert!(steps.refusal.is_none(), "{steps:?}");
+    level_ids(&engine);
+    assert_eq!(scan(&engine.snapshot()), model);
+    assert_eq!(scan(&snapshot), model);
+    for (key, value) in model {
+        assert_eq!(get(&engine, &key), Some(value));
+    }
+}

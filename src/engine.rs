@@ -140,7 +140,7 @@ const _: () = assert!(
 const BULK_INGEST_DIVISOR: usize = 2; // Sorted ingestion at half a memtable.
 const MAX_FROZEN_MEMTABLES: usize = 2; // Bound the flush backlog.
 const MAX_COMPACTION_INPUTS: usize = 32; // Optional level-0 fan-in.
-const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 input.
+const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 source bytes.
 const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowance.
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
 /// Fraction of the memtable budget the active table must reach before a quiet
