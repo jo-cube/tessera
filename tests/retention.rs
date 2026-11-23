@@ -220,6 +220,10 @@ fn engine_checkpoints(seed: u64) -> usize {
             compact_some(&engine, &mut rng, &mut merge);
         }
         if step % 1_000 == 999 {
+            // The allocator counts every thread: settle background
+            // compaction and hold it off, so the drop alone is measured.
+            engine.wait_for_compaction().unwrap();
+            let hold = diagnostics::hold_compaction(&engine);
             // Fill the pooled reader buffers now, so that the check frees
             // none of them.
             for snapshot in &held {
@@ -229,6 +233,7 @@ fn engine_checkpoints(seed: u64) -> usize {
             let sources: usize = stats.runs + stats.frozen_tables + 1;
             let allowance = held.len() * (OWN + 8 * sources);
             let freed = freed_by(|| held.clear());
+            drop(hold);
             assert!(
                 freed <= stats.retained_bytes + allowance,
                 "seed {seed} step {step}: dropping snapshots freed {freed} bytes, \
