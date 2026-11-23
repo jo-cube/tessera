@@ -304,6 +304,48 @@ impl Levels {
         }
     }
 
+    /// Cuts for a quiet tail flush: when level 0 holds runs and level 1 exists,
+    /// align to the level-1 boundaries of the oldest level-0 flush group so
+    /// each tail slice merges in the same settle job as the overlapping slice
+    /// instead of spanning all of level 1 and forcing a second rewrite.
+    pub(super) fn quiet_flush_cuts(&self, target_run_len: usize) -> FlushCuts {
+        let Some(oldest) = self.flushes.first().copied() else {
+            return self.flush_cuts(target_run_len);
+        };
+        let l1 = &self.levels[1];
+        if l1.is_empty() {
+            return self.flush_cuts(target_run_len);
+        }
+        let mut at = Vec::new();
+        for (run, &flush) in self.levels[0].iter().zip(&self.flushes) {
+            if flush != oldest {
+                break;
+            }
+            let min = min_of(run);
+            let idx = l1.partition_point(|below| min_of(below) <= min);
+            if let Some(pos) = idx.checked_sub(1)
+                && pos > 0
+            {
+                let bound = min_of(&l1[pos]);
+                if at
+                    .last()
+                    .is_none_or(|prev: &Vec<u8>| prev.as_slice() < bound)
+                {
+                    at.push(bound.to_vec());
+                }
+            }
+        }
+        if at.is_empty() {
+            return self.flush_cuts(target_run_len);
+        }
+        let max_pieces = (at.len() + 1).min(FLUSH_MAX_PIECES);
+        FlushCuts {
+            at,
+            min_piece: 1,
+            max_pieces,
+        }
+    }
+
     /// The level holding `run`.
     #[cfg(test)]
     pub(super) fn level_of(&self, run: &SharedRun) -> Option<usize> {

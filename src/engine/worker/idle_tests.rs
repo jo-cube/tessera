@@ -48,6 +48,19 @@ fn pause_build(engine: &Engine) -> (Receiver<()>, Sender<()>) {
     (built, release)
 }
 
+fn pause_flush(engine: &Engine) -> (Receiver<()>, Sender<()>) {
+    let (started, paused) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let resume = Mutex::new(Some(resume));
+    *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
+        if let Some(resume) = resume.lock().unwrap().take() {
+            started.send(()).unwrap();
+            resume.recv_timeout(TEST_TIMEOUT).unwrap();
+        }
+    }));
+    (paused, release)
+}
+
 fn assert_accounting(engine: &Engine) {
     let s = engine.engine_stats();
     assert_eq!(
@@ -373,4 +386,269 @@ fn quiet_compaction_reclaims_split_flush_remainders_at_each_builder_count() {
     let expected = run(1);
     assert_eq!(run(2), expected);
     assert_eq!(run(4), expected);
+}
+
+#[test]
+fn quiet_tail_at_or_above_threshold_flushes_and_settles_in_one_period() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 8 << 10,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let signal = signal_for(&engine);
+
+    // Cold start with no level-0 runs: crossing 1/8 of the budget arms quiet.
+    let mut batch = WriteBatch::new();
+    let value_a = vec![b'a'; 450];
+    let value_b = vec![b'b'; 450];
+    batch.put(&ks, b"k1", &value_a);
+    batch.put(&ks, b"k2", &value_b);
+    engine.write(&batch).unwrap();
+    assert_eq!(engine.engine_stats().flushes, 0);
+    assert!(engine.engine_stats().active.charged >= 1 << 10);
+    assert!(signal.lock().quiet.is_some());
+
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD - Duration::from_millis(1));
+    assert_eq!(signal.status().passes, passes);
+    assert_eq!(engine.engine_stats().flushes, 0);
+
+    advance_clock(signal, Duration::from_millis(1));
+    wait_for(signal, |progress| progress.status.passes > passes);
+    let stats = engine.engine_stats();
+    assert_eq!(stats.flushes, 1);
+    assert_eq!(stats.active.charged, 0);
+    assert_eq!(stats.level0_runs, 0);
+    assert!(stats.runs >= 1);
+    assert!(signal.lock().quiet.is_none());
+    assert_eq!(ks.get(b"k1").unwrap().as_deref(), Some(value_a.as_slice()));
+    assert_eq!(ks.get(b"k2").unwrap().as_deref(), Some(value_b.as_slice()));
+
+    // With level-0 residue already present, one quiet period covers both.
+    ks.put(b"k1", b"intermediate").unwrap();
+    drain(&engine);
+    assert_eq!(engine.engine_stats().level0_runs, 1);
+    let value_c = vec![b'c'; 500];
+    let value_d = vec![b'd'; 500];
+    batch.clear();
+    batch.put(&ks, b"k1", &value_c);
+    batch.put(&ks, b"k3", &value_d);
+    engine.write(&batch).unwrap();
+    engine.wait_for_compaction().unwrap();
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD);
+    wait_for(signal, |progress| progress.status.passes > passes);
+    let stats = engine.engine_stats();
+    assert_eq!(stats.flushes, 3);
+    assert_eq!(stats.active.charged, 0);
+    assert_eq!(stats.level0_runs, 0);
+    assert_eq!(ks.get(b"k1").unwrap().as_deref(), Some(value_c.as_slice()));
+    assert_eq!(ks.get(b"k2").unwrap().as_deref(), Some(value_b.as_slice()));
+    assert_eq!(ks.get(b"k3").unwrap().as_deref(), Some(value_d.as_slice()));
+}
+
+#[test]
+fn quiet_tail_below_threshold_stays_in_active_memtable() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 8 << 10,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let signal = signal_for(&engine);
+
+    ks.put(b"small", b"trickle").unwrap();
+    assert!(engine.engine_stats().active.charged < (1 << 10));
+    assert!(signal.lock().quiet.is_none());
+    let before = signal.status();
+    advance_clock(signal, QUIET_PERIOD * 3);
+    assert_eq!(signal.status(), before);
+    assert_eq!(engine.engine_stats().flushes, 0);
+    assert!(engine.engine_stats().active.charged > 0);
+    assert_eq!(ks.get(b"small").unwrap().unwrap(), b"trickle");
+
+    // Level-0 residue still settles while a below-threshold tail stays active.
+    drain(&engine);
+    ks.put(b"tiny", b"stays").unwrap();
+    engine.wait_for_compaction().unwrap();
+    assert!(engine.engine_stats().active.charged < (1 << 10));
+    settle(&engine);
+    assert_eq!(engine.engine_stats().flushes, 1);
+    assert!(engine.engine_stats().active.charged > 0);
+    assert!(signal.lock().quiet.is_none());
+    assert_eq!(ks.get(b"small").unwrap().unwrap(), b"trickle");
+    assert_eq!(ks.get(b"tiny").unwrap().unwrap(), b"stays");
+}
+
+#[test]
+fn a_write_during_a_quiet_tail_flush_defers_settling() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 8 << 10,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let signal = signal_for(&engine);
+
+    let mut batch = WriteBatch::new();
+    let value = vec![b'x'; 500];
+    batch.put(&ks, b"a", &value);
+    batch.put(&ks, b"b", &value);
+    engine.write(&batch).unwrap();
+
+    let (paused, release) = pause_flush(&engine);
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD);
+    paused.recv_timeout(TEST_TIMEOUT).unwrap();
+    // Building holds no state lock, so writes proceed and defer the settle.
+    ks.put(b"a", b"overwritten").unwrap();
+    release.send(()).unwrap();
+    wait_for(signal, |progress| progress.status.passes > passes);
+
+    assert_eq!(engine.engine_stats().flushes, 1);
+    assert_eq!(signal.status().compactions, 0);
+    assert_eq!(engine.engine_stats().level0_runs, 1);
+    assert_eq!(ks.get(b"a").unwrap().unwrap(), b"overwritten");
+    assert_eq!(ks.get(b"b").unwrap().as_deref(), Some(value.as_slice()));
+
+    settle(&engine);
+    assert_eq!(ks.get(b"a").unwrap().unwrap(), b"overwritten");
+    assert_eq!(ks.get(b"b").unwrap().as_deref(), Some(value.as_slice()));
+}
+
+#[test]
+fn close_during_a_quiet_tail_flush_stops_cleanly() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 8 << 10,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let mut batch = WriteBatch::new();
+    batch.put(&ks, b"a", &[b'v'; 500]);
+    batch.put(&ks, b"b", &[b'w'; 500]);
+    engine.write(&batch).unwrap();
+
+    let core = Arc::clone(&engine.core);
+    let signal = signal(&core);
+    let (paused, release) = pause_flush(&engine);
+    advance_clock(signal, QUIET_PERIOD);
+    paused.recv_timeout(TEST_TIMEOUT).unwrap();
+    thread::scope(|scope| {
+        let close = scope.spawn(|| engine.close());
+        wait_for(signal, |progress| progress.stop);
+        release.send(()).unwrap();
+        close.join().unwrap().unwrap();
+    });
+    let status = signal.status();
+    assert!(!status.running);
+    assert_eq!(status.compactions, 0);
+    assert!(status.panic.is_none());
+    assert_eq!(core.stats().flushes, 1);
+}
+
+#[test]
+fn quiet_tail_flush_clears_active_charge_and_lowers_memory_used() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 2 << 20,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let signal = signal_for(&engine);
+    let value = br#"{"group":"quiet","status":"active","payload":"repeated-json-fields"}"#;
+
+    // Warm the chunk pool so the build borrows from reserve rather than
+    // adding a fresh 1 MiB chunk to the reserve during this measurement.
+    ks.put(b"warm", value).unwrap();
+    drain(&engine);
+    settle(&engine);
+
+    let mut batch = WriteBatch::new();
+    for i in 0..4000u32 {
+        batch.put(&ks, format!("k{i:04}").as_bytes(), value);
+    }
+    engine.write(&batch).unwrap();
+    let before_stats = engine.stats();
+    assert!(engine.engine_stats().active.charged >= (256 << 10));
+    assert_accounting(&engine);
+
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD);
+    wait_for(signal, |progress| progress.status.passes > passes);
+
+    let after_engine = engine.engine_stats();
+    let after_stats = engine.stats();
+    assert_eq!(after_engine.active.charged, 0);
+    assert_eq!(after_engine.level0_runs, 0);
+    assert!(
+        after_stats.memory_used < before_stats.memory_used,
+        "memory_used did not fall: before={}, after={}",
+        before_stats.memory_used,
+        after_stats.memory_used
+    );
+    assert_accounting(&engine);
+    assert_eq!(ks.get(b"k0000").unwrap().as_deref(), Some(value.as_slice()));
+    assert_eq!(ks.get(b"k3999").unwrap().as_deref(), Some(value.as_slice()));
+}
+
+#[test]
+fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 16 << 10,
+        target_run_len: 4 << 10,
+        compression: Compression::Uncompressed,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    // Build three disjoint bottom runs so subsequent flushes split on them.
+    for prefix in [b'a', b'm', b'z'] {
+        for i in 0..8u8 {
+            ks.put(&[prefix, i], &[prefix; 500]).unwrap();
+        }
+        drain(&engine);
+        settle(&engine);
+    }
+    assert_eq!(engine.engine_stats().level0_runs, 0);
+    assert!(engine.engine_stats().runs >= 3);
+
+    // Flush one level-0 group split across the bottom runs, then write a tail
+    // above the 1/8 threshold (2 KiB) spanning the same key range.
+    let mut batch = WriteBatch::new();
+    for prefix in [b'a', b'm', b'z'] {
+        for i in 0..4u8 {
+            batch.put(&ks, &[prefix, i], &[1u8; 300]);
+        }
+    }
+    engine.write(&batch).unwrap();
+    drain(&engine);
+    let l0_before = engine.engine_stats().level0_runs;
+    assert!(l0_before >= 2, "expected split L0 flush, got {l0_before}");
+
+    batch.clear();
+    for prefix in [b'a', b'm', b'z'] {
+        batch.put(&ks, &[prefix, 0], &[2u8; 700]);
+    }
+    engine.write(&batch).unwrap();
+    engine.wait_for_compaction().unwrap();
+    assert!(engine.engine_stats().active.charged >= (2 << 10));
+
+    let (paused, release) = pause_build(&engine);
+    let signal = signal_for(&engine);
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD);
+    paused.recv_timeout(TEST_TIMEOUT).unwrap();
+    // Quiet tail flush has published aligned slices before the first merge.
+    assert_eq!(engine.engine_stats().active.charged, 0);
+    assert!(engine.engine_stats().level0_runs >= l0_before * 2);
+    release.send(()).unwrap();
+    wait_for(signal, |progress| progress.status.passes > passes);
+
+    assert_eq!(engine.engine_stats().level0_runs, 0);
+    for prefix in [b'a', b'm', b'z'] {
+        assert_eq!(ks.get(&[prefix, 0]).unwrap().unwrap(), vec![2u8; 700]);
+        assert_eq!(ks.get(&[prefix, 1]).unwrap().unwrap(), vec![1u8; 300]);
+    }
 }

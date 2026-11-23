@@ -88,6 +88,7 @@ struct Progress {
     stop: bool,
     status: BackgroundStatus,
     quiet: Option<(Instant, WriteActivity)>,
+    quiet_pending: Option<WriteActivity>,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -123,6 +124,21 @@ impl Signal {
         progress.requested += 1;
         self.changed.notify_all();
         progress.requested
+    }
+
+    /// Arms the quiet deadline when the worker is idle with no deadline set,
+    /// or records the crossing for the end of an in-flight pass.
+    pub(super) fn arm_quiet_if_idle(&self, activity: WriteActivity) {
+        let mut progress = self.lock();
+        if progress.stop || progress.quiet.is_some() {
+            return;
+        }
+        if !progress.status.busy && progress.requested == progress.started {
+            progress.arm_quiet(Some(activity));
+            self.changed.notify_all();
+        } else {
+            progress.quiet_pending = Some(activity);
+        }
     }
 
     /// Tells the worker to exit once the compaction it is running, if any,
@@ -244,6 +260,7 @@ impl Signal {
             }
         };
         progress.started = progress.requested;
+        progress.quiet = None;
         progress.status.busy = true;
         Some((progress.started, quiet))
     }
@@ -319,15 +336,26 @@ fn run(core: &Core) {
     let signal = signal(core);
     // Recovered engines can start with published level-0 runs.
     let activity = core.idle_activity();
-    signal.lock().arm_quiet(activity);
+    {
+        let mut progress = signal.lock();
+        if progress.quiet.is_none() {
+            progress.arm_quiet(activity);
+        }
+    }
     while let Some((generation, quiet)) = signal.start_pass() {
         let failure = pass(core, signal, quiet).err();
+        signal.lock().quiet_pending = None;
         let activity = if failure.is_none() {
             core.idle_activity()
         } else {
             None
         };
         let mut progress = signal.lock();
+        let activity = activity.or(if failure.is_none() {
+            progress.quiet_pending.take()
+        } else {
+            None
+        });
         progress.arm_quiet(activity);
         progress.finished = generation;
         progress.status.busy = false;
@@ -346,9 +374,24 @@ fn run(core: &Core) {
 /// ends; with them it ends once flushes stop, which the level-0 stop forces
 /// if compaction falls behind. A read failure ends the pass and is retried
 /// only after another publication or request.
-fn pass(core: &Core, signal: &Signal, quiet: Option<WriteActivity>) -> Result<(), CompactionError> {
+fn pass(
+    core: &Core,
+    signal: &Signal,
+    mut quiet: Option<WriteActivity>,
+) -> Result<(), CompactionError> {
     #[cfg(test)]
     tests::fault_point(core);
+    if let Some(activity) = quiet {
+        let progress = signal.lock();
+        if progress.stop || progress.requested != progress.started {
+            return Ok(());
+        }
+        drop(progress);
+        let Some(next) = core.flush_quiet_tail(activity) else {
+            return Ok(());
+        };
+        quiet = Some(next);
+    }
     let reclaim = quiet.is_none()
         && core
             .reclaim

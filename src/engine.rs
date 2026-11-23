@@ -143,6 +143,11 @@ const MAX_COMPACTION_INPUTS: usize = 32; // Optional level-0 fan-in.
 const COMPACTION_INPUT_BYTES: usize = 256 << 20; // Optional level-0 input.
 const COMPACTION_WORKSPACE_BYTES: usize = 64 << 20; // Parallel builder allowance.
 const COMPACTION_TRIGGER: usize = 4; // Flush groups that trigger level 0.
+/// Fraction of the memtable budget the active table must reach before a quiet
+/// period flushes it. Below one eighth, the saving is under an eighth of one
+/// memtable while promoting the flushed run can rewrite a full bottom run, so
+/// a trickle of small writes never causes a rewrite every quiet period.
+const QUIET_TAIL_DIVISOR: usize = 8;
 const SOFT_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,6 +597,7 @@ impl Core {
 
     /// Applies a RAM-only write to the active table.
     fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Result<u64, Refusal> {
+        let was_below = !self.quiet_tail_ready(state);
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
         state
             .active
@@ -606,6 +612,9 @@ impl Core {
                     Value::Tombstone => 0,
                 },
         );
+        if was_below && self.quiet_tail_ready(state) {
+            self.arm_quiet_tail(state);
+        }
         Ok(seq)
     }
 
@@ -798,9 +807,62 @@ impl Core {
         self.compact_when(options, workspace, None)
     }
 
+    fn quiet_tail_min(&self) -> usize {
+        self.memtable_budget.div_ceil(QUIET_TAIL_DIVISOR)
+    }
+
+    fn quiet_tail_ready(&self, state: &State) -> bool {
+        state.active.memory().charged >= self.quiet_tail_min()
+    }
+
+    fn arm_quiet_tail(&self, state: &State) {
+        if state.frozen.is_empty()
+            && let Some(signal) = &self.background
+        {
+            signal.arm_quiet_if_idle(state.write_activity());
+        }
+    }
+
     fn idle_activity(&self) -> Option<WriteActivity> {
         let state = self.read_state();
-        (state.level0_flushes != 0 && state.frozen.is_empty()).then(|| state.write_activity())
+        (state.frozen.is_empty() && (state.level0_flushes != 0 || self.quiet_tail_ready(&state)))
+            .then(|| state.write_activity())
+    }
+
+    /// Freezes and flushes a large active-memtable tail before a quiet settle,
+    /// using the normal flush path and serialization outside the state lock.
+    /// Returns the activity for the settle that follows, or `None` if writes
+    /// or frozen tables intervened.
+    fn flush_quiet_tail(&self, activity: WriteActivity) -> Option<WriteActivity> {
+        {
+            let state = self.read_state();
+            if !state.frozen.is_empty() || activity != state.write_activity() {
+                return None;
+            }
+            if !self.quiet_tail_ready(&state) || state.level0_flushes >= state.level0_stop {
+                return Some(activity);
+            }
+        }
+        let serial = self.serialize_flush();
+        let mut state = self.write_state();
+        if !state.frozen.is_empty() || activity != state.write_activity() {
+            return None;
+        }
+        if !self.quiet_tail_ready(&state) || state.level0_flushes >= state.level0_stop {
+            return Some(activity);
+        }
+        self.freeze_active(&mut state);
+        let job = FlushJob::new_quiet(self, serial, &state);
+        drop(state);
+        #[cfg(test)]
+        if let Some(hook) = self.before_flush_build.lock().unwrap().take() {
+            hook();
+        }
+        job.build().publish_quiet();
+        Some(WriteActivity {
+            flushes: activity.flushes + 1,
+            ..activity
+        })
     }
 
     fn compact_when(

@@ -277,6 +277,7 @@ impl Core {
             };
             let memory = state.active.memory();
             if needed <= memory.budget.saturating_sub(memory.charged) {
+                let was_below = memory.charged < self.quiet_tail_min();
                 let single_prefix = (!batch.mixed)
                     .then(|| {
                         batch
@@ -295,6 +296,9 @@ impl Core {
                     state.last_seq = seq;
                 }
                 self.chunks.ingested(batch.bytes.len());
+                if was_below && self.quiet_tail_ready(&state) {
+                    self.arm_quiet_tail(&state);
+                }
                 return (Ok(end), Some(state));
             }
             match self.admit(self.make_room(state)) {

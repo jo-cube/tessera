@@ -89,11 +89,13 @@ impl KeyspaceState {
     }
 
     /// Where a flush beginning now splits this keyspace's runs.
-    pub(super) fn flush_cuts(&self, split: bool, target_run_len: usize) -> FlushCuts {
-        if split {
-            self.levels.flush_cuts(target_run_len)
-        } else {
+    pub(super) fn flush_cuts(&self, split: bool, target_run_len: usize, quiet: bool) -> FlushCuts {
+        if !split {
             FlushCuts::default()
+        } else if quiet {
+            self.levels.quiet_flush_cuts(target_run_len)
+        } else {
+            self.levels.flush_cuts(target_run_len)
         }
     }
 }
@@ -236,7 +238,11 @@ impl State {
 
     /// The live keyspaces' prefixes and flush cuts, sorted by prefix, as a
     /// flush beginning now uses them.
-    pub(super) fn flush_spaces(&self, target_run_len: usize) -> Vec<(u32, KeyPrefix, FlushCuts)> {
+    pub(super) fn flush_spaces(
+        &self,
+        target_run_len: usize,
+        quiet: bool,
+    ) -> Vec<(u32, KeyPrefix, FlushCuts)> {
         #[cfg(test)]
         let split = self.split_flushes;
         #[cfg(not(test))]
@@ -244,7 +250,13 @@ impl State {
         let mut spaces: Vec<_> = self
             .keyspaces
             .iter()
-            .map(|(&id, space)| (id, space.prefix, space.flush_cuts(split, target_run_len)))
+            .map(|(&id, space)| {
+                (
+                    id,
+                    space.prefix,
+                    space.flush_cuts(split, target_run_len, quiet),
+                )
+            })
             .collect();
         spaces.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
         spaces
