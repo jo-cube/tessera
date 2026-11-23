@@ -170,6 +170,13 @@ fn memtable_metrics(phase: &str, out: &super::Out, stats: tessera::diagnostics::
 impl Store {
     pub fn tessera() -> Self {
         let mut options = Options::default();
+        if let Ok(mib) = std::env::var("TESSERA_BENCH_MEMTABLE_MIB") {
+            options.memtable_size = mib
+                .parse::<usize>()
+                .expect("integer memtable MiB")
+                .checked_mul(1 << 20)
+                .expect("memtable size fits usize");
+        }
         if let Ok(ratio) = std::env::var("TESSERA_BENCH_LEVEL_RATIO") {
             options.level_ratio = ratio.parse().expect("integer level ratio");
         }

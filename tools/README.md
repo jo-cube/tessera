@@ -61,6 +61,8 @@ Rust allocation bytes and sample `/proc/self/status` plus engine memory
 components every second and at phase ends. Run one named scenario per process.
 Native Zstandard allocations are outside the Rust counter. `--threads COUNT`
 sets builders; `--threads default` uses the engine default (otherwise one).
+`TESSERA_COUNTERS_MEMTABLE_MIB` sets `Options::memtable_size` in MiB for
+every scenario and variant. Use the same value on both sides of a comparison.
 
 ## Zstandard entropy measurements
 

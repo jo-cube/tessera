@@ -132,4 +132,6 @@ and at workload endpoints. Each child has a 300-second deadline and a 12 GiB
 RSS-plus-used-disk guard. Input generation is excluded from engine memory.
 `TESSERA_BENCH_SCALE` divides sizes; `TESSERA_BENCH_DISK_GIB` sets RAM-disk
 capacity. `TESSERA_BENCH_LEVEL_RATIO` and `TESSERA_BENCH_BACKGROUND_THREADS`
-override Tessera options for controlled comparisons.
+override Tessera options for controlled comparisons. `TESSERA_BENCH_MEMTABLE_MIB`
+sets `Options::memtable_size` in MiB for every Tessera store in both regular
+and streaming modes. Use the same value on both sides of a comparison.

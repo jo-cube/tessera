@@ -588,6 +588,13 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let engine = std::sync::Arc::new(
         Engine::in_memory({
             let mut options = Options::default();
+            if let Ok(mib) = std::env::var("TESSERA_COUNTERS_MEMTABLE_MIB") {
+                options.memtable_size = mib
+                    .parse::<usize>()
+                    .expect("integer memtable MiB")
+                    .checked_mul(1 << 20)
+                    .expect("memtable size fits usize");
+            }
             options.background_threads = threads;
             options
         })
