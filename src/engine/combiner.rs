@@ -799,7 +799,8 @@ mod tests {
                 readers.push(scope.spawn(move || {
                     start.wait();
                     let mut snapshots = 0usize;
-                    while !stop.load(Ordering::Relaxed) {
+                    // At least one snapshot, even if the writers finish first.
+                    while snapshots == 0 || !stop.load(Ordering::Relaxed) {
                         let snap = engine.snapshot();
                         let mut reader = snap.reader();
                         for w in 0..writers {
