@@ -604,7 +604,7 @@ fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
     .unwrap();
     let ks = engine.ks();
     // Build three disjoint bottom runs so subsequent flushes split on them.
-    for prefix in [b'a', b'm', b'z'] {
+    for prefix in *b"amz" {
         for i in 0..8u8 {
             ks.put(&[prefix, i], &[prefix; 500]).unwrap();
         }
@@ -617,7 +617,7 @@ fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
     // Flush one level-0 group split across the bottom runs, then write a tail
     // above the 1/8 threshold (2 KiB) spanning the same key range.
     let mut batch = WriteBatch::new();
-    for prefix in [b'a', b'm', b'z'] {
+    for prefix in *b"amz" {
         for i in 0..4u8 {
             batch.put(&ks, &[prefix, i], &[1u8; 300]);
         }
@@ -628,7 +628,7 @@ fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
     assert!(l0_before >= 2, "expected split L0 flush, got {l0_before}");
 
     batch.clear();
-    for prefix in [b'a', b'm', b'z'] {
+    for prefix in *b"amz" {
         batch.put(&ks, &[prefix, 0], &[2u8; 700]);
     }
     engine.write(&batch).unwrap();
@@ -647,7 +647,7 @@ fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
     wait_for(signal, |progress| progress.status.passes > passes);
 
     assert_eq!(engine.engine_stats().level0_runs, 0);
-    for prefix in [b'a', b'm', b'z'] {
+    for prefix in *b"amz" {
         assert_eq!(ks.get(&[prefix, 0]).unwrap().unwrap(), vec![2u8; 700]);
         assert_eq!(ks.get(&[prefix, 1]).unwrap().unwrap(), vec![1u8; 300]);
     }
