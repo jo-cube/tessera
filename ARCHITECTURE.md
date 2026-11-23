@@ -352,5 +352,6 @@ again, leaving cores to the leader when writers outnumber cores.
   still serialized on the queue mutex and paid kernel park/wake latency per
   group, capping multi-writer scaling for small writes.
 - A fairer lock alone: still costs one exclusive handoff per operation.
-- A concurrent memtable: deferred; requires replacing the copy-on-write
-  single-writer B+ tree.
+- A concurrent memtable: would require replacing the copy-on-write
+  single-writer B+ tree; combining already amortizes the exclusive lock over a
+  group of writes.
