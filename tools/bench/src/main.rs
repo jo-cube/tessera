@@ -181,6 +181,7 @@ impl MemoryReference {
         let heap = live_heap().saturating_sub(self.heap) + disk;
         let ram = rss().saturating_sub(self.rss) + disk;
         let physical = footprint().saturating_sub(self.footprint) + disk;
+        let relieved = unsafe { store::tb_relieve_allocator() }.then(footprint);
         out.emit(case, "engine_heap_bytes", heap);
         out.emit(
             case,
@@ -197,6 +198,14 @@ impl MemoryReference {
             "engine_footprint_mib",
             format!("{:.2}", physical as f64 / MIB as f64),
         );
+        if let Some(relieved) = relieved {
+            let physical = relieved.saturating_sub(self.footprint) + disk;
+            out.emit(
+                case,
+                "engine_footprint_relieved_mib",
+                format!("{:.2}", physical as f64 / MIB as f64),
+            );
+        }
         out.emit(
             case,
             "ram_disk_mib",

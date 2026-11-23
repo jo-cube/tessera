@@ -44,6 +44,7 @@ unsafe extern "C" {
     fn tb_stats(p: *mut c_void, a: *mut u64);
     pub fn tb_rss() -> u64;
     pub fn tb_footprint() -> u64;
+    pub fn tb_relieve_allocator() -> bool;
     pub fn tb_live_heap() -> u64;
 }
 

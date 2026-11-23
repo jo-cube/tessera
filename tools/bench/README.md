@@ -102,6 +102,14 @@ recorded; RocksDB includes used RAM-disk bytes. Write amplification is flush
 plus compaction output divided by flush output. Correctness gates check 20k
 sampled keys and 200 group scans after each load and update.
 
+The result CSV samples `engine_footprint_mib` before asking the allocator to
+return free pages and `engine_footprint_relieved_mib` immediately afterward.
+Both use the same pre-engine footprint reference and RAM-disk adjustment.
+The native adapter requests relief with `malloc_zone_pressure_relief` on macOS
+and `malloc_trim` on glibc Linux. The relieved row is omitted where the
+allocator relief call is unavailable. Relief can affect later samples in the
+same process.
+
 ## Streaming mode
 
 `run.sh --mode streaming` regenerates records with bounded input buffers:
