@@ -30,7 +30,10 @@ detail, with the alternatives that were rejected.
   stored bytes.
 - **Memtables.** Writes are buffered in up to three memtables (one active, two
   frozen) of `memtable_size` each. A memtable is charged its arena bytes,
-  including overwritten payloads, plus 80 bytes per live entry.
+  including overwritten payloads, plus 80 bytes per live entry. After five
+  quiet seconds without writes or pending flushes, an active memtable charged
+  at least one eighth of `memtable_size` is flushed and settled with level 0,
+  while smaller tails stay in the active table.
 - **Transient memory.** Compaction holds its inputs until each piece
   publishes, so a rewrite briefly needs its output beside its inputs; pieces
   and a shared output allowance bound that peak. Compaction after writes
@@ -60,10 +63,12 @@ buffers and allocator overhead are outside the budget.
   again when newer writes to nearby keys merge into the bottom level. Write
   amplification, and with it write CPU, therefore grows with the number of
   levels and with how widely updates spread over the key space. A quiet
-  period lets the worker promote leftover level-0 runs and reclaim their
-  obsolete data. The worker sleeps once level 0 empties. Active memtables
-  still rotate at their normal size or when a checkpoint or memory pressure
-  calls for it.
+  period lets the worker flush an active memtable charged at least one eighth
+  of `memtable_size` and promote leftover level-0 runs in the same settle to
+  reclaim obsolete data and uncompressed tail memory. Smaller tails stay in
+  the active table until normal rotation, a checkpoint or memory pressure
+  flushes them, and the worker sleeps once level 0 empties and the active
+  table is below that threshold.
 - **Bottom-level erasure and copy-forward.** At the bottom level a record's
   sequence number is erased once no other run can hold an older version of
   its key. Blocks whose records are all erased and that hold no deletions are

@@ -46,14 +46,19 @@ large write ─▶ private runs ────────────▶ level 0 
   of its runs remain in level 0, including slices outside the last merge.
 - **Compaction.** The worker takes the most overfull level, then eligible
   level 0, then small neighbours. Nonoverlapping runs usually move down by
-  relabelling. When ordinary work runs out and level 0 still holds runs, the
-  worker waits for five quiet seconds before promoting those runs. It waits
-  for frozen tables to publish and checks the committed sequence and flush
-  count at selection. If writes resume,
-  the selected job can finish and further idle selections wait for quiet.
-  An isolated idle promotion into the bottom can rewrite the source to
-  remove its filter and elide tombstones under the ordinary erasure rules.
-  Level-0 →
+  relabelling. When ordinary work runs out and either level 0 holds runs or
+  the active memtable is charged at least one eighth of its budget, the
+  worker waits for five quiet seconds before settling. It waits for frozen
+  tables to publish and checks the committed sequence and flush count before
+  acting. When the active table meets the eighth-budget threshold, the worker
+  freezes and flushes it outside the state lock through the normal flush
+  serialization—aligned to the oldest level-0 flush group's level-1
+  boundaries when level 0 is nonempty—before promoting level 0 in the same
+  quiet pass; a smaller tail stays in the active table. If writes resume
+  during the quiet flush or an idle job, the in-flight step finishes and
+  further idle selections wait for quiet. An isolated idle promotion into
+  the bottom can rewrite the source to remove its filter and elide tombstones
+  under the ordinary erasure rules. Level-0 →
   bottom jobs run as key-range pieces of about one target run of bottom input:
   each piece publishes atomically and frees its inputs, and level-0 sources
   shrink to bounded views of their remaining range. Up to
@@ -276,8 +281,15 @@ each key.
 - Eagerly scheduling every split slice of a partially merged flush group
   would spend a rewrite on a range that can still collect other writes.
   Deferring below-threshold slices until quiet keeps ordinary scoring and
-  piece bounds intact, and the worker stops timing its wait when level 0
-  empties.
+  piece bounds intact, and the worker stops timing its wait once level 0
+  empties and the active memtable sits below its quiet-flush threshold.
+- Flushing any nonempty active memtable on quiet would trigger bottom-run
+  rewrites on a trickle of small writes; requiring at least one eighth of
+  the memtable budget bounds idle uncompressed residue while keeping small
+  trickles in memory. Aligning that quiet tail flush to the oldest pending
+  level-0 flush group's level-1 cuts lets each tail slice coalesce with the
+  matching level-0 slice in one settle instead of spanning all of level 1
+  and forcing a second bottom rewrite.
 - Range-partitioned shards: no change to write amplification for random writes,
   at the cost of a large rewrite.
 
