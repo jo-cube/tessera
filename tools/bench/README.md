@@ -31,7 +31,7 @@ TESSERA_BENCH_SCALE=32 tools/bench/run.sh --engine tessera
 ```
 
 Cases are `load,update,reads,scan,mixed,bulk` (default selection), plus
-`bursts`, `reader_scale`, `writer_scale`, and `zipf` when named via `--case`. Datasets
+`update_heavy`, `bursts`, `reader_scale`, `writer_scale`, and `zipf` when named via `--case`. Datasets
 are `A`, `B` (default) and `C` (small records, via `--dataset A,B,C`). Read
 cases (`reads`, `scan`, `mixed`, `reader_scale`, `zipf`) prepare the load and
 updated state first; `writer_scale` opens a fresh store per configuration.
@@ -75,6 +75,14 @@ end of writes and after each sample.
 
 Additional selectable cases:
 
+- `update_heavy`: three shuffled passes over every loaded key in 256-record
+  batches, without drains between passes. Prepared updates are used where
+  available on the first and third pass, original values on the second.
+  Reports write-window and drain-inclusive timing, CPU per record, stored
+  write amplification and exact compaction bytes, writer level-0 and flush
+  waits, and live heap sampled every 10 ms through the drain and quiet wait.
+  Quiet rows include final heap, stored bytes and physical footprint;
+  `update_heavy_settled` includes quiet maintenance in write amplification.
 - `bursts`: four update bursts, each just over one memtable of updates, on a
   settled database with 6 s quiet gaps between them, reporting compaction
   input/output bytes, CPU, stored bytes and heap after the final gap.

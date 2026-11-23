@@ -358,7 +358,8 @@ impl Span {
 // ---- orchestrator ----
 
 const CASES: &str = "load,update,reads,scan,mixed,bulk";
-const ALL_CASES: &str = "load,update,reads,scan,mixed,bulk,bursts,reader_scale,writer_scale,zipf";
+const ALL_CASES: &str =
+    "load,update,update_heavy,reads,scan,mixed,bulk,bursts,reader_scale,writer_scale,zipf";
 
 /// Comma-separated selections; each defaults to everything.
 struct Filter {
@@ -580,7 +581,7 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         .iter()
         .any(|c| wants(cases, c));
     let update = on_updated || wants(cases, "update");
-    let load = update || wants(cases, "load");
+    let load = update || wants(cases, "load") || wants(cases, "update_heavy");
     let out = Out {
         prefix: format!("{ds},{engine}"),
     };
@@ -663,6 +664,10 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
         amplification(&out, "load", [0; 3], c);
         memory.report_end_state(&store, &out, "load", data.live_bytes(), n);
         gate(&store, &data, &mut rng, &out, "load");
+
+        if wants(cases, "update_heavy") {
+            update_heavy(&store, &mut data, &mut rng, &mut perm, &memory, &out);
+        }
 
         if update {
             // 3. Update half the keys, then delete 2%, drained.
@@ -1131,6 +1136,89 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
         ),
     );
     out.lat("mixed", &h);
+}
+
+/// Three shuffled full-key update passes without intervening drains.
+fn update_heavy(
+    store: &Store,
+    data: &mut Data,
+    rng: &mut Rng,
+    perm: &mut [u32],
+    memory: &MemoryReference,
+    out: &Out,
+) {
+    let stop = AtomicBool::new(false);
+    let peak = thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let mut peak = live_heap();
+            while !stop.load(Ordering::Relaxed) {
+                peak = peak.max(live_heap());
+                thread::sleep(Duration::from_millis(10));
+            }
+            peak.max(live_heap()).saturating_sub(memory.heap)
+        });
+        let before = store.counters();
+        let wait_before = store.maintenance();
+        let span = Span::new();
+        trace_phase("update_heavy");
+        let mut batch = store.batch();
+        let mut bytes = 0;
+        for pass in 0..3 {
+            rng.shuffle(perm);
+            for chunk in perm.chunks(256) {
+                for &i in chunk {
+                    let i = i as usize;
+                    let value = if pass != 1 && data.recs[i].has_update() {
+                        data.update(i)
+                    } else {
+                        data.value(i)
+                    };
+                    bytes += data.key_len + value.len();
+                    batch.push(data.recs[i].key(), Some(value));
+                }
+                store.write(&mut batch);
+            }
+        }
+        let ops = 3 * perm.len();
+        let finish = |phase: &str| {
+            let (u, s) = cpu();
+            span.finish(out, phase, ops, bytes);
+            out.emit(phase, "written_records", ops);
+            let per_record = (u - span.cpu.0 + s - span.cpu.1) * 1e6 / ops as f64;
+            out.emit(phase, "cpu_per_record_us", format!("{per_record:.6}"));
+            let after = store.counters();
+            amplification(out, phase, before, after);
+            out.emit(phase, "flush_bytes", after[0] - before[0]);
+            out.emit(phase, "compaction_bytes", after[1] - before[1]);
+        };
+        finish("update_heavy");
+        if let (Some(before), Some(after)) = (wait_before, store.maintenance()) {
+            let level0 = (after.level0_wait_ns - before.level0_wait_ns) as f64 / 1e9;
+            let flush = (after.flush_wait_ns - before.flush_wait_ns) as f64 / 1e9;
+            out.emit("update_heavy", "level0_wait_s", format!("{level0:.6}"));
+            out.emit("update_heavy", "flush_wait_s", format!("{flush:.6}"));
+        }
+        if matches!(store, Store::T(_, _)) && std::env::var_os("TESSERA_BENCH_QUIET_MS").is_some() {
+            store.drain_frozen();
+        } else {
+            store.drain();
+        }
+        finish("update_heavy_drained");
+        for (state, rec) in data.state.iter_mut().zip(&data.recs) {
+            *state = if rec.has_update() { UPDATED } else { ORIGINAL };
+        }
+        memory.report_end_state(store, out, "update_heavy", data.live_bytes(), perm.len());
+        amplification(out, "update_heavy_settled", before, store.counters());
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap()
+    });
+    out.emit("update_heavy", "peak_heap_bytes", peak);
+    out.emit(
+        "update_heavy",
+        "peak_heap_mib",
+        format!("{:.2}", peak as f64 / MIB as f64),
+    );
+    gate(store, data, rng, out, "update_heavy");
 }
 
 /// Four update bursts (each ~1.2 memtables) separated by 6 s quiet gaps on a
