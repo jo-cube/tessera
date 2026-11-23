@@ -31,7 +31,7 @@ TESSERA_BENCH_SCALE=32 tools/bench/run.sh --engine tessera
 ```
 
 Cases are `load,update,reads,scan,mixed,bulk` (default selection), plus
-`reader_scale`, `writer_scale`, and `zipf` when named via `--case`. Datasets
+`bursts`, `reader_scale`, `writer_scale`, and `zipf` when named via `--case`. Datasets
 are `A`, `B` (default) and `C` (small records, via `--dataset A,B,C`). Read
 cases (`reads`, `scan`, `mixed`, `reader_scale`, `zipf`) prepare the load and
 updated state first; `writer_scale` opens a fresh store per configuration.
@@ -59,11 +59,13 @@ amplification includes maintenance drains. `r-large`
 skips bulk and mixed. Load and update report batch latency separately from
 the maintenance drain.
 
-For Tessera steady-state comparisons, set `TESSERA_BENCH_QUIET_MS` to delay
-the samples after each regular load and update drain. Use a delay longer
+For Tessera steady-state comparisons, set `TESSERA_BENCH_QUIET_MS` to keep the
+active memtable unrotated at drain and delay the samples after each regular
+load and update drain. Use a delay longer
 than the engine's quiet period, and use the same delay on both sides of a
 comparison. The `load_quiet` and `update_quiet` rows include stored bytes,
-heap, and CPU and compaction bytes spent after the ordinary drain. The timed
+heap, peak heap during the wait, and CPU and compaction bytes spent after the
+ordinary drain. The timed
 load and update rows exclude the delay and its extra maintenance. Leave the
 variable unset to run without these pauses. With quiet sampling enabled,
 `TESSERA_BENCH_IDLE_SAMPLE_MS` adds a post-update window that records CPU,
@@ -73,6 +75,9 @@ end of writes and after each sample.
 
 Additional selectable cases:
 
+- `bursts`: four update bursts, each just over one memtable of updates, on a
+  settled database with 6 s quiet gaps between them, reporting compaction
+  input/output bytes, CPU, stored bytes and heap after the final gap.
 - `reader_scale`: 1, 2, 4, 8 reader threads (plus `maxt` at available
   parallelism when larger), measuring latest-state `Reader` and (on Tessera)
   `Snapshot` readers over uniform and scrambled Zipfian (θ = 0.99) lookups,

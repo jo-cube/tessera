@@ -345,6 +345,24 @@ impl Store {
             }
         }
     }
+    /// Waits for frozen tables and ordinary compaction without rotating active.
+    pub fn drain_frozen(&self) {
+        let Self::T(e, _) = self else {
+            self.drain();
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while e.engine_stats().frozen_tables != 0 {
+            assert!(std::time::Instant::now() < deadline, "flush did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        e.wait_for_compaction().unwrap();
+        let s = e.background_status().unwrap();
+        assert!(
+            s.failures == 0 && s.panic.is_none(),
+            "compaction failed: {s:?}"
+        );
+    }
     /// Flushes and waits until compaction is idle.
     pub fn drain(&self) {
         match self {

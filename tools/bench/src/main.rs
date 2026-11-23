@@ -122,16 +122,7 @@ impl MemoryReference {
         let (user, system) = cpu();
         let started = Instant::now();
         let before = engine.background_status().unwrap();
-        thread::sleep(delay);
-        let after = loop {
-            let status = engine.background_status().unwrap();
-            assert!(status.running && status.failures == 0, "{status:?}");
-            if !status.busy {
-                break status;
-            }
-            assert!(started.elapsed() < delay + Duration::from_secs(60));
-            thread::sleep(Duration::from_millis(10));
-        };
+        let (after, peak_heap) = wait_quiet(engine, delay, self.heap);
         let (end_user, end_system) = cpu();
         let work_cpu = end_user - user + end_system - system;
         out.emit(
@@ -142,10 +133,21 @@ impl MemoryReference {
         out.emit(&phase, "cpu_total_s", format!("{work_cpu:.6}"));
         out.emit(
             &phase,
+            "compaction_input_bytes",
+            after.input_bytes - before.input_bytes,
+        );
+        out.emit(
+            &phase,
             "compaction_bytes",
             after.output_bytes - before.output_bytes,
         );
         out.emit(&phase, "stored_bytes", store.counters()[2]);
+        out.emit(&phase, "peak_heap_bytes", peak_heap);
+        out.emit(
+            &phase,
+            "peak_heap_mib",
+            format!("{:.2}", peak_heap as f64 / MIB as f64),
+        );
         self.report(store, out, &phase, live);
         store.emit_levels(&phase, || live_keys, out);
 
@@ -229,6 +231,28 @@ impl MemoryReference {
 fn sample_duration(variable: &str) -> Option<Duration> {
     let millis = std::env::var(variable).ok()?.parse().expect("milliseconds");
     Some(Duration::from_millis(millis))
+}
+
+fn wait_quiet(
+    engine: &tessera::Engine,
+    delay: Duration,
+    base_heap: u64,
+) -> (tessera::diagnostics::BackgroundStatus, u64) {
+    let started = Instant::now();
+    let mut peak_heap = live_heap().saturating_sub(base_heap);
+    loop {
+        peak_heap = peak_heap.max(live_heap().saturating_sub(base_heap));
+        let elapsed = started.elapsed();
+        if elapsed >= delay {
+            let status = engine.background_status().unwrap();
+            assert!(status.running && status.failures == 0, "{status:?}");
+            if !status.busy && engine.engine_stats().frozen_tables == 0 {
+                return (status, peak_heap);
+            }
+            assert!(elapsed < delay + Duration::from_secs(60));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn disk_used() -> u64 {
@@ -325,7 +349,7 @@ impl Span {
 // ---- orchestrator ----
 
 const CASES: &str = "load,update,reads,scan,mixed,bulk";
-const ALL_CASES: &str = "load,update,reads,scan,mixed,bulk,reader_scale,writer_scale,zipf";
+const ALL_CASES: &str = "load,update,reads,scan,mixed,bulk,bursts,reader_scale,writer_scale,zipf";
 
 /// Comma-separated selections; each defaults to everything.
 struct Filter {
@@ -585,13 +609,14 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
     } else {
         format!("{MOUNT}/{ds}-{engine}")
     };
+    let raw = data.raw as u64;
     let open = |name: &str| {
         let path = format!("{dir}/{name}");
         fs::create_dir_all(&dir).unwrap();
         match engine {
             "tessera" => Store::tessera(),
             "r-small" => Store::rocks(&path, 128 << 20),
-            _ => Store::rocks(&path, data.raw as u64 * 5 / 4),
+            _ => Store::rocks(&path, raw * 5 / 4),
         }
     };
 
@@ -617,7 +642,12 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
             rec(&mut writer, started);
         }
         store.emit_memtables("load_before_drain", &out);
-        store.drain();
+        let quiet_end = engine == "tessera" && std::env::var_os("TESSERA_BENCH_QUIET_MS").is_some();
+        if quiet_end {
+            store.drain_frozen();
+        } else {
+            store.drain();
+        }
         span.finish(&out, "load", n, data.raw);
         out.lat("load_writer", &writer);
         let c = store.counters();
@@ -651,7 +681,11 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
                 rec(&mut writer, started);
             }
             store.emit_memtables("update_before_drain", &out);
-            store.drain();
+            if quiet_end {
+                store.drain_frozen();
+            } else {
+                store.drain();
+            }
             let ops = data.updates.len() + data.deletes.len();
             let update_rate = span.finish(&out, "update", ops, bytes);
             out.lat("update_writer", &writer);
@@ -692,6 +726,14 @@ fn case(ds: char, engine: &str, outdir: &str, rate: f64, cases: &str) {
                 mixed(&store, &data, &mut rng, &out, rate);
             }
         }
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    if engine == "tessera" && wants(cases, "bursts") {
+        data.state.fill(ORIGINAL);
+        let store = open("bursts");
+        bursts(&store, &mut data, &mut rng, &memory, &out);
         drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1080,6 +1122,69 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
         ),
     );
     out.lat("mixed", &h);
+}
+
+/// Four update bursts (each ~1.2 memtables) separated by 6 s quiet gaps on a
+/// settled database, reporting total compaction work, CPU and final memory.
+fn bursts(store: &Store, data: &mut Data, rng: &mut Rng, memory: &MemoryReference, out: &Out) {
+    let Store::T(engine, _) = store else { return };
+    let mut b = store.batch();
+    let mut bytes = 0;
+    for i in 0..data.recs.len() {
+        let v = data.value(i);
+        bytes += data.key_len + v.len();
+        b.push(data.recs[i].key(), Some(v));
+        if bytes >= 64 * MIB || i + 1 == data.recs.len() {
+            store.ingest(&mut b, "");
+            bytes = 0;
+        }
+    }
+    store.drain();
+    let before = store.counters();
+    let before_bg = engine.background_status().unwrap();
+    let span = Span::new();
+    trace_phase("bursts");
+    let (mut next, mut ops, mut written) = (0usize, 0usize, 0usize);
+    let mut after_bg = before_bg.clone();
+    for _ in 0..4 {
+        let mut charge = 0usize;
+        while charge < 76 * MIB {
+            for _ in 0..256 {
+                let i = data.updates[next % data.updates.len()] as usize;
+                let v = data.update(i);
+                let vlen = v.len();
+                b.push(data.recs[i].key(), Some(v));
+                data.state[i] = UPDATED;
+                written += data.key_len + vlen;
+                charge += 1 + data.key_len + vlen + tessera::diagnostics::ENTRY_OVERHEAD;
+                ops += 1;
+                next += 1;
+            }
+            store.write(&mut b);
+        }
+        store.drain_frozen();
+        after_bg = wait_quiet(engine, Duration::from_secs(6), memory.heap).0;
+    }
+    span.finish(out, "bursts", ops, written);
+    out.emit(
+        "bursts",
+        "compaction_input_bytes",
+        after_bg.input_bytes - before_bg.input_bytes,
+    );
+    out.emit(
+        "bursts",
+        "compaction_output_bytes",
+        after_bg.output_bytes - before_bg.output_bytes,
+    );
+    out.emit(
+        "bursts",
+        "compactions",
+        after_bg.compactions - before_bg.compactions,
+    );
+    amplification(out, "bursts", before, store.counters());
+    memory.report(store, out, "bursts", data.live_bytes());
+    store.emit_levels("bursts", || data.recs.len(), out);
+    gate(store, data, rng, out, "bursts");
 }
 
 #[cfg(test)]
