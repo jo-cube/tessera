@@ -341,10 +341,13 @@ writer bypasses the queue with a single atomic compare-and-swap and copies
 nothing. Under contention, writers publish owned requests into 16
 cache-line-isolated shards tracked by an atomic bitmask, and one leader drains
 up to 64 requests or 1 MiB of payload per exclusive state-lock acquisition,
-re-draining shards that fill while the group applies. Followers spin briefly
-before parking on a per-request condition variable, avoiding kernel wake
-handoffs for short memtable groups while parking during flushes, large batches
-and level-0 stops.
+re-draining shards that fill while the group applies. Followers spin for at
+most 20 µs of elapsed time, about one kernel park-and-wake round trip, before
+parking on a per-request condition variable. Short memtable groups avoid
+kernel wake handoffs; large batches, flushes and level-0 stops park after
+spinning no longer than parking costs. The bound does not depend on the cost
+of one spin hint, and a follower descheduled while spinning parks once it runs
+again, leaving cores to the leader when writers outnumber cores.
 - One global submission mutex with immediate condvar parking: every writer
   still serialized on the queue mutex and paid kernel park/wake latency per
   group, capping multi-writer scaling for small writes.

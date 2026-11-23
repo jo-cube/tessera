@@ -12,6 +12,7 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Maximum requests applied in one combined group (leader plus followers).
 /// Bounds exclusive state-lock hold time for waiting readers and tail latency
@@ -24,10 +25,19 @@ pub(super) const GROUP_MAX_REQUESTS: usize = 64;
 /// below one memtable budget.
 pub(super) const GROUP_MAX_BYTES: usize = 1 << 20;
 
-/// Bounded user-space spin iterations a follower runs before parking on its
-/// condvar. Covers short memtable groups without kernel park/wake overhead,
-/// then parks promptly during flushes, large batches or level-0 backpressure.
-const FOLLOWER_SPIN_LIMIT: u32 = 2048;
+/// Longest time a follower spins in user space before parking on its condvar.
+/// About one kernel park-and-wake round trip, so spinning never burns much
+/// more than parking would cost. A small in-memory insert takes well under a
+/// microsecond, so a group of a few dozen small requests finishes within the
+/// bound and its followers skip the kernel. Longer waits (large batches,
+/// flushes, level-0 backpressure) park after spinning at most this long.
+/// Bounding by elapsed time keeps the bound independent of the cost of one
+/// spin hint, and a follower descheduled while spinning parks as soon as it
+/// runs again instead of competing with the leader for a core.
+const FOLLOWER_SPIN_TIME: Duration = Duration::from_micros(20);
+
+/// Spin hints between clock reads while a follower spins.
+const FOLLOWER_SPIN_CHECK_EVERY: u32 = 32;
 
 /// Number of cache-line-isolated submission shards so concurrent writers do
 /// not contend on a single queue mutex across CPU clusters.
@@ -131,16 +141,17 @@ impl Slot {
     }
 
     fn wait(&self) -> SlotOutcome {
-        for _ in 0..FOLLOWER_SPIN_LIMIT {
-            if self.done.load(Ordering::Acquire) {
-                let mut inner = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                return match std::mem::replace(&mut inner.outcome, SlotState::Waiting) {
-                    SlotState::Done(result) => SlotOutcome::Done(result),
-                    SlotState::Leader(request) => SlotOutcome::Leader(request),
-                    SlotState::Waiting => unreachable!("done is set only after writing outcome"),
-                };
+        let start = Instant::now();
+        loop {
+            for _ in 0..FOLLOWER_SPIN_CHECK_EVERY {
+                if self.done.load(Ordering::Acquire) {
+                    return self.take_finished();
+                }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
+            if start.elapsed() >= FOLLOWER_SPIN_TIME {
+                break;
+            }
         }
         let mut inner = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -155,6 +166,15 @@ impl Slot {
                 SlotState::Done(result) => return SlotOutcome::Done(result),
                 SlotState::Leader(request) => return SlotOutcome::Leader(request),
             }
+        }
+    }
+
+    fn take_finished(&self) -> SlotOutcome {
+        let mut inner = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match std::mem::replace(&mut inner.outcome, SlotState::Waiting) {
+            SlotState::Done(result) => SlotOutcome::Done(result),
+            SlotState::Leader(request) => SlotOutcome::Leader(request),
+            SlotState::Waiting => unreachable!("done is set only after writing outcome"),
         }
     }
 
