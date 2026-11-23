@@ -1128,18 +1128,21 @@ fn mixed(store: &Store, data: &Data, rng: &mut Rng, out: &Out, rate: f64) {
 /// settled database, reporting total compaction work, CPU and final memory.
 fn bursts(store: &Store, data: &mut Data, rng: &mut Rng, memory: &MemoryReference, out: &Out) {
     let Store::T(engine, _) = store else { return };
-    let mut b = store.batch();
-    let mut bytes = 0;
-    for i in 0..data.recs.len() {
-        let v = data.value(i);
-        bytes += data.key_len + v.len();
-        b.push(data.recs[i].key(), Some(v));
-        if bytes >= 64 * MIB || i + 1 == data.recs.len() {
-            store.ingest(&mut b, "");
-            bytes = 0;
+    {
+        let mut b = store.batch();
+        let mut bytes = 0;
+        for i in 0..data.recs.len() {
+            let v = data.value(i);
+            bytes += data.key_len + v.len();
+            b.push(data.recs[i].key(), Some(v));
+            if bytes >= 64 * MIB || i + 1 == data.recs.len() {
+                store.ingest(&mut b, "");
+                bytes = 0;
+            }
         }
     }
     store.drain();
+    let mut b = store.batch();
     let before = store.counters();
     let before_bg = engine.background_status().unwrap();
     let span = Span::new();
