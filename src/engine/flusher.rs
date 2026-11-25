@@ -57,12 +57,8 @@ pub(super) fn start(core: Arc<Core>) -> std::io::Result<std::thread::JoinHandle<
         .spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| run(&core)));
             if let Err(payload) = result {
-                let message = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_owned())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "a panic without a message".into());
-                core.flush_signal.lock().failure = Some(BackgroundError::Panicked(message));
+                core.flush_signal.lock().failure =
+                    Some(BackgroundError::Panicked(worker::message(&*payload)));
             }
             core.flush_signal.changed();
         })

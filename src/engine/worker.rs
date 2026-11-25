@@ -334,7 +334,7 @@ fn spawn(core: Arc<Core>) -> io::Result<JoinHandle<()>> {
 }
 
 /// A panic payload's message, as `std` prints it.
-fn message(payload: &(dyn Any + Send)) -> String {
+pub(super) fn message(payload: &(dyn Any + Send)) -> String {
     match (
         payload.downcast_ref::<&str>(),
         payload.downcast_ref::<String>(),
