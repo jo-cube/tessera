@@ -22,7 +22,9 @@
 //! previous manifests. Before rename an error leaves the old commit intact;
 //! after rename a sync error retains both generations. A rename that reports
 //! an error is judged by reading CURRENT back: if it names the new
-//! generation, the commit stands and both generations are retained. Atomic
+//! generation, the commit stands and both generations are retained; if it
+//! cannot be read, the new generation is kept but reported as not committed,
+//! and the next commit reclaims it unless CURRENT names it. Atomic
 //! temporary run files prevent an interrupted write from becoming a reusable
 //! final file. A reused run file of the wrong length is rewritten from memory
 //! the same way; damage that keeps the length is found only by recovery.
@@ -645,9 +647,13 @@ mod tests {
     /// new generation. Either way the next checkpoint commits normally.
     #[test]
     fn a_rename_error_after_its_effect_keeps_the_new_generation() {
-        for (fault, committed) in [
-            (RenameFault::Fails, false),
-            (RenameFault::FailsAfterEffect, true),
+        // The fault, whether the commit took effect, and whether the new
+        // generation is kept: always when committed, and when CURRENT cannot
+        // be read back to tell.
+        for (fault, committed, kept) in [
+            (RenameFault::Fails, false, false),
+            (RenameFault::FailsAfterEffect, true, true),
+            (RenameFault::FailsUnread, false, true),
         ] {
             let dir = scratch(&format!("{fault:?}"));
             let engine = Engine::in_memory(manual()).unwrap();
@@ -665,7 +671,7 @@ mod tests {
             assert_eq!(error.checkpoint_committed(), committed, "{fault:?}");
             assert_eq!(manifest(&dir).generation, if committed { 2 } else { 1 });
             assert!(checkpoint_dir(&dir, 1).exists(), "{fault:?}");
-            assert_eq!(checkpoint_dir(&dir, 2).exists(), committed, "{fault:?}");
+            assert_eq!(checkpoint_dir(&dir, 2).exists(), kept, "{fault:?}");
             assert!(!dir.join(CURRENT_TMP).exists(), "{fault:?}");
             let recovered = Engine::open(&dir, manual()).unwrap();
             let expected = if committed { &new } else { &old };
@@ -673,8 +679,14 @@ mod tests {
             drop(recovered);
 
             let report = engine.checkpoint_to(&dir).unwrap();
-            assert_eq!(report.generation, if committed { 3 } else { 2 });
-            assert_eq!(report.reclaimed, usize::from(committed), "{fault:?}");
+            assert_eq!(report.generation, if kept { 3 } else { 2 });
+            assert_eq!(report.reclaimed, usize::from(kept), "{fault:?}");
+            if kept {
+                // The next commit reclaims the generation that neither it
+                // nor its predecessor names.
+                let stale = if committed { 1 } else { 2 };
+                assert!(!checkpoint_dir(&dir, stale).exists(), "{fault:?}");
+            }
             let recovered = Engine::open(&dir, manual()).unwrap();
             assert_eq!(state(&recovered), new, "{fault:?}");
             drop(recovered);

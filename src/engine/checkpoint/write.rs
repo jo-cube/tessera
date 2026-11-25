@@ -45,6 +45,8 @@ pub(super) enum RenameFault {
     Fails,
     /// The rename takes effect, then reports an error.
     FailsAfterEffect,
+    /// The rename fails and nothing changes, and CURRENT cannot be read back.
+    FailsUnread,
 }
 
 #[cfg(test)]
@@ -64,10 +66,14 @@ fn rename_current(tmp: &Path, dir: &Path) -> io::Result<()> {
     fs::rename(tmp, dir.join(CURRENT))
 }
 
-/// Whether CURRENT in `dir` can be read and names `generation`.
-fn current_names(dir: &Path, generation: u64) -> bool {
-    read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64)
-        .is_ok_and(|bytes| decode_current(&bytes) == Ok(generation))
+/// The generation CURRENT in `dir` names, or `None` if it cannot be read.
+fn current_generation(dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if RENAME_FAULT.with(std::cell::Cell::get) == Some(RenameFault::FailsUnread) {
+        return None;
+    }
+    let bytes = read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64).ok()?;
+    decode_current(&bytes).ok()
 }
 
 #[cfg(test)]
@@ -522,13 +528,18 @@ impl Core {
             // A rename can report an error after it took effect. If CURRENT
             // names the new generation, the commit is done: removing that
             // generation would lose the checkpoint, and reclamation waits
-            // for the next one.
-            let after_commit_point = current_names(dir, generation);
+            // for the next one. If CURRENT cannot be read back, the outcome
+            // is unknown, so the new generation is kept and reported as not
+            // committed; the next commit reclaims it unless CURRENT names it.
+            let named = current_generation(dir);
+            let after_commit_point = named == Some(generation);
             if after_commit_point {
                 let _ = sync_dir(dir);
             } else {
                 let _ = fs::remove_file(&tmp);
-                let _ = fs::remove_dir_all(&path);
+                if named.is_some() {
+                    let _ = fs::remove_dir_all(&path);
+                }
             }
             return Err(CheckpointError::Io {
                 path: dir.to_owned(),
