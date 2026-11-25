@@ -165,8 +165,14 @@ impl BuildCharge<'_> {
             .event
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        estimates.output = estimates.output - self.output + output;
-        estimates.workspace = estimates.workspace - self.workspace + workspace;
+        estimates.output = estimates
+            .output
+            .saturating_sub(self.output)
+            .saturating_add(output);
+        estimates.workspace = estimates
+            .workspace
+            .saturating_sub(self.workspace)
+            .saturating_add(workspace);
         self.output = output;
         self.workspace = workspace;
     }
@@ -405,6 +411,16 @@ mod tests {
         drop(large);
         assert_eq!(progress.estimates(), (0, 0));
         drop(small);
+        assert_eq!(progress.estimates(), (0, 0));
+    }
+
+    #[test]
+    fn build_charge_finished_saturates_after_saturated_build() {
+        let progress = Progress::default();
+        let large = progress.build(usize::MAX, usize::MAX);
+        let mut small = progress.build(1, 1);
+        drop(large);
+        small.finished(0, 0);
         assert_eq!(progress.estimates(), (0, 0));
     }
 
