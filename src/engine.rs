@@ -342,6 +342,10 @@ struct Core {
     piece_request: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once after a flush releases the state lock, while its job
+    /// still holds the flushed tables.
+    #[cfg(test)]
+    after_flush_publish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -447,6 +451,8 @@ impl Core {
             piece_request: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_flush_build: Mutex::new(None),
+            #[cfg(test)]
+            after_flush_publish: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
             #[cfg(test)]

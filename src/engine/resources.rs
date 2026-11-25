@@ -560,6 +560,36 @@ mod tests {
         assert_eq!(engine.ks().put_seq(b"new", b"value"), Ok(3));
     }
 
+    /// The publisher stops after releasing the state lock, while its job
+    /// still holds the flushed table.
+    #[test]
+    fn a_published_flush_counts_its_tables_until_they_are_freed() {
+        let core = fixture(0);
+        core.put(b"key", &[1; 4096]).unwrap();
+        let charged = core.read_state().active.memory().charged;
+        let (parked, park) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel::<()>();
+        let resumed = std::sync::Mutex::new(resumed);
+        *core.after_flush_publish.lock().unwrap() = Some(Arc::new(move || {
+            parked.send(()).unwrap();
+            resumed.lock().unwrap().recv().unwrap();
+        }));
+        let during = std::thread::scope(|scope| {
+            let publisher = scope.spawn(|| core.begin_flush().unwrap().build().publish());
+            park.recv().unwrap();
+            let usage = core.usage(&core.read_state());
+            resume.send(()).unwrap();
+            publisher.join().unwrap();
+            usage
+        });
+        assert_eq!(
+            during.snapshots, charged,
+            "a live flushed table is counted whole: memtables {} + snapshots {} vs charged {charged}",
+            during.memtables, during.snapshots,
+        );
+        assert_eq!(core.stats().snapshot_bytes, 0, "the freed table is not");
+    }
+
     #[test]
     fn pinned_history_is_counted_once_and_build_charges_unwind() {
         let core = fixture(0);
