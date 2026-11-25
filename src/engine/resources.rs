@@ -323,6 +323,7 @@ impl Core {
             state = self.wait_for_publication(state, true);
         }
         loop {
+            state = self.wait_for_level0(state);
             // Free reserve is immediately reclaimable and must never cause refusal.
             self.chunks.trim();
             let usage = self.usage(&state);
@@ -757,5 +758,49 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(15))
             .expect("resource-pressure operations must not deadlock");
         supervisor.join().unwrap();
+    }
+
+    #[test]
+    fn admit_rechecks_level0_stop_after_wait_for_flush() {
+        let core = Core::new(&Options {
+            memtable_size: 64 << 10,
+            target_run_len: 8 << 10,
+            compression: Compression::Zstd,
+            ..Options::default()
+        });
+        for i in 0..3u8 {
+            core.put(&[i], b"v").unwrap();
+            core.begin_flush().unwrap().build().publish();
+        }
+        // Leave compressible data in `active`: flushing it pushes level 0 to
+        // `level0_stop` (4) while compression drops `used` below `limit`.
+        core.put(b"compressible", &[0u8; 32 << 10]).unwrap();
+        core.chunks.trim();
+        let limit = core.stats().used;
+        core.write_state().level0_stop = 4;
+        let engine = start(core, limit);
+        let ks = engine.ks();
+        let compact_hold = engine.core.compacting.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let ks = &ks;
+            let writer = scope.spawn(move || {
+                tx.send(ks.put_seq(b"past-stop", b"x")).unwrap();
+            });
+            crate::test_support::wait_until(|| {
+                assert!(
+                    rx.try_recv().is_err(),
+                    "writer slipped past level0_stop without waiting"
+                );
+                engine.core.level0_waits.load(Ordering::SeqCst) > 0
+            });
+            assert_eq!(engine.engine_stats().level0_flushes, 4);
+            assert!(rx.try_recv().is_err());
+            drop(compact_hold);
+            assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+            writer.join().unwrap();
+        });
+        assert_eq!(ks.get(b"past-stop").unwrap().as_deref(), Some(&b"x"[..]));
     }
 }
