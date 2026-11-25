@@ -416,29 +416,27 @@ impl Engine {
             }
         };
         let result = self.core.checkpoint_into(dir, metadata);
-        let committed = match &result {
-            Ok(_) => true,
-            Err(CheckpointError::Io {
-                after_commit_point, ..
-            }) => *after_commit_point,
-            Err(_) => false,
+        let committed_report = match &result {
+            Ok(report) => Some(*report),
+            Err(CheckpointError::Io { committed, .. }) => committed.as_deref().copied(),
+            Err(_) => None,
         };
-        if committed {
+        if let Some(_report) = committed_report {
             *self
                 .shared
                 .metadata
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = metadata.map(<[u8]>::to_vec);
+            #[cfg(feature = "diagnostics")]
+            {
+                *self
+                    .shared
+                    .last_checkpoint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(_report);
+            }
         }
-        let _report = result?;
-        #[cfg(feature = "diagnostics")]
-        {
-            *self
-                .shared
-                .last_checkpoint
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(_report);
-        }
+        result?;
         Ok(())
     }
 

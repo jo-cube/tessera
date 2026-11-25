@@ -199,6 +199,50 @@ pub(super) fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod diagnostics_tests {
+    use super::*;
+    use crate::Engine;
+    use crate::diagnostics::EngineDiagnostics;
+
+    #[test]
+    fn diagnostic_report_tracks_committed_rename_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-committed-rename-report-{:032x}",
+            new_run_id()
+        ));
+        let engine = Engine::open(
+            &dir,
+            Options {
+                background_compaction: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let ks = engine.keyspace("data").unwrap();
+        ks.put(b"k", b"old").unwrap();
+        engine.checkpoint_with(b"one").unwrap();
+        let first = engine.last_checkpoint().unwrap().generation;
+
+        ks.put(b"k", b"new").unwrap();
+        RENAME_FAULT.with(|fault| fault.set(Some(RenameFault::FailsAfterEffect)));
+        let result = engine.checkpoint_with(b"two");
+        RENAME_FAULT.with(|fault| fault.set(None));
+        let error = result.unwrap_err();
+        let reported = engine.last_checkpoint().unwrap().generation;
+        let (_, _, manifest) = committed_manifest(&dir).unwrap();
+        let metadata = engine.metadata();
+
+        drop(ks);
+        engine.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(error.checkpoint_committed());
+        assert_eq!(metadata.as_deref(), Some(b"two".as_slice()));
+        assert_eq!(manifest.generation, first + 1);
+        assert_eq!(reported, manifest.generation);
+    }
+}
+
 #[cfg(test)]
 #[path = "checkpoint_robustness.rs"]
 mod robustness;

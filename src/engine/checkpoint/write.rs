@@ -29,11 +29,11 @@ pub(super) fn crash(at: Crash) -> bool {
 
 /// Stands for the crash a test asked for.
 #[cfg(test)]
-pub(super) fn crashed(path: &Path, after_commit_point: bool) -> CheckpointError {
+pub(super) fn crashed(path: &Path, committed: Option<Box<CheckpointReport>>) -> CheckpointError {
     CheckpointError::Io {
         path: path.to_owned(),
         error: io::Error::other("crash injected by a test"),
-        after_commit_point,
+        committed,
     }
 }
 
@@ -80,7 +80,7 @@ fn current_generation(dir: &Path) -> Option<u64> {
 macro_rules! crash_point {
     ($at:expr, $path:expr) => {
         if crash($at) {
-            return Err(Failure::Crashed(crashed($path, false)));
+            return Err(Failure::Crashed(crashed($path, None)));
         }
     };
 }
@@ -109,7 +109,7 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> CheckpointError + '_ {
     move |error| CheckpointError::Io {
         path: path.to_owned(),
         error,
-        after_commit_point: false,
+        committed: None,
     }
 }
 
@@ -298,6 +298,31 @@ struct Written {
     largest_run_bytes: usize,
 }
 
+impl Written {
+    fn report(
+        &self,
+        generation: u64,
+        files_deleted: usize,
+        reclaimed: usize,
+        unreclaimed: usize,
+    ) -> CheckpointReport {
+        CheckpointReport {
+            generation,
+            last_seq: self.manifest.last_seq,
+            records: self.manifest.records,
+            runs: self.manifest.runs.len(),
+            bytes_written: self.bytes,
+            bytes_reused: self.bytes_reused,
+            runs_written: self.runs_written,
+            runs_reused: self.runs_reused,
+            files_deleted: files_deleted + self.files_deleted,
+            largest_run_bytes: self.largest_run_bytes,
+            reclaimed,
+            unreclaimed,
+        }
+    }
+}
+
 fn write_runs(
     image: &Image,
     dir: &Path,
@@ -407,7 +432,7 @@ fn write_runs(
                 output
                     .write_all(&run.chunks().next().unwrap()[..1])
                     .map_err(io_error(&tmp))?;
-                return Err(Failure::Crashed(crashed(&tmp, false)));
+                return Err(Failure::Crashed(crashed(&tmp, None)));
             }
             let mut sum = Hasher::new();
             run_parts(run, |bytes| {
@@ -518,7 +543,7 @@ impl Core {
         #[cfg(test)]
         if crash(Crash::BeforeRename) {
             write_synced(&tmp, &current)?;
-            return Err(crashed(&tmp, false));
+            return Err(crashed(&tmp, None));
         }
         write_synced(&tmp, &current).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
@@ -544,42 +569,36 @@ impl Core {
             return Err(CheckpointError::Io {
                 path: dir.to_owned(),
                 error,
-                after_commit_point,
+                committed: after_commit_point
+                    .then(|| Box::new(written.report(generation, 0, 0, 0))),
             });
         }
         #[cfg(test)]
         if crash(Crash::AfterRename) {
-            return Err(crashed(dir, true));
+            return Err(crashed(
+                dir,
+                Some(Box::new(written.report(generation, 0, 0, 0))),
+            ));
         }
         if let Err(error) = sync_dir(dir) {
             return Err(CheckpointError::Io {
                 path: dir.to_owned(),
                 error,
-                after_commit_point: true,
+                committed: Some(Box::new(written.report(generation, 0, 0, 0))),
             });
         }
         #[cfg(test)]
         if crash(Crash::BeforeReclaim) {
-            return Err(crashed(dir, true));
+            return Err(crashed(
+                dir,
+                Some(Box::new(written.report(generation, 0, 0, 0))),
+            ));
         }
         let (files_deleted, reclaimed, unreclaimed) =
             reclaim(dir, &found, &written.manifest, previous.as_ref());
         let _ = sync_dir(&dir.join(RUNS));
         let _ = sync_dir(dir);
-        Ok(CheckpointReport {
-            generation,
-            last_seq: written.manifest.last_seq,
-            records: written.manifest.records,
-            runs: written.manifest.runs.len(),
-            bytes_written: written.bytes,
-            bytes_reused: written.bytes_reused,
-            runs_written: written.runs_written,
-            runs_reused: written.runs_reused,
-            files_deleted: files_deleted + written.files_deleted,
-            largest_run_bytes: written.largest_run_bytes,
-            reclaimed,
-            unreclaimed,
-        })
+        Ok(written.report(generation, files_deleted, reclaimed, unreclaimed))
     }
 }
 
