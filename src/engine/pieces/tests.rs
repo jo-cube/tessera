@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod boundary;
+
 const KEYS: u16 = 256;
 fn options() -> Options {
     Options {
