@@ -195,7 +195,7 @@ fn mutations(iterations: usize, seed: u64) {
                 entry.id = id;
             }
             manifest.next_run_id = manifest.runs.len() as u64 + 1;
-            fs::write(&manifest_path, manifest.encode()).unwrap();
+            fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
             assert!(!manifest.runs.is_empty());
             assert_eq!(manifest.runs.iter().any(|r| r.len > r.run_len + 4), filters);
             let current_path = scratch.0.join(CURRENT);
@@ -283,7 +283,7 @@ fn mutations(iterations: usize, seed: u64) {
                         .find(|r| r.id == entry.id)
                         .unwrap()
                         .sum = crc(&[&mutated]);
-                    fs::write(&manifest_path, updated.encode()).unwrap();
+                    fs::write(&manifest_path, updated.encode().unwrap()).unwrap();
                 }
                 fs::write(path, &mutated).unwrap();
                 let result = catch_unwind(AssertUnwindSafe(|| Engine::open(&scratch.0, options)));
@@ -382,7 +382,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
             ..manifest
         };
         change(&mut copy);
-        copy.encode()
+        copy.encode().unwrap()
     };
     // A run whose keyspace is not listed.
     rejected(
@@ -427,7 +427,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
         "malformed keyspace table",
     );
     // A table length that disagrees with its entries, resealed.
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     let table = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
     bytes[64..68].copy_from_slice(&(table - 1).to_le_bytes());
     let mut shorter = bytes[..MANIFEST_HEADER_LEN + table as usize - 1].to_vec();
@@ -435,7 +435,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
     reseal(&mut shorter);
     rejected(&scratch, &shorter, "malformed keyspace table");
     // More keyspaces than the limit.
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     bytes[60..64].copy_from_slice(&(MAX_KEYSPACES as u32 + 1).to_le_bytes());
     reseal(&mut bytes);
     rejected(&scratch, &bytes, "malformed keyspace table");
@@ -460,7 +460,7 @@ fn recovery_names_an_unsupported_manifest_version() {
     let scratch = Scratch::new("manifest-version");
     let manifest = keyspace_checkpoint(&scratch);
     for version in [0, 2, 5, u32::MAX] {
-        let mut bytes = manifest.encode();
+        let mut bytes = manifest.encode().unwrap();
         bytes[8..12].copy_from_slice(&version.to_le_bytes());
         reseal(&mut bytes);
         rejected(
@@ -476,7 +476,7 @@ fn recovery_names_an_unsupported_manifest_version() {
             &format!("unsupported manifest version {version}"),
         );
     }
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
     reseal(&mut bytes);
     rejected(&scratch, &bytes, "unsupported manifest flags 0x2");

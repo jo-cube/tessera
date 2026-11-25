@@ -466,10 +466,10 @@ fn write_runs(
         });
     }
     sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
-    let manifest = written.manifest.encode();
-    let total = written.bytes.saturating_add(manifest.len() as u64);
     let path = checkpoint_dir(dir, generation);
     let file = path.join(MANIFEST);
+    let manifest = written.manifest.encode().map_err(io_error(&file))?;
+    let total = written.bytes.saturating_add(manifest.len() as u64);
     write_synced(&file, &manifest)?;
     written.bytes = total;
     crash_point!(Crash::BeforeManifestSync, &file);

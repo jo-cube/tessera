@@ -260,7 +260,7 @@ mod tests {
         engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, _, manifest) = committed_manifest(&dir).unwrap();
-        let mut bytes = manifest.encode();
+        let mut bytes = manifest.encode().unwrap();
         bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         let end = bytes.len() - 4;
         let sum = crc(&[&bytes[..end]]);
@@ -291,7 +291,7 @@ mod tests {
             manifest.runs[0].run_len = run_len;
             manifest.runs[0].len = len;
             assert!(matches!(
-                Manifest::decode(&manifest.encode()),
+                Manifest::decode(&manifest.encode().unwrap()),
                 Err(Damage::Length { .. })
             ));
         }
@@ -312,7 +312,7 @@ mod tests {
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         assert_eq!(manifest.runs.len(), 3);
         manifest.runs[1].seq_override = manifest.runs[0].seq_override;
-        fs::write(path, manifest.encode()).unwrap();
+        fs::write(path, manifest.encode().unwrap()).unwrap();
         assert_eq!(
             Engine::open(&dir, manual()).unwrap_err().kind(),
             ErrorKind::Corruption
@@ -329,7 +329,7 @@ mod tests {
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.next_run_id = u64::MAX;
-        fs::write(path, manifest.encode()).unwrap();
+        fs::write(path, manifest.encode().unwrap()).unwrap();
         let recovered = Engine::open(&dir, manual()).unwrap();
         for key in [b"b", b"c"] {
             recovered.ks().put(key, b"new").unwrap();
@@ -363,7 +363,7 @@ mod tests {
             let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
             assert_eq!(manifest.runs.len(), 2);
             manifest.runs[1].seq_override = manifest.runs[0].seq_override;
-            fs::write(path, manifest.encode()).unwrap();
+            fs::write(path, manifest.encode().unwrap()).unwrap();
             let result = Engine::open(&dir, manual());
             if identical {
                 let recovered = result.unwrap();
@@ -395,7 +395,7 @@ mod tests {
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.runs[0].len = u64::MAX;
-        fs::write(&path, manifest.encode()).unwrap();
+        fs::write(&path, manifest.encode().unwrap()).unwrap();
         assert_eq!(
             Engine::open(&dir, manual()).unwrap_err().kind(),
             ErrorKind::Corruption
@@ -504,7 +504,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = manifest.encode();
+        let bytes = manifest.encode().unwrap();
         assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
         for at in [0, 9, 13, 20, bytes.len() - 1] {
             let mut damaged = bytes.clone();
@@ -562,7 +562,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = manifest.encode();
+        let bytes = manifest.encode().unwrap();
         for end in 0..bytes.len() {
             assert!(Manifest::decode(&bytes[..end]).is_err());
         }
@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(second.bytes_reused, original.runs[0].len);
         assert_eq!(
             second.bytes_written,
-            second_manifest.runs[1].len + second_manifest.encode().len() as u64
+            second_manifest.runs[1].len + second_manifest.encode().unwrap().len() as u64
         );
         assert!(second.bytes_written < first.bytes_written / 10);
         for (id, bytes) in &expected {
@@ -1157,7 +1157,7 @@ mod tests {
         );
         assert_eq!(
             third.bytes_written,
-            third_manifest.runs[0].len + third_manifest.encode().len() as u64
+            third_manifest.runs[0].len + third_manifest.encode().unwrap().len() as u64
         );
         // The preceding committed generation still recovers after GC.
         fs::write(dir.join(CURRENT), encode_current(second.generation)).unwrap();
@@ -1175,7 +1175,10 @@ mod tests {
             ),
             (0, 1, 2)
         );
-        assert_eq!(fourth.bytes_written, manifest(&dir).encode().len() as u64);
+        assert_eq!(
+            fourth.bytes_written,
+            manifest(&dir).encode().unwrap().len() as u64
+        );
         assert_eq!(fourth.bytes_reused, third_manifest.runs[0].len);
         for entry in &second_manifest.runs {
             assert!(!dir.join(RUNS).join(run_name(entry.id)).exists());
