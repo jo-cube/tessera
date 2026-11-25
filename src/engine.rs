@@ -681,36 +681,32 @@ impl Core {
 
     /// A consistent view of the state now, sharing every source.
     fn snapshot(&self) -> View {
+        let view = |state: &State, tables| View {
+            tables,
+            directories: Arc::clone(&state.directories),
+            #[cfg(test)]
+            last_seq: state.last_seq,
+            next_keyspace: state.next_keyspace,
+            _live: Arc::clone(&self.snapshots),
+        };
         // Taking a snapshot mutates state only to cache a new active-table
         // view; when the active table is empty or the cached view still
         // matches `last_seq`, a shared read lock suffices.
         {
             let state = self.read_state();
             if state.active.is_empty() {
-                return View {
-                    tables: state.frozen.iter().rev().cloned().collect(),
-                    directories: Arc::clone(&state.directories),
-                    last_seq: state.last_seq,
-                    next_keyspace: state.next_keyspace,
-                    _live: Arc::clone(&self.snapshots),
-                };
+                return view(&state, state.frozen.iter().rev().cloned().collect());
             }
-            if let Some(view) = state
+            if let Some(active) = state
                 .last_view
                 .as_ref()
                 .filter(|(seq, _)| *seq == state.last_seq)
                 .and_then(|(_, view)| view.upgrade())
             {
                 let mut tables = Vec::with_capacity(state.frozen.len() + 1);
-                tables.push(view);
+                tables.push(active);
                 tables.extend(state.frozen.iter().rev().cloned());
-                return View {
-                    tables,
-                    directories: Arc::clone(&state.directories),
-                    last_seq: state.last_seq,
-                    next_keyspace: state.next_keyspace,
-                    _live: Arc::clone(&self.snapshots),
-                };
+                return view(&state, tables);
             }
         }
         let mut state = self.write_state();
@@ -722,21 +718,15 @@ impl Core {
                 .as_ref()
                 .filter(|(seq, _)| *seq == state.last_seq)
                 .and_then(|(_, view)| view.upgrade());
-            let view = reusable.unwrap_or_else(|| {
+            let active = reusable.unwrap_or_else(|| {
                 let view = Arc::new(state.active.snapshot());
                 state.last_view = Some((state.last_seq, Arc::downgrade(&view)));
                 view
             });
-            tables.push(view);
+            tables.push(active);
         }
         tables.extend(state.frozen.iter().rev().cloned());
-        View {
-            tables,
-            directories: Arc::clone(&state.directories),
-            last_seq: state.last_seq,
-            next_keyspace: state.next_keyspace,
-            _live: Arc::clone(&self.snapshots),
-        }
+        view(&state, tables)
     }
 
     /// Drops keyspace `name` and retires its runs, and returns whether it
