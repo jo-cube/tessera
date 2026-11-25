@@ -2,8 +2,8 @@
 //! copies, the inherited-segment policy, integrity, and settled counts.
 use crate::block::Value;
 use crate::run::{
-    Codec, CompactLimits, Compacted, CorruptRun, MergeWorkspace, OutputCuts, RAW_BLOCK_CAP,
-    ReadError, ReadWorkspace, Run, RunBuilder, RunCorruption, compact_erasing,
+    Codec, CompactLimits, Compacted, CorruptRun, Encoding, MergeWorkspace, OutputCuts,
+    RAW_BLOCK_CAP, ReadError, ReadWorkspace, Run, RunBuilder, RunCorruption, compact_erasing,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -32,7 +32,16 @@ fn bottom(
     seq: impl Fn(usize) -> u64,
     tombstone: impl Fn(usize) -> bool,
 ) -> Run<Vec<u8>> {
-    let mut builder = RunBuilder::with_raw_block_target(Codec::Zstd, 1);
+    bottom_in(Codec::Zstd.into(), count, seq, tombstone)
+}
+
+fn bottom_in(
+    encoding: Encoding,
+    count: usize,
+    seq: impl Fn(usize) -> u64,
+    tombstone: impl Fn(usize) -> bool,
+) -> Run<Vec<u8>> {
+    let mut builder = RunBuilder::with_raw_block_target(encoding, 1);
     builder.limit_segment_len(RAW_BLOCK_CAP);
     for i in 0..count {
         let value = value(i);
@@ -56,11 +65,11 @@ fn newer(keys: &[Vec<u8>]) -> Run<Vec<u8>> {
     builder.finish()
 }
 
-fn limits(copy_forward: bool) -> CompactLimits {
+fn limits(encoding: Encoding, copy_forward: bool) -> CompactLimits {
     CompactLimits {
         target_run_len: usize::MAX,
         max_workspace_bytes: usize::MAX,
-        codec: Codec::Zstd,
+        encoding,
         target_block_compressed: 1024,
         zero_seq: true,
         copy_forward,
@@ -68,6 +77,14 @@ fn limits(copy_forward: bool) -> CompactLimits {
 }
 
 fn merge(inputs: &[&Run<Vec<u8>>], copy: bool) -> Result<Compacted, ReadError> {
+    merge_in(inputs, Codec::Zstd.into(), copy)
+}
+
+fn merge_in(
+    inputs: &[&Run<Vec<u8>>],
+    encoding: Encoding,
+    copy: bool,
+) -> Result<Compacted, ReadError> {
     let views: Vec<_> = inputs.iter().map(|run| run.view()).collect();
     let cuts = OutputCuts {
         omit_filter: true,
@@ -76,7 +93,7 @@ fn merge(inputs: &[&Run<Vec<u8>>], copy: bool) -> Result<Compacted, ReadError> {
     compact_erasing(
         &views,
         |_| true,
-        limits(copy),
+        limits(encoding, copy),
         &cuts,
         &[],
         &mut MergeWorkspace::new(),
@@ -134,6 +151,50 @@ fn blocks_touched_by_another_input_are_decoded() {
     assert_eq!(copied(&[&touching, &run]), 400 - 4);
     // The newer input listed after the bottom one: order changes nothing.
     assert_eq!(copied(&[&run, &touching]), 400 - 4);
+}
+
+fn payloads(runs: &[Run<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let views = runs.iter().map(Run::view);
+    views
+        .flat_map(|view| {
+            (0..view.block_count()).map(move |b| view.frame(b).unwrap().stored.to_vec())
+        })
+        .collect()
+}
+
+/// Copied blocks keep the encoding they were built with, and decoded blocks
+/// are encoded with the merge's, in either direction between encodings.
+#[test]
+fn copied_blocks_keep_their_encoding_and_others_take_the_merge_encoding() {
+    let fast = Encoding {
+        codec: Codec::Zstd,
+        raw_literals: true,
+    };
+    for (built, merged) in [(Encoding::default(), fast), (fast, Encoding::default())] {
+        let run = bottom_in(built, 400, |_| 0, |_| false);
+        let touching = newer(&[key(10), key(200)]);
+        let input = payloads(std::slice::from_ref(&run));
+        let on = merge_in(&[&touching, &run], merged, true).unwrap();
+        let off = merge_in(&[&touching, &run], merged, false).unwrap();
+        assert_eq!(records(&on.runs), records(&off.runs));
+        let coded = |payload: &Vec<u8>| super::literal_types(payload).contains(&2);
+        // Default-encoded blocks of this content have Huffman-coded literals.
+        assert_eq!(input.iter().any(coded), !built.raw_literals);
+        assert_eq!(on.copied.blocks, 400 - 2);
+        // Copied frames are the input's; the others are encoded as merged.
+        let encoded_as_merged = |p: &Vec<u8>| !(merged.raw_literals && coded(p));
+        let (kept, fresh): (Vec<_>, Vec<_>) = payloads(&on.runs)
+            .into_iter()
+            .partition(|p| input.contains(p));
+        assert_eq!(kept.len(), 400 - 2, "{built:?} into {merged:?}");
+        assert!(
+            fresh.iter().all(encoded_as_merged),
+            "{built:?} into {merged:?}"
+        );
+        let rewritten = payloads(&off.runs);
+        assert!(rewritten.iter().all(encoded_as_merged));
+        assert_eq!(rewritten.iter().any(coded), !merged.raw_literals);
+    }
 }
 
 #[test]

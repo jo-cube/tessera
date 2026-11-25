@@ -65,7 +65,7 @@ impl<'e> FlushJob<'e> {
         let built = flush_merged(
             &tables,
             self.engine.target_run_len,
-            self.engine.codec,
+            self.engine.encoding,
             self.engine.target_block_compressed,
             &spaces,
             &self.engine.chunks,

@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use crate::block::{MAX_KEY_LEN, Value};
 use crate::run::{
-    Codec, ConflictingCopies, CorruptRun, LiveRecord, LogicalCursor, LogicalWorkspace, ReadError,
-    Run, RunBuilder, RunCorruption, RunSet, RunView,
+    Codec, CompactLimits, ConflictingCopies, CorruptRun, Encoding, LiveRecord, LogicalCursor,
+    LogicalWorkspace, MergeWorkspace, ReadError, Run, RunBuilder, RunCorruption, RunSet, RunView,
+    compact,
 };
 
 type Input = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -40,10 +41,10 @@ fn owned(record: LiveRecord<'_>) -> Live {
 }
 
 /// Sorts into internal order, which a builder requires.
-fn build(codec: Codec, records: &[Input], target: usize) -> Run<Vec<u8>> {
+fn build(encoding: impl Into<Encoding>, records: &[Input], target: usize) -> Run<Vec<u8>> {
     let mut sorted: Vec<&Input> = records.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    let mut builder = RunBuilder::with_raw_block_target(codec, target);
+    let mut builder = RunBuilder::with_raw_block_target(encoding, target);
     for (key, seq, value) in sorted {
         let value = value.as_deref().map_or(Value::Tombstone, Value::Bytes);
         builder.add(key, *seq, value).unwrap();
@@ -536,18 +537,52 @@ fn long_version_chains_across_blocks_and_runs_resolve_to_one_record() {
 
 #[test]
 fn mixed_codecs_and_block_sizes_agree_with_the_model() {
+    let encodings = [
+        Codec::None.into(),
+        Codec::Zstd.into(),
+        Encoding {
+            codec: Codec::Zstd,
+            raw_literals: true,
+        },
+    ];
     let mut rng = Rng(11);
     let inputs: Vec<Vec<Input>> = (0..6).map(|_| random_input(&mut rng, 300)).collect();
     let expected = model_live(&model(&inputs));
     let runs: Vec<_> = inputs
         .iter()
         .enumerate()
-        .map(|(i, input)| build(CODECS[i % CODECS.len()], input, [128, 1024, 8192][i % 3]))
+        .map(|(i, input)| build(encodings[i % 3], input, [128, 1024, 8192][(i + i / 3) % 3]))
         .collect();
-    let views = views(&runs);
+    let mixed = views(&runs);
     let mut workspace = LogicalWorkspace::new();
-    let mut cursor = RunSet::new(&views).cursor(&mut workspace);
+    let mut cursor = RunSet::new(&mixed).cursor(&mut workspace);
     assert_eq!(rest(&mut cursor).unwrap(), expected);
+    // Compaction of the mix into each encoding, and of that output into
+    // every other, reads the same.
+    for encoding in encodings {
+        let limits = |encoding| CompactLimits {
+            target_run_len: usize::MAX,
+            max_workspace_bytes: usize::MAX,
+            encoding,
+            target_block_compressed: 256,
+            zero_seq: false,
+            copy_forward: false,
+        };
+        let mut merge = MergeWorkspace::new();
+        let once = compact(&mixed, |_| false, limits(encoding), &mut merge).unwrap();
+        let once = views(&once.runs);
+        for again in encodings {
+            let twice = compact(&once, |_| false, limits(again), &mut merge).unwrap();
+            for out in [once.clone(), views(&twice.runs)] {
+                let mut cursor = RunSet::new(&out).cursor(&mut workspace);
+                assert_eq!(
+                    rest(&mut cursor).unwrap(),
+                    expected,
+                    "{encoding:?}, {again:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

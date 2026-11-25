@@ -4,9 +4,9 @@
 
 use crate::block::Value;
 use crate::run::{
-    CONTEXT_ALLOWANCE, Codec, CompactLimits, Compacted, ConflictingCopies, MergeWorkspace,
-    OutputCuts, RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, ReadError, ReadWorkspace, Run, RunBuilder,
-    TARGET_BLOCK_LEN, compact, compact_with,
+    CONTEXT_ALLOWANCE, Codec, CompactLimits, Compacted, ConflictingCopies, Encoding,
+    MergeWorkspace, OutputCuts, RAW_BLOCK_CAP, RECORD_INPUT_OVERHEAD, ReadError, ReadWorkspace,
+    Run, RunBuilder, TARGET_BLOCK_LEN, compact, compact_with,
 };
 
 type Physical = (Vec<u8>, u64, Option<Vec<u8>>);
@@ -41,7 +41,10 @@ fn physical(key: &str, seq: u64, value: Option<&str>) -> Physical {
 const UNLIMITED: CompactLimits = CompactLimits {
     target_run_len: usize::MAX,
     max_workspace_bytes: usize::MAX,
-    codec: Codec::Zstd,
+    encoding: Encoding {
+        codec: Codec::Zstd,
+        raw_literals: false,
+    },
     target_block_compressed: crate::run::TARGET_BLOCK_LEN,
     zero_seq: false,
     copy_forward: true,
@@ -254,7 +257,7 @@ fn outputs_end_before_a_record_that_overshoots() {
     let input = run(&written);
     let limits = CompactLimits {
         target_run_len: target,
-        codec: Codec::None,
+        encoding: Codec::None.into(),
         ..UNLIMITED
     };
     let out = merge(&[&input], |_| true, limits).unwrap();

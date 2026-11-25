@@ -10,7 +10,7 @@
 //! compress its other blocks as they are cut.
 
 use super::OutputBudget;
-use super::codec::{Codec, Compressor};
+use super::codec::{Codec, Compressor, Encoding};
 use super::dictionary::{
     self, SAMPLE_LEN, SCOPE_MAX_RAW_MULTIPLE, SCOPE_STORED_MULTIPLE, SEGMENT_RAW_LEN, Segment,
 };
@@ -130,16 +130,17 @@ impl Default for RunBuilder {
     }
 }
 impl RunBuilder {
-    pub fn new(codec: Codec) -> Self {
-        Self::with_target_block_compressed(codec, TARGET_BLOCK_COMPRESSED)
+    pub fn new(encoding: impl Into<Encoding>) -> Self {
+        Self::with_target_block_compressed(encoding, TARGET_BLOCK_COMPRESSED)
     }
-    pub fn with_target_block_compressed(codec: Codec, target: usize) -> Self {
+    pub fn with_target_block_compressed(encoding: impl Into<Encoding>, target: usize) -> Self {
+        let encoding = encoding.into();
         Self {
             target: target.clamp(1, RAW_BLOCK_CAP),
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
-            block_target: (codec == Codec::None).then_some(TARGET_BLOCK_LEN),
-            compressor: Compressor::new(codec),
+            block_target: (encoding.codec == Codec::None).then_some(TARGET_BLOCK_LEN),
+            compressor: Compressor::new(encoding),
             block: BlockBuilder::new(),
             last_seq: 0,
             pending_key_bytes: 0,
@@ -166,15 +167,15 @@ impl RunBuilder {
             open: None,
         }
     }
-    pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
-        let mut builder = Self::with_target_block_compressed(codec, target);
+    pub(crate) fn in_pool(encoding: impl Into<Encoding>, target: usize, pool: &ChunkPool) -> Self {
+        let mut builder = Self::with_target_block_compressed(encoding, target);
         builder.storage = Packing::new(pool);
         builder
     }
     /// Fixed targets used by physical reader tests, including tiny blocks.
     #[cfg(test)]
-    pub fn with_raw_block_target(codec: Codec, target: usize) -> Self {
-        let mut builder = Self::new(codec);
+    pub fn with_raw_block_target(encoding: impl Into<Encoding>, target: usize) -> Self {
+        let mut builder = Self::new(encoding);
         builder.raw_target = Some(target.clamp(1, RAW_BLOCK_CAP));
         builder.block_target = builder.raw_target;
         builder

@@ -321,7 +321,7 @@ impl<'e> CompactionJob<'e> {
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
             max_workspace_bytes: workspace_bytes,
-            codec: self.engine.codec,
+            encoding: self.engine.encoding,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
             copy_forward: self.copy_forward(),

@@ -43,7 +43,7 @@
 //!
 //! # Format
 //!
-//! All integers are little-endian. A given record sequence, codec, target
+//! All integers are little-endian. A given record sequence, encoding, target
 //! block length and dictionary always encode to the same bytes. A run
 //! contains no process pointers.
 //!
@@ -105,7 +105,7 @@ use std::fmt;
 use crate::block::Corruption;
 
 pub use builder::RunBuilder;
-pub use codec::Codec;
+pub use codec::{Codec, Encoding};
 #[cfg(feature = "diagnostics")]
 pub(crate) use compact::CopyStats;
 #[cfg(test)]

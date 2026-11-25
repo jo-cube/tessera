@@ -174,6 +174,10 @@ impl std::error::Error for ConfigError {}
 /// dictionary per roughly 4 MiB segment, with independently decoded blocks
 /// sized to [`Options::block_size`]. Every decode loads the dictionary by
 /// reference into the reader's context.
+///
+/// Every block records how it is stored, so an engine reads runs built with
+/// any setting. A change applies to newly encoded blocks: blocks that
+/// compaction copies forward keep the setting they were built with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
@@ -182,12 +186,19 @@ pub enum Compression {
     Zstd,
     /// Raw 16 KiB blocks, read in place.
     Uncompressed,
+    /// Zstandard level 1 with literals stored uncompressed: faster gets,
+    /// larger runs. Weakly compressible data is stored nearly uncompressed.
+    ZstdFastDecode,
 }
 impl Compression {
-    pub(super) fn codec(self) -> Codec {
+    pub(super) fn encoding(self) -> Encoding {
         match self {
-            Self::Zstd => Codec::Zstd,
-            Self::Uncompressed => Codec::None,
+            Self::Zstd => Codec::Zstd.into(),
+            Self::Uncompressed => Codec::None.into(),
+            Self::ZstdFastDecode => Encoding {
+                codec: Codec::Zstd,
+                raw_literals: true,
+            },
         }
     }
 }

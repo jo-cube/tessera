@@ -15,8 +15,8 @@ use super::filter::{self as key_filter, KeyFilter};
 use super::frame::Frame;
 use super::merge::Step;
 use super::{
-    Codec, CorruptRun, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace, RECORD_INPUT_OVERHEAD,
-    ReadError, Run, RunBuilder, RunView,
+    Codec, CorruptRun, Encoding, MAX_TARGET_RUN_LEN, MergeCursor, MergeWorkspace,
+    RECORD_INPUT_OVERHEAD, ReadError, Run, RunBuilder, RunView,
 };
 
 const BUILDABLE: &str = "merged records are ordered, within the limits, and fit in one run";
@@ -31,8 +31,8 @@ pub struct CompactLimits {
     /// builders and filter hashes share its remaining room. A filter needing
     /// more scratch is omitted; the merge still succeeds.
     pub max_workspace_bytes: usize,
-    /// How the output runs store their blocks.
-    pub codec: Codec,
+    /// How the output runs encode their blocks.
+    pub encoding: Encoding,
     /// Estimated compressed bytes per output block.
     pub target_block_compressed: usize,
     /// The output goes into the bottom level: write sequence 0 for every
@@ -782,7 +782,7 @@ fn compact_range_checked<'a>(
     let mut audit = super::copy_audit::CopyAudit::new(inputs, range.start);
     let copy = limits.copy_forward
         && limits.zero_seq
-        && limits.codec == Codec::Zstd
+        && limits.encoding.codec == Codec::Zstd
         && cuts.omit_filter
         && !cuts.single
         && cuts.at.is_empty()
@@ -1160,7 +1160,7 @@ impl<'c> Output<'c> {
     fn builder(&mut self) -> &mut RunBuilder {
         self.builder.get_or_insert_with(|| {
             let mut builder = RunBuilder::in_pool(
-                self.limits.codec,
+                self.limits.encoding,
                 self.limits.target_block_compressed,
                 &self.pool,
             );

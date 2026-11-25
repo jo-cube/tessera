@@ -2,7 +2,7 @@
 //! fields supplied by the run header; size checks bound decode allocations.
 //! Contexts are reused, and raw dictionaries are borrowed for each decode.
 
-use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat};
+use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat, ParamSwitch};
 
 /// Block compression used by a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -12,6 +12,25 @@ pub enum Codec {
     /// Zstandard level 1 with a raw-content segment dictionary.
     #[default]
     Zstd,
+}
+
+/// How a builder encodes new blocks. Frames record only the codec: blocks
+/// with uncompressed literals are ordinary Zstandard frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Encoding {
+    pub codec: Codec,
+    /// Store Zstandard literals uncompressed, so that decoding builds no
+    /// Huffman table, at the cost of larger frames.
+    pub raw_literals: bool,
+}
+
+impl From<Codec> for Encoding {
+    fn from(codec: Codec) -> Self {
+        Self {
+            codec,
+            raw_literals: false,
+        }
+    }
 }
 
 pub(super) const ZSTD_LEVEL: i32 = 1;
@@ -38,13 +57,23 @@ impl Codec {
 
 pub(super) struct Compressor {
     codec: Codec,
+    literals: ParamSwitch,
     zstd: Option<CCtx<'static>>,
 }
 
 impl Compressor {
-    pub(super) fn new(codec: Codec) -> Self {
+    pub(super) fn new(encoding: impl Into<Encoding>) -> Self {
+        let Encoding {
+            codec,
+            raw_literals,
+        } = encoding.into();
         Self {
             codec,
+            literals: if raw_literals {
+                ParamSwitch::Disable
+            } else {
+                ParamSwitch::Auto
+            },
             zstd: (codec == Codec::Zstd).then(|| {
                 let mut ctx = CCtx::create();
                 for parameter in [
@@ -72,24 +101,19 @@ impl Compressor {
     /// the first compress2 call; subsequent frames reuse it and the CCtx.
     pub(super) fn begin_segment(&mut self, dictionary: &[u8], block_len: usize) {
         if let Some(ctx) = &mut self.zstd {
-            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
-                .expect("supported level");
-            ctx.set_parameter(CParameter::SrcSizeHint(block_len as u32))
-                .expect("bounded block size hint");
+            set_level(ctx, self.literals, block_len);
             ctx.load_dictionary(dictionary)
                 .expect("raw segment dictionary");
         }
     }
 
-    /// Compressed length of `sample` at level 1 without a dictionary, for a
-    /// ratio estimate before a segment's dictionary exists. The next
-    /// [`begin_segment`](Self::begin_segment) replaces these settings.
+    /// Compressed length of `sample` at level 1 without a dictionary, with
+    /// the builder's literal setting, for a ratio estimate before a segment's
+    /// dictionary exists. The next [`begin_segment`](Self::begin_segment)
+    /// replaces these settings.
     pub(super) fn probe(&mut self, sample: &[u8], out: &mut Vec<u8>) -> usize {
         if let Some(ctx) = &mut self.zstd {
-            ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
-                .expect("supported level");
-            ctx.set_parameter(CParameter::SrcSizeHint(sample.len() as u32))
-                .expect("bounded sample size hint");
+            set_level(ctx, self.literals, sample.len());
             ctx.load_dictionary(&[]).expect("no dictionary");
         }
         out.clear();
@@ -107,6 +131,18 @@ impl Compressor {
             }
             None => out.extend_from_slice(block),
         }
+    }
+}
+
+/// Level 1 with `literals`, its tables sized for `len` input bytes.
+fn set_level(ctx: &mut CCtx<'static>, literals: ParamSwitch, len: usize) {
+    for parameter in [
+        CParameter::CompressionLevel(ZSTD_LEVEL),
+        CParameter::LiteralCompressionMode(literals),
+        CParameter::SrcSizeHint(len as u32),
+    ] {
+        ctx.set_parameter(parameter)
+            .expect("supported level parameter");
     }
 }
 

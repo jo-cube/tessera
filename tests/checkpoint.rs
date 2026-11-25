@@ -212,7 +212,11 @@ fn recovery_reproduces_the_checkpointed_state_and_continues_its_sequence() {
 /// any other, and compaction rewrites what it merges.
 #[test]
 fn checkpoints_recover_under_any_compression() {
-    const ALL: [Compression; 2] = [Compression::Zstd, Compression::Uncompressed];
+    const ALL: [Compression; 3] = [
+        Compression::Zstd,
+        Compression::Uncompressed,
+        Compression::ZstdFastDecode,
+    ];
     let with = |compression| Options {
         target_run_len: 1 << 20,
         compression,

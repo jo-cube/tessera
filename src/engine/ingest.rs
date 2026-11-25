@@ -65,7 +65,7 @@ impl Core {
             let space = built.last_mut().expect("a keyspace was begun");
             builder
                 .get_or_insert_with(|| {
-                    RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.chunks)
+                    RunBuilder::in_pool(self.encoding, self.target_block_compressed, &self.chunks)
                 })
                 .add(key, 0, value)
                 .expect("validated unique sorted records");

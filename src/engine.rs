@@ -89,8 +89,8 @@ use crate::memtable::{
     FlushCuts, FlushSpace, FrozenMemtable, Key, Memtable, Records, TableError, flush_merged,
 };
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP, Run, RunView,
-    SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
+    Codec, CompactLimits, Encoding, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP,
+    Run, RunView, SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
 };
 
 use directory::RunDirectory;
@@ -297,8 +297,8 @@ struct Core {
     flush_signal: flusher::Signal,
     bulk_ingest_min: usize,
     target_run_len: usize,
-    /// The codec of the runs this engine builds.
-    codec: Codec,
+    /// How the runs this engine builds encode their blocks.
+    encoding: Encoding,
     /// The estimated compressed block target of the runs this engine builds.
     target_block_compressed: usize,
     /// Cloned by every snapshot, so that its count is the live snapshots.
@@ -415,7 +415,7 @@ impl Core {
             flush_signal: flusher::Signal::new(),
             bulk_ingest_min,
             target_run_len,
-            codec: options.compression.codec(),
+            encoding: options.compression.encoding(),
             target_block_compressed: options.block_size,
             snapshots: Arc::new(()),
             background,
