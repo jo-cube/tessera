@@ -94,17 +94,21 @@ impl Shared {
             let _ = handle.join();
         }
         let flush_error = self.core.flush_signal.failure();
-        let Some(handle) = workers.compaction.take() else {
-            return flush_error.map_or(Ok(()), Err);
-        };
-        let signal = self.core.background.as_ref().expect(WORKER);
-        signal.stop();
-        // The thread catches its own panics, so joining cannot fail.
-        let _ = handle.join();
-        match signal.status().panic {
-            Some(message) => Err(BackgroundError::Panicked(message)),
-            None => flush_error.map_or(Ok(()), Err),
+        if let Some(handle) = workers.compaction.take() {
+            let signal = self.core.background.as_ref().expect(WORKER);
+            signal.stop();
+            // The thread catches its own panics, so joining cannot fail.
+            let _ = handle.join();
         }
+        if let Some(message) = self
+            .core
+            .background
+            .as_ref()
+            .and_then(|signal| signal.status().panic)
+        {
+            return Err(BackgroundError::Panicked(message));
+        }
+        flush_error.map_or(Ok(()), Err)
     }
 }
 
@@ -492,7 +496,7 @@ impl Engine {
     }
 
     pub(super) fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
-        {
+        let first = {
             let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
                 on_stripe(i);
                 self.shared.open[i]
@@ -500,16 +504,18 @@ impl Engine {
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
             });
-            if !*guards[0] {
-                return Ok(());
+            if *guards[0] {
+                self.shared
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                for guard in &mut guards {
+                    **guard = false;
+                }
+                true
+            } else {
+                false
             }
-            self.shared
-                .closed
-                .store(true, std::sync::atomic::Ordering::Release);
-            for guard in &mut guards {
-                **guard = false;
-            }
-        }
+        };
         self.core.combiner.close();
         let stopped = self.shared.stop_workers();
         drop(
@@ -519,7 +525,7 @@ impl Engine {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
-        Ok(stopped?)
+        if first { Ok(stopped?) } else { Ok(()) }
     }
 }
 
@@ -956,5 +962,101 @@ mod close_tests {
                 .kind(),
             ErrorKind::Stopped
         );
+    }
+
+    #[test]
+    fn concurrent_close_waits_for_workers_and_lock_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-concurrent-close-{:032x}",
+            checkpoint::new_run_id()
+        ));
+        let engine = Engine::open(
+            &dir,
+            Options {
+                background_compaction: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let ks = engine.ks();
+        ks.put(b"k", b"v").unwrap();
+        drop(ks);
+
+        let (flush_started_tx, flush_started_rx) = mpsc::channel();
+        let (release_flush_tx, release_flush_rx) = mpsc::channel();
+        let release_flush_rx = Mutex::new(release_flush_rx);
+        *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
+            flush_started_tx.send(()).unwrap();
+            let _ = release_flush_rx.lock().unwrap().recv();
+        }));
+        {
+            let mut state = engine.core.write_state();
+            engine.core.freeze_active(&mut state);
+        }
+        engine.core.flush_signal.request();
+        flush_started_rx.recv().unwrap();
+
+        let (c1_at_stripe1_tx, c1_at_stripe1_rx) = mpsc::channel();
+        let (c1_resume_tx, c1_resume_rx) = mpsc::channel();
+        let (c2_started_tx, c2_started_rx) = mpsc::channel();
+        let (c2_at_last_tx, c2_at_last_rx) = mpsc::channel();
+        let (c2_returned_tx, c2_returned_rx) = mpsc::channel();
+
+        let first = engine.clone();
+        let second = engine.clone();
+        let reopen_dir = dir.clone();
+
+        let (returned_early, first_result, second_result) = std::thread::scope(|scope| {
+            let first_handle = scope.spawn(move || {
+                first.close_with(|stripe| {
+                    if stripe == 1 {
+                        c1_at_stripe1_tx.send(()).unwrap();
+                        c1_resume_rx.recv().unwrap();
+                    }
+                })
+            });
+            c1_at_stripe1_rx.recv().unwrap();
+
+            let second_handle = scope.spawn(move || {
+                second.close_with(|stripe| {
+                    if stripe == 0 {
+                        c2_started_tx.send(()).unwrap();
+                    } else if stripe == OPEN_STRIPES - 1 {
+                        c2_at_last_tx.send(()).unwrap();
+                    }
+                })?;
+                let _ = c2_returned_tx.send(());
+                let reopened = Engine::open(
+                    &reopen_dir,
+                    Options {
+                        background_compaction: None,
+                        ..Options::default()
+                    },
+                )?;
+                reopened.close()
+            });
+
+            c2_started_rx.recv().unwrap();
+            c1_resume_tx.send(()).unwrap();
+            c2_at_last_rx.recv().unwrap();
+            drop(engine.shared.open[0].0.read().unwrap());
+            let returned_early = c2_returned_rx.try_recv().is_ok();
+            release_flush_tx.send(()).unwrap();
+
+            (
+                returned_early,
+                first_handle.join().unwrap(),
+                second_handle.join().unwrap(),
+            )
+        });
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            !returned_early,
+            "second close returned before workers stopped and lock was released"
+        );
+        first_result.unwrap();
+        second_result.unwrap();
     }
 }
