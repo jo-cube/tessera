@@ -89,7 +89,7 @@ impl fmt::Display for UpdateError {
             Self::KeyspaceDropped => f.write_str("the keyspace was dropped"),
             Self::Keyspaces => write!(
                 f,
-                "an engine holds at most {} live keyspaces and 2^32 over its life",
+                "an engine holds at most {} live keyspaces and 2^32 - 1 over its life",
                 keyspaces::MAX_KEYSPACES
             ),
             Self::Stopped => f.write_str("the engine was closed"),

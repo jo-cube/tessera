@@ -68,11 +68,9 @@ mod tests;
 
 /// Bytes charged per entry beyond its key and value.
 ///
-/// This is an upper bound on the worst case, on 64-bit targets: the entry's
-/// slot in a leaf at the half occupancy every leaf off the tree's right edge
-/// keeps (about 66 bytes), plus its share of branch nodes. A table filled with
-/// random keys measures about 55 bytes per entry. Allocator rounding is not
-/// included, so this is an estimate.
+/// On 64-bit targets a 24-byte slot in a half-full leaf takes about 53.5 bytes
+/// (about 39 bytes under random keys) plus branch nodes; 80 bytes bounds
+/// typical keys with allocator rounding, while large branch separators are uncharged.
 pub const ENTRY_OVERHEAD: usize = 80;
 
 /// Input per output run suggested for [`FrozenMemtable::flush_with`].

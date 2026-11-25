@@ -640,7 +640,7 @@ impl Keyspace {
     }
 
     /// The latest value of `key`, copied, or `None` if it is absent or
-    /// deleted. Uses a pooled [`Reader`]; take one to read without copying.
+    /// deleted. Uses a pooled [`Reader`]; take one to borrow without allocating.
     ///
     /// # Errors
     /// [`ErrorKind::Corruption`] for damaged data the lookup touches;
