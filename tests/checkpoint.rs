@@ -1030,3 +1030,86 @@ fn checkpoint_recovers_and_validates_widened_segment() {
     }
     assert_eq!(seen, count);
 }
+
+/// One tree holding runs of all three encodings at once, each written after
+/// reopening the previous checkpoint under the next setting, reads alike,
+/// recovers under every setting without re-encoding anything, compacts into
+/// the configured setting, and checkpoints and recovers again.
+#[test]
+fn a_tree_of_every_encoding_reads_compacts_and_recovers_alike() {
+    const ORDER: [Compression; 3] = [
+        Compression::Zstd,
+        Compression::ZstdFastDecode,
+        Compression::Uncompressed,
+    ];
+    let with = |compression| Options {
+        target_run_len: 1 << 20,
+        compression,
+        ..manual()
+    };
+    let round = |engine: &Engine, model: &mut Model, round: u32| {
+        for i in 0..3_000u32 {
+            let key = i.to_be_bytes().to_vec();
+            if round == 0 || i % 3 == round {
+                let value = format!("value {} of {i} in round {round}", i % 10).into_bytes();
+                engine.ks().put(&key, &value).unwrap();
+                model.insert(key.clone(), value);
+            }
+            if round > 0 && i % 7 == round {
+                engine.ks().delete(&key).unwrap();
+                model.remove(&key);
+            }
+        }
+        engine.flush().unwrap();
+    };
+    let scratch = Scratch::new("every-encoding");
+    let mut model = Model::new();
+    let first = Engine::in_memory(with(ORDER[0])).unwrap();
+    round(&first, &mut model, 0);
+    first.checkpoint_to(&scratch.0).unwrap();
+    first.close().unwrap();
+    for (at, compression) in ORDER.iter().enumerate().skip(1) {
+        let engine = Engine::open(&scratch.0, with(*compression)).unwrap();
+        assert_eq!(contents(&engine, b""), model, "{compression:?}");
+        round(&engine, &mut model, at as u32);
+        engine.checkpoint().unwrap();
+        engine.close().unwrap();
+    }
+    let (runs, run_bytes) = {
+        let engine = Engine::open(&scratch.0, with(Compression::Zstd)).unwrap();
+        let stats = engine.engine_stats();
+        engine.close().unwrap();
+        (stats.runs, stats.run_bytes)
+    };
+    assert!(runs >= 3, "one run per encoding at least: {runs}");
+    for read in ORDER {
+        let engine = Engine::open(&scratch.0, with(read)).unwrap();
+        // Recovery keeps every stored byte: nothing is re-encoded.
+        assert_eq!(engine.engine_stats().run_bytes, run_bytes, "{read:?}");
+        assert_eq!(contents(&engine, b""), model, "{read:?}");
+        for i in [0u32, 1, 2, 3, 6, 7, 2_999] {
+            assert_eq!(
+                get(&engine, &i.to_be_bytes()),
+                model.get(&i.to_be_bytes()[..]).cloned(),
+                "{read:?} key {i}"
+            );
+        }
+        let snapshot = engine.snapshot();
+        compact_all(&engine);
+        assert_eq!(contents(&engine, b""), model, "{read:?} compacted");
+        assert_eq!(
+            snapshot_contents(&snapshot, &engine.ks(), b""),
+            model,
+            "{read:?} snapshot"
+        );
+        drop(snapshot);
+        let again = Scratch::new(&format!("every-encoding-{read:?}"));
+        engine.checkpoint_to(&again.0).unwrap();
+        engine.close().unwrap();
+        for reopen in ORDER {
+            let recovered = Engine::open(&again.0, with(reopen)).unwrap();
+            assert_eq!(contents(&recovered, b""), model, "{read:?} as {reopen:?}");
+            recovered.close().unwrap();
+        }
+    }
+}
