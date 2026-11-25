@@ -91,9 +91,10 @@ attributed to keyspaces. Dropping a keyspace releases its runs at once
 flush discards them.
 
 The budget is not a cap on the process's memory. Reader buffers (up to 1 MiB
-retained per buffer, pooled per engine), allocator overhead and native
-Zstandard contexts are outside it. An active memtable plus two frozen ones
-can charge about 192 MiB at the default `memtable_size`.
+retained per buffer, pooled per engine), queued write-combiner copies (up to
+1 MiB per waiting writer), allocator overhead and native Zstandard contexts
+are outside it. An active memtable plus two frozen ones can charge about
+192 MiB at the default `memtable_size`.
 
 ### Resident memory on Linux
 

@@ -48,7 +48,8 @@ detail, with the alternatives that were rejected.
 
 `Engine::stats` reports the budget figure (`memory_used`), the stored bytes
 in total and per keyspace, and the part held only by snapshots. Reader
-buffers and allocator overhead are outside the budget.
+buffers, queued write-combiner copies (up to 1 MiB per waiting writer) and
+allocator overhead are outside the budget.
 
 ## Where CPU goes
 

@@ -167,7 +167,8 @@ snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
 never refused, so maintenance can always finish and free space. Quiet
 level-0 compaction uses the same estimates and charges for pieces and
 retired sources. Snapshots and checkpoints may retain the inputs after
-publication. Readers' buffers and allocator overhead are outside the budget.
+publication. Readers' buffers, queued write-combiner copies (up to 1 MiB per
+waiting writer) and allocator overhead are outside the budget.
 
 ## Checkpoints
 
