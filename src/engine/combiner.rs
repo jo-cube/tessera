@@ -88,6 +88,8 @@ pub(super) struct WriteCombiner {
     pending_mask: AtomicU32,
     drain_cursor: AtomicUsize,
     shards: Box<[Shard; SHARDS]>,
+    #[cfg(test)]
+    before_abort_release: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for WriteCombiner {
@@ -97,6 +99,8 @@ impl Default for WriteCombiner {
             pending_mask: AtomicU32::new(0),
             drain_cursor: AtomicUsize::new(0),
             shards: Box::new(std::array::from_fn(|_| Shard::default())),
+            #[cfg(test)]
+            before_abort_release: Mutex::new(None),
         }
     }
 }
@@ -457,8 +461,10 @@ impl WriteCombiner {
         }
     }
 
+    /// Drains and fails every queued follower before releasing or handing off
+    /// `COMBINING`, so an unwinding leader cannot steal a successor group's
+    /// followers and late arrivals are promoted rather than stranded.
     fn abort_leader(&self) {
-        self.mode.fetch_and(!COMBINING, Ordering::SeqCst);
         let mut waiting = Vec::new();
         for idx in 0..SHARDS {
             let mut entries = self.lock_shard(idx);
@@ -469,6 +475,18 @@ impl WriteCombiner {
         for entry in waiting {
             entry.slot.complete(Err(UpdateError::LeaderPanicked));
         }
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_abort_release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.handoff_or_release();
     }
 
     /// Marks the combiner closed and wakes waiting followers with `Stopped`.
@@ -595,8 +613,11 @@ impl Core {
             return Err(UpdateError::Stopped);
         }
         #[cfg(test)]
-        if let Some(hook) = self.before_combine.lock().unwrap().clone() {
-            hook();
+        {
+            let hook = self.before_combine.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let state = match self.admit(self.write_state()) {
             Ok(state) => state,
@@ -1344,6 +1365,82 @@ mod tests {
         assert_eq!(ks.get(b"l0").unwrap().as_deref(), Some(big_a.as_slice()));
         assert_eq!(ks.get(b"f1").unwrap().as_deref(), Some(big_b.as_slice()));
         assert_eq!(ks.get(b"f2").unwrap().as_deref(), Some(&b"tiny"[..]));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn abort_leader_drains_before_releasing_combiner_to_successor() {
+        let engine = Engine::in_memory(manual()).unwrap();
+        let ks = engine.ks();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let fired = AtomicBool::new(false);
+        *engine.core.before_combine.lock().unwrap() = Some(Arc::new(move || {
+            if fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            panic!("injected leader failure");
+        }));
+
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let (abort_release_tx, abort_release_rx) = mpsc::channel();
+        let abort_release_rx = Mutex::new(abort_release_rx);
+        *engine.core.combiner.before_abort_release.lock().unwrap() = Some(Arc::new(move || {
+            drained_tx.send(()).unwrap();
+            abort_release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+
+        let direct = engine.core.combiner.try_enter_direct().unwrap();
+        let (r_l1, r_f1, r_s1, r_s2) = std::thread::scope(|scope| {
+            let l1 = scope.spawn(|| ks.put(b"l1", b"v1"));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait_for_combining(&engine.core);
+
+            let f1 = scope.spawn(|| ks.put(b"f1", b"v1"));
+            wait_for_queued(&engine.core, 1);
+
+            drop(direct);
+            release_tx.send(()).unwrap();
+
+            // After draining and failing `f1`, `COMBINING` is still held until
+            // handoff, so late arrivals are promoted rather than failed or stranded.
+            drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(engine.core.combiner.is_combining());
+            let r_f1 = f1.join().unwrap();
+
+            let s1 = scope.spawn(|| ks.put(b"s1", b"ok1"));
+            wait_for_queued(&engine.core, 1);
+            let s2 = scope.spawn(|| ks.put(b"s2", b"ok2"));
+            wait_for_queued(&engine.core, 2);
+
+            abort_release_tx.send(()).unwrap();
+            (
+                l1.join(),
+                r_f1,
+                s1.join().unwrap(),
+                s2.join().unwrap(),
+            )
+        });
+
+        assert!(r_l1.is_err());
+        assert_eq!(r_f1.unwrap_err().kind(), ErrorKind::Background);
+        assert!(r_s1.is_ok(), "{r_s1:?}");
+        assert!(r_s2.is_ok(), "{r_s2:?}");
+        assert_eq!(engine.core.combiner.queued_len(), 0);
+        assert_eq!(ks.get(b"f1").unwrap(), None);
+        assert_eq!(ks.get(b"s1").unwrap().as_deref(), Some(&b"ok1"[..]));
+        assert_eq!(ks.get(b"s2").unwrap().as_deref(), Some(&b"ok2"[..]));
         engine.close().unwrap();
     }
 }
