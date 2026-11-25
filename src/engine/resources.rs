@@ -48,21 +48,6 @@ struct Estimates {
 }
 
 #[cfg(feature = "diagnostics")]
-pub(super) struct WaitCharge<'a> {
-    progress: &'a Progress,
-    started: std::time::Instant,
-}
-#[cfg(feature = "diagnostics")]
-impl Drop for WaitCharge<'_> {
-    fn drop(&mut self) {
-        let nanos = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.progress
-            .writer_wait_ns
-            .fetch_add(nanos, Ordering::Relaxed);
-    }
-}
-
-#[cfg(feature = "diagnostics")]
 pub(super) struct Level0Charge<'a> {
     progress: &'a Progress,
     started: std::time::Instant,
@@ -123,9 +108,9 @@ impl Progress {
         }
     }
     #[cfg(feature = "diagnostics")]
-    pub(super) fn waiting(&self) -> WaitCharge<'_> {
-        WaitCharge {
-            progress: self,
+    pub(super) fn waiting(&self) -> AtomicWaitCharge<'_> {
+        AtomicWaitCharge {
+            counter: &self.writer_wait_ns,
             started: std::time::Instant::now(),
         }
     }
