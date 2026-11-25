@@ -30,19 +30,12 @@ impl CompactionPolicy {
             reclaim: false,
         }
     }
+    #[cfg(test)]
     pub(super) fn with_test_policy(self, policy: Self) -> Self {
-        #[cfg(test)]
-        {
-            Self {
-                max_input_bytes: self.max_input_bytes.min(policy.max_input_bytes),
-                max_workspace_bytes: self.max_workspace_bytes.min(policy.max_workspace_bytes),
-                ..policy
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = policy;
-            self
+        Self {
+            max_input_bytes: self.max_input_bytes.min(policy.max_input_bytes),
+            max_workspace_bytes: self.max_workspace_bytes.min(policy.max_workspace_bytes),
+            ..policy
         }
     }
     pub(super) fn fit(&self, target_run_len: usize, level0_stop: usize) -> Fit {

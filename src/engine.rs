@@ -361,6 +361,7 @@ impl Core {
     }
 
     fn with_pool(options: &Options, chunks: ChunkPool) -> Self {
+        let policy = CompactionPolicy::for_memory(options.memory_limit);
         #[cfg(test)]
         let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
             options.last_seq,
@@ -369,16 +370,15 @@ impl Core {
             options
                 .bulk_ingest_min
                 .unwrap_or(options.memtable_size / BULK_INGEST_DIVISOR),
-            options.background_compaction.unwrap_or_default(),
+            policy.with_test_policy(options.background_compaction.unwrap_or_default()),
             options.background_compaction.map(|_| worker::Signal::new()),
         );
         #[cfg(not(test))]
-        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
+        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, background) = (
             0,
             TARGET_RUN_LEN,
             MAX_FROZEN_MEMTABLES,
             options.memtable_size / BULK_INGEST_DIVISOR,
-            CompactionPolicy::for_memory(options.memory_limit),
             Some(worker::Signal::new()),
         );
         let active = Memtable::in_pool(options.memtable_size, Some(last_seq), &chunks);
@@ -427,7 +427,7 @@ impl Core {
             snapshots: Arc::new(()),
             background,
             memory_limit: options.memory_limit,
-            policy: CompactionPolicy::for_memory(options.memory_limit).with_test_policy(policy),
+            policy,
             resources: resources::Progress::default(),
             reclaim: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
