@@ -84,7 +84,7 @@
 //! # Memory
 //!
 //! [`Options::memory_limit`] is a writer admission budget, unlimited by
-//! default. [`Stats::memory_used`] sums charged memtables, stored runs and
+//! default and at least 2 MiB when set. [`Stats::memory_used`] sums charged memtables, stored runs and
 //! their filters and indexes, pool reserve, retained snapshot sources and
 //! estimates of builds in progress. Estimates and allocator overhead make it
 //! an admission budget, not a cap on the process's memory. Below 90% of the

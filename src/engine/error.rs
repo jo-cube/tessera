@@ -238,10 +238,10 @@ impl From<CheckpointError> for Error {
             CheckpointError::Io {
                 path,
                 error,
-                after_commit_point,
+                committed,
             } => {
                 let mut error = Self::new(ErrorKind::Io, message).at(path).caused_by(error);
-                error.inner.committed = after_commit_point;
+                error.inner.committed = committed.is_some();
                 error
             }
         }

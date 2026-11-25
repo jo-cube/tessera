@@ -278,7 +278,11 @@ fn idle_compaction_keeps_snapshot_inputs_charged_until_release() {
     let after = engine.engine_stats();
     assert_eq!(after.level0_runs, 0);
     assert_eq!(after.build_output_bytes + after.build_workspace_bytes, 0);
-    assert_eq!(after.snapshot_bytes, before.run_bytes + before.held_bytes);
+    // A flushed table stays charged until the flusher drops its job, which
+    // can be after `flush` returns, so wait for that charge to go.
+    crate::test_support::wait_until(|| {
+        engine.stats().snapshot_bytes == before.run_bytes + before.held_bytes
+    });
     assert_accounting(&engine);
     assert_eq!(
         initial.reader().get(&ks, b"deleted").unwrap(),
@@ -651,4 +655,48 @@ fn quiet_tail_flush_aligns_cuts_to_oldest_level_0_flush_group() {
         assert_eq!(ks.get(&[prefix, 0]).unwrap().unwrap(), vec![2u8; 700]);
         assert_eq!(ks.get(&[prefix, 1]).unwrap().unwrap(), vec![1u8; 300]);
     }
+}
+
+#[test]
+fn rotation_during_quiet_tail_flush_re_signals_flusher_and_loses_nothing() {
+    let engine = Engine::in_memory(Options {
+        memtable_size: 4 << 10,
+        ..Options::default()
+    })
+    .unwrap();
+    let ks = engine.ks();
+    let signal = signal_for(&engine);
+
+    let quiet_val = vec![b'q'; 600];
+    ks.put(b"q1", &quiet_val).unwrap();
+    assert!(signal.lock().quiet.is_some());
+
+    let (paused, release) = pause_flush(&engine);
+    let passes = signal.status().passes;
+    advance_clock(signal, QUIET_PERIOD);
+    paused.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    // Fill and rotate `active` into `frozen[1]` while `flush_quiet_tail` holds `flushing`.
+    let val = vec![b'w'; 1200];
+    for i in 0..4u8 {
+        ks.put(format!("k{i}").as_bytes(), &val).unwrap();
+    }
+    assert_eq!(engine.engine_stats().frozen_tables, 2);
+
+    release.send(()).unwrap();
+    wait_for(signal, |progress| progress.status.passes > passes);
+    crate::test_support::wait_until(|| engine.engine_stats().frozen_tables == 0);
+
+    assert_eq!(engine.engine_stats().flushes, 2);
+    assert_eq!(
+        ks.get(b"q1").unwrap().as_deref(),
+        Some(quiet_val.as_slice())
+    );
+    for i in 0..4u8 {
+        assert_eq!(
+            ks.get(format!("k{i}").as_bytes()).unwrap().as_deref(),
+            Some(val.as_slice())
+        );
+    }
+    engine.close().unwrap();
 }

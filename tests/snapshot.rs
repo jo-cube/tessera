@@ -464,3 +464,58 @@ fn a_point_read_keeps_no_replaced_run_alive_after_it_returns() {
     );
     assert_eq!(reader.get(&ks, b"b").unwrap(), Some(&b"1"[..]));
 }
+
+/// The cached view of the active table is reused only while `last_seq` is
+/// unchanged, and that is only while the active table is: a rotation and
+/// the writes after it, an ingestion beside unrelated active records and a
+/// refused write each leave every new snapshot exactly at its cut.
+#[test]
+fn a_reused_active_view_is_never_stale_across_rotation_ingestion_and_refusal() {
+    let engine = Engine::in_memory(manual()).unwrap();
+    let ks = engine.ks();
+    let extra = engine.keyspace("extra").unwrap();
+    let value = |snapshot: &Snapshot, key: &[u8]| {
+        snapshot.reader().get(&ks, key).unwrap().map(<[u8]>::to_vec)
+    };
+    ks.put(b"a", b"1").unwrap();
+    let cached = engine.snapshot();
+    let reused = engine.snapshot();
+    assert_eq!(cached.last_seq(), reused.last_seq());
+
+    // Rotation freezes the cached table; the next write makes a new one.
+    engine.flush().unwrap();
+    ks.put(b"b", b"2").unwrap();
+    let rotated = engine.snapshot();
+    assert_eq!(rotated.last_seq(), reused.last_seq() + 1);
+    assert_eq!(value(&rotated, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(value(&rotated, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(value(&reused, b"b"), None);
+    let rotated_again = engine.snapshot();
+    assert_eq!(value(&rotated_again, b"b").as_deref(), Some(&b"2"[..]));
+
+    // Ingestion of a key the active table does not hold publishes a run and
+    // advances `last_seq` without touching the active table.
+    let mut batch = crate::WriteBatch::new();
+    batch.put(&ks, b"c", b"3");
+    let seq = engine.ingest_sorted(&batch).unwrap();
+    let ingested = engine.snapshot();
+    assert_eq!(ingested.last_seq(), seq);
+    assert_eq!(value(&ingested, b"c").as_deref(), Some(&b"3"[..]));
+    assert_eq!(value(&ingested, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(value(&rotated_again, b"c"), None);
+
+    // A write refused under the state lock changes neither the active table
+    // nor `last_seq`, so the reused view is still exactly the cut.
+    assert!(engine.drop_keyspace("extra").unwrap());
+    assert!(extra.put(b"x", b"refused").is_err());
+    let refused = engine.snapshot();
+    assert_eq!(refused.last_seq(), seq);
+    assert_eq!(value(&refused, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(value(&refused, b"c").as_deref(), Some(&b"3"[..]));
+    ks.put(b"d", b"4").unwrap();
+    let written = engine.snapshot();
+    assert_eq!(written.last_seq(), seq + 1);
+    assert_eq!(value(&written, b"d").as_deref(), Some(&b"4"[..]));
+    assert_eq!(value(&refused, b"d"), None);
+    assert_eq!(value(&ingested, b"d"), None);
+}

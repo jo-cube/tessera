@@ -65,7 +65,7 @@ impl<'e> FlushJob<'e> {
         let built = flush_merged(
             &tables,
             self.engine.target_run_len,
-            self.engine.codec,
+            self.engine.encoding,
             self.engine.target_block_compressed,
             &spaces,
             &self.engine.chunks,
@@ -203,12 +203,22 @@ impl BuiltFlush<'_> {
             // are taken only under the lock, so any other is a snapshot's,
             // which keeps the whole table. Otherwise only views of it can
             // remain, which share its family, so this follows all of them.
-            let bytes = if Arc::strong_count(&table) > 2 {
-                table.memory().charged
+            let charged = table.memory().charged;
+            let held = if Arc::strong_count(&table) > 2 {
+                charged
             } else {
                 table.held_by_snapshots()
             };
-            state.retire(table.family() as Weak<dyn Send + Sync>, bytes, None);
+            state.retire(table.family() as Weak<dyn Send + Sync>, held, None);
+            // `job` frees the table after the lock is released; until then
+            // the rest of its charge is counted through the table itself.
+            if held < charged {
+                state.retire(
+                    Arc::downgrade(&table) as Weak<dyn Send + Sync>,
+                    charged - held,
+                    None,
+                );
+            }
         }
         drop(charge);
         if notify_compaction {
@@ -221,6 +231,10 @@ impl BuiltFlush<'_> {
         // Unless a snapshot holds them, `job` has the last references, so the
         // tables are freed after this releases the lock.
         drop(state);
+        #[cfg(test)]
+        if let Some(hook) = job.engine.after_flush_publish.lock().unwrap().take() {
+            hook();
+        }
         job.engine.flush_signal.changed();
         job.engine.resources.changed();
         (report, kept)

@@ -163,11 +163,14 @@ the pool reserve and unused checked-out capacity, and estimates of in-flight
 build output and workspace. Shared sources count once. Below 90% writers
 proceed; above it they wait briefly on publication; at 100% they request
 reclamation and fail with `MemoryLimit` only when live data and held
-snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
-never refused, so maintenance can always finish and free space. Quiet
-level-0 compaction uses the same estimates and charges for pieces and
-retired sources. Snapshots and checkpoints may retain the inputs after
-publication. Readers' buffers and allocator overhead are outside the budget.
+snapshots cannot shrink. Admission checks usage as it is before a write and
+reserves nothing for it, so one write, or one ingested batch with its build
+charge, can take usage past the limit by its own size. Flushes, compactions,
+snapshots and checkpoints are never refused, so maintenance can always finish
+and free space. Quiet level-0 compaction uses the same estimates and charges
+for pieces and retired sources. Snapshots and checkpoints may retain the inputs after
+publication. Readers' buffers, queued write-combiner copies (up to 1 MiB per
+waiting writer) and allocator overhead are outside the budget.
 
 ## Checkpoints
 
@@ -260,6 +263,12 @@ each key.
 - A per-segment adaptive level 1/3 choice: almost never triggered.
 - Zstd effort by output level: fast levels store weak-locality blocks raw, and
   level 3 gains almost nothing on dictionary blocks.
+- Higher levels (6–12) for the bottom: on small records they save up to a
+  fifth of stored bytes, but weak-locality and large grouped records grow
+  with a dictionary, for 3–9× the compression CPU.
+- Literals stored uncompressed (`ZstdFastDecode`): an opt-in, not the default.
+  Decoding skips the per-frame Huffman table, but stored bytes grow in
+  proportion to the data, by about a fifth on compressible data.
 
 **Frame CRCs on every decode; dictionaries trusted after build or validation.**
 - Verifying each dictionary's CRC on every decode: about a tenth of write CPU

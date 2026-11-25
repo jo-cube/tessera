@@ -231,7 +231,6 @@ impl Levels {
         levels.cursors.resize_with(depth.max(1) + 1, Vec::new);
         for &(level, flush, ref run) in runs {
             levels.levels[level].push(Arc::clone(run));
-            levels.bytes[level] += bytes_of(run);
             if level == 0 {
                 levels.flushes.push(flush);
                 levels.next_flush = levels.next_flush.max(flush + 1);
@@ -628,7 +627,7 @@ impl Levels {
         if let Some((level, _, _)) = self.due(fit, segment) {
             return self.plan_level(level, fit, false);
         }
-        self.plan_neighbours(fit, segment).unwrap_or(Plan::Idle)
+        self.plan_neighbours(segment).unwrap_or(Plan::Idle)
     }
 
     /// How much [`Self::plan`] has to do, or `None` if it would be idle.
@@ -640,8 +639,7 @@ impl Levels {
         if let Some((_, numerator, denominator)) = self.due(fit, segment) {
             return Some(Score::new(1, numerator, denominator));
         }
-        self.plan_neighbours(fit, segment)
-            .map(|_| Score::new(0, 1, 1))
+        self.plan_neighbours(segment).map(|_| Score::new(0, 1, 1))
     }
 
     /// Bytes a reclaiming compaction could free at most: every level above
@@ -816,7 +814,7 @@ impl Levels {
 
     /// Two adjacent runs of a level below 0, both under half a segment,
     /// whose merged range overlaps at most `ratio` segments' bytes below.
-    fn plan_neighbours(&self, _fit: &Fit, segment: usize) -> Option<Plan> {
+    fn plan_neighbours(&self, segment: usize) -> Option<Plan> {
         let small = segment / 2;
         let last = self.levels.len() - 1;
         for level in 1..=last {

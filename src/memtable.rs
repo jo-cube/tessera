@@ -59,7 +59,7 @@ use crate::chunk::ChunkPool;
 
 #[cfg(test)]
 use crate::run::TARGET_BLOCK_COMPRESSED;
-use crate::run::{Codec, RECORD_INPUT_OVERHEAD, Run, RunBuilder};
+use crate::run::{Encoding, RECORD_INPUT_OVERHEAD, Run, RunBuilder};
 mod arena;
 use arena::{Arena, Location};
 
@@ -68,11 +68,9 @@ mod tests;
 
 /// Bytes charged per entry beyond its key and value.
 ///
-/// This is an upper bound on the worst case, on 64-bit targets: the entry's
-/// slot in a leaf at the half occupancy every leaf off the tree's right edge
-/// keeps (about 66 bytes), plus its share of branch nodes. A table filled with
-/// random keys measures about 55 bytes per entry. Allocator rounding is not
-/// included, so this is an estimate.
+/// On 64-bit targets a 24-byte slot in a half-full leaf takes about 53.5 bytes
+/// (about 39 bytes under random keys) plus branch nodes; 80 bytes bounds
+/// typical keys with allocator rounding, while large branch separators are uncharged.
 pub const ENTRY_OVERHEAD: usize = 80;
 
 /// Input per output run suggested for [`FrozenMemtable::flush_with`].
@@ -917,17 +915,18 @@ impl Memtable {
     }
 
     /// A conservative upper bound on the charge of one additional update,
-    /// including nodes and records a live snapshot could pin.
-    pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> usize {
+    /// split into its per-operation cost (including nodes a live snapshot
+    /// could pin) and the one-time copy of a shared active arena chunk.
+    pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> (usize, usize) {
         let bytes = match value {
             Value::Bytes(bytes) => bytes.len(),
             Value::Tombstone => 0,
         };
-        key.len()
-            .saturating_add(bytes)
+        let len = key.len().saturating_add(bytes);
+        let op = len
             .saturating_add(ENTRY_OVERHEAD)
-            .saturating_add(self.0.plan(key).2)
-            .saturating_add(self.0.arena.copy_charge(key.len().saturating_add(bytes)))
+            .saturating_add(self.0.plan(key).2);
+        (op, self.0.arena.copy_charge(len))
     }
 
     /// Shares every tree node and copies the arena chunk handles, leaving the
@@ -1035,11 +1034,11 @@ impl FrozenMemtable {
     /// the default codec and block length, as [`Self::flush_with`] does.
     #[cfg(test)]
     pub fn flush(&self, target_run_len: usize) -> Flush<'_> {
-        self.flush_with(target_run_len, Codec::default(), TARGET_BLOCK_COMPRESSED)
+        self.flush_with(target_run_len, Encoding::default(), TARGET_BLOCK_COMPRESSED)
     }
 
     /// Returns an iterator that builds this table's runs one at a time, with
-    /// `codec` and an estimated compressed target of `target_block_compressed` bytes
+    /// `encoding` and an estimated compressed target of `target_block_compressed` bytes
     /// (see [`RunBuilder::with_target_block_compressed`]).
     ///
     /// A run ends once its records reach `target_run_len` bytes of input,
@@ -1053,14 +1052,14 @@ impl FrozenMemtable {
     pub fn flush_with(
         &self,
         target_run_len: usize,
-        codec: Codec,
+        encoding: impl Into<Encoding>,
         target_block_compressed: usize,
     ) -> Flush<'_> {
         Flush {
             records: self.iter(),
             pool: ChunkPool::new(0),
             target: target_run_len.min(MAX_TARGET_RUN_LEN),
-            codec,
+            encoding: encoding.into(),
             target_block_compressed,
         }
     }
@@ -1129,7 +1128,7 @@ fn locate<'k>(
 pub(crate) fn flush_merged(
     tables: &[&FrozenMemtable],
     target_run_len: usize,
-    codec: Codec,
+    encoding: Encoding,
     target_block_compressed: usize,
     spaces: &[FlushSpace<'_>],
     pool: &ChunkPool,
@@ -1226,7 +1225,7 @@ pub(crate) fn flush_merged(
             pieces += 1;
         }
         builder
-            .get_or_insert_with(|| RunBuilder::in_pool(codec, target_block_compressed, pool))
+            .get_or_insert_with(|| RunBuilder::in_pool(encoding, target_block_compressed, pool))
             .add(key, record.seq, record.value)
             .expect(FLUSHABLE);
         (input, piece, rest) = (input + len, piece + len, rest.saturating_sub(len));
@@ -1302,7 +1301,7 @@ pub struct Flush<'a> {
     pool: ChunkPool,
     records: Records<'a>,
     target: usize,
-    codec: Codec,
+    encoding: Encoding,
     target_block_compressed: usize,
 }
 
@@ -1312,7 +1311,8 @@ impl Iterator for Flush<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut record = self.records.next()?;
-        let mut builder = RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.pool);
+        let mut builder =
+            RunBuilder::in_pool(self.encoding, self.target_block_compressed, &self.pool);
         let mut input = 0;
         loop {
             builder

@@ -335,3 +335,211 @@ impl ReuseTracker {
             .collect()
     }
 }
+
+/// Cache capacities of the byte-weighted curves, in MiB.
+pub const CAPACITY_MIB: [f64; 5] = [0.25, 1.0, 4.0, 16.0, 64.0];
+const CAPS: usize = CAPACITY_MIB.len();
+
+fn capacity_bytes(at: usize) -> u64 {
+    (CAPACITY_MIB[at] * f64::from(1u32 << 20)) as u64
+}
+
+/// LRU at every capacity of [`CAPACITY_MIB`] from one byte-weighted stack
+/// distance: an access hits a cache of `C` bytes when the bytes of the
+/// distinct entries used since its previous use, plus its own, fit in `C`.
+/// This is exact when entries have equal sizes and none is invalidated; an
+/// invalidation frees its bytes for entries a real LRU already evicted, so
+/// read/update mixes are slightly overstated.
+pub struct ByteLru {
+    bit: Bit,
+    step: usize,
+    last: HashMap<u64, (usize, u32)>,
+}
+
+impl ByteLru {
+    pub fn new(accesses: usize) -> Self {
+        Self {
+            bit: Bit::new(accesses),
+            step: 0,
+            last: HashMap::new(),
+        }
+    }
+
+    /// Records an access and returns, per capacity, whether it hit.
+    pub fn access(&mut self, key: u64, size: u32) -> [bool; CAPS] {
+        self.step += 1;
+        if self.step + 1 >= self.bit.tree.len() {
+            let mut next = Bit::new(self.bit.tree.len() * 2);
+            for &(at, bytes) in self.last.values() {
+                next.add(at, i64::from(bytes));
+            }
+            self.bit = next;
+        }
+        let distance = self.last.insert(key, (self.step, size)).map(|(prev, old)| {
+            let above = self.bit.sum(self.step - 1) - self.bit.sum(prev);
+            self.bit.add(prev, -i64::from(old));
+            above as u64 + u64::from(size)
+        });
+        self.bit.add(self.step, i64::from(size));
+        std::array::from_fn(|at| distance.is_some_and(|d| d <= capacity_bytes(at)))
+    }
+
+    /// Removes `key`, as an update does to a cached record.
+    pub fn invalidate(&mut self, key: u64) {
+        if let Some((at, bytes)) = self.last.remove(&key) {
+            self.bit.add(at, -i64::from(bytes));
+        }
+    }
+}
+
+struct Entry {
+    generation: u32,
+    size: u32,
+    freq: u8,
+    main: bool,
+}
+
+/// Byte-weighted S3-FIFO: a small FIFO of a tenth of the bytes, a main FIFO
+/// that reinserts entries read again (frequency capped at 3), and a ghost
+/// FIFO of evicted keys as large in bytes as the main queue.
+pub struct ByteS3Fifo {
+    capacity: [u64; 2],
+    bytes: [u64; 3],
+    queues: [VecDeque<(u64, u32, u32)>; 3],
+    live: HashMap<u64, Entry>,
+    ghosts: HashMap<u64, (u32, u32)>,
+    generation: u32,
+}
+
+impl ByteS3Fifo {
+    pub fn new(capacity: u64) -> Self {
+        Self {
+            capacity: [capacity / 10, capacity - capacity / 10],
+            bytes: [0; 3],
+            queues: Default::default(),
+            live: HashMap::new(),
+            ghosts: HashMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// Records an access, inserting on a miss, and returns whether it hit.
+    pub fn access(&mut self, key: u64, size: u32) -> bool {
+        if let Some(entry) = self.live.get_mut(&key) {
+            entry.freq = (entry.freq + 1).min(3);
+            return true;
+        }
+        self.generation += 1;
+        let main = self.ghosts.remove(&key).is_some_and(|(_, bytes)| {
+            self.bytes[2] -= u64::from(bytes);
+            true
+        });
+        self.insert(key, size, self.generation, main);
+        false
+    }
+
+    pub fn invalidate(&mut self, key: u64) {
+        if let Some(entry) = self.live.remove(&key) {
+            self.bytes[usize::from(entry.main)] -= u64::from(entry.size);
+        }
+    }
+
+    fn insert(&mut self, key: u64, size: u32, generation: u32, main: bool) {
+        let q = usize::from(main);
+        self.queues[q].push_back((key, size, generation));
+        self.bytes[q] += u64::from(size);
+        let entry = Entry {
+            generation,
+            size,
+            freq: 0,
+            main,
+        };
+        self.live.insert(key, entry);
+        while self.bytes[q] > self.capacity[q] {
+            let Some((key, size, generation)) = self.queues[q].pop_front() else {
+                break;
+            };
+            let Some(entry) = self.live.get_mut(&key) else {
+                continue;
+            };
+            if entry.generation != generation || entry.main != main {
+                continue;
+            }
+            if main && entry.freq > 0 {
+                entry.freq -= 1;
+                self.queues[1].push_back((key, size, generation));
+                continue;
+            }
+            let freq = entry.freq;
+            self.live.remove(&key);
+            self.bytes[q] -= u64::from(size);
+            if main {
+                continue;
+            }
+            if freq > 0 {
+                self.insert(key, size, generation, true);
+            } else {
+                self.ghost(key, size, generation);
+            }
+        }
+    }
+
+    fn ghost(&mut self, key: u64, size: u32, generation: u32) {
+        self.queues[2].push_back((key, size, generation));
+        self.ghosts.insert(key, (generation, size));
+        self.bytes[2] += u64::from(size);
+        while self.bytes[2] > self.capacity[1] {
+            let Some((key, size, generation)) = self.queues[2].pop_front() else {
+                break;
+            };
+            if self.ghosts.get(&key).is_some_and(|g| g.0 == generation) {
+                self.ghosts.remove(&key);
+                self.bytes[2] -= u64::from(size);
+            }
+        }
+    }
+}
+
+/// Byte-weighted LRU and S3-FIFO hit counts at every capacity of
+/// [`CAPACITY_MIB`]. Hits count only while `counting` is set.
+pub struct Curves {
+    lru: ByteLru,
+    s3: [ByteS3Fifo; CAPS],
+    /// LRU, then S3-FIFO hits per capacity.
+    pub hits: [[u64; CAPS]; 2],
+    pub counted: usize,
+}
+
+impl Curves {
+    pub fn new(accesses: usize) -> Self {
+        Self {
+            lru: ByteLru::new(accesses),
+            s3: std::array::from_fn(|at| ByteS3Fifo::new(capacity_bytes(at))),
+            hits: [[0; CAPS]; 2],
+            counted: 0,
+        }
+    }
+
+    /// Accesses `key`, returning per policy and capacity whether it hit.
+    pub fn access(&mut self, key: u64, size: u32) -> [[bool; CAPS]; 2] {
+        let lru = self.lru.access(key, size);
+        [lru, std::array::from_fn(|at| self.s3[at].access(key, size))]
+    }
+
+    /// Counts one lookup made of accesses whose hits are `all`.
+    pub fn count(&mut self, all: [[bool; CAPS]; 2], counting: bool) {
+        if counting {
+            self.counted += 1;
+            for (hits, all) in self.hits.iter_mut().zip(all) {
+                hits.iter_mut()
+                    .zip(all)
+                    .for_each(|(h, a)| *h += u64::from(a));
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self, key: u64) {
+        self.lru.invalidate(key);
+        self.s3.iter_mut().for_each(|c| c.invalidate(key));
+    }
+}

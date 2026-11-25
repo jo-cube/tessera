@@ -65,7 +65,7 @@ impl Core {
             let space = built.last_mut().expect("a keyspace was begun");
             builder
                 .get_or_insert_with(|| {
-                    RunBuilder::in_pool(self.codec, self.target_block_compressed, &self.chunks)
+                    RunBuilder::in_pool(self.encoding, self.target_block_compressed, &self.chunks)
                 })
                 .add(key, 0, value)
                 .expect("validated unique sorted records");
@@ -232,18 +232,7 @@ impl Core {
         state.last_seq = seq;
         #[cfg(feature = "diagnostics")]
         self.chunks.work(0, 0, raw, bytes);
-        self.chunks.ingested(
-            batch
-                .records()
-                .map(|(_, key, value)| {
-                    key.len()
-                        + match value {
-                            Value::Bytes(bytes) => bytes.len(),
-                            Value::Tombstone => 0,
-                        }
-                })
-                .sum(),
-        );
+        self.chunks.ingested(batch.payload_bytes());
         drop(charge);
         drop(state);
         self.resources.changed();

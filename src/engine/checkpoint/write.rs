@@ -29,19 +29,58 @@ pub(super) fn crash(at: Crash) -> bool {
 
 /// Stands for the crash a test asked for.
 #[cfg(test)]
-pub(super) fn crashed(path: &Path, after_commit_point: bool) -> CheckpointError {
+pub(super) fn crashed(path: &Path, committed: Option<Box<CheckpointReport>>) -> CheckpointError {
     CheckpointError::Io {
         path: path.to_owned(),
         error: io::Error::other("crash injected by a test"),
-        after_commit_point,
+        committed,
     }
+}
+
+/// An error a test makes the rename of CURRENT report.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenameFault {
+    /// The rename fails and nothing changes.
+    Fails,
+    /// The rename takes effect, then reports an error.
+    FailsAfterEffect,
+    /// The rename fails and nothing changes, and CURRENT cannot be read back.
+    FailsUnread,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RENAME_FAULT: std::cell::Cell<Option<RenameFault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renames `tmp` over CURRENT in `dir`.
+fn rename_current(tmp: &Path, dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(fault) = RENAME_FAULT.with(std::cell::Cell::get) {
+        if fault == RenameFault::FailsAfterEffect {
+            fs::rename(tmp, dir.join(CURRENT))?;
+        }
+        return Err(io::Error::other("rename error injected by a test"));
+    }
+    fs::rename(tmp, dir.join(CURRENT))
+}
+
+/// The generation CURRENT in `dir` names, or `None` if it cannot be read.
+fn current_generation(dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if RENAME_FAULT.with(std::cell::Cell::get) == Some(RenameFault::FailsUnread) {
+        return None;
+    }
+    let bytes = read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64).ok()?;
+    decode_current(&bytes).ok()
 }
 
 #[cfg(test)]
 macro_rules! crash_point {
     ($at:expr, $path:expr) => {
         if crash($at) {
-            return Err(Failure::Crashed(crashed($path, false)));
+            return Err(Failure::Crashed(crashed($path, None)));
         }
     };
 }
@@ -70,7 +109,7 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> CheckpointError + '_ {
     move |error| CheckpointError::Io {
         path: path.to_owned(),
         error,
-        after_commit_point: false,
+        committed: None,
     }
 }
 
@@ -173,7 +212,7 @@ impl Core {
     /// Use the normal flush job, keeping precisely the run image at rotation.
     /// Taking a later snapshot of the state would include runs published by
     /// concurrent ingestion, or miss pre-ceiling runs replaced by compaction.
-    fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
+    fn checkpoint_image(&self) -> Image {
         loop {
             let serial = self.serialize_flush();
             let mut state = self.write_state();
@@ -204,7 +243,7 @@ impl Core {
                 self.freeze_active(&mut state);
             }
             if state.frozen.is_empty() {
-                return Ok(image);
+                return image;
             }
             let job = FlushJob::new(self, serial, &state);
             drop(state);
@@ -228,7 +267,7 @@ impl Core {
                     .extend(kept.runs.into_iter().map(|run| (0, kept.flush, run)));
                 space.runs.sort_by_key(|(level, _, _)| *level);
             }
-            return Ok(image);
+            return image;
         }
     }
 }
@@ -257,6 +296,31 @@ struct Written {
     runs_reused: usize,
     files_deleted: usize,
     largest_run_bytes: usize,
+}
+
+impl Written {
+    fn report(
+        &self,
+        generation: u64,
+        files_deleted: usize,
+        reclaimed: usize,
+        unreclaimed: usize,
+    ) -> CheckpointReport {
+        CheckpointReport {
+            generation,
+            last_seq: self.manifest.last_seq,
+            records: self.manifest.records,
+            runs: self.manifest.runs.len(),
+            bytes_written: self.bytes,
+            bytes_reused: self.bytes_reused,
+            runs_written: self.runs_written,
+            runs_reused: self.runs_reused,
+            files_deleted: files_deleted + self.files_deleted,
+            largest_run_bytes: self.largest_run_bytes,
+            reclaimed,
+            unreclaimed,
+        }
+    }
 }
 
 fn write_runs(
@@ -336,13 +400,9 @@ fn write_runs(
         let file = runs_dir.join(run_name(published.id));
         let exists = match fs::metadata(&file) {
             Ok(found) if found.len() == len => true,
-            Ok(_) => {
-                return Err(io_error(&file)(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "existing run file has the wrong length",
-                ))
-                .into());
-            }
+            // Memory holds the exact bytes, so a damaged file is replaced
+            // through a temporary file and a rename, like a missing one.
+            Ok(_) => false,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(io_error(&file)(e).into()),
         };
@@ -372,7 +432,7 @@ fn write_runs(
                 output
                     .write_all(&run.chunks().next().unwrap()[..1])
                     .map_err(io_error(&tmp))?;
-                return Err(Failure::Crashed(crashed(&tmp, false)));
+                return Err(Failure::Crashed(crashed(&tmp, None)));
             }
             let mut sum = Hasher::new();
             run_parts(run, |bytes| {
@@ -406,10 +466,10 @@ fn write_runs(
         });
     }
     sync_dir(&runs_dir).map_err(io_error(&runs_dir))?;
-    let manifest = written.manifest.encode();
-    let total = written.bytes.saturating_add(manifest.len() as u64);
     let path = checkpoint_dir(dir, generation);
     let file = path.join(MANIFEST);
+    let manifest = written.manifest.encode().map_err(io_error(&file))?;
+    let total = written.bytes.saturating_add(manifest.len() as u64);
     write_synced(&file, &manifest)?;
     written.bytes = total;
     crash_point!(Crash::BeforeManifestSync, &file);
@@ -451,24 +511,20 @@ impl Core {
         let _ = fs::remove_file(dir.join(CURRENT_TMP));
         let path = checkpoint_dir(dir, generation);
         fs::create_dir(&path).map_err(io_error(&path))?;
-        let built = self
-            .checkpoint_image()
-            .map_err(Failure::Error)
-            .and_then(|image| {
-                #[cfg(test)]
-                AFTER_IMAGE.with(|hook| {
-                    if let Some(hook) = hook.borrow_mut().take() {
-                        hook();
-                    }
-                });
-                write_runs(
-                    &image,
-                    dir,
-                    generation,
-                    previous.as_ref().map_or(0, |m| m.generation),
-                    metadata,
-                )
-            });
+        let image = self.checkpoint_image();
+        #[cfg(test)]
+        AFTER_IMAGE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let built = write_runs(
+            &image,
+            dir,
+            generation,
+            previous.as_ref().map_or(0, |m| m.generation),
+            metadata,
+        );
         let written = match built {
             Ok(written) => written,
             Err(Failure::Error(error)) => {
@@ -483,48 +539,62 @@ impl Core {
         #[cfg(test)]
         if crash(Crash::BeforeRename) {
             write_synced(&tmp, &current)?;
-            return Err(crashed(&tmp, false));
+            return Err(crashed(&tmp, None));
         }
-        let committed = write_synced(&tmp, &current)
-            .and_then(|()| fs::rename(&tmp, dir.join(CURRENT)).map_err(io_error(dir)));
-        if let Err(error) = committed {
+        write_synced(&tmp, &current).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
             let _ = fs::remove_dir_all(&path);
-            return Err(error);
+        })?;
+        if let Err(error) = rename_current(&tmp, dir) {
+            // A rename can report an error after it took effect. If CURRENT
+            // names the new generation, the commit is done: removing that
+            // generation would lose the checkpoint, and reclamation waits
+            // for the next one. If CURRENT cannot be read back, the outcome
+            // is unknown, so the new generation is kept and reported as not
+            // committed; the next commit reclaims it unless CURRENT names it.
+            let named = current_generation(dir);
+            let after_commit_point = named == Some(generation);
+            if after_commit_point {
+                let _ = sync_dir(dir);
+            } else {
+                let _ = fs::remove_file(&tmp);
+                if named.is_some() {
+                    let _ = fs::remove_dir_all(&path);
+                }
+            }
+            return Err(CheckpointError::Io {
+                path: dir.to_owned(),
+                error,
+                committed: after_commit_point
+                    .then(|| Box::new(written.report(generation, 0, 0, 0))),
+            });
         }
         #[cfg(test)]
         if crash(Crash::AfterRename) {
-            return Err(crashed(dir, true));
+            return Err(crashed(
+                dir,
+                Some(Box::new(written.report(generation, 0, 0, 0))),
+            ));
         }
         if let Err(error) = sync_dir(dir) {
             return Err(CheckpointError::Io {
                 path: dir.to_owned(),
                 error,
-                after_commit_point: true,
+                committed: Some(Box::new(written.report(generation, 0, 0, 0))),
             });
         }
         #[cfg(test)]
         if crash(Crash::BeforeReclaim) {
-            return Err(crashed(dir, true));
+            return Err(crashed(
+                dir,
+                Some(Box::new(written.report(generation, 0, 0, 0))),
+            ));
         }
         let (files_deleted, reclaimed, unreclaimed) =
             reclaim(dir, &found, &written.manifest, previous.as_ref());
         let _ = sync_dir(&dir.join(RUNS));
         let _ = sync_dir(dir);
-        Ok(CheckpointReport {
-            generation,
-            last_seq: written.manifest.last_seq,
-            records: written.manifest.records,
-            runs: written.manifest.runs.len(),
-            bytes_written: written.bytes,
-            bytes_reused: written.bytes_reused,
-            runs_written: written.runs_written,
-            runs_reused: written.runs_reused,
-            files_deleted: files_deleted + written.files_deleted,
-            largest_run_bytes: written.largest_run_bytes,
-            reclaimed,
-            unreclaimed,
-        })
+        Ok(written.report(generation, files_deleted, reclaimed, unreclaimed))
     }
 }
 

@@ -145,7 +145,9 @@ pub(super) fn check_version(bytes: &[u8]) -> Result<(), Damage> {
 }
 
 impl Manifest {
-    pub(super) fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> io::Result<Vec<u8>> {
+        let run_count = u32::try_from(self.runs.len())
+            .map_err(|_| io::Error::other("manifest run count exceeds u32::MAX"))?;
         let bounds_len: usize = self
             .runs
             .iter()
@@ -187,7 +189,7 @@ impl Manifest {
             self.next_keyspace,
             self.keyspaces.len() as u32,
             table_len as u32,
-            self.runs.len() as u32,
+            run_count,
         ] {
             bytes.extend_from_slice(&n.to_le_bytes());
         }
@@ -225,7 +227,7 @@ impl Manifest {
         bytes.extend_from_slice(metadata);
         let sum = crc(&[&bytes]);
         bytes.extend_from_slice(&sum.to_le_bytes());
-        bytes
+        Ok(bytes)
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, Damage> {

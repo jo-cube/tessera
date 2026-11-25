@@ -143,11 +143,11 @@ Start from `Options::default()` and set the fields to change.
 
 | Option | Default | What it trades |
 | --- | --- | --- |
-| `memory_limit` | none | A budget for writes: near it writers wait for compaction, at it they fail with `MemoryLimit`. Not a cap on process memory. |
+| `memory_limit` | none | A budget for writes: near it writers wait for compaction, at it they fail with `MemoryLimit`. Not a cap on process memory. At least 2 MiB. |
 | `memtable_size` | 64 MiB | Bytes buffered before a flush. Larger flushes less often but holds up to three tables' worth in memory. It also caps one record. |
 | `level_ratio` | 10 | Size ratio between levels. Larger favours reads and memory; smaller rewrites less on writes. |
 | `background_threads` | half the CPUs, 1–4 | Threads building one compaction. More gives faster writes for more CPU and transient memory. |
-| `compression` | `Zstd` | `Uncompressed` stores 16 KiB raw blocks: less CPU, much more memory. |
+| `compression` | `Zstd` | `ZstdFastDecode` leaves literals uncompressed: faster reads, somewhat more memory. `Uncompressed` stores 16 KiB raw blocks: less CPU, much more memory. |
 | `block_size` | 1 KiB | Target **stored** bytes of a block after compression, not raw bytes. Smaller blocks decode less per point read and compress worse. |
 
 ## Documentation

@@ -6,7 +6,7 @@
 //!
 //! `counters [--variant LABEL] [--settle] [--scale SHIFT] [--copy-audit]
 //! [--c2] [--dict-scope] [--write-only] [--memtable VALUE_LEN]
-//! [--memtable-key KEY_LEN] [--worst] [--zipf] [--read-shapes] [--keyspaces N]
+//! [--memtable-key KEY_LEN] [--worst] [--zipf] [--read-shapes] [--reuse] [--keyspaces N]
 //! [SCENARIO...]`
 //!
 //! With `--keyspaces N`, record `i` goes to keyspace `i % N`, so the same
@@ -17,7 +17,7 @@ use std::time::Instant;
 use tessera::diagnostics::{
     self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics, SegmentSample,
 };
-use tessera::{Engine, Keyspace, Options};
+use tessera::{Compression, Engine, Keyspace, Options};
 
 pub(crate) mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -46,6 +46,8 @@ impl Rng {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Grouped,
+    /// Grouped JSON whose members share their group's random strings.
+    GroupedRandom,
     Weak,
     Small,
 }
@@ -60,7 +62,7 @@ fn key_bytes(i: usize, kind: Kind) -> Vec<u8> {
             key[16..20].copy_from_slice(&((i % 4) as u32).to_be_bytes());
             key
         }
-        Kind::Grouped | Kind::Weak => {
+        Kind::Grouped | Kind::GroupedRandom | Kind::Weak => {
             let mut key = vec![0u8; 16];
             key[..8].copy_from_slice(&(i as u64 / MEMBERS as u64).to_be_bytes());
             key[8..16].copy_from_slice(&(i as u64 % MEMBERS as u64).to_be_bytes());
@@ -86,6 +88,7 @@ fn value(i: usize, version: u8, kind: Kind, len: usize) -> Vec<u8> {
             )
             .into_bytes()
         }
+        Kind::GroupedRandom => grouped_random(i, version),
         Kind::Weak => {
             let mut rng = Rng(
                 (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (u64::from(version) << 40)
@@ -115,6 +118,44 @@ fn value(i: usize, version: u8, kind: Kind, len: usize) -> Vec<u8> {
             out
         }
     }
+}
+/// The comparison harness's grouped JSON (dataset A): 360-, 260- and 60-byte
+/// random strings shared by the group's members, then per-member fields and a
+/// random token. Updates redraw the timestamp, quantity, price, status and
+/// token. Groups have `MEMBERS` members.
+fn grouped_random(i: usize, version: u8) -> Vec<u8> {
+    fn text(rng: &mut Rng, n: usize) -> String {
+        (0..n)
+            .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[rng.next() as usize % 36] as char)
+            .collect()
+    }
+    let (group, member) = (i / MEMBERS, i % MEMBERS);
+    let mut shared = Rng((group as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let (a, b, c) = (
+        text(&mut shared, 360),
+        text(&mut shared, 260),
+        text(&mut shared, 60),
+    );
+    let mut rng =
+        Rng((i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (u64::from(version) << 40));
+    const STATUS: [&str; 3] = ["active", "pending", "paused"];
+    let (ts, q, p, st) = if version == 0 {
+        (
+            1_700_000_000 + member,
+            member % 17,
+            1000 + member % 250,
+            member % 3,
+        )
+    } else {
+        let mut n = |m: u64| (rng.next() % m) as usize;
+        (1_700_086_400 + n(86_400), n(17), 1000 + n(250), n(3))
+    };
+    let token = text(&mut rng, 8);
+    format!(
+        r#"{{"group_id":{group},"description":"{a}","attributes":"{b}","category_text":"{c}","member_id":{member},"timestamp":{ts},"quantity":{q},"price":{p},"status":"{}","token":"{token}","preferences":{{"notifications":true,"locale":"en-US","timezone":"UTC","delivery":"standard","visibility":"members","version":1}},"source":"synthetic-group-members","kind":"membership-record"}}"#,
+        STATUS[st]
+    )
+    .into_bytes()
 }
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
@@ -147,7 +188,9 @@ struct Flags {
     worst: bool,
     zipf: bool,
     read_shapes: bool,
+    reuse: bool,
     keyspaces: usize,
+    compression: Compression,
 }
 
 impl Default for Flags {
@@ -161,7 +204,9 @@ impl Default for Flags {
             worst: false,
             zipf: false,
             read_shapes: false,
+            reuse: false,
             keyspaces: 1,
+            compression: Compression::Zstd,
         }
     }
 }
@@ -541,6 +586,152 @@ fn probe_zipf_reads(
     }
 }
 
+/// Per-entry charge of a simulated record cache beyond key and value bytes.
+const RECORD_OVERHEAD: usize = 64;
+
+/// On the settled tree: work per get for uniform hits and in-range misses and
+/// for Zipf hits and misses (absent keys drawn over a miss space as large as
+/// the live set), then byte-capacity cache curves. The block cache is charged
+/// decoded bytes; the record cache key + value + `RECORD_OVERHEAD`, and the
+/// negative cache key + `RECORD_OVERHEAD`. Each reuse stream holds ten times
+/// the largest capacity's entry count; the first half warms the caches.
+fn probe_reuse(
+    engine: &Engine,
+    ks: &Keyspace,
+    s: &Scenario,
+    variant: &str,
+    expect: &dyn Fn(usize) -> Vec<u8>,
+) {
+    settle_bottom(engine);
+    let (name, kind, records) = (s.name, s.kind, s.records);
+    let (depth, run_map) = diagnostics::run_levels(engine);
+    let stored = engine.engine_stats().run_bytes as f64;
+    let charge = |i: usize, miss: bool| {
+        key_bytes(i, kind).len() + RECORD_OVERHEAD + if miss { 1 } else { expect(i).len() }
+    };
+    let mean = |miss| (0..1024).map(|i| charge(i, miss)).sum::<usize>() as f64 / 1024.0;
+    let length = |miss| 10 * (zipf::CAPACITY_MIB[4] * f64::from(1u32 << 20) / mean(miss)) as usize;
+    let long = length(false);
+    println!(
+        "reuse_meta,{name},{variant},{records},{:.1},{long},{stored}",
+        mean(false)
+    );
+    let emit = |cache: &str, workload: &str, theta: f64, curves: &zipf::Curves| {
+        for (policy, hits) in ["lru", "s3fifo"].iter().zip(&curves.hits) {
+            for (at, &mib) in zipf::CAPACITY_MIB.iter().enumerate() {
+                let pct = 100.0 * mib * f64::from(1u32 << 20) / stored;
+                let (rate, n) = (ratio(hits[at], curves.counted as u64), curves.counted);
+                println!(
+                    "reuse,{name},{variant},{cache},{workload},{theta:.2},{policy},{mib},{pct:.3},{rate:.4},{n}"
+                );
+            }
+        }
+    };
+    let seed = |theta: f64, miss: bool| 0x7265_7573_6500 ^ theta.to_bits() ^ u64::from(miss);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&seen);
+    let mut reader = engine.reader();
+    diagnostics::with_block_observer(Box::new(move |ev| sink.borrow_mut().push(ev)), || {
+        let streams = [
+            ("uniform_hit", 0.0, false),
+            ("uniform_miss", 0.0, true),
+            ("zipf_miss", 0.99, true),
+            ("zipf_hit", 0.99, false),
+            ("zipf_hit", 0.80, false),
+        ];
+        for (stream, theta, miss) in streams {
+            let reuse = stream == "zipf_hit";
+            let gets = if reuse { long } else { 50_000 };
+            let zipf = (theta > 0.0)
+                .then(|| zipf::ScrambledZipfian::new(records, theta, seed(theta, miss)));
+            let mut rng = Rng(seed(theta, miss));
+            let before = reader.counters();
+            let mut levels = vec![(0u64, 0u64); depth + 1];
+            let mut curves = zipf::Curves::new(if reuse { gets * (depth + 1) } else { 0 });
+            for at in 0..gets {
+                let i = zipf
+                    .as_ref()
+                    .map_or(at * 7919 % (records - usize::from(miss)), |z| {
+                        z.sample(rng.unit())
+                    });
+                let mut key = key_bytes(i, kind);
+                if miss {
+                    key.push(0);
+                    assert!(reader.get(ks, &key).unwrap().is_none());
+                } else {
+                    assert_eq!(reader.get(ks, &key).unwrap().unwrap(), expect(i));
+                }
+                let mut all = [[true; 5]; 2];
+                for ev in seen.borrow_mut().drain(..) {
+                    let level = run_map.get(&ev.run_id).copied().unwrap_or(depth);
+                    levels[level].0 += 1;
+                    levels[level].1 += ev.decoded_bytes as u64;
+                    if reuse {
+                        let block = ((ev.run_id as u64) << 32) | ev.block as u64;
+                        let hit = curves.access(block, ev.decoded_bytes as u32);
+                        all.iter_mut()
+                            .flatten()
+                            .zip(hit.iter().flatten())
+                            .for_each(|(a, h)| *a &= h);
+                    }
+                }
+                curves.count(all, at >= gets / 2);
+            }
+            let c = reader.counters();
+            let per = |a: u64, b: u64| (a - b) as f64 / gets as f64;
+            println!(
+                "get_work,{name},{variant},{stream},{theta:.2},{gets},{:.4},{:.1},{:.1},{:.4}",
+                per(c.blocks_loaded, before.blocks_loaded),
+                per(c.decoded_bytes, before.decoded_bytes),
+                per(c.crc_bytes, before.crc_bytes),
+                per(c.filter_probes, before.filter_probes),
+            );
+            for (level, &(blocks, bytes)) in levels.iter().enumerate() {
+                println!(
+                    "get_work_level,{name},{variant},{stream},{theta:.2},{},{:.4},{:.1},{:.1}",
+                    level_label(level, depth),
+                    blocks as f64 / gets as f64,
+                    bytes as f64 / gets as f64,
+                    ratio(bytes, blocks),
+                );
+            }
+            if reuse {
+                emit("block", "read", theta, &curves);
+            }
+        }
+    });
+    // Record and negative caches need only key indices and sizes. The read
+    // streams repeat the block-cache streams; an update removes the record.
+    for (workload, theta, write_pct, miss) in [
+        ("read", 0.99, 0, false),
+        ("read", 0.80, 0, false),
+        ("mix_95_5", 0.99, 5, false),
+        ("mix_50_50", 0.99, 50, false),
+        ("miss", 0.99, 0, true),
+    ] {
+        let draw = zipf::ScrambledZipfian::new(records, theta, seed(theta, miss));
+        let mut rng = Rng(seed(theta, miss));
+        let mut writes = Rng(0x7570_6461_7465 ^ write_pct);
+        let n = length(miss);
+        let mut curves = zipf::Curves::new(n);
+        for at in 0..n {
+            let i = draw.sample(rng.unit());
+            if writes.next() % 100 < write_pct {
+                curves.invalidate(i as u64);
+            } else {
+                let hit = curves.access(i as u64, charge(i, miss) as u32);
+                curves.count(hit, at >= n / 2);
+            }
+        }
+        emit(
+            if miss { "negative" } else { "record" },
+            workload,
+            theta,
+            &curves,
+        );
+    }
+}
+
 /// One row per audited bottom input segment, then the bottom work totals.
 fn print_copy_audit(name: &str, variant: &str) {
     let (segments, other_raw) = diagnostics::take_copy_audit();
@@ -596,6 +787,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                     .expect("memtable size fits usize");
             }
             options.background_threads = threads;
+            options.compression = flags.compression;
             options
         })
         .unwrap(),
@@ -775,7 +967,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let depth = levels.len() - 1;
     for (level, m) in levels.iter().enumerate() {
         println!(
-            "level,{name},{variant},{level}{},{},{},{},{},{},{},{},{},{},{}",
+            "level,{name},{variant},{level}{},{},{},{},{},{},{},{},{},{},{},{}",
             if level == depth { "-bottom" } else { "" },
             m.runs,
             m.records,
@@ -786,7 +978,8 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
             m.index,
             m.filters,
             m.footer,
-            m.physical
+            m.physical,
+            m.blocks
         );
     }
     emit_per_record(name, variant, &levels);
@@ -833,6 +1026,9 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         }
         if flags.zipf {
             probe_zipf_reads(&engine, ks, s, variant, "post_update", &expect);
+        }
+        if flags.reuse {
+            probe_reuse(&engine, ks, s, variant, &expect);
         }
     }
     if flags.zipf && single {
@@ -911,7 +1107,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         let depth = levels.len() - 1;
         for (level, m) in levels.iter().enumerate() {
             println!(
-                "level,{name},{variant}+settled,{level}{},{},{},{},{},{},{},{},{},{},{}",
+                "level,{name},{variant}+settled,{level}{},{},{},{},{},{},{},{},{},{},{},{}",
                 if level == depth { "-bottom" } else { "" },
                 m.runs,
                 m.records,
@@ -922,7 +1118,8 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                 m.index,
                 m.filters,
                 m.footer,
-                m.physical
+                m.physical,
+                m.blocks
             );
         }
         emit_per_record(name, &format!("{variant}+settled"), &levels);
@@ -1064,12 +1261,21 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             "--worst" => flags.worst = true,
             "--zipf" => flags.zipf = true,
             "--read-shapes" => flags.read_shapes = true,
+            "--reuse" => flags.reuse = true,
             "--keyspaces" => {
                 flags.keyspaces = args.next().expect("N").parse().expect("positive N");
                 assert!(flags.keyspaces > 0, "--keyspaces needs at least 1");
             }
             "--memtable" => memtable = Some(args.next().expect("VALUE_LEN").parse().unwrap()),
             "--memtable-key" => memtable_key = args.next().expect("KEY_LEN").parse().unwrap(),
+            "--compression" => {
+                flags.compression = match args.next().as_deref() {
+                    Some("zstd") => Compression::Zstd,
+                    Some("fast-decode") => Compression::ZstdFastDecode,
+                    Some("uncompressed") => Compression::Uncompressed,
+                    other => panic!("--compression zstd|fast-decode|uncompressed, not {other:?}"),
+                }
+            }
             _ => names.push(arg),
         }
     }
@@ -1079,6 +1285,13 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             kind: Kind::Grouped,
             records: 2_097_152 >> scale,
             value_len: 600,
+            clustered: false,
+        },
+        Scenario {
+            name: "grouped-random",
+            kind: Kind::GroupedRandom,
+            records: 1_048_576 >> scale,
+            value_len: 0,
             clustered: false,
         },
         Scenario {
@@ -1139,7 +1352,7 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
     );
     println!("erasure,scenario,variant,records,erased,probes,kept_unfiltered,kept_filtered");
     println!(
-        "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"
+        "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical,blocks"
     );
     println!(
         "per_record,scenario,variant,records,raw_per_rec,stored_per_rec,frames_per_rec,dicts_per_rec,seg_table_per_rec,index_per_rec,filters_per_rec,footer_per_rec,physical_per_rec,total_per_rec"
@@ -1174,16 +1387,29 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             "zipf_update,scenario,variant,theta,updates,raw_in_delta,raw_out_delta,stored_out_delta,copy_blocks_delta,copy_input_blocks_delta,run_bytes,held_bytes,hit_decoded_per_get"
         );
     }
+    if flags.reuse {
+        println!(
+            "get_work,scenario,variant,stream,theta,gets,blocks_per_get,decoded_per_get,crc_per_get,filter_probes_per_get"
+        );
+        println!(
+            "get_work_level,scenario,variant,stream,theta,level,blocks_per_get,decoded_per_get,mean_block_raw"
+        );
+        println!(
+            "reuse,scenario,variant,cache,workload,theta,policy,capacity_mib,pct_stored,hit_rate,accesses"
+        );
+        println!("reuse_meta,scenario,variant,records,mean_record_charge,stream_len,run_bytes");
+    }
     if settle {
         println!(
             "settled,scenario,variant,run_bytes,held_bytes,hit_decoded_per_get,blocks_per_100_record_scan"
         );
     }
     for s in &scenarios {
-        if (names.is_empty() && !s.clustered) || names.iter().any(|n| n == s.name) {
+        let default = !s.clustered && s.kind != Kind::GroupedRandom;
+        if (names.is_empty() && default) || names.iter().any(|n| n == s.name) {
             eprintln!(
-                "config,{},{variant},records={},background_threads={threads}",
-                s.name, s.records
+                "config,{},{variant},records={},background_threads={threads},compression={:?}",
+                s.name, s.records, flags.compression
             );
             run(s, &variant, settle, threads, &flags);
         }

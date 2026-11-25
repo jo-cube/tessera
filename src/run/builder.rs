@@ -10,7 +10,7 @@
 //! compress its other blocks as they are cut.
 
 use super::OutputBudget;
-use super::codec::{Codec, Compressor};
+use super::codec::{Codec, Compressor, Encoding};
 use super::dictionary::{
     self, SAMPLE_LEN, SCOPE_MAX_RAW_MULTIPLE, SCOPE_STORED_MULTIPLE, SEGMENT_RAW_LEN, Segment,
 };
@@ -101,7 +101,7 @@ struct OpenSegment {
 
 #[derive(Debug)]
 enum SegmentMode {
-    Inherited { dictionary: Vec<u8> },
+    Inherited(Vec<u8>),
     Continued(Continuation),
 }
 
@@ -130,22 +130,26 @@ impl Default for RunBuilder {
     }
 }
 impl RunBuilder {
-    pub fn new(codec: Codec) -> Self {
-        Self::with_target_block_compressed(codec, TARGET_BLOCK_COMPRESSED)
+    pub fn new(encoding: impl Into<Encoding>) -> Self {
+        Self::with_target_block_compressed(encoding, TARGET_BLOCK_COMPRESSED)
     }
-    pub fn with_target_block_compressed(codec: Codec, target: usize) -> Self {
+    pub fn with_target_block_compressed(encoding: impl Into<Encoding>, target: usize) -> Self {
+        Self::in_pool(encoding, target, &ChunkPool::new(0))
+    }
+    pub(crate) fn in_pool(encoding: impl Into<Encoding>, target: usize, pool: &ChunkPool) -> Self {
+        let encoding = encoding.into();
         Self {
             target: target.clamp(1, RAW_BLOCK_CAP),
             segment_len: SEGMENT_RAW_LEN,
             raw_target: None,
-            block_target: (codec == Codec::None).then_some(TARGET_BLOCK_LEN),
-            compressor: Compressor::new(codec),
+            block_target: (encoding.codec == Codec::None).then_some(TARGET_BLOCK_LEN),
+            compressor: Compressor::new(encoding),
             block: BlockBuilder::new(),
             last_seq: 0,
             pending_key_bytes: 0,
             pending_blocks: Vec::new(),
             frames: Vec::new(),
-            storage: Packing::new(&ChunkPool::new(0)),
+            storage: Packing::new(pool),
             scratch: Vec::new(),
             segments: Vec::new(),
             table: Vec::new(),
@@ -166,15 +170,10 @@ impl RunBuilder {
             open: None,
         }
     }
-    pub(crate) fn in_pool(codec: Codec, target: usize, pool: &ChunkPool) -> Self {
-        let mut builder = Self::with_target_block_compressed(codec, target);
-        builder.storage = Packing::new(pool);
-        builder
-    }
     /// Fixed targets used by physical reader tests, including tiny blocks.
     #[cfg(test)]
-    pub fn with_raw_block_target(codec: Codec, target: usize) -> Self {
-        let mut builder = Self::new(codec);
+    pub fn with_raw_block_target(encoding: impl Into<Encoding>, target: usize) -> Self {
+        let mut builder = Self::new(encoding);
         builder.raw_target = Some(target.clamp(1, RAW_BLOCK_CAP));
         builder.block_target = builder.raw_target;
         builder
@@ -345,7 +344,7 @@ impl RunBuilder {
         matches!(
             self.open,
             Some(OpenSegment {
-                mode: SegmentMode::Inherited { .. },
+                mode: SegmentMode::Inherited(_),
                 ..
             })
         )
@@ -379,9 +378,7 @@ impl RunBuilder {
         self.compressor.begin_segment(dictionary, target);
         self.block_target = Some(target);
         self.open = Some(OpenSegment {
-            mode: SegmentMode::Inherited {
-                dictionary: dictionary.to_vec(),
-            },
+            mode: SegmentMode::Inherited(dictionary.to_vec()),
             reference: None,
             raw: 0,
             raw_cap,
@@ -424,7 +421,7 @@ impl RunBuilder {
         let Some(open) = &self.open else {
             return Ok(false);
         };
-        if !matches!(open.mode, SegmentMode::Inherited { .. }) {
+        if !matches!(open.mode, SegmentMode::Inherited(_)) {
             return Ok(false);
         }
         if self.output_refused
@@ -509,7 +506,7 @@ impl RunBuilder {
         if let Some(reference) = open.reference {
             return Some(reference);
         }
-        let SegmentMode::Inherited { dictionary } = &open.mode else {
+        let SegmentMode::Inherited(dictionary) = &open.mode else {
             unreachable!("continued segments assign their reference on cut");
         };
         let len = dictionary.len();
@@ -517,17 +514,18 @@ impl RunBuilder {
             return None;
         }
         let open = self.open.as_mut().expect("checked above");
-        let SegmentMode::Inherited { dictionary } = &open.mode else {
+        let SegmentMode::Inherited(dictionary) = &mut open.mode else {
             unreachable!("checked above");
         };
+        let dictionary = std::mem::take(dictionary);
         let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
         assert!(id < 1 << 24, "segment reference fits in 24 bits");
         self.segments
             .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
         self.segments.extend_from_slice(&(len as u32).to_le_bytes());
         self.segments
-            .extend_from_slice(&crc32fast::hash(dictionary).to_le_bytes());
-        self.storage.dictionary(dictionary);
+            .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
+        self.storage.dictionary(&dictionary);
         open.reference = Some(id as u32);
         Some(id as u32)
     }
@@ -732,7 +730,7 @@ impl RunBuilder {
         let close = if let Some(open) = &mut self.open {
             open.raw += len;
             match &mut open.mode {
-                SegmentMode::Inherited { .. } => false,
+                SegmentMode::Inherited(_) => false,
                 SegmentMode::Continued(c) => {
                     c.stored += stored_len;
                     c.window_raw += len;

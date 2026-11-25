@@ -38,6 +38,7 @@ fi
 {
   echo "RAM disk: $disk_gib GiB (0 means none)"
   echo "Tessera level ratio: ${TESSERA_BENCH_LEVEL_RATIO:-default}"
+  echo "Tessera compression: ${TESSERA_BENCH_COMPRESSION:-zstd}"
   echo "date: $(date '+%Y-%m-%d %H:%M:%S %z')"
   echo "sha: $(git -C "$root" rev-parse HEAD) (branch $(git -C "$root" branch --show-current), $(git -C "$root" status --porcelain | wc -l | tr -d ' ') uncommitted paths)"
   echo "machine: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.physicalcpu) cores ($(sysctl -n hw.perflevel0.physicalcpu)P+$(sysctl -n hw.perflevel1.physicalcpu)E), $(( $(sysctl -n hw.memsize) >> 30 )) GiB"

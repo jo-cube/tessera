@@ -1202,7 +1202,7 @@ fn split_flush(tables: &[&FrozenMemtable], target: usize, cuts: &FlushCuts) -> V
     let mut spaces = flush_merged(
         tables,
         target,
-        Codec::None,
+        Codec::None.into(),
         TARGET_BLOCK_LEN,
         &[FlushSpace { prefix: &[], cuts }],
         &crate::chunk::ChunkPool::new(0),
@@ -1394,7 +1394,7 @@ fn a_flush_splits_spaces_strips_prefixes_and_leaves_out_the_rest() {
     let built = flush_merged(
         &[&older, &newer],
         TARGET_RUN_LEN,
-        Codec::None,
+        Codec::None.into(),
         TARGET_BLOCK_LEN,
         &spaces,
         &crate::chunk::ChunkPool::new(0),

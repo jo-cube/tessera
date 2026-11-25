@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod boundary;
+
 const KEYS: u16 = 256;
 fn options() -> Options {
     Options {
@@ -113,8 +115,12 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
         let held = engine.snapshot();
         let guard = engine.core.read_state();
         resume_tx.send(()).unwrap();
+        crate::test_support::wait_until(|| {
+            engine.core.waiting_writers.load(Ordering::Acquire) > 0
+                && engine.core.gate.try_lock().is_err()
+        });
         assert!(
-            ready_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            ready_rx.try_recv().is_err(),
             "publication waits for the state lock"
         );
         drop(guard);
@@ -570,5 +576,227 @@ fn piecewise_compaction_and_ingestion_record_diagnostics() {
     assert!(
         after[2] > before[2],
         "ingestion should record stored output"
+    );
+}
+
+/// Levels and the run set agree, every key reads once with its newest
+/// value, and no build charge is left behind.
+fn assert_valid_after_abandon(engine: &Engine) {
+    {
+        let state = engine.core.read_state();
+        state.only().levels.check(&state.only().runs);
+        assert_eq!(
+            state.level0_flushes,
+            state.only().levels.level0_flushes(),
+            "the published level-0 count follows the levels"
+        );
+    }
+    assert_eq!(engine.engine_stats().build_output_bytes, 0);
+    assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
+    check(&engine.snapshot(), &engine.ks(), ones);
+}
+
+#[test]
+fn a_panic_after_two_serial_pieces_keeps_them_and_the_next_job_completes() {
+    let engine = fixture();
+    let before = engine.snapshot();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    // The third build panics outside the state lock, after two publications.
+    *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 2 {
+            panic!("injected piece build failure");
+        }
+    }));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.compact(&mut MergeWorkspace::new())
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    *engine.core.after_build.lock().unwrap() = None;
+    {
+        let state = engine.core.read_state();
+        // Two bottom inputs were replaced; the source remains as one sliced view.
+        assert!(state.only().levels.runs()[0].iter().any(|r| {
+            r.run
+                .slice()
+                .is_some_and(|(min, _)| min == 64u16.to_be_bytes())
+        }));
+    }
+    assert_valid_after_abandon(&engine);
+    check(&before, &engine.ks(), ones);
+    // The state lock is not poisoned and the next jobs finish the range.
+    engine.ks().put(&7u16.to_be_bytes(), &[1; 128]).unwrap();
+    while engine
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    assert_valid_after_abandon(&engine);
+}
+
+#[test]
+fn a_panicking_concurrent_piece_leaves_a_valid_tree_and_the_next_job_completes() {
+    let engine = fixture_with_threads(4);
+    engine
+        .core
+        .piece_output_budget
+        .store(32 << 10, Ordering::Relaxed);
+    let before = engine.snapshot();
+    // Whichever other pieces publish first, the outcome below is the same.
+    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(|index| {
+        if index == 2 {
+            panic!("injected concurrent piece failure");
+        }
+    }));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.compact(&mut MergeWorkspace::new())
+    }));
+    assert!(unwound.is_err());
+    *engine.core.before_piece.lock().unwrap() = None;
+    assert_valid_after_abandon(&engine);
+    check(&before, &engine.ks(), ones);
+    let scratch = Scratch::new("panicked-concurrent-piece");
+    engine.checkpoint_to(&scratch.0).unwrap();
+    let recovered = Engine::open(&scratch.0, options()).unwrap();
+    check(&recovered.snapshot(), &recovered.ks(), ones);
+    while engine
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    assert_valid_after_abandon(&engine);
+}
+
+/// The charge held while sources are split covers what bounding them keeps.
+#[test]
+fn a_read_charge_covers_bounding_every_input() {
+    let engine = fixture();
+    let job = engine
+        .core
+        .begin_job(CompactionPolicy {
+            max_overlap: 1,
+            ..CompactionPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+    let charge = job.read_charge(&job.inputs);
+    let charged = engine.engine_stats().build_workspace_bytes;
+    let mut reader = crate::run::ReadWorkspace::new();
+    for run in &job.inputs {
+        for key in (0..KEYS).step_by(17) {
+            let key = key.to_be_bytes();
+            run.run.bounded(Some(&key), None, &mut reader).unwrap();
+            run.run.bounded(None, Some(&key), &mut reader).unwrap();
+        }
+    }
+    let held = reader.capacity() + reader.context_bytes();
+    assert!(
+        0 < held && held <= charged,
+        "held {held}, charged {charged}"
+    );
+    drop(charge);
+    assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
+}
+
+/// What `pinned` alone keeps, each storage once, equals what the state
+/// counts as retained.
+fn assert_retained_exact(engine: &Engine, pinned: &[SharedRun]) {
+    let state = engine.core.read_state();
+    let live: HashSet<_> = state
+        .only()
+        .runs
+        .iter()
+        .map(|run| run.run.storage_id())
+        .collect();
+    let expected = physical_runs(pinned)
+        .filter(|run| !live.contains(&run.run.storage_id()))
+        .fold((0, 0), |(stored, held), run| {
+            (stored + run.run.stored_len(), held + run.run.held_bytes())
+        });
+    let retained = state.retained();
+    assert_eq!((retained.run_bytes, retained.held_bytes), expected);
+}
+
+/// Concurrent pieces publish aliases of each source, sharing its storage,
+/// without retiring it. A snapshot holding the sources and every bottom run
+/// is counted exactly at each piece and after the job.
+#[test]
+fn retained_bytes_stay_exact_while_split_aliases_and_a_snapshot_coexist() {
+    enum Step {
+        Piece,
+        Done,
+    }
+    struct SendsDone(mpsc::Sender<Step>);
+    impl Drop for SendsDone {
+        fn drop(&mut self) {
+            let _ = self.0.send(Step::Done);
+        }
+    }
+    let engine = fixture_with_threads(4);
+    let pinned = engine.core.read_state().only().runs.clone();
+    let before = engine.snapshot();
+    let (step, steps) = mpsc::channel();
+    let (go, gate) = mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let piece = step.clone();
+    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(move |_| {
+        piece.send(Step::Piece).unwrap();
+        gate.lock().unwrap().recv().unwrap();
+    }));
+    let pieces = std::thread::scope(|scope| {
+        let done = SendsDone(step);
+        let engine = &engine;
+        scope.spawn(move || {
+            let _done = done;
+            engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+        });
+        let mut pieces = 0;
+        while let Step::Piece = steps.recv().unwrap() {
+            pieces += 1;
+            if pieces == 1 {
+                let state = engine.core.read_state();
+                let runs = &state.only().runs;
+                assert!(
+                    physical_runs(runs).count() < runs.len(),
+                    "aliases share storage"
+                );
+            }
+            assert_retained_exact(engine, &pinned);
+            go.send(()).unwrap();
+        }
+        pieces
+    });
+    assert!(pieces > 1, "the job ran in {pieces} pieces");
+    assert_retained_exact(&engine, &pinned);
+    assert!(engine.engine_stats().retained_run_bytes > 0);
+    drop((before, pinned));
+    assert_eq!(engine.engine_stats().retained_run_bytes, 0);
+}
+
+#[test]
+fn split_views_count_physical_input_bytes_once() {
+    let engine = fixture_with_threads(4);
+    engine.core.piece_output_budget.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        engine.compact(&mut MergeWorkspace::new()),
+        Err(CompactionError::OutputLimit { .. })
+    ));
+    engine.core.piece_output_budget.store(0, Ordering::Relaxed);
+    engine.ks().put(&0u16.to_be_bytes(), &[2; 128]).unwrap();
+    engine
+        .ks()
+        .put(&(KEYS - 1).to_be_bytes(), &[2; 128])
+        .unwrap();
+    engine.flush().unwrap();
+    let stats = engine.engine_stats();
+    let report = engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+    assert_eq!(
+        report.input_bytes, stats.run_bytes,
+        "split views of one physical run must not be counted repeatedly"
+    );
+    assert_eq!(
+        report.input_held_bytes, stats.held_bytes,
+        "split views of one physical run must not count held bytes repeatedly"
     );
 }

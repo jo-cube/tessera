@@ -91,6 +91,8 @@ struct Progress {
     quiet_pending: Option<WriteActivity>,
     #[cfg(test)]
     clock: Option<Instant>,
+    #[cfg(test)]
+    parked: bool,
 }
 
 impl Progress {
@@ -155,6 +157,15 @@ impl Signal {
     #[cfg(test)]
     pub(super) fn stop_requested(&self) -> bool {
         self.lock().stop
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_idle_parked(&self) -> bool {
+        let progress = self.lock();
+        progress.parked
+            && !progress.status.busy
+            && progress.requested == progress.started
+            && progress.quiet.is_none()
     }
 
     /// Requests a pass and waits until `room` holds, a pass started after
@@ -239,7 +250,15 @@ impl Signal {
                 break None;
             }
             let Some((deadline, activity)) = progress.quiet else {
+                #[cfg(test)]
+                {
+                    progress.parked = true;
+                }
                 progress = self.wait_on(progress);
+                #[cfg(test)]
+                {
+                    progress.parked = false;
+                }
                 continue;
             };
             let remaining = deadline.saturating_duration_since(progress.now());
@@ -315,7 +334,7 @@ fn spawn(core: Arc<Core>) -> io::Result<JoinHandle<()>> {
 }
 
 /// A panic payload's message, as `std` prints it.
-fn message(payload: &(dyn Any + Send)) -> String {
+pub(super) fn message(payload: &(dyn Any + Send)) -> String {
     match (
         payload.downcast_ref::<&str>(),
         payload.downcast_ref::<String>(),

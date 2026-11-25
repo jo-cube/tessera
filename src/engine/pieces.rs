@@ -32,6 +32,13 @@ impl<'e> CompactionJob<'e> {
             .max(minimum)
     }
 
+    /// Charges a read workspace that bounds `runs`, for as long as it is held.
+    fn read_charge(&self, runs: &[SharedRun]) -> resources::BuildCharge<'e> {
+        let largest = runs.iter().map(|run| run.largest_block).max().unwrap_or(0);
+        let estimate = crate::run::ReadWorkspace::estimate(largest);
+        self.engine.resources.build(0, estimate)
+    }
+
     pub(super) fn execute(
         self,
         workspace: &mut MergeWorkspace,
@@ -54,24 +61,10 @@ impl<'e> CompactionJob<'e> {
         mut self,
         workspace: &mut MergeWorkspace,
     ) -> Result<CompactionReport, CompactionError> {
-        let mut report = CompactionReport {
-            kind: self.kind,
-            level: self.level,
-            inputs: self.inputs.len(),
-            input_bytes: self.input_bytes(),
-            input_held_bytes: self.inputs.iter().map(|r| r.run.held_bytes()).sum(),
-            outputs: 0,
-            output_bytes: 0,
-            output_held_bytes: 0,
-            filter_build_bytes: 0,
-            complete: self.is_complete(),
-            stats: CompactStats::default(),
-            workspace_bytes: 0,
-        };
+        let mut report = self.begin_report();
         let budget = self.piece_budget();
         let mut sources: Vec<_> = self.inputs.drain(..self.source_count).collect();
         let mut bottom: VecDeque<_> = std::mem::take(&mut self.inputs).into();
-        let mut reader = crate::run::ReadWorkspace::new();
         let mut piece_count = 0;
         #[cfg(feature = "diagnostics")]
         let mut peak_output = 0;
@@ -100,6 +93,9 @@ impl<'e> CompactionJob<'e> {
             let end = bottom
                 .front()
                 .map(|r| r.run.key_range().unwrap().min.to_vec());
+            // Charged for the split only, so never beside this piece's build.
+            let reader_charge = self.read_charge(&sources);
+            let mut reader = crate::run::ReadWorkspace::new();
             let mut replacements = Vec::with_capacity(sources.len());
             for source in sources.drain(..) {
                 if let Some(run) = source
@@ -120,6 +116,8 @@ impl<'e> CompactionJob<'e> {
                 };
                 replacements.push((source, remainder));
             }
+            drop(reader);
+            drop(reader_charge);
             self.inputs.extend(selected.iter().cloned());
             let built = self.build_with_threads(workspace, 1)?;
             let (part, mut job) = built.publish_piece(&replacements, &selected)?;
@@ -161,16 +159,17 @@ fn view_of(source: &SharedRun, run: Run<Vec<u8>>) -> SharedRun {
 }
 
 fn add_report(sum: &mut CompactionReport, part: CompactionReport) {
-    sum.outputs += part.outputs;
     sum.output_bytes += part.output_bytes;
     sum.output_held_bytes += part.output_held_bytes;
-    sum.filter_build_bytes = sum.filter_build_bytes.max(part.filter_build_bytes);
-    sum.workspace_bytes = sum.workspace_bytes.max(part.workspace_bytes);
-    sum.stats.records_read += part.stats.records_read;
-    sum.stats.records_written += part.stats.records_written;
-    sum.stats.versions_dropped += part.stats.versions_dropped;
-    sum.stats.copies_collapsed += part.stats.copies_collapsed;
-    sum.stats.tombstones_dropped += part.stats.tombstones_dropped;
+    #[cfg(test)]
+    {
+        sum.outputs += part.outputs;
+        sum.stats.records_read += part.stats.records_read;
+        sum.stats.records_written += part.stats.records_written;
+        sum.stats.versions_dropped += part.stats.versions_dropped;
+        sum.stats.copies_collapsed += part.stats.copies_collapsed;
+        sum.stats.tombstones_dropped += part.stats.tombstones_dropped;
+    }
 }
 
 impl<'e> BuiltCompaction<'e> {
@@ -184,25 +183,7 @@ impl<'e> BuiltCompaction<'e> {
             output,
             charge,
         } = self;
-        let report = CompactionReport {
-            kind: job.kind,
-            level: job.level,
-            inputs: job.inputs.len(),
-            input_bytes: job.input_bytes(),
-            input_held_bytes: job.inputs.iter().map(|r| r.run.held_bytes()).sum(),
-            outputs: output.runs.len(),
-            output_bytes: output.output_bytes,
-            output_held_bytes: output.held_bytes,
-            filter_build_bytes: output
-                .runs
-                .iter()
-                .map(Run::filter_build_bytes)
-                .max()
-                .unwrap_or(0),
-            complete: job.is_complete(),
-            stats: output.stats,
-            workspace_bytes: output.workspace_bytes,
-        };
+        let report = job.report(&job.inputs, &output);
         #[cfg(feature = "diagnostics")]
         diagnostics::observe("piece_before_publish", job.engine.stats());
         let outputs: Vec<_> = published(output.runs).collect();

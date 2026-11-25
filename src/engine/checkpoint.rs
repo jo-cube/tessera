@@ -20,8 +20,14 @@
 //! CURRENT.tmp, rename over CURRENT (the commit point), then sync the parent.
 //! Only after that sync does GC remove files outside the union of the new and
 //! previous manifests. Before rename an error leaves the old commit intact;
-//! after rename a sync error retains both generations. Atomic temporary run
-//! files prevent an interrupted write from becoming a reusable final file.
+//! after rename a sync error retains both generations. A rename that reports
+//! an error is judged by reading CURRENT back: if it names the new
+//! generation, the commit stands and both generations are retained; if it
+//! cannot be read, the new generation is kept but reported as not committed,
+//! and the next commit reclaims it unless CURRENT names it. Atomic
+//! temporary run files prevent an interrupted write from becoming a reusable
+//! final file. A reused run file of the wrong length is rewritten from memory
+//! the same way; damage that keeps the length is found only by recovery.
 //!
 //! LOCK is an advisory exclusive file lock, released on close or process exit.
 //! Recovery reads exactly CURRENT, with no fallback, and leaves checkpoint data
@@ -156,6 +162,29 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The parents [`create_dir`] synced on this thread.
+    static SYNCED_PARENTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Creates `dir` and any missing ancestors. When `dir` did not exist, its
+/// parent is synced once, so the new entry survives a power loss along with
+/// the first commit inside it.
+pub(super) fn create_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    let parent = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    #[cfg(test)]
+    SYNCED_PARENTS.with(|synced| synced.borrow_mut().push(parent.to_owned()));
+    sync_dir(parent)
+}
+
 /// Opens and locks `LOCK`, which is released when the file is dropped.
 pub(super) fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
     let file = OpenOptions::new()
@@ -167,6 +196,50 @@ pub(super) fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
         Ok(()) => Ok(Ok(file)),
         Err(TryLockError::WouldBlock) => Ok(Err(())),
         Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod diagnostics_tests {
+    use super::*;
+    use crate::Engine;
+    use crate::diagnostics::EngineDiagnostics;
+
+    #[test]
+    fn diagnostic_report_tracks_committed_rename_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-committed-rename-report-{:032x}",
+            new_run_id()
+        ));
+        let engine = Engine::open(
+            &dir,
+            Options {
+                background_compaction: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let ks = engine.keyspace("data").unwrap();
+        ks.put(b"k", b"old").unwrap();
+        engine.checkpoint_with(b"one").unwrap();
+        let first = engine.last_checkpoint().unwrap().generation;
+
+        ks.put(b"k", b"new").unwrap();
+        RENAME_FAULT.with(|fault| fault.set(Some(RenameFault::FailsAfterEffect)));
+        let result = engine.checkpoint_with(b"two");
+        RENAME_FAULT.with(|fault| fault.set(None));
+        let error = result.unwrap_err();
+        let reported = engine.last_checkpoint().unwrap().generation;
+        let (_, _, manifest) = committed_manifest(&dir).unwrap();
+        let metadata = engine.metadata();
+
+        drop(ks);
+        engine.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(error.checkpoint_committed());
+        assert_eq!(metadata.as_deref(), Some(b"two".as_slice()));
+        assert_eq!(manifest.generation, first + 1);
+        assert_eq!(reported, manifest.generation);
     }
 }
 
@@ -187,7 +260,7 @@ mod tests {
         engine.checkpoint_to(&dir).unwrap();
         engine.close().unwrap();
         let (_, _, manifest) = committed_manifest(&dir).unwrap();
-        let mut bytes = manifest.encode();
+        let mut bytes = manifest.encode().unwrap();
         bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         let end = bytes.len() - 4;
         let sum = crc(&[&bytes[..end]]);
@@ -218,7 +291,7 @@ mod tests {
             manifest.runs[0].run_len = run_len;
             manifest.runs[0].len = len;
             assert!(matches!(
-                Manifest::decode(&manifest.encode()),
+                Manifest::decode(&manifest.encode().unwrap()),
                 Err(Damage::Length { .. })
             ));
         }
@@ -239,7 +312,7 @@ mod tests {
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         assert_eq!(manifest.runs.len(), 3);
         manifest.runs[1].seq_override = manifest.runs[0].seq_override;
-        fs::write(path, manifest.encode()).unwrap();
+        fs::write(path, manifest.encode().unwrap()).unwrap();
         assert_eq!(
             Engine::open(&dir, manual()).unwrap_err().kind(),
             ErrorKind::Corruption
@@ -256,7 +329,7 @@ mod tests {
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.next_run_id = u64::MAX;
-        fs::write(path, manifest.encode()).unwrap();
+        fs::write(path, manifest.encode().unwrap()).unwrap();
         let recovered = Engine::open(&dir, manual()).unwrap();
         for key in [b"b", b"c"] {
             recovered.ks().put(key, b"new").unwrap();
@@ -290,7 +363,7 @@ mod tests {
             let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
             assert_eq!(manifest.runs.len(), 2);
             manifest.runs[1].seq_override = manifest.runs[0].seq_override;
-            fs::write(path, manifest.encode()).unwrap();
+            fs::write(path, manifest.encode().unwrap()).unwrap();
             let result = Engine::open(&dir, manual());
             if identical {
                 let recovered = result.unwrap();
@@ -322,7 +395,7 @@ mod tests {
         engine.close().unwrap();
         let (_, path, mut manifest) = committed_manifest(&dir).unwrap();
         manifest.runs[0].len = u64::MAX;
-        fs::write(&path, manifest.encode()).unwrap();
+        fs::write(&path, manifest.encode().unwrap()).unwrap();
         assert_eq!(
             Engine::open(&dir, manual()).unwrap_err().kind(),
             ErrorKind::Corruption
@@ -431,7 +504,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = manifest.encode();
+        let bytes = manifest.encode().unwrap();
         assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
         for at in [0, 9, 13, 20, bytes.len() - 1] {
             let mut damaged = bytes.clone();
@@ -489,7 +562,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = manifest.encode();
+        let bytes = manifest.encode().unwrap();
         for end in 0..bytes.len() {
             assert!(Manifest::decode(&bytes[..end]).is_err());
         }
@@ -612,6 +685,305 @@ mod tests {
         }
     }
 
+    /// A rename of CURRENT that reports an error is judged by what CURRENT
+    /// names afterwards. One that took effect is a commit, and its generation
+    /// is kept; one that did not leaves the previous commit and removes the
+    /// new generation. Either way the next checkpoint commits normally.
+    #[test]
+    fn a_rename_error_after_its_effect_keeps_the_new_generation() {
+        // The fault, whether the commit took effect, and whether the new
+        // generation is kept: always when committed, and when CURRENT cannot
+        // be read back to tell.
+        for (fault, committed, kept) in [
+            (RenameFault::Fails, false, false),
+            (RenameFault::FailsAfterEffect, true, true),
+            (RenameFault::FailsUnread, false, true),
+        ] {
+            let dir = scratch(&format!("{fault:?}"));
+            let engine = Engine::in_memory(manual()).unwrap();
+            engine.ks().put(b"a", b"old").unwrap();
+            engine.checkpoint_to(&dir).unwrap();
+            let old = state(&engine);
+            engine.ks().put(b"a", b"new").unwrap();
+            engine.ks().put(b"b", b"new").unwrap();
+            let new = state(&engine);
+
+            RENAME_FAULT.with(|at| at.set(Some(fault)));
+            let error = engine.checkpoint_to(&dir).unwrap_err();
+            RENAME_FAULT.with(|at| at.set(None));
+            assert_eq!(error.kind(), ErrorKind::Io, "{fault:?}: {error}");
+            assert_eq!(error.checkpoint_committed(), committed, "{fault:?}");
+            assert_eq!(manifest(&dir).generation, if committed { 2 } else { 1 });
+            assert!(checkpoint_dir(&dir, 1).exists(), "{fault:?}");
+            assert_eq!(checkpoint_dir(&dir, 2).exists(), kept, "{fault:?}");
+            assert!(!dir.join(CURRENT_TMP).exists(), "{fault:?}");
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            let expected = if committed { &new } else { &old };
+            assert_eq!(&state(&recovered), expected, "{fault:?}");
+            drop(recovered);
+
+            let report = engine.checkpoint_to(&dir).unwrap();
+            assert_eq!(report.generation, if kept { 3 } else { 2 });
+            assert_eq!(report.reclaimed, usize::from(kept), "{fault:?}");
+            if kept {
+                // The next commit reclaims the generation that neither it
+                // nor its predecessor names.
+                let stale = if committed { 1 } else { 2 };
+                assert!(!checkpoint_dir(&dir, stale).exists(), "{fault:?}");
+            }
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            assert_eq!(state(&recovered), new, "{fault:?}");
+            drop(recovered);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Opening or checkpointing into a missing directory creates it and syncs
+    /// its parent once; an existing directory syncs no parent. What a power
+    /// loss would do is not tested.
+    #[test]
+    fn creating_the_directory_syncs_its_parent_once() {
+        let root = scratch("create-dir");
+        let opened = root.join("open").join("store");
+        let copied = root.join("copy").join("store");
+        let synced = || SYNCED_PARENTS.with(|synced| std::mem::take(&mut *synced.borrow_mut()));
+        synced();
+
+        let engine = Engine::open(&opened, manual()).unwrap();
+        assert_eq!(synced(), [root.join("open")]);
+        engine.ks().put(b"key", b"value").unwrap();
+        engine.checkpoint().unwrap();
+        engine.checkpoint_to(&copied).unwrap();
+        assert_eq!(synced(), [root.join("copy")]);
+        engine.checkpoint_to(&copied).unwrap();
+        drop(engine);
+        for dir in [&opened, &copied] {
+            let recovered = Engine::open(dir, manual()).unwrap();
+            assert_eq!(state(&recovered), [(b"key".to_vec(), b"value".to_vec())]);
+        }
+        assert_eq!(synced(), Vec::<PathBuf>::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A reused run file of the wrong length is rewritten from memory at the
+    /// next checkpoint, which then recovers.
+    #[test]
+    fn a_run_file_of_the_wrong_length_is_rewritten_at_the_next_checkpoint() {
+        let dir = scratch("wrong-length");
+        let engine = Engine::in_memory(manual()).unwrap();
+        for key in [b"a", b"b"] {
+            engine.ks().put(key, b"value").unwrap();
+            engine.flush().unwrap();
+        }
+        let first = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!(first.runs_written, 2);
+        let runs = manifest(&dir).runs;
+        let damaged = dir.join(RUNS).join(run_name(runs[0].id));
+        let file = OpenOptions::new().write(true).open(&damaged).unwrap();
+        file.set_len(runs[0].len - 1).unwrap();
+        drop(file);
+        assert!(Engine::open(&dir, manual()).is_err());
+
+        engine.ks().put(b"c", b"later").unwrap();
+        let report = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!((report.runs_written, report.runs_reused), (2, 1));
+        assert_eq!(fs::metadata(&damaged).unwrap().len(), runs[0].len);
+        assert!(
+            !dir.join(RUNS)
+                .join(format!("{}.tmp", run_name(runs[0].id)))
+                .exists()
+        );
+        let expected = state(&engine);
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A keyspace's name and records.
+    type NamedRecords = (String, Vec<(Vec<u8>, Vec<u8>)>);
+
+    /// Every live keyspace's records, by name.
+    fn every_keyspace(engine: &Engine) -> Vec<NamedRecords> {
+        let snapshot = engine.snapshot();
+        engine
+            .keyspaces()
+            .into_iter()
+            .map(|name| {
+                let records = snapshot_state(&snapshot, &engine.keyspace(&name).unwrap());
+                (name, records)
+            })
+            .collect()
+    }
+
+    /// Per keyspace: ID, name, depth, level-0 flushes, and each run's level,
+    /// flush group, run ID, bounds and sequence override, in checkpoint order.
+    type RunShape = (usize, u64, u128, Option<(Vec<u8>, Vec<u8>)>, Option<u64>);
+    fn shape(engine: &Engine) -> Vec<(u32, String, usize, usize, Vec<RunShape>)> {
+        let state = engine.core.read_state();
+        state
+            .keyspaces
+            .iter()
+            .map(|(&id, space)| {
+                let runs = space
+                    .levels
+                    .checkpoint_runs()
+                    .into_iter()
+                    .map(|(level, flush, run)| {
+                        (
+                            level,
+                            flush,
+                            run.id,
+                            run.run.slice().map(|(a, b)| (a.to_vec(), b.to_vec())),
+                            run.run.seq_override(),
+                        )
+                    })
+                    .collect();
+                (
+                    id,
+                    space.name.to_string(),
+                    space.levels.depth(),
+                    space.levels.level0_flushes(),
+                    runs,
+                )
+            })
+            .collect()
+    }
+
+    /// Level 0 holding bounded views left by a piecewise job stopped after
+    /// two pieces, over a seq-0 bottom; a keyspace with an ingested run's
+    /// sequence override; and a name dropped and created again.
+    fn rich_engine() -> Engine {
+        let engine = Engine::in_memory(Options {
+            memtable_size: 1 << 20,
+            target_run_len: 64 << 10,
+            background_threads: 1,
+            ..manual()
+        })
+        .unwrap();
+        let runs: Vec<_> = (0..8u16)
+            .map(|group| {
+                let mut builder = crate::run::RunBuilder::in_pool(
+                    crate::run::Codec::Zstd,
+                    128,
+                    &engine.core.chunks,
+                );
+                for key in group * 32..(group + 1) * 32 {
+                    builder
+                        .add(&key.to_be_bytes(), 0, crate::block::Value::Bytes(&[0; 128]))
+                        .unwrap();
+                }
+                builder.finish()
+            })
+            .collect();
+        engine.ks();
+        {
+            let mut state = engine.core.write_state();
+            let id = state.only_id();
+            let space = state.only_mut();
+            space.runs = super::super::published(runs).collect();
+            let bottom: Vec<_> = space.runs.iter().map(|r| (1, 0, r.clone())).collect();
+            space.levels = Levels::recovered(&bottom, 1, 10);
+            state.published([id]);
+            state.split_flushes = false;
+        }
+        for key in 0..256u16 {
+            engine.ks().put(&key.to_be_bytes(), &[1; 128]).unwrap();
+        }
+        engine.flush().unwrap();
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        engine.core.piece_budget.store(1, relaxed);
+        engine.core.fail_piece.store(3, relaxed);
+        assert!(
+            engine
+                .compact(&mut super::super::MergeWorkspace::new())
+                .is_err()
+        );
+        assert!(
+            engine
+                .core
+                .read_state()
+                .only()
+                .levels
+                .checkpoint_runs()
+                .iter()
+                .any(|(level, _, run)| *level == 0 && run.run.slice().is_some()),
+            "a bounded level-0 view remains"
+        );
+        let other = engine.keyspace("other").unwrap();
+        other.put(b"o", b"plain").unwrap();
+        let mut batch = crate::engine::WriteBatch::new();
+        batch.put(&other, b"i1", b"ingested");
+        batch.put(&other, b"i2", b"ingested");
+        engine.ingest_sorted(&batch).unwrap();
+        engine
+            .keyspace("gone")
+            .unwrap()
+            .put(b"g", b"dropped")
+            .unwrap();
+        engine.flush().unwrap();
+        assert!(engine.drop_keyspace("gone").unwrap());
+        engine
+            .keyspace("gone")
+            .unwrap()
+            .put(b"g", b"recreated")
+            .unwrap();
+        engine
+    }
+
+    /// The crash points against an image with bounded views, sequence
+    /// overrides, several keyspaces and a recreated name: recovery opens the
+    /// old or the new generation whole, with the same keyspace IDs, levels,
+    /// flush groups, bounds and overrides.
+    #[test]
+    fn a_crash_at_each_boundary_keeps_views_overrides_and_keyspaces() {
+        for (crash, committed) in [
+            (Crash::PartialRun, false),
+            (Crash::AfterFirstRun, false),
+            (Crash::BeforeManifestSync, false),
+            (Crash::BeforeRename, false),
+            (Crash::AfterRename, true),
+            (Crash::BeforeReclaim, true),
+        ] {
+            let dir = scratch(&format!("rich-{crash:?}"));
+            let engine = rich_engine();
+            engine.checkpoint_to(&dir).unwrap();
+            let (old, old_shape) = (every_keyspace(&engine), shape(&engine));
+            for key in 0..16u16 {
+                engine.ks().put(&key.to_be_bytes(), &[2; 128]).unwrap();
+            }
+            let mut batch = crate::engine::WriteBatch::new();
+            batch.put(&engine.keyspace("other").unwrap(), b"i3", b"ingested later");
+            engine.ingest_sorted(&batch).unwrap();
+            assert!(engine.drop_keyspace("gone").unwrap());
+            engine.keyspace("again").unwrap().put(b"a", b"new").unwrap();
+            let new = every_keyspace(&engine);
+
+            CRASH_AT.with(|at| at.set(Some(crash)));
+            let error = engine.checkpoint_to(&dir).unwrap_err();
+            CRASH_AT.with(|at| at.set(None));
+            assert_eq!(error.checkpoint_committed(), committed, "{crash:?}");
+            let attempted = shape(&engine);
+            let (expected, expected_shape) = if committed {
+                (&new, &attempted)
+            } else {
+                (&old, &old_shape)
+            };
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            assert_eq!(&every_keyspace(&recovered), expected, "{crash:?}");
+            assert_eq!(&shape(&recovered), expected_shape, "{crash:?}");
+            drop(recovered);
+
+            let report = engine.checkpoint_to(&dir).unwrap();
+            assert_eq!((report.generation, report.reclaimed), (3, 1), "{crash:?}");
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            assert_eq!(every_keyspace(&recovered), new, "{crash:?}");
+            assert_eq!(shape(&recovered), shape(&engine), "{crash:?}");
+            drop(recovered);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// An open engine holds the directory's lock for its life: a second
     /// open, or another process's lock, is refused until it is released.
     #[test]
@@ -637,6 +1009,58 @@ mod tests {
         let second = Engine::open(&dir, manual()).unwrap();
         drop(second);
         Engine::open(&dir, manual()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An I/O error while writing a run file, after an earlier run of the
+    /// same checkpoint was renamed into place, leaves CURRENT and the engine
+    /// as they were; the next checkpoint reuses the file already written.
+    #[test]
+    fn an_error_between_run_files_cleans_up_and_the_next_checkpoint_reuses_them() {
+        let dir = scratch("error-between-runs");
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"a", b"committed").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
+        let old = state(&engine);
+        for key in [b"b", b"c"] {
+            engine.ks().put(key, b"later").unwrap();
+            engine.flush().unwrap();
+        }
+        let ids: Vec<u128> = engine
+            .core
+            .read_state()
+            .only()
+            .levels
+            .checkpoint_runs()
+            .iter()
+            .map(|(_, _, run)| run.id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        // A directory where the last run's temporary file goes cannot be
+        // removed as a file, so writing that run fails.
+        let obstacle = dir.join(RUNS).join(format!("{}.tmp", run_name(ids[2])));
+        fs::create_dir(&obstacle).unwrap();
+        fs::write(obstacle.join("inside"), b"x").unwrap();
+        let error = engine.checkpoint_to(&dir).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Io, "{error}");
+        assert!(!error.checkpoint_committed());
+        assert_eq!(manifest(&dir).generation, 1);
+        assert!(!checkpoint_dir(&dir, 2).exists());
+        assert!(dir.join(RUNS).join(run_name(ids[1])).exists());
+        assert!(!dir.join(RUNS).join(run_name(ids[2])).exists());
+        let expected = state(&engine);
+        assert_ne!(expected, old);
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), old);
+        drop(recovered);
+
+        fs::remove_dir_all(&obstacle).unwrap();
+        let report = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!(report.generation, 2);
+        assert_eq!((report.runs_written, report.runs_reused), (1, 2));
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        drop(recovered);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -714,7 +1138,7 @@ mod tests {
         assert_eq!(second.bytes_reused, original.runs[0].len);
         assert_eq!(
             second.bytes_written,
-            second_manifest.runs[1].len + second_manifest.encode().len() as u64
+            second_manifest.runs[1].len + second_manifest.encode().unwrap().len() as u64
         );
         assert!(second.bytes_written < first.bytes_written / 10);
         for (id, bytes) in &expected {
@@ -733,7 +1157,7 @@ mod tests {
         );
         assert_eq!(
             third.bytes_written,
-            third_manifest.runs[0].len + third_manifest.encode().len() as u64
+            third_manifest.runs[0].len + third_manifest.encode().unwrap().len() as u64
         );
         // The preceding committed generation still recovers after GC.
         fs::write(dir.join(CURRENT), encode_current(second.generation)).unwrap();
@@ -751,7 +1175,10 @@ mod tests {
             ),
             (0, 1, 2)
         );
-        assert_eq!(fourth.bytes_written, manifest(&dir).encode().len() as u64);
+        assert_eq!(
+            fourth.bytes_written,
+            manifest(&dir).encode().unwrap().len() as u64
+        );
         assert_eq!(fourth.bytes_reused, third_manifest.runs[0].len);
         for entry in &second_manifest.runs {
             assert!(!dir.join(RUNS).join(run_name(entry.id)).exists());
@@ -797,6 +1224,35 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A run-named entry that GC cannot remove counts as unreclaimed at each
+    /// commit, and the first commit after it becomes removable removes it.
+    #[test]
+    fn a_failed_reclaim_is_retried_after_the_next_commit() {
+        let dir = scratch("reclaim-retry");
+        let engine = Engine::in_memory(manual()).unwrap();
+        engine.ks().put(b"a", b"1").unwrap();
+        engine.checkpoint_to(&dir).unwrap();
+        let stale = dir.join(RUNS).join("f".repeat(32));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("inside"), b"x").unwrap();
+        for value in [b"2", b"3"] {
+            engine.ks().put(b"a", value).unwrap();
+            let report = engine.checkpoint_to(&dir).unwrap();
+            assert_eq!(report.unreclaimed, 1);
+            assert!(stale.exists());
+        }
+        fs::remove_dir_all(&stale).unwrap();
+        fs::write(&stale, b"now a removable file").unwrap();
+        engine.ks().put(b"a", b"4").unwrap();
+        let report = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!(report.unreclaimed, 0);
+        assert!(!stale.exists());
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), state(&engine));
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn metadata_commits_with_its_checkpoint_and_carries_forward() {
         let dir = scratch("metadata");
@@ -833,6 +1289,43 @@ mod tests {
         assert_eq!(recovered.metadata().as_deref(), Some(&b""[..]));
         recovered.close().unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Through `Engine::checkpoint_with`, which `checkpoint_to` bypasses: the
+    /// engine reports the metadata of whichever generation a crash at each
+    /// point leaves committed, and a plain checkpoint carries that blob.
+    #[test]
+    fn metadata_follows_the_commit_point_at_each_crash() {
+        for (crash, committed) in [
+            (Crash::PartialRun, false),
+            (Crash::AfterFirstRun, false),
+            (Crash::BeforeManifestSync, false),
+            (Crash::BeforeRename, false),
+            (Crash::AfterRename, true),
+            (Crash::BeforeReclaim, true),
+        ] {
+            let dir = scratch(&format!("metadata-{crash:?}"));
+            let engine = Engine::open(&dir, manual()).unwrap();
+            engine.ks().put(b"a", b"one").unwrap();
+            engine.checkpoint_with(b"one").unwrap();
+            engine.ks().put(b"b", b"two").unwrap();
+            CRASH_AT.with(|at| at.set(Some(crash)));
+            let error = engine.checkpoint_with(b"two").unwrap_err();
+            CRASH_AT.with(|at| at.set(None));
+            assert_eq!(error.checkpoint_committed(), committed, "{crash:?}");
+            let expected: &[u8] = if committed { b"two" } else { b"one" };
+            assert_eq!(engine.metadata().as_deref(), Some(expected), "{crash:?}");
+            engine.ks().put(b"c", b"three").unwrap();
+            engine.checkpoint().unwrap();
+            assert_eq!(engine.metadata().as_deref(), Some(expected), "{crash:?}");
+            let contents = state(&engine);
+            engine.close().unwrap();
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            assert_eq!(recovered.metadata().as_deref(), Some(expected), "{crash:?}");
+            assert_eq!(state(&recovered), contents, "{crash:?}");
+            recovered.close().unwrap();
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
@@ -903,6 +1396,101 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Pauses `engine`'s next checkpoint on a new thread after its image,
+    /// returning the thread, a receiver that fires at the pause and a sender
+    /// that resumes it.
+    #[allow(clippy::type_complexity)]
+    fn paused_checkpoint(
+        engine: &Engine,
+        metadata: Option<&'static [u8]>,
+    ) -> (
+        std::thread::JoinHandle<crate::engine::Result<()>>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let engine = engine.clone();
+        let thread = std::thread::spawn(move || {
+            AFTER_IMAGE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            match metadata {
+                Some(metadata) => engine.checkpoint_with(metadata),
+                None => engine.checkpoint(),
+            }
+        });
+        (thread, ready_rx, resume_tx)
+    }
+
+    /// Checkpoints serialize: while the first is paused after its image it
+    /// holds the serializer, and a second started then commits the next
+    /// generation with its own state and metadata. The first keeps its cut.
+    #[test]
+    fn concurrent_checkpoints_commit_one_after_the_other() {
+        let dir = scratch("concurrent-checkpoints");
+        let engine = Engine::open(&dir, manual()).unwrap();
+        engine.ks().put(b"a", b"first").unwrap();
+        let (first, ready, resume) = paused_checkpoint(&engine, Some(&b"first"[..]));
+        ready.recv().unwrap();
+        assert!(engine.core.checkpointing.try_lock().is_err());
+        engine.ks().put(b"b", b"after the first image").unwrap();
+        let second = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.checkpoint_with(b"second"))
+        };
+        resume.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let committed = manifest(&dir);
+        assert_eq!((committed.generation, committed.previous), (2, 1));
+        assert_eq!(engine.metadata().as_deref(), Some(&b"second"[..]));
+        let expected = state(&engine);
+        engine.close().unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        assert_eq!(recovered.metadata().as_deref(), Some(&b"second"[..]));
+        recovered.close().unwrap();
+        // The first generation, still kept, holds only what preceded its image.
+        fs::write(dir.join(CURRENT), encode_current(1)).unwrap();
+        let first = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&first), vec![(b"a".to_vec(), b"first".to_vec())]);
+        assert_eq!(first.metadata().as_deref(), Some(&b"first"[..]));
+        first.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `close` begun while a checkpoint is paused waits for it: the
+    /// checkpoint commits, and later checkpoints are refused as stopped.
+    #[test]
+    fn close_waits_for_a_checkpoint_in_flight() {
+        let dir = scratch("close-during-checkpoint");
+        let engine = Engine::open(&dir, manual()).unwrap();
+        engine.ks().put(b"a", b"kept").unwrap();
+        let (checkpoint, ready, resume) = paused_checkpoint(&engine, None);
+        ready.recv().unwrap();
+        let (stripe_tx, stripe_rx) = std::sync::mpsc::channel();
+        let closer = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.close_with(|stripe| stripe_tx.send(stripe).unwrap()))
+        };
+        // Close has begun before the checkpoint resumes.
+        assert_eq!(stripe_rx.recv().unwrap(), 0);
+        resume.send(()).unwrap();
+        checkpoint.join().unwrap().unwrap();
+        closer.join().unwrap().unwrap();
+        assert_eq!(engine.checkpoint().unwrap_err().kind(), ErrorKind::Stopped);
+        drop(engine);
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), vec![(b"a".to_vec(), b"kept".to_vec())]);
+        assert_eq!(manifest(&dir).generation, 1);
+        recovered.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Recovers `dir` without its lock, as another process holding a
     /// copy of the directory would.
     fn branch(dir: &Path) -> Engine {
@@ -929,6 +1517,71 @@ mod tests {
         let recovered = Engine::open(&dir, manual()).unwrap();
         assert_eq!(state(&recovered), state(&right));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A keyspace dropped and created again, with a write and an ingestion,
+    /// while a checkpoint writes after its image: that checkpoint holds the
+    /// old keyspace under its old ID, the next holds the new one, and a
+    /// keyspace created after recovery takes an ID after the image's.
+    #[test]
+    fn a_drop_and_recreate_during_a_paused_checkpoint_stays_after_its_cut() {
+        let dir = scratch("drop-during-checkpoint");
+        let engine = Engine::in_memory(manual()).unwrap();
+        let named = engine.keyspace("named").unwrap();
+        named.put(b"k", b"old").unwrap();
+        engine.flush().unwrap();
+        named.put(b"m", b"old, in the active table").unwrap();
+        let id_of =
+            |engine: &Engine, name: &str| *engine.core.read_state().names.get(name).unwrap();
+        let old_id = id_of(&engine, "named");
+        let old = snapshot_state(&engine.snapshot(), &named);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let checkpoint = {
+            let (engine, dir) = (engine.clone(), dir.clone());
+            std::thread::spawn(move || {
+                AFTER_IMAGE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }))
+                });
+                engine.checkpoint_to(&dir)
+            })
+        };
+        ready_rx.recv().unwrap();
+        assert!(engine.drop_keyspace("named").unwrap());
+        let again = engine.keyspace("named").unwrap();
+        again.put(b"k", b"new").unwrap();
+        let mut batch = crate::engine::WriteBatch::new();
+        batch.put(&again, b"z", b"ingested");
+        engine.ingest_sorted(&batch).unwrap();
+        engine.keyspace("later").unwrap().put(b"x", b"y").unwrap();
+        let new_id = id_of(&engine, "named");
+        assert_ne!(new_id, old_id);
+        let new = snapshot_state(&engine.snapshot(), &again);
+        resume_tx.send(()).unwrap();
+        checkpoint.join().unwrap().unwrap();
+
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(recovered.keyspaces(), ["named"]);
+        assert_eq!(id_of(&recovered, "named"), old_id);
+        let ks = recovered.keyspace("named").unwrap();
+        assert_eq!(snapshot_state(&recovered.snapshot(), &ks), old);
+        recovered.keyspace("fresh").unwrap();
+        assert!(id_of(&recovered, "fresh") > old_id);
+        // A keyspace handle keeps its engine, and the directory lock, alive.
+        drop(ks);
+        drop(recovered);
+
+        engine.checkpoint_to(&dir).unwrap();
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(recovered.keyspaces(), ["later", "named"]);
+        assert_eq!(id_of(&recovered, "named"), new_id);
+        let ks = recovered.keyspace("named").unwrap();
+        assert_eq!(snapshot_state(&recovered.snapshot(), &ks), new);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

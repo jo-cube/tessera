@@ -53,8 +53,10 @@ pub use batch::WriteBatch;
 #[cfg(feature = "diagnostics")]
 use checkpoint::CheckpointReport;
 use checkpoint::{CheckpointError, OpenError};
-use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob, Cursor};
-pub(crate) use compaction::{CompactionKind, CompactionPolicy, CompactionReport};
+#[cfg(test)]
+pub(crate) use compaction::CompactionKind;
+use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob};
+pub(crate) use compaction::{CompactionPolicy, CompactionReport};
 pub use error::{Error, ErrorKind, Result};
 use errors::{UpdateError, WriteError};
 #[cfg(test)]
@@ -73,12 +75,13 @@ use worker::BackgroundStatus;
 pub use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub(crate) use crate::chunk::BuildCounters;
 pub(crate) use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
-pub(crate) use crate::run::{CompactStats, MergeWorkspace};
+#[cfg(test)]
+use crate::run::CompactStats;
+pub(crate) use crate::run::MergeWorkspace;
 use crate::run::{ConflictingCopies, LiveRecord, LiveValue, ReadError};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
@@ -89,8 +92,8 @@ use crate::memtable::{
     FlushCuts, FlushSpace, FrozenMemtable, Key, Memtable, Records, TableError, flush_merged,
 };
 use crate::run::{
-    Codec, CompactLimits, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP, Run, RunView,
-    SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
+    Codec, CompactLimits, Encoding, LogicalCursor, LogicalWorkspace, OutputCuts, RAW_BLOCK_CAP,
+    Run, RunView, SeqFloor, TARGET_BLOCK_COMPRESSED, compact_parallel_in, latest_from,
 };
 
 use directory::RunDirectory;
@@ -231,39 +234,25 @@ impl State {
     }
 
     /// Released sources still held, each counted once however many snapshots
-    /// hold it, and the history pinned in the engine's memtables.
+    /// hold it.
     fn retained(&self) -> Retained {
-        let pinned = self.active.memory().pinned
-            + self
-                .frozen
-                .iter()
-                .map(|table| table.memory().pinned)
-                .sum::<usize>();
         self.retired
             .iter()
             .filter(|retired| retired.source.strong_count() > 0)
-            .fold(
+            .fold(Retained::default(), |sum, retired| {
+                let filter = retired.held_bytes.unwrap_or(0);
+                let run = if retired.held_bytes.is_some() {
+                    retired.bytes
+                } else {
+                    0
+                };
                 Retained {
-                    sources: 0,
-                    bytes: pinned,
-                    run_bytes: 0,
-                    held_bytes: 0,
-                },
-                |sum, retired| {
-                    let filter = retired.held_bytes.unwrap_or(0);
-                    let run = if retired.held_bytes.is_some() {
-                        retired.bytes
-                    } else {
-                        0
-                    };
-                    Retained {
-                        sources: sum.sources + 1,
-                        bytes: sum.bytes + retired.bytes + filter,
-                        run_bytes: sum.run_bytes + run,
-                        held_bytes: sum.held_bytes + filter,
-                    }
-                },
-            )
+                    sources: sum.sources + 1,
+                    bytes: sum.bytes + retired.bytes + filter,
+                    run_bytes: sum.run_bytes + run,
+                    held_bytes: sum.held_bytes + filter,
+                }
+            })
     }
 }
 
@@ -297,8 +286,8 @@ struct Core {
     flush_signal: flusher::Signal,
     bulk_ingest_min: usize,
     target_run_len: usize,
-    /// The codec of the runs this engine builds.
-    codec: Codec,
+    /// How the runs this engine builds encode their blocks.
+    encoding: Encoding,
     /// The estimated compressed block target of the runs this engine builds.
     target_block_compressed: usize,
     /// Cloned by every snapshot, so that its count is the live snapshots.
@@ -320,6 +309,9 @@ struct Core {
     /// writer is blocked.
     #[cfg(test)]
     level0_waits: std::sync::atomic::AtomicUsize,
+    /// Writers that have waited for a flush to clear frozen tables.
+    #[cfg(test)]
+    flush_waits: std::sync::atomic::AtomicUsize,
     /// Runs between building a compaction and returning it.
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -339,6 +331,10 @@ struct Core {
     piece_request: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     before_flush_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once after a flush releases the state lock, while its job
+    /// still holds the flushed tables.
+    #[cfg(test)]
+    after_flush_publish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_ingest_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -351,6 +347,7 @@ impl Core {
     }
 
     fn with_pool(options: &Options, chunks: ChunkPool) -> Self {
+        let policy = CompactionPolicy::for_memory(options.memory_limit);
         #[cfg(test)]
         let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
             options.last_seq,
@@ -359,16 +356,15 @@ impl Core {
             options
                 .bulk_ingest_min
                 .unwrap_or(options.memtable_size / BULK_INGEST_DIVISOR),
-            options.background_compaction.unwrap_or_default(),
+            policy.with_test_policy(options.background_compaction.unwrap_or_default()),
             options.background_compaction.map(|_| worker::Signal::new()),
         );
         #[cfg(not(test))]
-        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, policy, background) = (
+        let (last_seq, target_run_len, max_frozen_memtables, bulk_ingest_min, background) = (
             0,
             TARGET_RUN_LEN,
             MAX_FROZEN_MEMTABLES,
             options.memtable_size / BULK_INGEST_DIVISOR,
-            CompactionPolicy::for_memory(options.memory_limit),
             Some(worker::Signal::new()),
         );
         let active = Memtable::in_pool(options.memtable_size, Some(last_seq), &chunks);
@@ -412,12 +408,12 @@ impl Core {
             flush_signal: flusher::Signal::new(),
             bulk_ingest_min,
             target_run_len,
-            codec: options.compression.codec(),
+            encoding: options.compression.encoding(),
             target_block_compressed: options.block_size,
             snapshots: Arc::new(()),
             background,
             memory_limit: options.memory_limit,
-            policy: CompactionPolicy::for_memory(options.memory_limit).with_test_policy(policy),
+            policy,
             resources: resources::Progress::default(),
             reclaim: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -426,6 +422,8 @@ impl Core {
             panic_step: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             level0_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            flush_waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             after_build: Mutex::new(None),
             #[cfg(test)]
@@ -442,6 +440,8 @@ impl Core {
             piece_request: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_flush_build: Mutex::new(None),
+            #[cfg(test)]
+            after_flush_publish: Mutex::new(None),
             #[cfg(test)]
             after_ingest_build: Mutex::new(None),
             #[cfg(test)]
@@ -504,11 +504,11 @@ impl Core {
                 Err(error) => return (Err(error), Some(state)),
             };
             match self.write(&mut state, prefix.key(key), value) {
-                Err(Refusal::Full) => match self.admit(self.make_room(state)) {
+                None => match self.admit(self.make_room(state)) {
                     Ok(next) => state = next,
                     Err(error) => return (Err(error), None),
                 },
-                written => return (written.map_err(Refusal::into_error), Some(state)),
+                Some(seq) => return (Ok(seq), Some(state)),
             }
         }
     }
@@ -553,6 +553,9 @@ impl Core {
         // Acquire the notification mutex before releasing state: completion
         // cannot slip between checking the predicate and entering the condvar.
         drop(state);
+        #[cfg(test)]
+        self.flush_waits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(self.flush_signal.wait(progress));
         self.write_state()
     }
@@ -595,14 +598,16 @@ impl Core {
         self.flushing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Applies a RAM-only write to the active table.
-    fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Result<u64, Refusal> {
+    /// Applies a validated RAM-only write to the active table, returning
+    /// `None` if the active table must rotate first.
+    fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Option<u64> {
         let was_below = !self.quiet_tail_ready(state);
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
-        state
-            .active
-            .write(key, seq, value)
-            .map_err(|error| self.refusal(error))?;
+        match state.active.write(key, seq, value) {
+            Ok(()) => {}
+            Err(TableError::BudgetExceeded { .. }) => return None,
+            Err(error) => unreachable!("validated record rejected by memtable: {error:?}"),
+        }
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         self.chunks.ingested(
@@ -615,26 +620,7 @@ impl Core {
         if was_below && self.quiet_tail_ready(state) {
             self.arm_quiet_tail(state);
         }
-        Ok(seq)
-    }
-
-    /// Distinguishes invalid records from an active table needing rotation.
-    fn refusal(&self, error: TableError) -> Refusal {
-        let rejected = |error| Refusal::Error(UpdateError::Rejected(error));
-        match error {
-            TableError::KeyTooLong { len } => rejected(WriteError::KeyTooLong { len }),
-            TableError::ValueTooLong { len } => rejected(WriteError::ValueTooLong { len }),
-            TableError::RecordExceedsBudget { charge, .. } => {
-                rejected(WriteError::RecordExceedsBudget {
-                    charge,
-                    budget: self.memtable_budget,
-                })
-            }
-            TableError::BudgetExceeded { .. } => Refusal::Full,
-            TableError::SequenceNotIncreasing { .. } => {
-                unreachable!("the engine assigns increasing sequence numbers")
-            }
-        }
+        Some(seq)
     }
 
     /// Freezes the active table and replaces it, in constant time.
@@ -685,18 +671,32 @@ impl Core {
 
     /// A consistent view of the state now, sharing every source.
     fn snapshot(&self) -> View {
-        // When the active table is empty, taking a snapshot mutates nothing
-        // and needs only a shared read lock.
+        let view = |state: &State, tables| View {
+            tables,
+            directories: Arc::clone(&state.directories),
+            #[cfg(test)]
+            last_seq: state.last_seq,
+            next_keyspace: state.next_keyspace,
+            _live: Arc::clone(&self.snapshots),
+        };
+        // Taking a snapshot mutates state only to cache a new active-table
+        // view; when the active table is empty or the cached view still
+        // matches `last_seq`, a shared read lock suffices.
         {
             let state = self.read_state();
             if state.active.is_empty() {
-                return View {
-                    tables: state.frozen.iter().rev().cloned().collect(),
-                    directories: Arc::clone(&state.directories),
-                    last_seq: state.last_seq,
-                    next_keyspace: state.next_keyspace,
-                    _live: Arc::clone(&self.snapshots),
-                };
+                return view(&state, state.frozen.iter().rev().cloned().collect());
+            }
+            if let Some(active) = state
+                .last_view
+                .as_ref()
+                .filter(|(seq, _)| *seq == state.last_seq)
+                .and_then(|(_, view)| view.upgrade())
+            {
+                let mut tables = Vec::with_capacity(state.frozen.len() + 1);
+                tables.push(active);
+                tables.extend(state.frozen.iter().rev().cloned());
+                return view(&state, tables);
             }
         }
         let mut state = self.write_state();
@@ -708,21 +708,15 @@ impl Core {
                 .as_ref()
                 .filter(|(seq, _)| *seq == state.last_seq)
                 .and_then(|(_, view)| view.upgrade());
-            let view = reusable.unwrap_or_else(|| {
+            let active = reusable.unwrap_or_else(|| {
                 let view = Arc::new(state.active.snapshot());
                 state.last_view = Some((state.last_seq, Arc::downgrade(&view)));
                 view
             });
-            tables.push(view);
+            tables.push(active);
         }
         tables.extend(state.frozen.iter().rev().cloned());
-        View {
-            tables,
-            directories: Arc::clone(&state.directories),
-            last_seq: state.last_seq,
-            next_keyspace: state.next_keyspace,
-            _live: Arc::clone(&self.snapshots),
-        }
+        view(&state, tables)
     }
 
     /// Drops keyspace `name` and retires its runs, and returns whether it
@@ -965,7 +959,12 @@ impl Core {
             space.levels.plan(&fit)
         };
         let mut source_count = 0;
-        let (kind, level, inputs, dest, mut cuts, cursor) = match plan {
+        #[cfg(test)]
+        let kind = match &plan {
+            Plan::Neighbours { .. } => CompactionKind::Neighbours,
+            _ => CompactionKind::Merge,
+        };
+        let (level, inputs, dest, mut cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Move { level, run } => {
                 if space.levels.move_down(level, &run).is_err() {
@@ -977,18 +976,11 @@ impl Core {
                 state.levels_changed();
                 self.flush_signal.request();
                 return Ok(Some(Begun::Done(CompactionReport {
+                    #[cfg(test)]
                     kind: CompactionKind::Move,
+                    #[cfg(test)]
                     level,
-                    inputs: 0,
-                    input_bytes: 0,
-                    input_held_bytes: 0,
-                    outputs: 0,
-                    output_bytes: 0,
-                    output_held_bytes: 0,
-                    filter_build_bytes: 0,
-                    complete: false,
-                    stats: CompactStats::default(),
-                    workspace_bytes: 0,
+                    ..CompactionReport::default()
                 })));
             }
             Plan::Merge {
@@ -998,7 +990,7 @@ impl Core {
                 below,
             } => {
                 let cursor =
-                    Cursor::After(sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
+                    (level > 0).then(|| sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
                 let cuts = OutputCuts {
                     overlapped: below,
                     // A run reaching `level_ratio` runs below has crossed the
@@ -1011,17 +1003,9 @@ impl Core {
                 }
                 let inputs = sources.into_iter().chain(dests).collect();
                 let dest = Dest::Level(level + 1);
-                (
-                    CompactionKind::Merge,
-                    level,
-                    inputs,
-                    dest,
-                    cuts,
-                    Some(cursor),
-                )
+                (level, inputs, dest, cuts, cursor)
             }
             Plan::Clean { level, run } => (
-                CompactionKind::Merge,
                 level,
                 vec![run],
                 Dest::Level(level),
@@ -1034,14 +1018,7 @@ impl Core {
                     ..OutputCuts::default()
                 };
                 let inputs = runs.into_iter().collect();
-                (
-                    CompactionKind::Neighbours,
-                    level,
-                    inputs,
-                    Dest::Level(level),
-                    cuts,
-                    None,
-                )
+                (level, inputs, Dest::Level(level), cuts, None)
             }
         };
         let space = state.space_mut(keyspace);
@@ -1053,13 +1030,14 @@ impl Core {
         let zero_seq = matches!(dest, Dest::Level(level) if level == space.levels.depth());
         let estimated_run_bytes = space.levels.segment(&fit);
         drop(state);
-        Ok(Some(Begun::Job(CompactionJob {
+        Ok(Some(Begun::Job(Box::new(CompactionJob {
             engine: self,
             _serial: serial,
             keyspace,
             inputs,
             others,
             options,
+            #[cfg(test)]
             kind,
             level,
             dest,
@@ -1068,7 +1046,7 @@ impl Core {
             cursor,
             estimated_run_bytes,
             source_count,
-        })))
+        }))))
     }
 
     /// Begins the next compaction that reads and writes, taking any moves
@@ -1080,7 +1058,7 @@ impl Core {
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         loop {
             match self.begin_compaction(options, None)? {
-                Some(Begun::Job(job)) => return Ok(Some(job)),
+                Some(Begun::Job(job)) => return Ok(Some(*job)),
                 Some(Begun::Done(_)) => {}
                 None => return Ok(None),
             }
@@ -1167,6 +1145,18 @@ impl Core {
         let sum = |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).sum::<usize>();
         let most =
             |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).max().unwrap_or(0);
+        let active = state.active.memory();
+        let frozen = state
+            .frozen
+            .iter()
+            .map(|table| table.memory())
+            .reduce(|sum, table| MemoryUsage {
+                payload: sum.payload + table.payload,
+                arena_bytes: sum.arena_bytes + table.arena_bytes,
+                charged: sum.charged + table.charged,
+                pinned: sum.pinned + table.pinned,
+                budget: sum.budget + table.budget,
+            });
 
         EngineStats {
             build: self.chunks.counters(),
@@ -1185,18 +1175,8 @@ impl Core {
             pool_in_use_bytes: usage.pool_in_use,
             pool_reserve_limit: usage.pool_cap,
             last_seq: state.last_seq,
-            active: state.active.memory(),
-            frozen: state
-                .frozen
-                .iter()
-                .map(|table| table.memory())
-                .reduce(|sum, table| MemoryUsage {
-                    payload: sum.payload + table.payload,
-                    arena_bytes: sum.arena_bytes + table.arena_bytes,
-                    charged: sum.charged + table.charged,
-                    pinned: sum.pinned + table.pinned,
-                    budget: sum.budget + table.budget,
-                }),
+            active,
+            frozen,
             frozen_tables: state.frozen.len(),
             runs: sum(|space| space.runs),
             run_bytes: state.run_bytes,
@@ -1204,7 +1184,7 @@ impl Core {
             max_overlap: most(|space| space.max_overlap),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
-            retained_bytes: retained.bytes,
+            retained_bytes: retained.bytes + active.pinned + frozen.map_or(0, |f| f.pinned),
             retained_run_bytes: retained.run_bytes,
             retained_held_bytes: retained.held_bytes,
             level0_flushes: state.level0_flushes,
@@ -1254,10 +1234,10 @@ impl Core {
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(test, feature = "diagnostics"))]
             self.resources
                 .gate_waits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             drop(self.pass_gate());
         }
         self.state.read().expect(LOCK)
@@ -1275,7 +1255,7 @@ impl Core {
         let _waiting = WaitingWriter(&self.waiting_writers);
         let _gate = self.pass_gate();
         let guard = self.state.write().expect(LOCK);
-        #[cfg(feature = "diagnostics")]
+        #[cfg(any(test, feature = "diagnostics"))]
         self.resources
             .write_locks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1285,32 +1265,6 @@ impl Core {
     fn pass_gate(&self) -> MutexGuard<'_, ()> {
         // The gate guards no data, so a panic elsewhere leaves nothing wrong.
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Why a write did not land.
-#[derive(Clone, Debug)]
-enum Refusal {
-    /// The memtables have no room for the record until a flush makes some.
-    /// Never returned to a caller.
-    Full,
-    /// A refusal for the caller.
-    Error(UpdateError),
-}
-
-impl Refusal {
-    /// The caller's error, for a refusal that cannot be [`Refusal::Full`].
-    fn into_error(self) -> UpdateError {
-        match self {
-            Self::Error(error) => error,
-            Self::Full => unreachable!("a write with no room flushes"),
-        }
-    }
-}
-
-impl From<UpdateError> for Refusal {
-    fn from(error: UpdateError) -> Self {
-        Self::Error(error)
     }
 }
 
@@ -1511,19 +1465,101 @@ mod tests {
             let writer = scope.spawn(|| ks.put(b"k", b"new").unwrap());
             // The read lock keeps the writer waiting, so once it has the gate it
             // keeps it until the guard is dropped.
-            while engine.core.gate.try_lock().is_ok() {
-                std::thread::yield_now();
-            }
-            for _ in 0..100 {
-                assert!(engine.core.gate.try_lock().is_err());
-                assert!(!writer.is_finished());
-                std::thread::yield_now();
-            }
+            crate::test_support::wait_until(|| {
+                engine.core.waiting_writers.load(Ordering::Acquire) == 1
+                    && engine.core.gate.try_lock().is_err()
+            });
+            let reader = scope.spawn(|| ks.get(b"k").unwrap());
+            crate::test_support::wait_until(|| {
+                engine.core.resources.gate_waits.load(Ordering::Acquire) == 1
+            });
+            assert!(engine.core.gate.try_lock().is_err());
+            assert!(!writer.is_finished());
+            assert!(!reader.is_finished());
             drop(held);
             writer.join().unwrap();
+            assert_eq!(reader.join().unwrap().as_deref(), Some(&b"new"[..]));
         });
         assert!(engine.core.gate.try_lock().is_ok());
         assert_eq!(ks.get(b"k").unwrap().unwrap(), b"new");
+    }
+
+    #[test]
+    fn repeated_snapshot_without_writes_takes_no_exclusive_lock() {
+        let engine = Engine::in_memory(manual()).unwrap();
+        let ks = engine.ks();
+        let extra = engine.keyspace("extra").unwrap();
+        let write_locks = || engine.core.resources.write_locks.load(Ordering::Relaxed);
+
+        // Empty active table needs only the shared read lock.
+        let before = write_locks();
+        let empty = engine.snapshot();
+        assert_eq!(write_locks(), before);
+        drop(empty);
+
+        ks.put(b"k1", b"v1").unwrap();
+        extra.put(b"e1", b"ev1").unwrap();
+
+        // First snapshot after a write takes the exclusive lock once to cache `last_view`.
+        let before = write_locks();
+        let snap1 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+
+        // Repeated snapshots without intervening writes reuse `last_view` under the read lock.
+        let snap2 = engine.snapshot();
+        let held_read = engine.core.read_state();
+        let snap3 = engine.snapshot();
+        drop(held_read);
+        assert_eq!(write_locks(), before + 1);
+        assert_eq!(snap2.reader().get(&ks, b"k1").unwrap(), Some(&b"v1"[..]));
+        assert_eq!(
+            snap3.reader().get(&extra, b"e1").unwrap(),
+            Some(&b"ev1"[..])
+        );
+
+        // Dropping a keyspace leaves `active` and `last_seq` unchanged, so reusing
+        // `last_view` under the read lock still observes the updated directory.
+        assert!(engine.drop_keyspace("extra").unwrap());
+        // Hold `flushing` so the flush worker woken by `drop_keyspace` cannot
+        // take `write_state` during the lock-count assertions below.
+        let _flushing = engine.core.serialize_flush();
+        let after_drop = write_locks();
+        let snap_after_drop = engine.snapshot();
+        assert_eq!(write_locks(), after_drop);
+        assert_eq!(
+            snap1.reader().get(&extra, b"e1").unwrap(),
+            Some(&b"ev1"[..])
+        );
+        assert_eq!(
+            snap_after_drop
+                .reader()
+                .get(&extra, b"e1")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::KeyspaceDropped
+        );
+        assert_eq!(
+            snap_after_drop.reader().get(&ks, b"k1").unwrap(),
+            Some(&b"v1"[..])
+        );
+
+        // Once every snapshot holding `last_view` drops, the next snapshot recreates it.
+        drop((snap1, snap2, snap3, snap_after_drop));
+        let before = write_locks();
+        let snap4 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+
+        // A new write advances `last_seq`, so the next snapshot creates a new view once.
+        ks.put(b"k2", b"v2").unwrap();
+        let before = write_locks();
+        let snap5 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+        let snap6 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+        assert_eq!(snap4.reader().get(&ks, b"k2").unwrap(), None);
+        assert_eq!(snap5.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
+        assert_eq!(snap6.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
+        drop(_flushing);
     }
 
     #[test]
@@ -1785,11 +1821,15 @@ mod tests {
         assert_eq!(engine.engine_stats().runs, 1);
         assert_eq!(engine.engine_stats().max_overlap, 1);
         assert_eq!(value(&engine, b"a").unwrap(), b"3");
-        // With nothing requested, nothing runs.
-        for _ in 0..1000 {
-            std::thread::yield_now();
-        }
+        // With nothing requested, the worker parks idle and runs no more passes.
+        let core = Arc::clone(&engine.core);
+        crate::test_support::wait_until(|| core.background.as_ref().unwrap().is_idle_parked());
         assert_eq!(engine.background_status().unwrap(), status);
+        engine.close().unwrap();
+        let stopped = core.background.as_ref().unwrap().status();
+        assert!(!stopped.running && !stopped.busy);
+        assert_eq!(stopped.passes, status.passes);
+        assert_eq!(stopped.compactions, status.compactions);
     }
 
     /// Requests made while the worker cannot run count as one more pass.

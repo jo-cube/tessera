@@ -94,17 +94,21 @@ impl Shared {
             let _ = handle.join();
         }
         let flush_error = self.core.flush_signal.failure();
-        let Some(handle) = workers.compaction.take() else {
-            return flush_error.map_or(Ok(()), Err);
-        };
-        let signal = self.core.background.as_ref().expect(WORKER);
-        signal.stop();
-        // The thread catches its own panics, so joining cannot fail.
-        let _ = handle.join();
-        match signal.status().panic {
-            Some(message) => Err(BackgroundError::Panicked(message)),
-            None => flush_error.map_or(Ok(()), Err),
+        if let Some(handle) = workers.compaction.take() {
+            let signal = self.core.background.as_ref().expect(WORKER);
+            signal.stop();
+            // The thread catches its own panics, so joining cannot fail.
+            let _ = handle.join();
         }
+        if let Some(message) = self
+            .core
+            .background
+            .as_ref()
+            .and_then(|signal| signal.status().panic)
+        {
+            return Err(BackgroundError::Panicked(message));
+        }
+        flush_error.map_or(Ok(()), Err)
     }
 }
 
@@ -132,9 +136,10 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Opens the engine stored in `dir`, creating the directory if it is
-    /// missing: recovers the checkpoint its `CURRENT` file names, or starts
-    /// empty if there is none. The engine holds `dir/LOCK` until it closes.
+    /// Opens the engine stored in `dir`, creating the directory and syncing
+    /// its parent if it is missing: recovers the checkpoint its `CURRENT`
+    /// file names, or starts empty if there is none. The engine holds
+    /// `dir/LOCK` until it closes.
     ///
     /// Recovery reads and checks every file of exactly that checkpoint
     /// before it returns, and never falls back to an older one. Run files
@@ -150,7 +155,7 @@ impl Engine {
     pub fn open(dir: impl AsRef<Path>, options: Options) -> Result<Engine> {
         let dir = dir.as_ref();
         options.validate()?;
-        fs::create_dir_all(dir)
+        checkpoint::create_dir(dir)
             .map_err(|error| Error::io(dir, error, format!("cannot create {}", dir.display())))?;
         let lock = match checkpoint::lock(dir) {
             Ok(Ok(file)) => file,
@@ -334,16 +339,7 @@ impl Engine {
     /// Panics if the state lock is poisoned or a synchronous build panics.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         let _open = self.shared.enter()?;
-        match batch.engine() {
-            Err(name) => return Err(Error::unknown_keyspace(name)),
-            Ok(Some(engine)) if engine != self.shared.id => {
-                return Err(Error::new(
-                    ErrorKind::UnknownKeyspace,
-                    "the batch's keyspaces belong to another engine",
-                ));
-            }
-            Ok(_) => {}
-        }
+        batch.check_engine(self.shared.id)?;
         self.core.write_batch(batch)?;
         Ok(())
     }
@@ -424,29 +420,27 @@ impl Engine {
             }
         };
         let result = self.core.checkpoint_into(dir, metadata);
-        let committed = match &result {
-            Ok(_) => true,
-            Err(CheckpointError::Io {
-                after_commit_point, ..
-            }) => *after_commit_point,
-            Err(_) => false,
+        let committed_report = match &result {
+            Ok(report) => Some(*report),
+            Err(CheckpointError::Io { committed, .. }) => committed.as_deref().copied(),
+            Err(_) => None,
         };
-        if committed {
+        if let Some(_report) = committed_report {
             *self
                 .shared
                 .metadata
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = metadata.map(<[u8]>::to_vec);
+            #[cfg(feature = "diagnostics")]
+            {
+                *self
+                    .shared
+                    .last_checkpoint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(_report);
+            }
         }
-        let _report = result?;
-        #[cfg(feature = "diagnostics")]
-        {
-            *self
-                .shared
-                .last_checkpoint
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(_report);
-        }
+        result?;
         Ok(())
     }
 
@@ -501,8 +495,8 @@ impl Engine {
         self.close_with(|_| {})
     }
 
-    fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
-        {
+    pub(super) fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
+        let first = {
             let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
                 on_stripe(i);
                 self.shared.open[i]
@@ -510,16 +504,18 @@ impl Engine {
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
             });
-            if !*guards[0] {
-                return Ok(());
+            if *guards[0] {
+                self.shared
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                for guard in &mut guards {
+                    **guard = false;
+                }
+                true
+            } else {
+                false
             }
-            self.shared
-                .closed
-                .store(true, std::sync::atomic::Ordering::Release);
-            for guard in &mut guards {
-                **guard = false;
-            }
-        }
+        };
         self.core.combiner.close();
         let stopped = self.shared.stop_workers();
         drop(
@@ -529,7 +525,7 @@ impl Engine {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
-        Ok(stopped?)
+        if first { Ok(stopped?) } else { Ok(()) }
     }
 }
 
@@ -644,7 +640,7 @@ impl Keyspace {
     }
 
     /// The latest value of `key`, copied, or `None` if it is absent or
-    /// deleted. Uses a pooled [`Reader`]; take one to read without copying.
+    /// deleted. Uses a pooled [`Reader`]; take one to borrow without allocating.
     ///
     /// # Errors
     /// [`ErrorKind::Corruption`] for damaged data the lookup touches;
@@ -774,7 +770,8 @@ impl Engine {
         metadata: Option<&[u8]>,
     ) -> Result<checkpoint::CheckpointReport> {
         let _open = self.shared.enter()?;
-        fs::create_dir_all(dir).map_err(|error| Error::io(dir, error, "creating the directory"))?;
+        checkpoint::create_dir(dir)
+            .map_err(|error| Error::io(dir, error, "creating the directory"))?;
         let _serial = self
             .core
             .checkpointing
@@ -965,5 +962,101 @@ mod close_tests {
                 .kind(),
             ErrorKind::Stopped
         );
+    }
+
+    #[test]
+    fn concurrent_close_waits_for_workers_and_lock_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-concurrent-close-{:032x}",
+            checkpoint::new_run_id()
+        ));
+        let engine = Engine::open(
+            &dir,
+            Options {
+                background_compaction: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let ks = engine.ks();
+        ks.put(b"k", b"v").unwrap();
+        drop(ks);
+
+        let (flush_started_tx, flush_started_rx) = mpsc::channel();
+        let (release_flush_tx, release_flush_rx) = mpsc::channel();
+        let release_flush_rx = Mutex::new(release_flush_rx);
+        *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
+            flush_started_tx.send(()).unwrap();
+            let _ = release_flush_rx.lock().unwrap().recv();
+        }));
+        {
+            let mut state = engine.core.write_state();
+            engine.core.freeze_active(&mut state);
+        }
+        engine.core.flush_signal.request();
+        flush_started_rx.recv().unwrap();
+
+        let (c1_at_stripe1_tx, c1_at_stripe1_rx) = mpsc::channel();
+        let (c1_resume_tx, c1_resume_rx) = mpsc::channel();
+        let (c2_started_tx, c2_started_rx) = mpsc::channel();
+        let (c2_at_last_tx, c2_at_last_rx) = mpsc::channel();
+        let (c2_returned_tx, c2_returned_rx) = mpsc::channel();
+
+        let first = engine.clone();
+        let second = engine.clone();
+        let reopen_dir = dir.clone();
+
+        let (returned_early, first_result, second_result) = std::thread::scope(|scope| {
+            let first_handle = scope.spawn(move || {
+                first.close_with(|stripe| {
+                    if stripe == 1 {
+                        c1_at_stripe1_tx.send(()).unwrap();
+                        c1_resume_rx.recv().unwrap();
+                    }
+                })
+            });
+            c1_at_stripe1_rx.recv().unwrap();
+
+            let second_handle = scope.spawn(move || {
+                second.close_with(|stripe| {
+                    if stripe == 0 {
+                        c2_started_tx.send(()).unwrap();
+                    } else if stripe == OPEN_STRIPES - 1 {
+                        c2_at_last_tx.send(()).unwrap();
+                    }
+                })?;
+                let _ = c2_returned_tx.send(());
+                let reopened = Engine::open(
+                    &reopen_dir,
+                    Options {
+                        background_compaction: None,
+                        ..Options::default()
+                    },
+                )?;
+                reopened.close()
+            });
+
+            c2_started_rx.recv().unwrap();
+            c1_resume_tx.send(()).unwrap();
+            c2_at_last_rx.recv().unwrap();
+            drop(engine.shared.open[0].0.read().unwrap());
+            let returned_early = c2_returned_rx.try_recv().is_ok();
+            release_flush_tx.send(()).unwrap();
+
+            (
+                returned_early,
+                first_handle.join().unwrap(),
+                second_handle.join().unwrap(),
+            )
+        });
+
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            !returned_early,
+            "second close returned before workers stopped and lock was released"
+        );
+        first_result.unwrap();
+        second_result.unwrap();
     }
 }

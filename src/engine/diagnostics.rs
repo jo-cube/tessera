@@ -135,6 +135,8 @@ pub struct LevelMemory {
     pub footer: usize,
     /// Physical chunk and piece metadata.
     pub physical: usize,
+    /// Blocks in the level's runs.
+    pub blocks: usize,
 }
 
 /// Every keyspace's runs by level, level 0 first and the bottom level
@@ -184,6 +186,7 @@ pub fn levels(engine: &Engine) -> Vec<LevelMemory> {
                 level.filters += m.filters;
                 level.footer += m.footer;
                 level.physical += m.physical;
+                level.blocks += run.run.view().block_count();
             }
             level
         })

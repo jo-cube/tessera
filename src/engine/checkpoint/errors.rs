@@ -18,10 +18,10 @@ pub(crate) enum CheckpointError {
         path: PathBuf,
         /// The error.
         error: io::Error,
-        /// Whether `CURRENT` had already been replaced, so that the new
-        /// checkpoint may be committed (if the final sync failed) and both
-        /// were kept.
-        after_commit_point: bool,
+        /// The committed checkpoint's report if `CURRENT` had already been
+        /// replaced, so that the new checkpoint may be committed (if the final
+        /// sync failed) and both were kept.
+        committed: Option<Box<CheckpointReport>>,
     },
 }
 
@@ -35,12 +35,12 @@ impl fmt::Display for CheckpointError {
             Self::Io {
                 path,
                 error,
-                after_commit_point,
+                committed,
             } => write!(
                 f,
                 "checkpoint failed at {}{}: {error}",
                 path.display(),
-                if *after_commit_point {
+                if committed.is_some() {
                     " after replacing CURRENT"
                 } else {
                     ""

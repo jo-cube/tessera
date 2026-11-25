@@ -30,19 +30,12 @@ impl CompactionPolicy {
             reclaim: false,
         }
     }
+    #[cfg(test)]
     pub(super) fn with_test_policy(self, policy: Self) -> Self {
-        #[cfg(test)]
-        {
-            Self {
-                max_input_bytes: self.max_input_bytes.min(policy.max_input_bytes),
-                max_workspace_bytes: self.max_workspace_bytes.min(policy.max_workspace_bytes),
-                ..policy
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = policy;
-            self
+        Self {
+            max_input_bytes: self.max_input_bytes.min(policy.max_input_bytes),
+            max_workspace_bytes: self.max_workspace_bytes.min(policy.max_workspace_bytes),
+            ..policy
         }
     }
     pub(super) fn fit(&self, target_run_len: usize, level0_stop: usize) -> Fit {
@@ -113,11 +106,13 @@ impl fmt::Display for CompactionError {
 impl std::error::Error for CompactionError {}
 
 /// What kind of step a compaction took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum CompactionKind {
     /// Runs of one level merged with the runs of the next that they
     /// overlap, into the next.
+    #[default]
     Merge,
     /// A run relabelled to the next level, which it overlaps nowhere:
     /// nothing was read or written.
@@ -127,35 +122,37 @@ pub(crate) enum CompactionKind {
 }
 
 /// What a compaction replaced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompactionReport {
     /// What kind of step it was. A move replaces nothing, and every count
     /// below is 0.
+    #[cfg(test)]
     pub kind: CompactionKind,
     /// The level the step took its runs from.
+    #[cfg(test)]
     pub level: usize,
     /// Runs removed.
+    #[cfg(test)]
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
     /// What they held beside that: key filters and physical segment metadata.
+    #[cfg(test)]
     pub input_held_bytes: usize,
     /// Runs published in their place.
+    #[cfg(test)]
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
     /// What they hold beside that: key filters and physical segment metadata.
     pub output_held_bytes: usize,
-    /// The most bytes one output's filter construction held for key hashes,
-    /// freed when that run was finished.
-    pub filter_build_bytes: usize,
     /// Whether no other run overlapped the inputs, so that every tombstone
     /// could be dropped.
+    #[cfg(test)]
     pub complete: bool,
     /// What the merge read and wrote.
+    #[cfg(test)]
     pub stats: CompactStats,
-    /// The workspace estimate checked before merging.
-    pub workspace_bytes: usize,
 }
 
 /// A compaction whose inputs are chosen and whose output is not built yet.
@@ -175,6 +172,7 @@ pub(super) struct CompactionJob<'e> {
     /// hold older versions that the inputs' tombstones hide.
     pub(super) others: Vec<SharedRun>,
     pub(super) options: CompactionPolicy,
+    #[cfg(test)]
     pub(super) kind: CompactionKind,
     pub(super) level: usize,
     /// Where the output goes.
@@ -182,35 +180,80 @@ pub(super) struct CompactionJob<'e> {
     /// Output into the bottom level, which erases uncontested sequences.
     pub(super) zero_seq: bool,
     pub(super) cuts: OutputCuts,
-    /// Where the source level's next job starts once this publishes.
-    pub(super) cursor: Option<Cursor>,
+    /// The source's largest key to advance the source level's cursor past.
+    pub(super) cursor: Option<Vec<u8>>,
     /// Stored size of a full target-length run, using the planner estimate.
     pub(super) estimated_run_bytes: usize,
     /// Number of leading level-0 sources, for bottom-range publication.
     pub(super) source_count: usize,
 }
 
-/// How a published job moves its source level's cursor.
-#[derive(Debug)]
-pub(super) enum Cursor {
-    /// Past this key, the source's largest.
-    After(Vec<u8>),
-}
-
-/// A compaction step chosen under the lock: a job to build, or a move,
-/// already done.
+/// A compaction step chosen under the lock: a job to build or a finished move.
 pub(super) enum Begun<'e> {
-    Job(CompactionJob<'e>),
+    Job(Box<CompactionJob<'e>>),
     Done(CompactionReport),
 }
 
 impl<'e> CompactionJob<'e> {
     pub(super) fn input_bytes(&self) -> usize {
-        self.inputs.iter().map(|run| run.run.stored_len()).sum()
+        physical_runs(&self.inputs)
+            .map(|run| run.run.stored_len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn input_held_bytes(&self) -> usize {
+        physical_runs(&self.inputs)
+            .map(|run| run.run.held_bytes())
+            .sum()
+    }
+
+    pub(super) fn begin_report(&self) -> CompactionReport {
+        CompactionReport {
+            #[cfg(test)]
+            kind: self.kind,
+            #[cfg(test)]
+            level: self.level,
+            #[cfg(test)]
+            inputs: self.inputs.len(),
+            input_bytes: self.input_bytes(),
+            #[cfg(test)]
+            input_held_bytes: self.input_held_bytes(),
+            #[cfg(test)]
+            complete: self.is_complete(),
+            ..CompactionReport::default()
+        }
+    }
+
+    pub(super) fn report(
+        &self,
+        inputs: &[SharedRun],
+        output: &crate::run::Compacted,
+    ) -> CompactionReport {
+        CompactionReport {
+            #[cfg(test)]
+            kind: self.kind,
+            #[cfg(test)]
+            level: self.level,
+            #[cfg(test)]
+            inputs: inputs.len(),
+            input_bytes: physical_runs(inputs).map(|r| r.run.stored_len()).sum(),
+            #[cfg(test)]
+            input_held_bytes: physical_runs(inputs).map(|r| r.run.held_bytes()).sum(),
+            #[cfg(test)]
+            outputs: output.runs.len(),
+            output_bytes: output.output_bytes,
+            output_held_bytes: output.held_bytes,
+            #[cfg(test)]
+            complete: self.is_complete(),
+            #[cfg(test)]
+            stats: output.stats,
+        }
     }
 
     /// Returns whether no other run overlaps the inputs, so that every
     /// tombstone can be dropped.
+    #[cfg(test)]
     pub(super) fn is_complete(&self) -> bool {
         self.others.is_empty()
     }
@@ -321,7 +364,7 @@ impl<'e> CompactionJob<'e> {
         let limits = CompactLimits {
             target_run_len: self.engine.target_run_len,
             max_workspace_bytes: workspace_bytes,
-            codec: self.engine.codec,
+            encoding: self.engine.encoding,
             target_block_compressed: self.engine.target_block_compressed,
             zero_seq: self.zero_seq,
             copy_forward: self.copy_forward(),
@@ -350,7 +393,8 @@ impl<'e> CompactionJob<'e> {
                 &self.cuts,
                 (workspace, &self.engine.chunks, &floors),
                 budget,
-            )?
+            )
+            .map_err(CompactionError::from)
         } else {
             compact_parallel_in(
                 &views,
@@ -360,8 +404,13 @@ impl<'e> CompactionJob<'e> {
                 threads,
                 self.estimated_run_bytes,
                 (workspace, &self.engine.chunks, &floors),
-            )?
+            )
+            .map_err(CompactionError::from)
         };
+        // The workspace's buffers and contexts are charged only as part of
+        // this build, so they do not outlive it.
+        *workspace = MergeWorkspace::new();
+        let output = output?;
         #[cfg(feature = "diagnostics")]
         crate::run::copy_audit::set_bottom_inputs(None);
         #[cfg(test)]
@@ -382,7 +431,6 @@ impl<'e> CompactionJob<'e> {
 impl fmt::Debug for CompactionJob<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompactionJob")
-            .field("kind", &self.kind)
             .field("level", &self.level)
             .field("inputs", &self.inputs.len())
             .field("input_bytes", &self.input_bytes())
@@ -414,25 +462,7 @@ impl<'e> CompactionJob<'e> {
         charge: resources::BuildCharge<'e>,
         _record_job: bool,
     ) -> Result<CompactionReport, CompactionError> {
-        let report = CompactionReport {
-            kind: self.kind,
-            level: self.level,
-            inputs: inputs.len(),
-            input_bytes: inputs.iter().map(|r| r.run.stored_len()).sum(),
-            input_held_bytes: inputs.iter().map(|run| run.run.held_bytes()).sum(),
-            outputs: output.runs.len(),
-            output_bytes: output.output_bytes,
-            output_held_bytes: output.held_bytes,
-            filter_build_bytes: output
-                .runs
-                .iter()
-                .map(Run::filter_build_bytes)
-                .max()
-                .unwrap_or(0),
-            complete: self.is_complete(),
-            stats: output.stats,
-            workspace_bytes: output.workspace_bytes,
-        };
+        let report = self.report(inputs, &output);
         #[cfg(feature = "diagnostics")]
         diagnostics::observe("job_before_publish", self.engine.stats());
         let is_input = |run: &SharedRun| inputs.iter().any(|input| Arc::ptr_eq(input, run));
@@ -470,9 +500,8 @@ impl<'e> CompactionJob<'e> {
         if space.levels.replace(inputs, &outputs, self.dest).is_err() {
             return Err(CompactionError::Stale);
         }
-        match &self.cursor {
-            Some(Cursor::After(key)) => space.levels.advance(self.level, key),
-            None => {}
+        if let Some(key) = &self.cursor {
+            space.levels.advance(self.level, key);
         }
         #[cfg(feature = "diagnostics")]
         #[allow(irrefutable_let_patterns, reason = "test-only destinations")]

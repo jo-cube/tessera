@@ -3,7 +3,7 @@ use super::*;
 use crate::block::Value;
 use crate::engine::{CompactionPolicy, Compression, Engine, ErrorKind};
 use crate::run::ReadWorkspace;
-use crate::test_support::{Rng, Scratch, mutate};
+use crate::test_support::{Rng, Scratch, campaign_seed, mutate};
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -131,11 +131,19 @@ fn reseal_run(bytes: &mut [u8], original: &[u8]) {
     bytes[footer + 36..footer + 40].copy_from_slice(&sum.to_le_bytes());
 }
 
-fn mutations(iterations: usize) {
+/// The mutation stream's fixed seed. In the long campaign it derives from
+/// `TESSERA_TEST_SEED` when that is set.
+const MUTATION_SEED: u64 = 0x6861_7264_656e_696e;
+
+fn mutations(iterations: usize, seed: u64) {
     let started = Instant::now();
-    let mut rng = Rng(0x6861_7264_656e_696e);
+    let mut rng = Rng(seed);
     let (mut changed, mut accepted, mut accepted_runs, mut unrepaired_runs) = (0, 0, 0, 0);
-    for compression in [Compression::Uncompressed, Compression::Zstd] {
+    for compression in [
+        Compression::Uncompressed,
+        Compression::Zstd,
+        Compression::ZstdFastDecode,
+    ] {
         for filters in [true, false] {
             let scratch = Scratch::new("mutation");
             let options = Options {
@@ -187,7 +195,7 @@ fn mutations(iterations: usize) {
                 entry.id = id;
             }
             manifest.next_run_id = manifest.runs.len() as u64 + 1;
-            fs::write(&manifest_path, manifest.encode()).unwrap();
+            fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
             assert!(!manifest.runs.is_empty());
             assert_eq!(manifest.runs.iter().any(|r| r.len > r.run_len + 4), filters);
             let current_path = scratch.0.join(CURRENT);
@@ -275,7 +283,7 @@ fn mutations(iterations: usize) {
                         .find(|r| r.id == entry.id)
                         .unwrap()
                         .sum = crc(&[&mutated]);
-                    fs::write(&manifest_path, updated.encode()).unwrap();
+                    fs::write(&manifest_path, updated.encode().unwrap()).unwrap();
                 }
                 fs::write(path, &mutated).unwrap();
                 let result = catch_unwind(AssertUnwindSafe(|| Engine::open(&scratch.0, options)));
@@ -304,20 +312,20 @@ fn mutations(iterations: usize) {
         }
     }
     eprintln!(
-        "mutations: {changed} changed files, {accepted} accepted after checksum repair; {accepted_runs} changed raw runs accepted ({unrepaired_runs} without repair); {:?}",
+        "mutations (seed {seed}): {changed} changed files, {accepted} accepted after checksum repair; {accepted_runs} changed raw runs accepted ({unrepaired_runs} without repair); {:?}",
         started.elapsed()
     );
 }
 
 #[test]
 fn bounded_checkpoint_mutations() {
-    mutations(300);
+    mutations(300, MUTATION_SEED);
 }
 
 #[test]
 #[ignore = "long deterministic checkpoint mutation campaign"]
 fn long_checkpoint_mutations() {
-    mutations(10_000);
+    mutations(10_000, campaign_seed(MUTATION_SEED));
 }
 
 /// A checkpoint of keyspaces "a", "b" and "c", where "b" was dropped and
@@ -374,7 +382,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
             ..manifest
         };
         change(&mut copy);
-        copy.encode()
+        copy.encode().unwrap()
     };
     // A run whose keyspace is not listed.
     rejected(
@@ -419,7 +427,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
         "malformed keyspace table",
     );
     // A table length that disagrees with its entries, resealed.
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     let table = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
     bytes[64..68].copy_from_slice(&(table - 1).to_le_bytes());
     let mut shorter = bytes[..MANIFEST_HEADER_LEN + table as usize - 1].to_vec();
@@ -427,7 +435,7 @@ fn recovery_rejects_each_damaged_keyspace_table() {
     reseal(&mut shorter);
     rejected(&scratch, &shorter, "malformed keyspace table");
     // More keyspaces than the limit.
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     bytes[60..64].copy_from_slice(&(MAX_KEYSPACES as u32 + 1).to_le_bytes());
     reseal(&mut bytes);
     rejected(&scratch, &bytes, "malformed keyspace table");
@@ -452,7 +460,7 @@ fn recovery_names_an_unsupported_manifest_version() {
     let scratch = Scratch::new("manifest-version");
     let manifest = keyspace_checkpoint(&scratch);
     for version in [0, 2, 5, u32::MAX] {
-        let mut bytes = manifest.encode();
+        let mut bytes = manifest.encode().unwrap();
         bytes[8..12].copy_from_slice(&version.to_le_bytes());
         reseal(&mut bytes);
         rejected(
@@ -468,7 +476,7 @@ fn recovery_names_an_unsupported_manifest_version() {
             &format!("unsupported manifest version {version}"),
         );
     }
-    let mut bytes = manifest.encode();
+    let mut bytes = manifest.encode().unwrap();
     bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
     reseal(&mut bytes);
     rejected(&scratch, &bytes, "unsupported manifest flags 0x2");

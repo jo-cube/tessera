@@ -1,6 +1,8 @@
 //! Segment dictionaries, adaptive cuts and checked direct-load decoding.
 use crate::block::Value;
-use crate::run::{Codec, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption, RunView};
+use crate::run::{
+    Codec, Encoding, RAW_BLOCK_CAP, ReadWorkspace, Run, RunBuilder, RunCorruption, RunView,
+};
 
 fn u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
@@ -475,4 +477,93 @@ fn weakly_compressible_segments_stay_at_one_sampled_prefix() {
         );
     }
     Run::new(run.as_bytes()).unwrap();
+}
+
+/// Deterministic text-like records: words from a small vocabulary, with
+/// some tombstones, over several segments.
+fn build_text(encoding: impl Into<Encoding>) -> Run<Vec<u8>> {
+    let mut b = RunBuilder::new(encoding);
+    for i in 0..TEXT_RECORDS {
+        match text_value(i) {
+            Some(value) => b.add(&text_key(i), u64::from(i % 5), Value::Bytes(&value)),
+            None => b.add(&text_key(i), 7, Value::Tombstone),
+        }
+        .unwrap();
+    }
+    b.finish()
+}
+const TEXT_RECORDS: u32 = 40_000;
+fn text_key(i: u32) -> Vec<u8> {
+    format!("user:{:08}", i.wrapping_mul(7)).into_bytes()
+}
+fn text_value(i: u32) -> Option<Vec<u8>> {
+    const WORDS: [&str; 12] = [
+        "alpha", "bravo", "cache", "delta", "entry", "frame", "group", "heap", "index", "journal",
+        "kilo", "level",
+    ];
+    if i.is_multiple_of(13) {
+        return None;
+    }
+    let mut state = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut value = format!("{{\"id\":{i},\"tags\":[");
+    for _ in 0..(8 + i % 24) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        value.push_str(WORDS[(state % 12) as usize]);
+        value.push(if state & 64 == 0 { ' ' } else { ',' });
+    }
+    value.push_str("]}");
+    Some(value.into_bytes())
+}
+
+/// The default encoding is pinned: these bytes were recorded from the
+/// builder before literal settings existed.
+#[test]
+fn the_default_encoding_builds_the_recorded_bytes() {
+    let run = build_text(Codec::Zstd);
+    let bytes = run.as_bytes();
+    assert!(run.view().segment_count() > 1);
+    assert_eq!(
+        (bytes.len(), crc32fast::hash(&bytes)),
+        (DEFAULT_TEXT_LEN, DEFAULT_TEXT_CRC)
+    );
+    assert_eq!(build_text(Encoding::default()).as_bytes(), bytes);
+}
+const DEFAULT_TEXT_LEN: usize = 1_604_111;
+const DEFAULT_TEXT_CRC: u32 = 0x3e0e_4d20;
+
+#[test]
+fn raw_literal_runs_round_trip_without_literal_tables() {
+    let fast = Encoding {
+        codec: Codec::Zstd,
+        raw_literals: true,
+    };
+    let (plain, raw) = (build_text(Codec::Zstd), build_text(fast));
+    assert_eq!(build_text(fast).as_bytes(), raw.as_bytes(), "deterministic");
+    let plain_counts = super::literal_counts(&plain);
+    let raw_counts = super::literal_counts(&raw);
+    assert!(plain_counts[2] > 0, "{plain_counts:?}");
+    assert_eq!(raw_counts[2] + raw_counts[3], 0, "{raw_counts:?}");
+    assert!(raw_counts[0] > 0, "{raw_counts:?}");
+    assert!(raw.as_bytes().len() > plain.as_bytes().len());
+    // Smaller raw blocks at the same stored target.
+    assert!(raw.block_count() > plain.block_count());
+    let copy = Run::new(raw.as_bytes().to_vec()).unwrap();
+    let mut w = ReadWorkspace::new();
+    for i in (0..TEXT_RECORDS).step_by(7) {
+        let found = copy.get(&text_key(i), &mut w).unwrap().unwrap();
+        match text_value(i) {
+            Some(value) => assert_eq!(found.value, Value::Bytes(&value)),
+            None => assert_eq!(found.value, Value::Tombstone),
+        }
+    }
+    let view = copy.view();
+    let mut cursor = view.cursor(&mut w);
+    let mut n = 0;
+    while cursor.next_record().unwrap().is_some() {
+        n += 1;
+        assert!(n <= TEXT_RECORDS);
+    }
+    assert_eq!(n, TEXT_RECORDS);
 }

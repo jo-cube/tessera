@@ -57,12 +57,8 @@ pub(super) fn start(core: Arc<Core>) -> std::io::Result<std::thread::JoinHandle<
         .spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| run(&core)));
             if let Err(payload) = result {
-                let message = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_owned())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "a panic without a message".into());
-                core.flush_signal.lock().failure = Some(BackgroundError::Panicked(message));
+                core.flush_signal.lock().failure =
+                    Some(BackgroundError::Panicked(worker::message(&*payload)));
             }
             core.flush_signal.changed();
         })
@@ -157,10 +153,19 @@ mod tests {
                 tx.send(()).unwrap();
             });
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            crate::test_support::wait_until(|| {
+                engine
+                    .core
+                    .flush_waits
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 1
+            });
             assert_eq!(engine.core.read_state().frozen.len(), 2);
+            assert_eq!(engine.engine_stats().last_seq, 3);
+            assert!(rx.try_recv().is_err());
             resume.wait();
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(engine.engine_stats().last_seq, 4);
             writer.join().unwrap();
         });
         engine.flush().unwrap();

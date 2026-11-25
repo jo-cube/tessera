@@ -35,8 +35,8 @@ struct Operation {
 pub struct WriteBatch {
     bytes: Vec<u8>,
     operations: Vec<Operation>,
-    /// The engine of the first keyspace appended.
-    engine: Option<u64>,
+    /// The engine and name of the first keyspace appended.
+    engine: Option<(u64, Arc<str>)>,
     /// The name of a keyspace of another engine, if one was appended.
     foreign: Option<Arc<str>>,
     /// Whether operations name more than one keyspace.
@@ -93,8 +93,10 @@ impl WriteBatch {
     }
 
     fn note(&mut self, keyspace: &Keyspace) {
-        let engine = *self.engine.get_or_insert(keyspace.engine_id());
-        if engine != keyspace.engine_id() && self.foreign.is_none() {
+        let (engine, _) = self
+            .engine
+            .get_or_insert_with(|| (keyspace.engine_id(), keyspace.shared_name()));
+        if *engine != keyspace.engine_id() && self.foreign.is_none() {
             self.foreign = Some(keyspace.shared_name());
         }
         self.mixed |= self
@@ -134,13 +136,25 @@ impl WriteBatch {
         )
     }
 
-    /// The engine its keyspaces belong to, or the name of one that belongs
-    /// to another engine than the first.
-    pub(super) fn engine(&self) -> Result<Option<u64>, &str> {
-        match &self.foreign {
-            Some(name) => Err(name),
-            None => Ok(self.engine),
+    /// Checks that every keyspace in the batch belongs to `engine`.
+    pub(super) fn check_engine(&self, engine: u64) -> Result<(), Error> {
+        let Some((first_engine, first_name)) = &self.engine else {
+            return Ok(());
+        };
+        if *first_engine != engine {
+            return Err(if self.foreign.is_some() {
+                Error::unknown_keyspace(first_name)
+            } else {
+                Error::new(
+                    ErrorKind::UnknownKeyspace,
+                    "the batch's keyspaces belong to another engine",
+                )
+            });
         }
+        if let Some(name) = &self.foreign {
+            return Err(Error::unknown_keyspace(name));
+        }
+        Ok(())
     }
 
     /// The keyspaces the operations name, ascending and each once.
@@ -233,7 +247,7 @@ impl Core {
         }
         if batch.len() == 1 {
             let (keyspace, key, value) = batch.records().next().unwrap();
-            return self.update(keyspace, key, value);
+            return self.combine_single(keyspace, key, value);
         }
         self.combine_batch(batch, charge)
     }
@@ -268,10 +282,15 @@ impl Core {
             // append and a new slot for every operation. Only snapshots can
             // add copy-on-write costs, and none can start under the state lock.
             let needed = if state.active.has_shared_storage() {
-                batch.records().fold(0usize, |sum, (keyspace, key, value)| {
-                    let prefix = KeyPrefix::new(keyspace);
-                    sum.saturating_add(state.active.write_charge(prefix.key(key), value))
-                })
+                let (ops, copy) = batch.records().fold(
+                    (0usize, 0usize),
+                    |(ops, copy), (keyspace, key, value)| {
+                        let prefix = KeyPrefix::new(keyspace);
+                        let (op, chunk) = state.active.write_charge(prefix.key(key), value);
+                        (ops.saturating_add(op), copy.max(chunk))
+                    },
+                );
+                ops.saturating_add(copy)
             } else {
                 charge
             };
@@ -306,5 +325,72 @@ impl Core {
                 Err(error) => return (Err(error), None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_engine_batch_names_the_foreign_keyspace() {
+        let local_engine = Engine::in_memory(Options::default()).unwrap();
+        let other_engine = Engine::in_memory(Options::default()).unwrap();
+        let local = local_engine.keyspace("local").unwrap();
+        let foreign = other_engine.keyspace("foreign").unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(&foreign, b"a", b"1");
+        batch.put(&local, b"b", b"2");
+
+        let error = local_engine.write(&batch).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownKeyspace);
+        assert!(
+            error.to_string().contains("\"foreign\""),
+            "expected foreign keyspace in error, got: {error}"
+        );
+
+        let mut reversed = WriteBatch::new();
+        reversed.put(&local, b"a", b"1");
+        reversed.put(&foreign, b"b", b"2");
+        let error = local_engine.write(&reversed).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownKeyspace);
+        assert!(
+            error.to_string().contains("\"foreign\""),
+            "expected foreign keyspace in error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn small_batch_under_snapshot_does_not_flush_partly_filled_memtable() {
+        let engine = Engine::in_memory(Options {
+            memtable_size: 1 << 20,
+            background_compaction: None,
+            ..Options::default()
+        })
+        .unwrap();
+        let ks = engine.keyspace("data").unwrap();
+        ks.put(b"seed", &[1u8; 64 << 10]).unwrap();
+        let snapshot = engine.snapshot();
+        let before = engine.engine_stats();
+
+        let mut batch = WriteBatch::new();
+        for i in 0..100u32 {
+            batch.put(&ks, &i.to_be_bytes(), b"val");
+        }
+        engine.write(&batch).unwrap();
+
+        let after = engine.engine_stats();
+        assert_eq!(after.flushes, before.flushes);
+        assert!(after.frozen.is_none());
+        assert_eq!(after.runs, 0);
+        assert_eq!(
+            snapshot.reader().get(&ks, b"seed").unwrap(),
+            Some(&[1u8; 64 << 10][..])
+        );
+        assert_eq!(
+            ks.get(&99u32.to_be_bytes()).unwrap().as_deref(),
+            Some(&b"val"[..])
+        );
     }
 }

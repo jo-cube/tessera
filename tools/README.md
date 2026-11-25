@@ -10,15 +10,18 @@ compaction and checks every read path against an independent value oracle.
 
 Long-format CSV rows report raw bytes decoded and compressed and stored bytes
 written by flush and by compaction into each level; stored bytes by component
-(frames, dictionaries, segment table, index, filters, footer, physical) and
-records per level, plus per-record component breakdown (`per_record`); records
+(frames, dictionaries, segment table, index, filters, footer, physical),
+blocks and records per level, plus per-record component breakdown (`per_record`); records
 written into the bottom level, how many had their sequence erased, the filter
 probes that took and why the rest kept theirs; decoded bytes per get, blocks
 per scan, write amplification and writer wait / lock counters (`waits`).
 `--settle` then compacts everything into the bottom level and measures again,
 `--variant LABEL` labels the rows and `--scale SHIFT` runs smaller scenarios;
 name scenarios to run only those. `clustered` (time-ordered load of grouped
-JSON, then updates to the newest 10% of entities) runs only when named.
+JSON, then updates to the newest 10% of entities) and `grouped-random`
+(1,048,576 keys with the comparison harness's dataset A values, ~1 KiB JSON
+whose 360-, 260- and 60-byte random strings are shared by each group of 64
+members) run only when named.
 
 Workload-shape flags: `--zipf` runs scrambled Zipfian gets at θ = 0.99 and
 θ = 0.80, reporting decoded bytes, CRC bytes, filter probes and a block-reuse
@@ -28,7 +31,16 @@ by a scrambled Zipfian update phase (θ = 0.99) and re-measured reads.
 `--read-shapes` measures point gets with 0%, 50% and 100% misses (filter
 probes, false positives, decoded bytes per miss and per-level block decodes),
 absent-prefix scans, and short scans of 1, 5 and 10 records with per-level
-block and decoded-byte breakdowns.
+block and decoded-byte breakdowns. `--reuse` settles the bottom level, then
+prints work per get (blocks, decoded, CRC bytes, filter probes, per-level mean
+raw block length) for uniform hits, uniform in-range misses, Zipfian hits
+(θ = 0.99, 0.80) and Zipfian misses (absent keys drawn over a miss space as
+large as the live set), and byte-capacity cache curves at 0.25, 1, 4, 16 and
+64 MiB: LRU by byte-weighted stack distance and byte-weighted S3-FIFO, for a
+whole-block cache charged decoded bytes, a record cache charged key + value +
+64 B (also under 95/5 and 50/50 read/update mixes, where an update removes the
+record) and a negative cache charged key + 64 B. Reuse streams are ten times
+the 64 MiB record count long; the first half warms the caches.
 
 Audit flags: `--copy-audit` prints, per bottom input segment of every level-0
 → bottom merge, how many blocks could be copied verbatim (no other input's key
@@ -48,7 +60,7 @@ optional `--memtable-key KEY_LEN`, default 16) fills one memtable to its
 budget with random keys and prints its live heap per entry beyond key and
 value. `--keyspaces N` spreads the same records over N keyspaces, record `i` in
 keyspace `i % N`, and checks every read in its keyspace; the probe rows,
-`--read-shapes`, `--zipf` and `--worst` need one keyspace.
+`--read-shapes`, `--zipf`, `--reuse` and `--worst` need one keyspace.
 
 The hidden `diagnostics` feature provides the counters. It is not part of the
 stable API. The programs in [`examples/`](../examples) demonstrate the public
@@ -63,6 +75,9 @@ Native Zstandard allocations are outside the Rust counter. `--threads COUNT`
 sets builders; `--threads default` uses the engine default (otherwise one).
 `TESSERA_COUNTERS_MEMTABLE_MIB` sets `Options::memtable_size` in MiB for
 every scenario and variant. Use the same value on both sides of a comparison.
+`--compression zstd|fast-decode|uncompressed` sets `Options::compression`
+(`Zstd`, the default; `ZstdFastDecode`; `Uncompressed`); the `config` line
+records it.
 
 ## Zstandard entropy measurements
 

@@ -15,8 +15,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Options {
-    /// The writer admission budget in bytes; `None` (the default) is
-    /// unlimited. See [Memory](crate#memory).
+    /// The writer admission budget in bytes, at least 2 MiB; `None` (the
+    /// default) is unlimited. See [Memory](crate#memory).
     pub memory_limit: Option<usize>,
     /// Bytes one memtable is charged before it is flushed into runs
     /// (default 64 MiB). A record is charged its key, its value and 80 bytes,
@@ -71,10 +71,24 @@ impl Default for Options {
     }
 }
 
+/// The least `memory_limit`. The active memtable takes memory in 1 MiB pool
+/// chunks, each counted in full when taken, so a smaller limit leaves no
+/// room to fill one and makes nearly every write flush or fail.
+pub(super) const MIN_MEMORY_LIMIT: usize = 2 * crate::chunk::CHUNK_BYTES;
+
 impl Options {
     /// The one check of these options, made before an engine starts a
     /// worker, allocates or touches a file. See [`ConfigError`].
     pub(super) fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(limit) = self.memory_limit {
+            ConfigError::check(
+                "Options::memory_limit",
+                limit as u64,
+                MIN_MEMORY_LIMIT as u64,
+                usize::MAX as u64,
+                "the active memtable takes memory in 1 MiB chunks, so the limit must leave room to fill one",
+            )?;
+        }
         ConfigError::check(
             "Options::memtable_size",
             self.memtable_size as u64,
@@ -174,6 +188,10 @@ impl std::error::Error for ConfigError {}
 /// dictionary per roughly 4 MiB segment, with independently decoded blocks
 /// sized to [`Options::block_size`]. Every decode loads the dictionary by
 /// reference into the reader's context.
+///
+/// Every block records how it is stored, so an engine reads runs built with
+/// any setting. A change applies to newly encoded blocks: blocks that
+/// compaction copies forward keep the setting they were built with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
@@ -182,12 +200,20 @@ pub enum Compression {
     Zstd,
     /// Raw 16 KiB blocks, read in place.
     Uncompressed,
+    /// Zstandard level 1 with literals stored uncompressed: faster gets,
+    /// larger runs. Weakly compressible data comes out larger than with
+    /// [`Uncompressed`](Self::Uncompressed), the better choice there.
+    ZstdFastDecode,
 }
 impl Compression {
-    pub(super) fn codec(self) -> Codec {
+    pub(super) fn encoding(self) -> Encoding {
         match self {
-            Self::Zstd => Codec::Zstd,
-            Self::Uncompressed => Codec::None,
+            Self::Zstd => Codec::Zstd.into(),
+            Self::Uncompressed => Codec::None.into(),
+            Self::ZstdFastDecode => Encoding {
+                codec: Codec::Zstd,
+                raw_literals: true,
+            },
         }
     }
 }

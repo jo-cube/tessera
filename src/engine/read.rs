@@ -9,13 +9,12 @@ use std::sync::LazyLock;
 
 /// The engine's state at one moment: what a [`Snapshot`] holds, and what a
 /// latest-state scan pins for its life.
-#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 pub(super) struct View {
     /// Newest first.
     pub(super) tables: Vec<Arc<FrozenMemtable>>,
     /// The directory of every keyspace live at that moment.
     pub(super) directories: Directories,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) last_seq: u64,
     /// The ID the next keyspace created after that moment gets.
     pub(super) next_keyspace: u32,

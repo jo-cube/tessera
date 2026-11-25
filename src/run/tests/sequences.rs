@@ -17,7 +17,7 @@ fn limits(zero_seq: bool) -> CompactLimits {
     CompactLimits {
         target_run_len: usize::MAX,
         max_workspace_bytes: usize::MAX,
-        codec: Codec::Zstd,
+        encoding: Codec::Zstd.into(),
         target_block_compressed: 1024,
         zero_seq,
         copy_forward: true,
