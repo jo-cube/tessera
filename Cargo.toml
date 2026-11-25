@@ -2,7 +2,7 @@
 # Engine suites are included as unit modules so scheduling hooks stay private.
 autotests = false
 name = "tessera"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A safe Rust, RAM-first compressed LSM key-value engine with explicit checkpoints"

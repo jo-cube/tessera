@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-25
+
+### Features
+
+- tools: add byte-capacity record and block cache curves (0bf9c8c)
+- tools: add grouped-random counters scenario (ec54a56)
+- engine: add zstd compression with uncompressed literals (eac4d2d)
+- tools: select engine compression in bench and counters (a18b6da)
+- tools: report blocks per level in counters (f4d69d2)
+
+### Fixes
+
+- engine: drain combiner shards before releasing on leader abort (c792368)
+- memory: re-check level-0 stop after waits during admission (5840bb2)
+- memory: count a flushed table until its job frees it (190fe28)
+- memory: release a merge workspace with the build that charged it (2705da1)
+- memory: charge the read workspaces that split piece sources (17c91a2)
+- checkpoint: keep the generation a failed rename committed (61baa6a)
+- checkpoint: sync the parent of a newly created directory (1238ccc)
+- checkpoint: rewrite a reused run file of the wrong length (1ca5f81)
+- memory: saturate build estimates instead of overflowing (a61ba42)
+- checkpoint: keep a generation whose commit cannot be read back (7ec8b07)
+- engine: name a foreign keyspace in mixed-engine batch errors (154dff8)
+- memory: saturate BuildCharge::finished estimates (e83936a)
+- compaction: count physical input bytes once across split views (1f25cd1)
+- checkpoint: record last_checkpoint on committed rename errors (12f89fd)
+- engine: wait for workers and lock release on concurrent close (efaeabe)
+- memtable: charge shared arena copy once per write batch (8fdaa1b)
+- checkpoint: reject manifest run counts above u32::MAX (66302a0)
+
+### Performance
+
+- read: reuse cached active snapshot view under read lock (483e942)
+- read: skip decoding on empty or inverted range seeks (c3d8eb3)
+
+### API
+
+- api: document the zstd fast-decode compression choice (4339e2c)
+- api: reject a memory limit below 2 MiB **(breaking)** (a062dc1)
+
+### Other
+
+- engine: format updated concurrency and snapshot tests (8dbb02e)
+- tools: format grouped-random scenario fields (739dcc9)
+- engine: format the accounting and coverage tests (cfa3fc7)
+- engine: use batch.payload_bytes() during ingestion (9e77646)
+- engine: drop unreachable refusal paths and extra batch check (4d8505d)
+- read: gate View::last_seq on tests and drop dead_code attr (0dfeb14)
+- compaction: drop unread CompactionReport fields in release (0203393)
+- run: pass chunk pool directly to RunBuilder and Output (a43067f)
+- run: drop inherited dictionary buffer after packing (a0f4deb)
+- engine: compute compaction policy once in Core::with_pool (e0fb09c)
+- memory: replace WaitCharge with AtomicWaitCharge (deb5cd6)
+- engine: share worker::message with flusher::start (064ce9f)
+- memory: avoid recomputing pinned bytes in Core::usage (1f444b6)
+- compaction: remove dead level bytes, _fit arg, and L0 cursor (7363d5b)
+- checkpoint: return Image directly from checkpoint_image (bc59481)
+- compaction: box CompactionJob in Begun and clean range test (5b75d59)
+
 ## 0.2.0 - 2026-11-23
 
 ### Features
