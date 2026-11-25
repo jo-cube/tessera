@@ -501,7 +501,7 @@ fn text_value(i: u32) -> Option<Vec<u8>> {
         "alpha", "bravo", "cache", "delta", "entry", "frame", "group", "heap", "index", "journal",
         "kilo", "level",
     ];
-    if i % 13 == 0 {
+    if i.is_multiple_of(13) {
         return None;
     }
     let mut state = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
