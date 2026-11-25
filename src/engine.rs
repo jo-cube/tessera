@@ -693,13 +693,31 @@ impl Core {
 
     /// A consistent view of the state now, sharing every source.
     fn snapshot(&self) -> View {
-        // When the active table is empty, taking a snapshot mutates nothing
-        // and needs only a shared read lock.
+        // Taking a snapshot mutates state only to cache a new active-table
+        // view; when the active table is empty or the cached view still
+        // matches `last_seq`, a shared read lock suffices.
         {
             let state = self.read_state();
             if state.active.is_empty() {
                 return View {
                     tables: state.frozen.iter().rev().cloned().collect(),
+                    directories: Arc::clone(&state.directories),
+                    last_seq: state.last_seq,
+                    next_keyspace: state.next_keyspace,
+                    _live: Arc::clone(&self.snapshots),
+                };
+            }
+            if let Some(view) = state
+                .last_view
+                .as_ref()
+                .filter(|(seq, _)| *seq == state.last_seq)
+                .and_then(|(_, view)| view.upgrade())
+            {
+                let mut tables = Vec::with_capacity(state.frozen.len() + 1);
+                tables.push(view);
+                tables.extend(state.frozen.iter().rev().cloned());
+                return View {
+                    tables,
                     directories: Arc::clone(&state.directories),
                     last_seq: state.last_seq,
                     next_keyspace: state.next_keyspace,
@@ -1283,7 +1301,7 @@ impl Core {
         let _waiting = WaitingWriter(&self.waiting_writers);
         let _gate = self.pass_gate();
         let guard = self.state.write().expect(LOCK);
-        #[cfg(feature = "diagnostics")]
+        #[cfg(any(test, feature = "diagnostics"))]
         self.resources
             .write_locks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1536,6 +1554,74 @@ mod tests {
         });
         assert!(engine.core.gate.try_lock().is_ok());
         assert_eq!(ks.get(b"k").unwrap().unwrap(), b"new");
+    }
+
+    #[test]
+    fn repeated_snapshot_without_writes_takes_no_exclusive_lock() {
+        let engine = Engine::in_memory(manual()).unwrap();
+        let ks = engine.ks();
+        let extra = engine.keyspace("extra").unwrap();
+        let write_locks = || engine.core.resources.write_locks.load(Ordering::Relaxed);
+
+        // Empty active table needs only the shared read lock.
+        let before = write_locks();
+        let empty = engine.snapshot();
+        assert_eq!(write_locks(), before);
+        drop(empty);
+
+        ks.put(b"k1", b"v1").unwrap();
+        extra.put(b"e1", b"ev1").unwrap();
+
+        // First snapshot after a write takes the exclusive lock once to cache `last_view`.
+        let before = write_locks();
+        let snap1 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+
+        // Repeated snapshots without intervening writes reuse `last_view` under the read lock.
+        let snap2 = engine.snapshot();
+        let held_read = engine.core.read_state();
+        let snap3 = engine.snapshot();
+        drop(held_read);
+        assert_eq!(write_locks(), before + 1);
+        assert_eq!(snap2.reader().get(&ks, b"k1").unwrap(), Some(&b"v1"[..]));
+        assert_eq!(snap3.reader().get(&extra, b"e1").unwrap(), Some(&b"ev1"[..]));
+
+        // Dropping a keyspace leaves `active` and `last_seq` unchanged, so reusing
+        // `last_view` under the read lock still observes the updated directory.
+        assert!(engine.drop_keyspace("extra").unwrap());
+        let after_drop = write_locks();
+        let snap_after_drop = engine.snapshot();
+        assert_eq!(write_locks(), after_drop);
+        assert_eq!(snap1.reader().get(&extra, b"e1").unwrap(), Some(&b"ev1"[..]));
+        assert_eq!(
+            snap_after_drop
+                .reader()
+                .get(&extra, b"e1")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::KeyspaceDropped
+        );
+        assert_eq!(
+            snap_after_drop.reader().get(&ks, b"k1").unwrap(),
+            Some(&b"v1"[..])
+        );
+
+        // Once every snapshot holding `last_view` drops, the next snapshot recreates it.
+        drop((snap1, snap2, snap3, snap_after_drop));
+        let before = write_locks();
+        let snap4 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+
+        // A new write advances `last_seq`, so the next snapshot creates a new view once.
+        ks.put(b"k2", b"v2").unwrap();
+        let before = write_locks();
+        let snap5 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+        let snap6 = engine.snapshot();
+        assert_eq!(write_locks(), before + 1);
+        assert_eq!(snap4.reader().get(&ks, b"k2").unwrap(), None);
+        assert_eq!(snap5.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
+        assert_eq!(snap6.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
     }
 
     #[test]

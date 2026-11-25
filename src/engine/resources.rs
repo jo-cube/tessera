@@ -23,7 +23,7 @@ pub(super) struct Progress {
     pub(super) memory_wait_ns: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "diagnostics"))]
     pub(super) gate_waits: std::sync::atomic::AtomicU64,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) write_locks: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "diagnostics"))]
     pub(super) write_groups: std::sync::atomic::AtomicU64,
