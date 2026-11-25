@@ -369,13 +369,9 @@ fn write_runs(
         let file = runs_dir.join(run_name(published.id));
         let exists = match fs::metadata(&file) {
             Ok(found) if found.len() == len => true,
-            Ok(_) => {
-                return Err(io_error(&file)(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "existing run file has the wrong length",
-                ))
-                .into());
-            }
+            // Memory holds the exact bytes, so a damaged file is replaced
+            // through a temporary file and a rename, like a missing one.
+            Ok(_) => false,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(io_error(&file)(e).into()),
         };

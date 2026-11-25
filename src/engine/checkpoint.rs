@@ -24,7 +24,8 @@
 //! an error is judged by reading CURRENT back: if it names the new
 //! generation, the commit stands and both generations are retained. Atomic
 //! temporary run files prevent an interrupted write from becoming a reusable
-//! final file.
+//! final file. A reused run file of the wrong length is rewritten from memory
+//! the same way; damage that keeps the length is found only by recovery.
 //!
 //! LOCK is an advisory exclusive file lock, released on close or process exit.
 //! Recovery reads exactly CURRENT, with no fallback, and leaves checkpoint data
@@ -706,6 +707,41 @@ mod tests {
         }
         assert_eq!(synced(), Vec::<PathBuf>::new());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A reused run file of the wrong length is rewritten from memory at the
+    /// next checkpoint, which then recovers.
+    #[test]
+    fn a_run_file_of_the_wrong_length_is_rewritten_at_the_next_checkpoint() {
+        let dir = scratch("wrong-length");
+        let engine = Engine::in_memory(manual()).unwrap();
+        for key in [b"a", b"b"] {
+            engine.ks().put(key, b"value").unwrap();
+            engine.flush().unwrap();
+        }
+        let first = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!(first.runs_written, 2);
+        let runs = manifest(&dir).runs;
+        let damaged = dir.join(RUNS).join(run_name(runs[0].id));
+        let file = OpenOptions::new().write(true).open(&damaged).unwrap();
+        file.set_len(runs[0].len - 1).unwrap();
+        drop(file);
+        assert!(Engine::open(&dir, manual()).is_err());
+
+        engine.ks().put(b"c", b"later").unwrap();
+        let report = engine.checkpoint_to(&dir).unwrap();
+        assert_eq!((report.runs_written, report.runs_reused), (2, 1));
+        assert_eq!(fs::metadata(&damaged).unwrap().len(), runs[0].len);
+        assert!(
+            !dir.join(RUNS)
+                .join(format!("{}.tmp", run_name(runs[0].id)))
+                .exists()
+        );
+        let expected = state(&engine);
+        let recovered = Engine::open(&dir, manual()).unwrap();
+        assert_eq!(state(&recovered), expected);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A keyspace's name and records.
