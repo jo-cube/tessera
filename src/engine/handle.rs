@@ -501,7 +501,7 @@ impl Engine {
         self.close_with(|_| {})
     }
 
-    fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
+    pub(super) fn close_with(self, mut on_stripe: impl FnMut(usize)) -> Result<()> {
         {
             let mut guards = std::array::from_fn::<_, OPEN_STRIPES, _>(|i| {
                 on_stripe(i);

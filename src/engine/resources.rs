@@ -21,7 +21,7 @@ pub(super) struct Progress {
     pub(super) flush_wait_ns: std::sync::atomic::AtomicU64,
     #[cfg(feature = "diagnostics")]
     pub(super) memory_wait_ns: std::sync::atomic::AtomicU64,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) gate_waits: std::sync::atomic::AtomicU64,
     #[cfg(feature = "diagnostics")]
     pub(super) write_locks: std::sync::atomic::AtomicU64,
@@ -499,10 +499,12 @@ mod tests {
             let engine = &engine;
             scope.spawn(move || tx.send(engine.ks().put_seq(b"key", b"latest")).unwrap());
             built_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
             let stats = engine.engine_stats();
+            assert_eq!(stats.last_seq, 3);
             assert!(stats.used >= limit);
             assert!(stats.build_output_bytes > 0 && stats.build_workspace_bytes > 0);
+            assert!(engine.background_status().unwrap().busy);
+            assert!(rx.try_recv().is_err());
             assert_formula(stats);
             // The one pressure merge consumes every overlapping version.
             resume_tx.send(()).unwrap();

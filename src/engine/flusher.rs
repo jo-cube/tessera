@@ -157,10 +157,19 @@ mod tests {
                 tx.send(()).unwrap();
             });
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            crate::test_support::wait_until(|| {
+                engine
+                    .core
+                    .flush_waits
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 1
+            });
             assert_eq!(engine.core.read_state().frozen.len(), 2);
+            assert_eq!(engine.engine_stats().last_seq, 3);
+            assert!(rx.try_recv().is_err());
             resume.wait();
             rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(engine.engine_stats().last_seq, 4);
             writer.join().unwrap();
         });
         engine.flush().unwrap();

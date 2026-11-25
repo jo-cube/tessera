@@ -490,6 +490,21 @@ impl WriteCombiner {
     pub(super) fn queued_len(&self) -> usize {
         (0..SHARDS).map(|idx| self.lock_shard(idx).len()).sum()
     }
+
+    #[cfg(test)]
+    pub(super) fn all_queued_published(&self, expected: usize) -> bool {
+        let mut total = 0usize;
+        let mut non_empty_mask = 0u32;
+        for idx in 0..SHARDS {
+            let len = self.lock_shard(idx).len();
+            if len > 0 {
+                total += len;
+                non_empty_mask |= 1u32 << idx;
+            }
+        }
+        total >= expected
+            && (self.pending_mask.load(Ordering::SeqCst) & non_empty_mask) == non_empty_mask
+    }
 }
 
 impl Core {
@@ -700,7 +715,7 @@ impl Core {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Barrier, mpsc};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     fn manual() -> Options {
@@ -712,7 +727,7 @@ mod tests {
 
     fn wait_for_queued(core: &Core, expected: usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while core.combiner.queued_len() < expected {
+        while !core.combiner.all_queued_published(expected) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for {expected} queued followers (saw {})",
@@ -784,77 +799,133 @@ mod tests {
 
     #[test]
     fn concurrent_batches_are_atomic_and_contiguous_under_snapshot_oracle() {
-        let engine = Engine::in_memory(Options::default()).unwrap();
+        // Each 4-op batch charges ~860 bytes (below bulk_ingest_min = 1024), so
+        // two batches fit in `active` and the 6-writer group rotates mid-group,
+        // pausing on `wait_for_flush` while the flush worker holds `frozen[0]`.
+        let engine = Engine::in_memory(Options {
+            memtable_size: 2048,
+            max_frozen_memtables: 1,
+            ..manual()
+        })
+        .unwrap();
         let ks = engine.ks();
         let writers = 6usize;
-        let rounds = 40u32;
+        let rounds = 4u8;
         let ops_per_batch = 4usize;
-        let stop = AtomicBool::new(false);
-        let start = Barrier::new(writers + 2);
 
-        let all_ends: Vec<Vec<u64>> = std::thread::scope(|scope| {
-            let mut readers = Vec::new();
-            for _ in 0..2 {
-                let (engine, ks, stop, start) = (&engine, &ks, &stop, &start);
-                readers.push(scope.spawn(move || {
-                    start.wait();
-                    let mut snapshots = 0usize;
-                    // At least one snapshot, even if the writers finish first.
-                    while snapshots == 0 || !stop.load(Ordering::Relaxed) {
-                        let snap = engine.snapshot();
-                        let mut reader = snap.reader();
-                        for w in 0..writers {
-                            let mut seen = None;
-                            for slot in 0..ops_per_batch {
-                                let key = format!("w{w:02}/k{slot}");
-                                let val =
-                                    reader.get(ks, key.as_bytes()).unwrap().map(<[u8]>::to_vec);
-                                if let Some(expected) = &seen {
-                                    assert_eq!(
-                                        &val, expected,
-                                        "partial batch observed for writer {w} slot {slot}"
-                                    );
-                                } else {
-                                    seen = Some(val);
-                                }
-                            }
-                        }
-                        snapshots += 1;
-                    }
-                    snapshots
-                }));
-            }
-
-            let mut handles = Vec::new();
+        let check_oracle = |snap: &Snapshot,
+                            expected_new: &[u8],
+                            expected_prev: Option<&[u8]>,
+                            require_partial: bool| {
+            let mut reader = snap.reader();
+            let mut at_new = 0usize;
+            let mut at_prev = 0usize;
             for w in 0..writers {
-                let (engine, ks, start) = (&engine, &ks, &start);
-                handles.push(scope.spawn(move || {
-                    let mut batch = WriteBatch::new();
-                    let mut ends = Vec::with_capacity(rounds as usize);
-                    start.wait();
-                    for round in 1..=rounds {
-                        batch.clear();
-                        let payload = round.to_be_bytes();
+                let mut seen = None;
+                for slot in 0..ops_per_batch {
+                    let key = format!("w{w:02}/k{slot}");
+                    let val = reader.get(&ks, key.as_bytes()).unwrap().map(<[u8]>::to_vec);
+                    if let Some(expected) = &seen {
+                        assert_eq!(
+                            &val, expected,
+                            "partial batch observed for writer {w} slot {slot}"
+                        );
+                    } else {
+                        seen = Some(val);
+                    }
+                }
+                match seen.unwrap().as_deref() {
+                    Some(v) if v == expected_new => at_new += 1,
+                    v if v == expected_prev => at_prev += 1,
+                    other => panic!("unexpected value for writer {w}: {other:?}"),
+                }
+            }
+            if require_partial {
+                assert!(
+                    at_new > 0 && at_prev > 0,
+                    "expected mid-group snapshot to split round (new={at_new}, prev={at_prev})"
+                );
+            } else {
+                assert_eq!(at_new, writers);
+            }
+        };
+
+        let mut ends = Vec::with_capacity(writers * usize::from(rounds));
+        for round in 1..=rounds {
+            let payload = [round; 128];
+            let prev_payload = (round > 1).then_some([round - 1; 128]);
+            let (flush_entered_tx, flush_entered_rx) = mpsc::channel();
+            let (flush_release_tx, flush_release_rx) = mpsc::channel();
+            let flush_release_rx = Mutex::new(flush_release_rx);
+            *engine.core.before_flush_build.lock().unwrap() = Some(Arc::new(move || {
+                flush_entered_tx.send(()).unwrap();
+                flush_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("flush release");
+            }));
+
+            let waits_before = engine.core.flush_waits.load(Ordering::SeqCst);
+            let groups_before = engine.core.resources.write_groups.load(Ordering::Relaxed);
+            let grouped_before = engine.core.resources.grouped_writes.load(Ordering::Relaxed);
+            let (entered_rx, release_tx) = pause_leader(&engine.core);
+            let direct = engine.core.combiner.try_enter_direct().unwrap();
+
+            let round_ends: Vec<u64> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(writers);
+                for w in 0..writers {
+                    let (engine, ks) = (&engine, &ks);
+                    handles.push(scope.spawn(move || {
+                        let mut batch = WriteBatch::new();
                         for slot in 0..ops_per_batch {
                             let key = format!("w{w:02}/k{slot}");
                             batch.put(ks, key.as_bytes(), &payload);
                         }
-                        ends.push(engine.write_seq(&batch).unwrap());
+                        engine.write_seq(&batch).unwrap()
+                    }));
+                    if w == 0 {
+                        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        wait_for_combining(&engine.core);
+                    } else {
+                        wait_for_queued(&engine.core, w);
                     }
-                    ends
-                }));
-            }
+                }
 
-            let ends: Vec<Vec<u64>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            stop.store(true, Ordering::Relaxed);
-            let total_snaps: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
-            assert!(total_snaps > 0);
-            ends
-        });
+                drop(direct);
+                release_tx.send(()).unwrap();
 
-        let mut ends: Vec<u64> = all_ends.into_iter().flatten().collect();
+                flush_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                crate::test_support::wait_until(|| {
+                    engine.core.flush_waits.load(Ordering::SeqCst) > waits_before
+                });
+                let mid = engine.snapshot();
+                check_oracle(&mid, &payload, prev_payload.as_ref().map(|p| &p[..]), true);
+                drop(mid);
+
+                flush_release_tx.send(()).unwrap();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            assert_eq!(
+                engine.core.resources.write_groups.load(Ordering::Relaxed),
+                groups_before + 1
+            );
+            assert_eq!(
+                engine.core.resources.grouped_writes.load(Ordering::Relaxed),
+                grouped_before + writers as u64
+            );
+            ends.extend(round_ends);
+            let post = engine.snapshot();
+            check_oracle(&post, &payload, prev_payload.as_ref().map(|p| &p[..]), false);
+            drop(post);
+            engine.flush().unwrap();
+        }
+
         ends.sort_unstable();
-        let total_batches = writers * rounds as usize;
+        let total_batches = writers * usize::from(rounds);
         assert_eq!(ends.len(), total_batches);
         for (i, &end) in ends.iter().enumerate() {
             assert_eq!(
@@ -867,12 +938,13 @@ mod tests {
             engine.engine_stats().last_seq,
             (total_batches * ops_per_batch) as u64
         );
+        let final_payload = [rounds; 128];
         for w in 0..writers {
             for slot in 0..ops_per_batch {
                 let key = format!("w{w:02}/k{slot}");
                 assert_eq!(
                     ks.get(key.as_bytes()).unwrap().as_deref(),
-                    Some(&rounds.to_be_bytes()[..])
+                    Some(&final_payload[..])
                 );
             }
         }
@@ -1093,39 +1165,56 @@ mod tests {
         assert!(leader_res.is_ok() || leader_res == Err(UpdateError::Stopped));
         engine.close().unwrap();
 
-        // Concurrent Engine::close under active multi-writer load finishes cleanly.
+        // Concurrent Engine::close during an active combined group waits for
+        // the in-flight group to finish, closes cleanly and rejects new writes.
         let engine = Engine::in_memory(Options::default()).unwrap();
         let ks = engine.ks();
-        let barrier = Barrier::new(7);
+        let (entered_rx, release_tx) = pause_leader(&engine.core);
+        let direct = engine.core.combiner.try_enter_direct().unwrap();
+        let (closing_tx, closing_rx) = mpsc::channel();
         std::thread::scope(|scope| {
-            let mut writers = Vec::new();
-            for w in 0..6u32 {
-                let (ks, barrier) = (ks.clone(), &barrier);
-                writers.push(scope.spawn(move || {
-                    barrier.wait();
-                    for step in 0..500u32 {
-                        let key = (w << 16 | step).to_be_bytes();
-                        match ks.put(&key, b"payload") {
-                            Ok(()) => {}
-                            Err(err) => {
-                                assert_eq!(err.kind(), ErrorKind::Stopped, "{err}");
-                                break;
-                            }
-                        }
-                    }
-                }));
+            let leader = scope.spawn(|| ks.put(b"l", b"payload"));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait_for_combining(&engine.core);
+
+            let mut followers = Vec::new();
+            for i in 0..4usize {
+                let key = format!("f{i}");
+                let ks = &ks;
+                followers.push(scope.spawn(move || ks.put(key.as_bytes(), b"payload")));
+                wait_for_queued(&engine.core, i + 1);
             }
+
             let closer = engine.clone();
-            let barrier = &barrier;
             let closer_handle = scope.spawn(move || {
-                barrier.wait();
-                closer.close().unwrap();
+                closer.close_with(|stripe| {
+                    if stripe == 0 {
+                        closing_tx.send(()).unwrap();
+                    }
+                })
             });
-            closer_handle.join().unwrap();
-            for writer in writers {
-                writer.join().unwrap();
+            closing_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            drop(direct);
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            for follower in followers {
+                follower.join().unwrap().unwrap();
             }
+            closer_handle.join().unwrap().unwrap();
         });
+        assert_eq!(
+            engine.core.resources.write_groups.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            engine.core.resources.grouped_writes.load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            ks.put(b"after", b"payload").unwrap_err().kind(),
+            ErrorKind::Stopped
+        );
     }
 
     #[test]

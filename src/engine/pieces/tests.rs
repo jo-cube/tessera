@@ -113,8 +113,12 @@ fn readers_snapshots_and_checkpoints_cross_piece_publications() {
         let held = engine.snapshot();
         let guard = engine.core.read_state();
         resume_tx.send(()).unwrap();
+        crate::test_support::wait_until(|| {
+            engine.core.waiting_writers.load(Ordering::Acquire) > 0
+                && engine.core.gate.try_lock().is_err()
+        });
         assert!(
-            ready_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            ready_rx.try_recv().is_err(),
             "publication waits for the state lock"
         );
         drop(guard);

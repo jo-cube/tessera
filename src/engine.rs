@@ -320,6 +320,9 @@ struct Core {
     /// writer is blocked.
     #[cfg(test)]
     level0_waits: std::sync::atomic::AtomicUsize,
+    /// Writers that have waited for a flush to clear frozen tables.
+    #[cfg(test)]
+    flush_waits: std::sync::atomic::AtomicUsize,
     /// Runs between building a compaction and returning it.
     #[cfg(test)]
     after_build: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -426,6 +429,8 @@ impl Core {
             panic_step: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             level0_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            flush_waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             after_build: Mutex::new(None),
             #[cfg(test)]
@@ -553,6 +558,9 @@ impl Core {
         // Acquire the notification mutex before releasing state: completion
         // cannot slip between checking the predicate and entering the condvar.
         drop(state);
+        #[cfg(test)]
+        self.flush_waits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(self.flush_signal.wait(progress));
         self.write_state()
     }
@@ -1254,10 +1262,10 @@ impl Core {
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(test, feature = "diagnostics"))]
             self.resources
                 .gate_waits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             drop(self.pass_gate());
         }
         self.state.read().expect(LOCK)
@@ -1511,16 +1519,20 @@ mod tests {
             let writer = scope.spawn(|| ks.put(b"k", b"new").unwrap());
             // The read lock keeps the writer waiting, so once it has the gate it
             // keeps it until the guard is dropped.
-            while engine.core.gate.try_lock().is_ok() {
-                std::thread::yield_now();
-            }
-            for _ in 0..100 {
-                assert!(engine.core.gate.try_lock().is_err());
-                assert!(!writer.is_finished());
-                std::thread::yield_now();
-            }
+            crate::test_support::wait_until(|| {
+                engine.core.waiting_writers.load(Ordering::Acquire) == 1
+                    && engine.core.gate.try_lock().is_err()
+            });
+            let reader = scope.spawn(|| ks.get(b"k").unwrap());
+            crate::test_support::wait_until(|| {
+                engine.core.resources.gate_waits.load(Ordering::Acquire) == 1
+            });
+            assert!(engine.core.gate.try_lock().is_err());
+            assert!(!writer.is_finished());
+            assert!(!reader.is_finished());
             drop(held);
             writer.join().unwrap();
+            assert_eq!(reader.join().unwrap().as_deref(), Some(&b"new"[..]));
         });
         assert!(engine.core.gate.try_lock().is_ok());
         assert_eq!(ks.get(b"k").unwrap().unwrap(), b"new");
@@ -1785,11 +1797,15 @@ mod tests {
         assert_eq!(engine.engine_stats().runs, 1);
         assert_eq!(engine.engine_stats().max_overlap, 1);
         assert_eq!(value(&engine, b"a").unwrap(), b"3");
-        // With nothing requested, nothing runs.
-        for _ in 0..1000 {
-            std::thread::yield_now();
-        }
+        // With nothing requested, the worker parks idle and runs no more passes.
+        let core = Arc::clone(&engine.core);
+        crate::test_support::wait_until(|| core.background.as_ref().unwrap().is_idle_parked());
         assert_eq!(engine.background_status().unwrap(), status);
+        engine.close().unwrap();
+        let stopped = core.background.as_ref().unwrap().status();
+        assert!(!stopped.running && !stopped.busy);
+        assert_eq!(stopped.passes, status.passes);
+        assert_eq!(stopped.compactions, status.compactions);
     }
 
     /// Requests made while the worker cannot run count as one more pass.
