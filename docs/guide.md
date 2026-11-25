@@ -61,7 +61,8 @@ with a key prefix.
 ## Memory and admission
 
 `Options::memory_limit` is one writer-admission budget for the whole engine,
-unlimited by default. `Stats::memory_used` sums:
+unlimited by default and at least 2 MiB when set, so that the active
+memtable has room to fill one 1 MiB pool chunk. `Stats::memory_used` sums:
 
 - charged memtables: their arena bytes, including overwritten values, plus
   80 bytes and the keyspace prefix (1 to 5 bytes) per entry, plus history

@@ -15,8 +15,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Options {
-    /// The writer admission budget in bytes; `None` (the default) is
-    /// unlimited. See [Memory](crate#memory).
+    /// The writer admission budget in bytes, at least 2 MiB; `None` (the
+    /// default) is unlimited. See [Memory](crate#memory).
     pub memory_limit: Option<usize>,
     /// Bytes one memtable is charged before it is flushed into runs
     /// (default 64 MiB). A record is charged its key, its value and 80 bytes,
@@ -71,10 +71,24 @@ impl Default for Options {
     }
 }
 
+/// The least `memory_limit`. The active memtable takes memory in 1 MiB pool
+/// chunks, each counted in full when taken, so a smaller limit leaves no
+/// room to fill one and makes nearly every write flush or fail.
+pub(super) const MIN_MEMORY_LIMIT: usize = 2 * crate::chunk::CHUNK_BYTES;
+
 impl Options {
     /// The one check of these options, made before an engine starts a
     /// worker, allocates or touches a file. See [`ConfigError`].
     pub(super) fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(limit) = self.memory_limit {
+            ConfigError::check(
+                "Options::memory_limit",
+                limit as u64,
+                MIN_MEMORY_LIMIT as u64,
+                usize::MAX as u64,
+                "the active memtable takes memory in 1 MiB chunks, so the limit must leave room to fill one",
+            )?;
+        }
         ConfigError::check(
             "Options::memtable_size",
             self.memtable_size as u64,

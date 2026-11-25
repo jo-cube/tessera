@@ -716,6 +716,13 @@ mod tests {
         let cases = [
             (
                 Options {
+                    memory_limit: Some(options::MIN_MEMORY_LIMIT - 1),
+                    ..Options::default()
+                },
+                "Options::memory_limit",
+            ),
+            (
+                Options {
                     memtable_size: ENTRY_OVERHEAD + MAX_PREFIX_LEN - 1,
                     ..Options::default()
                 },
@@ -763,11 +770,14 @@ mod tests {
             assert!(error.to_string().contains(setting), "{error}");
         }
         assert_eq!(Options::default().memory_limit, None);
-        let engine = Engine::in_memory(Options {
-            memory_limit: Some(0),
+        Engine::in_memory(Options {
+            memory_limit: Some(options::MIN_MEMORY_LIMIT),
             ..Options::default()
         })
         .unwrap();
+        // Below the minimum only through the core: nothing fits, so even an
+        // empty engine refuses a write and an empty batch uses no sequence.
+        let engine = start(Core::new(&Options::default()), 0);
         assert_eq!(engine.write_seq(&WriteBatch::new()), Ok(0));
         let ks = engine.keyspace("limited").unwrap();
         assert_eq!(
@@ -792,14 +802,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         engine.checkpoint_to(&directory).unwrap();
         engine.close().unwrap();
-        let recovered = Engine::open(
-            &directory,
-            Options {
-                memory_limit: Some(1),
-                ..Options::default()
-            },
-        )
-        .unwrap();
+        // Recovered as `Engine::open` does, under a limit below the minimum
+        // option, so that the live data alone exceeds it.
+        let (core, _) = checkpoint::recover(&directory, &Options::default())
+            .unwrap()
+            .unwrap();
+        let recovered = start(core, 1);
         assert!(!recovered.core.read_state().only().runs[0].run.reclaimable());
         let error = recovered.ks().put(b"new", b"value").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MemoryLimit);

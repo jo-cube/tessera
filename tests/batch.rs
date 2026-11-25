@@ -400,12 +400,16 @@ fn random_batches_ingestion_snapshots_and_multi_get_match_a_map() {
 #[test]
 fn rejected_batches_and_memory_limited_ingestion_leave_no_partial_data_or_sequences() {
     use crate::engine::MAX_KEY_LEN;
-    let engine = Engine::in_memory(Options {
-        memory_limit: Some(0),
+    // A limit of 0, below the minimum option, set on the core: every write
+    // and ingestion is refused.
+    let options = Options {
         background_compaction: None,
         ..Options::default()
-    })
-    .unwrap();
+    };
+    let mut core = crate::engine::Core::new(&options);
+    core.memory_limit = Some(0);
+    core.policy = crate::engine::CompactionPolicy::for_memory(Some(0));
+    let engine = Engine::start(core, &options, None, None).unwrap();
     let ks = engine.ks();
     let mut batch = WriteBatch::new();
     batch.put(&ks, b"a", b"value");
