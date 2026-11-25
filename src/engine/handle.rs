@@ -132,9 +132,10 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Opens the engine stored in `dir`, creating the directory if it is
-    /// missing: recovers the checkpoint its `CURRENT` file names, or starts
-    /// empty if there is none. The engine holds `dir/LOCK` until it closes.
+    /// Opens the engine stored in `dir`, creating the directory and syncing
+    /// its parent if it is missing: recovers the checkpoint its `CURRENT`
+    /// file names, or starts empty if there is none. The engine holds
+    /// `dir/LOCK` until it closes.
     ///
     /// Recovery reads and checks every file of exactly that checkpoint
     /// before it returns, and never falls back to an older one. Run files
@@ -150,7 +151,7 @@ impl Engine {
     pub fn open(dir: impl AsRef<Path>, options: Options) -> Result<Engine> {
         let dir = dir.as_ref();
         options.validate()?;
-        fs::create_dir_all(dir)
+        checkpoint::create_dir(dir)
             .map_err(|error| Error::io(dir, error, format!("cannot create {}", dir.display())))?;
         let lock = match checkpoint::lock(dir) {
             Ok(Ok(file)) => file,
@@ -774,7 +775,8 @@ impl Engine {
         metadata: Option<&[u8]>,
     ) -> Result<checkpoint::CheckpointReport> {
         let _open = self.shared.enter()?;
-        fs::create_dir_all(dir).map_err(|error| Error::io(dir, error, "creating the directory"))?;
+        checkpoint::create_dir(dir)
+            .map_err(|error| Error::io(dir, error, "creating the directory"))?;
         let _serial = self
             .core
             .checkpointing

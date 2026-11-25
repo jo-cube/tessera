@@ -78,7 +78,6 @@ use crate::run::{ConflictingCopies, LiveRecord, LiveValue, ReadError};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };

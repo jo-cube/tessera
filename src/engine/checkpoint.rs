@@ -159,6 +159,29 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The parents [`create_dir`] synced on this thread.
+    static SYNCED_PARENTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Creates `dir` and any missing ancestors. When `dir` did not exist, its
+/// parent is synced once, so the new entry survives a power loss along with
+/// the first commit inside it.
+pub(super) fn create_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    let parent = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    #[cfg(test)]
+    SYNCED_PARENTS.with(|synced| synced.borrow_mut().push(parent.to_owned()));
+    sync_dir(parent)
+}
+
 /// Opens and locks `LOCK`, which is released when the file is dropped.
 pub(super) fn lock(dir: &Path) -> io::Result<Result<File, ()>> {
     let file = OpenOptions::new()
@@ -656,6 +679,33 @@ mod tests {
             drop(recovered);
             fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Opening or checkpointing into a missing directory creates it and syncs
+    /// its parent once; an existing directory syncs no parent. What a power
+    /// loss would do is not tested.
+    #[test]
+    fn creating_the_directory_syncs_its_parent_once() {
+        let root = scratch("create-dir");
+        let opened = root.join("open").join("store");
+        let copied = root.join("copy").join("store");
+        let synced = || SYNCED_PARENTS.with(|synced| std::mem::take(&mut *synced.borrow_mut()));
+        synced();
+
+        let engine = Engine::open(&opened, manual()).unwrap();
+        assert_eq!(synced(), [root.join("open")]);
+        engine.ks().put(b"key", b"value").unwrap();
+        engine.checkpoint().unwrap();
+        engine.checkpoint_to(&copied).unwrap();
+        assert_eq!(synced(), [root.join("copy")]);
+        engine.checkpoint_to(&copied).unwrap();
+        drop(engine);
+        for dir in [&opened, &copied] {
+            let recovered = Engine::open(dir, manual()).unwrap();
+            assert_eq!(state(&recovered), [(b"key".to_vec(), b"value".to_vec())]);
+        }
+        assert_eq!(synced(), Vec::<PathBuf>::new());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// A keyspace's name and records.
