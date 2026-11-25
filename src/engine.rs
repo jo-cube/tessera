@@ -1030,7 +1030,7 @@ impl Core {
         let zero_seq = matches!(dest, Dest::Level(level) if level == space.levels.depth());
         let estimated_run_bytes = space.levels.segment(&fit);
         drop(state);
-        Ok(Some(Begun::Job(CompactionJob {
+        Ok(Some(Begun::Job(Box::new(CompactionJob {
             engine: self,
             _serial: serial,
             keyspace,
@@ -1046,7 +1046,7 @@ impl Core {
             cursor,
             estimated_run_bytes,
             source_count,
-        })))
+        }))))
     }
 
     /// Begins the next compaction that reads and writes, taking any moves
@@ -1058,7 +1058,7 @@ impl Core {
     ) -> Result<Option<CompactionJob<'_>>, CompactionError> {
         loop {
             match self.begin_compaction(options, None)? {
-                Some(Begun::Job(job)) => return Ok(Some(job)),
+                Some(Begun::Job(job)) => return Ok(Some(*job)),
                 Some(Begun::Done(_)) => {}
                 None => return Ok(None),
             }

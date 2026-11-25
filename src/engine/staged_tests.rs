@@ -547,7 +547,7 @@ mod compaction {
                                         if !background && !job.seq_floors().is_empty() {
                                             contested += 1;
                                         }
-                                        Stage::Begun(job)
+                                        Stage::Begun(*job)
                                     }
                                     // A move publishes as it is chosen.
                                     Some(Begun::Done(_)) | None => Stage::Idle,

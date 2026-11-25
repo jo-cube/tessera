@@ -188,10 +188,9 @@ pub(super) struct CompactionJob<'e> {
     pub(super) source_count: usize,
 }
 
-/// A compaction step chosen under the lock: a job to build, or a move,
-/// already done.
+/// A compaction step chosen under the lock: a job to build or a finished move.
 pub(super) enum Begun<'e> {
-    Job(CompactionJob<'e>),
+    Job(Box<CompactionJob<'e>>),
     Done(CompactionReport),
 }
 

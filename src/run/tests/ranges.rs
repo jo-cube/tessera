@@ -292,7 +292,6 @@ fn empty_and_inverted_range_seeks_decode_nothing() {
         cursor.seek_range(start, end).unwrap();
         assert_eq!(cursor.next_record().unwrap(), None);
     }
-    drop(cursor);
     assert_eq!(workspace.blocks_loaded(), 0);
 }
 
