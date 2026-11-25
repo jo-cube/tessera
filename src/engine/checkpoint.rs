@@ -20,8 +20,11 @@
 //! CURRENT.tmp, rename over CURRENT (the commit point), then sync the parent.
 //! Only after that sync does GC remove files outside the union of the new and
 //! previous manifests. Before rename an error leaves the old commit intact;
-//! after rename a sync error retains both generations. Atomic temporary run
-//! files prevent an interrupted write from becoming a reusable final file.
+//! after rename a sync error retains both generations. A rename that reports
+//! an error is judged by reading CURRENT back: if it names the new
+//! generation, the commit stands and both generations are retained. Atomic
+//! temporary run files prevent an interrupted write from becoming a reusable
+//! final file.
 //!
 //! LOCK is an advisory exclusive file lock, released on close or process exit.
 //! Recovery reads exactly CURRENT, with no fallback, and leaves checkpoint data
@@ -608,6 +611,49 @@ mod tests {
             );
             let recovered = Engine::open(&dir, manual()).unwrap();
             assert_eq!(state(&recovered), new, "{crash:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A rename of CURRENT that reports an error is judged by what CURRENT
+    /// names afterwards. One that took effect is a commit, and its generation
+    /// is kept; one that did not leaves the previous commit and removes the
+    /// new generation. Either way the next checkpoint commits normally.
+    #[test]
+    fn a_rename_error_after_its_effect_keeps_the_new_generation() {
+        for (fault, committed) in [
+            (RenameFault::Fails, false),
+            (RenameFault::FailsAfterEffect, true),
+        ] {
+            let dir = scratch(&format!("{fault:?}"));
+            let engine = Engine::in_memory(manual()).unwrap();
+            engine.ks().put(b"a", b"old").unwrap();
+            engine.checkpoint_to(&dir).unwrap();
+            let old = state(&engine);
+            engine.ks().put(b"a", b"new").unwrap();
+            engine.ks().put(b"b", b"new").unwrap();
+            let new = state(&engine);
+
+            RENAME_FAULT.with(|at| at.set(Some(fault)));
+            let error = engine.checkpoint_to(&dir).unwrap_err();
+            RENAME_FAULT.with(|at| at.set(None));
+            assert_eq!(error.kind(), ErrorKind::Io, "{fault:?}: {error}");
+            assert_eq!(error.checkpoint_committed(), committed, "{fault:?}");
+            assert_eq!(manifest(&dir).generation, if committed { 2 } else { 1 });
+            assert!(checkpoint_dir(&dir, 1).exists(), "{fault:?}");
+            assert_eq!(checkpoint_dir(&dir, 2).exists(), committed, "{fault:?}");
+            assert!(!dir.join(CURRENT_TMP).exists(), "{fault:?}");
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            let expected = if committed { &new } else { &old };
+            assert_eq!(&state(&recovered), expected, "{fault:?}");
+            drop(recovered);
+
+            let report = engine.checkpoint_to(&dir).unwrap();
+            assert_eq!(report.generation, if committed { 3 } else { 2 });
+            assert_eq!(report.reclaimed, usize::from(committed), "{fault:?}");
+            let recovered = Engine::open(&dir, manual()).unwrap();
+            assert_eq!(state(&recovered), new, "{fault:?}");
+            drop(recovered);
             fs::remove_dir_all(&dir).unwrap();
         }
     }

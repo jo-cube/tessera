@@ -37,6 +37,39 @@ pub(super) fn crashed(path: &Path, after_commit_point: bool) -> CheckpointError 
     }
 }
 
+/// An error a test makes the rename of CURRENT report.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenameFault {
+    /// The rename fails and nothing changes.
+    Fails,
+    /// The rename takes effect, then reports an error.
+    FailsAfterEffect,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RENAME_FAULT: std::cell::Cell<Option<RenameFault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renames `tmp` over CURRENT in `dir`.
+fn rename_current(tmp: &Path, dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(fault) = RENAME_FAULT.with(std::cell::Cell::get) {
+        if fault == RenameFault::FailsAfterEffect {
+            fs::rename(tmp, dir.join(CURRENT))?;
+        }
+        return Err(io::Error::other("rename error injected by a test"));
+    }
+    fs::rename(tmp, dir.join(CURRENT))
+}
+
+/// Whether CURRENT in `dir` can be read and names `generation`.
+fn current_names(dir: &Path, generation: u64) -> bool {
+    read_bounded(&dir.join(CURRENT), CURRENT_LEN as u64)
+        .is_ok_and(|bytes| decode_current(&bytes) == Ok(generation))
+}
+
 #[cfg(test)]
 macro_rules! crash_point {
     ($at:expr, $path:expr) => {
@@ -485,12 +518,27 @@ impl Core {
             write_synced(&tmp, &current)?;
             return Err(crashed(&tmp, false));
         }
-        let committed = write_synced(&tmp, &current)
-            .and_then(|()| fs::rename(&tmp, dir.join(CURRENT)).map_err(io_error(dir)));
-        if let Err(error) = committed {
+        write_synced(&tmp, &current).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
             let _ = fs::remove_dir_all(&path);
-            return Err(error);
+        })?;
+        if let Err(error) = rename_current(&tmp, dir) {
+            // A rename can report an error after it took effect. If CURRENT
+            // names the new generation, the commit is done: removing that
+            // generation would lose the checkpoint, and reclamation waits
+            // for the next one.
+            let after_commit_point = current_names(dir, generation);
+            if after_commit_point {
+                let _ = sync_dir(dir);
+            } else {
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::remove_dir_all(&path);
+            }
+            return Err(CheckpointError::Io {
+                path: dir.to_owned(),
+                error,
+                after_commit_point,
+            });
         }
         #[cfg(test)]
         if crash(Crash::AfterRename) {
