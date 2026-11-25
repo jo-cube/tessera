@@ -590,6 +590,38 @@ mod tests {
         assert_eq!(core.stats().snapshot_bytes, 0, "the freed table is not");
     }
 
+    /// Snapshots of the active table are views that share its family and
+    /// never reference the frozen table, so only a snapshot taken after the
+    /// table froze holds it whole.
+    #[test]
+    fn only_a_snapshot_taken_after_freezing_holds_a_flushed_table_whole() {
+        let core = fixture(0);
+        core.put(b"key", &[1; 4096]).unwrap();
+        let first = core.snapshot();
+        let reused = core.snapshot();
+        assert!(Arc::ptr_eq(&first.tables[0], &reused.tables[0]));
+        core.put(b"other", &[2; 4096]).unwrap();
+        let job = core.begin_flush().unwrap();
+        let table = Arc::clone(&core.read_state().frozen[0]);
+        assert_eq!(Arc::strong_count(&table), 3, "the state, the job and this");
+        let (held, charged) = (table.held_by_snapshots(), table.memory().charged);
+        assert!(0 < held && held < charged, "held {held} of {charged}");
+        drop(table);
+        job.build().publish();
+        assert_eq!(core.stats().snapshot_bytes, held);
+        drop((first, reused));
+        assert_eq!(core.stats().snapshot_bytes, 0);
+
+        core.put(b"key", &[3; 4096]).unwrap();
+        let job = core.begin_flush().unwrap();
+        let whole = core.snapshot();
+        let charged = core.read_state().frozen[0].memory().charged;
+        job.build().publish();
+        assert_eq!(core.stats().snapshot_bytes, charged);
+        drop(whole);
+        assert_eq!(core.stats().snapshot_bytes, 0);
+    }
+
     #[test]
     fn pinned_history_is_counted_once_and_build_charges_unwind() {
         let core = fixture(0);
