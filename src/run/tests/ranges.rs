@@ -4,6 +4,7 @@
 //! expected decode counts from the input records' key ranges.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use crate::block::{MAX_KEY_LEN, Value};
 use crate::run::{
@@ -276,6 +277,23 @@ fn an_empty_run_with_a_stored_minimum_is_rejected() {
     put_u32(&mut bytes, 20, 1);
     let error = RunView::open(&bytes).unwrap_err();
     assert_eq!(kind_of(error), RunCorruption::InvalidFooter);
+}
+
+#[test]
+fn empty_and_inverted_range_seeks_decode_nothing() {
+    let run = build(Codec::Zstd, &numbered(100..200), SMALL_BLOCK);
+    let mut workspace = ReadWorkspace::new();
+    let mut cursor = run.cursor(&mut workspace);
+    for (start, end) in [
+        (&b"key:00150"[..], Bound::Excluded(&b"key:00150"[..])),
+        (&b"key:00160"[..], Bound::Excluded(&b"key:00140"[..])),
+        (&b"key:00160"[..], Bound::Included(&b"key:00140"[..])),
+    ] {
+        cursor.seek_range(start, end).unwrap();
+        assert_eq!(cursor.next_record().unwrap(), None);
+    }
+    drop(cursor);
+    assert_eq!(workspace.blocks_loaded(), 0);
 }
 
 #[test]

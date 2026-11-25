@@ -1127,23 +1127,18 @@ impl<'a> RunCursor<'a> {
     pub fn seek_range(&mut self, target: &[u8], end: Bound<&[u8]>) -> Result<(), CorruptRun> {
         let workspace = &mut *self.workspace;
         workspace.clear_bounds();
-        match end {
-            Bound::Unbounded => {}
+        let (key, bound) = match end {
+            Bound::Unbounded => (&[][..], EndBound::Unbounded),
             Bound::Included(key) | Bound::Excluded(key) if key.len() > MAX_KEY_LEN => {
-                workspace.end.extend_from_slice(&key[..MAX_KEY_LEN]);
-                workspace.end_bound = EndBound::Through;
+                (&key[..MAX_KEY_LEN], EndBound::Through)
             }
-            Bound::Included(key) => {
-                workspace.end.extend_from_slice(key);
-                workspace.end_bound = EndBound::Through;
-            }
-            Bound::Excluded(key) => {
-                workspace.end.extend_from_slice(key);
-                workspace.end_bound = EndBound::Below;
-            }
-        }
-        let first = self.view.slice.map_or(self.view.min_key, |range| range.min);
-        if !self.view.table.is_empty() && !self.workspace.admits(first) {
+            Bound::Included(key) => (key, EndBound::Through),
+            Bound::Excluded(key) => (key, EndBound::Below),
+        };
+        workspace.end.extend_from_slice(key);
+        workspace.end_bound = bound;
+        let start = target.max(self.view.slice.map_or(self.view.min_key, |r| r.min));
+        if !self.workspace.admits(start) {
             self.failure = None;
             self.finish();
             return Ok(());
