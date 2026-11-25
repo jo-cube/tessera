@@ -1592,6 +1592,9 @@ mod tests {
         // Dropping a keyspace leaves `active` and `last_seq` unchanged, so reusing
         // `last_view` under the read lock still observes the updated directory.
         assert!(engine.drop_keyspace("extra").unwrap());
+        // Hold `flushing` so the flush worker woken by `drop_keyspace` cannot
+        // take `write_state` during the lock-count assertions below.
+        let _flushing = engine.core.serialize_flush();
         let after_drop = write_locks();
         let snap_after_drop = engine.snapshot();
         assert_eq!(write_locks(), after_drop);
@@ -1628,6 +1631,7 @@ mod tests {
         assert_eq!(snap4.reader().get(&ks, b"k2").unwrap(), None);
         assert_eq!(snap5.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
         assert_eq!(snap6.reader().get(&ks, b"k2").unwrap(), Some(&b"v2"[..]));
+        drop(_flushing);
     }
 
     #[test]
