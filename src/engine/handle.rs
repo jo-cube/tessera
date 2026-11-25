@@ -335,16 +335,7 @@ impl Engine {
     /// Panics if the state lock is poisoned or a synchronous build panics.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         let _open = self.shared.enter()?;
-        match batch.engine() {
-            Err(name) => return Err(Error::unknown_keyspace(name)),
-            Ok(Some(engine)) if engine != self.shared.id => {
-                return Err(Error::new(
-                    ErrorKind::UnknownKeyspace,
-                    "the batch's keyspaces belong to another engine",
-                ));
-            }
-            Ok(_) => {}
-        }
+        batch.check_engine(self.shared.id)?;
         self.core.write_batch(batch)?;
         Ok(())
     }

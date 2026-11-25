@@ -35,8 +35,8 @@ struct Operation {
 pub struct WriteBatch {
     bytes: Vec<u8>,
     operations: Vec<Operation>,
-    /// The engine of the first keyspace appended.
-    engine: Option<u64>,
+    /// The engine and name of the first keyspace appended.
+    engine: Option<(u64, Arc<str>)>,
     /// The name of a keyspace of another engine, if one was appended.
     foreign: Option<Arc<str>>,
     /// Whether operations name more than one keyspace.
@@ -93,8 +93,10 @@ impl WriteBatch {
     }
 
     fn note(&mut self, keyspace: &Keyspace) {
-        let engine = *self.engine.get_or_insert(keyspace.engine_id());
-        if engine != keyspace.engine_id() && self.foreign.is_none() {
+        let (engine, _) = self
+            .engine
+            .get_or_insert_with(|| (keyspace.engine_id(), keyspace.shared_name()));
+        if *engine != keyspace.engine_id() && self.foreign.is_none() {
             self.foreign = Some(keyspace.shared_name());
         }
         self.mixed |= self
@@ -134,13 +136,25 @@ impl WriteBatch {
         )
     }
 
-    /// The engine its keyspaces belong to, or the name of one that belongs
-    /// to another engine than the first.
-    pub(super) fn engine(&self) -> Result<Option<u64>, &str> {
-        match &self.foreign {
-            Some(name) => Err(name),
-            None => Ok(self.engine),
+    /// Checks that every keyspace in the batch belongs to `engine`.
+    pub(super) fn check_engine(&self, engine: u64) -> Result<(), Error> {
+        let Some((first_engine, first_name)) = &self.engine else {
+            return Ok(());
+        };
+        if *first_engine != engine {
+            return Err(if self.foreign.is_some() {
+                Error::unknown_keyspace(first_name)
+            } else {
+                Error::new(
+                    ErrorKind::UnknownKeyspace,
+                    "the batch's keyspaces belong to another engine",
+                )
+            });
         }
+        if let Some(name) = &self.foreign {
+            return Err(Error::unknown_keyspace(name));
+        }
+        Ok(())
     }
 
     /// The keyspaces the operations name, ascending and each once.
@@ -306,5 +320,39 @@ impl Core {
                 Err(error) => return (Err(error), None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_engine_batch_names_the_foreign_keyspace() {
+        let local_engine = Engine::in_memory(Options::default()).unwrap();
+        let other_engine = Engine::in_memory(Options::default()).unwrap();
+        let local = local_engine.keyspace("local").unwrap();
+        let foreign = other_engine.keyspace("foreign").unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(&foreign, b"a", b"1");
+        batch.put(&local, b"b", b"2");
+
+        let error = local_engine.write(&batch).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownKeyspace);
+        assert!(
+            error.to_string().contains("\"foreign\""),
+            "expected foreign keyspace in error, got: {error}"
+        );
+
+        let mut reversed = WriteBatch::new();
+        reversed.put(&local, b"a", b"1");
+        reversed.put(&foreign, b"b", b"2");
+        let error = local_engine.write(&reversed).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownKeyspace);
+        assert!(
+            error.to_string().contains("\"foreign\""),
+            "expected foreign keyspace in error, got: {error}"
+        );
     }
 }
