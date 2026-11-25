@@ -140,7 +140,12 @@ fn grouped_random(i: usize, version: u8) -> Vec<u8> {
         Rng((i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (u64::from(version) << 40));
     const STATUS: [&str; 3] = ["active", "pending", "paused"];
     let (ts, q, p, st) = if version == 0 {
-        (1_700_000_000 + member, member % 17, 1000 + member % 250, member % 3)
+        (
+            1_700_000_000 + member,
+            member % 17,
+            1000 + member % 250,
+            member % 3,
+        )
     } else {
         let mut n = |m: u64| (rng.next() % m) as usize;
         (1_700_086_400 + n(86_400), n(17), 1000 + n(250), n(3))
