@@ -91,9 +91,7 @@ impl CompactionJob<'_> {
             level: self.level,
             inputs: self.inputs.len(),
             input_bytes: self.input_bytes(),
-            input_held_bytes: physical_runs(&self.inputs)
-                .map(|r| r.run.held_bytes())
-                .sum(),
+            input_held_bytes: self.input_held_bytes(),
             outputs: 0,
             output_bytes: 0,
             output_held_bytes: 0,

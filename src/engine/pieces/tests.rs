@@ -773,3 +773,30 @@ fn retained_bytes_stay_exact_while_split_aliases_and_a_snapshot_coexist() {
     drop((before, pinned));
     assert_eq!(engine.engine_stats().retained_run_bytes, 0);
 }
+
+#[test]
+fn split_views_count_physical_input_bytes_once() {
+    let engine = fixture_with_threads(4);
+    engine.core.piece_output_budget.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        engine.compact(&mut MergeWorkspace::new()),
+        Err(CompactionError::OutputLimit { .. })
+    ));
+    engine.core.piece_output_budget.store(0, Ordering::Relaxed);
+    engine.ks().put(&0u16.to_be_bytes(), &[2; 128]).unwrap();
+    engine
+        .ks()
+        .put(&(KEYS - 1).to_be_bytes(), &[2; 128])
+        .unwrap();
+    engine.flush().unwrap();
+    let stats = engine.engine_stats();
+    let report = engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+    assert_eq!(
+        report.input_bytes, stats.run_bytes,
+        "split views of one physical run must not be counted repeatedly"
+    );
+    assert_eq!(
+        report.input_held_bytes, stats.held_bytes,
+        "split views of one physical run must not count held bytes repeatedly"
+    );
+}

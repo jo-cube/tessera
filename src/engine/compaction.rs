@@ -206,7 +206,15 @@ pub(super) enum Begun<'e> {
 
 impl<'e> CompactionJob<'e> {
     pub(super) fn input_bytes(&self) -> usize {
-        self.inputs.iter().map(|run| run.run.stored_len()).sum()
+        physical_runs(&self.inputs)
+            .map(|run| run.run.stored_len())
+            .sum()
+    }
+
+    pub(super) fn input_held_bytes(&self) -> usize {
+        physical_runs(&self.inputs)
+            .map(|run| run.run.held_bytes())
+            .sum()
     }
 
     /// Returns whether no other run overlaps the inputs, so that every
@@ -424,8 +432,8 @@ impl<'e> CompactionJob<'e> {
             kind: self.kind,
             level: self.level,
             inputs: inputs.len(),
-            input_bytes: inputs.iter().map(|r| r.run.stored_len()).sum(),
-            input_held_bytes: inputs.iter().map(|run| run.run.held_bytes()).sum(),
+            input_bytes: physical_runs(inputs).map(|r| r.run.stored_len()).sum(),
+            input_held_bytes: physical_runs(inputs).map(|run| run.run.held_bytes()).sum(),
             outputs: output.runs.len(),
             output_bytes: output.output_bytes,
             output_held_bytes: output.held_bytes,
