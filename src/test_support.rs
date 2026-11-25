@@ -17,6 +17,23 @@ impl Rng {
     }
 }
 
+/// The seed a long campaign uses in place of its fixed `seed`: `seed` itself
+/// unless `TESSERA_TEST_SEED` holds a `u64`, and otherwise one derived from
+/// both, so that each of a campaign's streams still differs.
+///
+/// # Panics
+/// If `TESSERA_TEST_SEED` is set but is not a decimal `u64`.
+pub(crate) fn campaign_seed(seed: u64) -> u64 {
+    let Some(value) = std::env::var_os("TESSERA_TEST_SEED") else {
+        return seed;
+    };
+    let base: u64 = value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("TESSERA_TEST_SEED is not a u64: {value:?}"));
+    Rng(base ^ seed).next()
+}
+
 /// Every mutation has bounded output, including when replacing length fields.
 pub(crate) fn mutate(
     original: &[u8],

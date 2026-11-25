@@ -3,7 +3,7 @@ use super::*;
 use crate::block::Value;
 use crate::engine::{CompactionPolicy, Compression, Engine, ErrorKind};
 use crate::run::ReadWorkspace;
-use crate::test_support::{Rng, Scratch, mutate};
+use crate::test_support::{Rng, Scratch, campaign_seed, mutate};
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -131,9 +131,13 @@ fn reseal_run(bytes: &mut [u8], original: &[u8]) {
     bytes[footer + 36..footer + 40].copy_from_slice(&sum.to_le_bytes());
 }
 
-fn mutations(iterations: usize) {
+/// The mutation stream's fixed seed. In the long campaign it derives from
+/// `TESSERA_TEST_SEED` when that is set.
+const MUTATION_SEED: u64 = 0x6861_7264_656e_696e;
+
+fn mutations(iterations: usize, seed: u64) {
     let started = Instant::now();
-    let mut rng = Rng(0x6861_7264_656e_696e);
+    let mut rng = Rng(seed);
     let (mut changed, mut accepted, mut accepted_runs, mut unrepaired_runs) = (0, 0, 0, 0);
     for compression in [
         Compression::Uncompressed,
@@ -308,20 +312,20 @@ fn mutations(iterations: usize) {
         }
     }
     eprintln!(
-        "mutations: {changed} changed files, {accepted} accepted after checksum repair; {accepted_runs} changed raw runs accepted ({unrepaired_runs} without repair); {:?}",
+        "mutations (seed {seed}): {changed} changed files, {accepted} accepted after checksum repair; {accepted_runs} changed raw runs accepted ({unrepaired_runs} without repair); {:?}",
         started.elapsed()
     );
 }
 
 #[test]
 fn bounded_checkpoint_mutations() {
-    mutations(300);
+    mutations(300, MUTATION_SEED);
 }
 
 #[test]
 #[ignore = "long deterministic checkpoint mutation campaign"]
 fn long_checkpoint_mutations() {
-    mutations(10_000);
+    mutations(10_000, campaign_seed(MUTATION_SEED));
 }
 
 /// A checkpoint of keyspaces "a", "b" and "c", where "b" was dropped and

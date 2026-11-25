@@ -34,6 +34,12 @@ The default suite includes bounded mutation tests, a concurrent sequence
 model with a 20-second process deadline and a model of five keyspaces with
 drops, snapshots and reopening. The long campaigns are longer variants of
 these, sized to finish within half the `long` step's bound in the container.
+They use fixed seeds unless `TESSERA_TEST_SEED` holds a decimal `u64`; the
+checkpoint mutation, concurrent model and keyspace model campaigns then
+derive their seeds from it. The same value repeats the same operation
+streams, though the concurrent model's interleavings still vary.
+The bounded tests keep their fixed seeds. For example:
+`scripts/validate.sh exec 300 env TESSERA_TEST_SEED=7 just long`.
 The large-allocation boundary tests are also ignored and run only in the
 container (`scripts/validate.sh limits`).
 

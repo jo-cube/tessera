@@ -1,6 +1,6 @@
 //! A bounded concurrent history, replayed independently at every read ceiling.
 use super::*;
-use crate::test_support::{Rng, Scratch};
+use crate::test_support::{Rng, Scratch, campaign_seed};
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -128,7 +128,9 @@ fn check(snapshot: &Snapshot, ks: &Keyspace, oracle: &Oracle) {
     }
 }
 
-fn workload(iterations: usize) {
+/// Runs the model. With `long`, the writers' seeds derive from
+/// `TESSERA_TEST_SEED` when it is set.
+fn workload(iterations: usize, long: bool) {
     let started = Instant::now();
     let scratch = Scratch::new("concurrent");
     let options = Options {
@@ -153,7 +155,8 @@ fn workload(iterations: usize) {
             let (engine, oracle, barrier, writers, admitted, refused) =
                 (&engine, &oracle, &barrier, &writers, &admitted, &refused);
             scope.spawn(move || {
-                let mut rng = Rng(0x7374_7265_7373 + writer as u64);
+                let seed = 0x7374_7265_7373 + writer as u64;
+                let mut rng = Rng(if long { campaign_seed(seed) } else { seed });
                 barrier.wait();
                 for iteration in 0..iterations {
                     let kind = iteration % 4;
@@ -269,7 +272,7 @@ fn bounded(long: bool) {
         "engine::stress_tests::bounded_concurrent_model"
     };
     if std::env::var("TESSERA_MODEL_CHILD").as_deref() == Ok(name) {
-        workload(if long { 2000 } else { 640 });
+        workload(if long { 2000 } else { 640 }, long);
         return;
     }
     let mut child = Command::new(std::env::current_exe().unwrap())

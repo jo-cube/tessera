@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::engine::{CompactionPolicy, Engine, ErrorKind, Keyspace, Options, WriteBatch};
-use crate::test_support::Rng;
+use crate::test_support::{Rng, campaign_seed};
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -598,6 +598,6 @@ fn a_keyspace_model_agrees_through_drops_snapshots_and_recovery() {
 #[ignore = "long keyspace model campaign"]
 fn long_keyspace_model() {
     for seed in 3..12 {
-        keyspace_model(seed, 5000);
+        keyspace_model(campaign_seed(seed), 5000);
     }
 }
