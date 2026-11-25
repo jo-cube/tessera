@@ -278,7 +278,11 @@ fn idle_compaction_keeps_snapshot_inputs_charged_until_release() {
     let after = engine.engine_stats();
     assert_eq!(after.level0_runs, 0);
     assert_eq!(after.build_output_bytes + after.build_workspace_bytes, 0);
-    assert_eq!(after.snapshot_bytes, before.run_bytes + before.held_bytes);
+    // A flushed table stays charged until the flusher drops its job, which
+    // can be after `flush` returns, so wait for that charge to go.
+    crate::test_support::wait_until(|| {
+        engine.stats().snapshot_bytes == before.run_bytes + before.held_bytes
+    });
     assert_accounting(&engine);
     assert_eq!(
         initial.reader().get(&ks, b"deleted").unwrap(),
