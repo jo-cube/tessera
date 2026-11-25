@@ -187,7 +187,8 @@ pub enum Compression {
     /// Raw 16 KiB blocks, read in place.
     Uncompressed,
     /// Zstandard level 1 with literals stored uncompressed: faster gets,
-    /// larger runs. Weakly compressible data is stored nearly uncompressed.
+    /// larger runs. Weakly compressible data comes out larger than with
+    /// [`Uncompressed`](Self::Uncompressed), the better choice there.
     ZstdFastDecode,
 }
 impl Compression {

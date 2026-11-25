@@ -261,6 +261,9 @@ each key.
 - A per-segment adaptive level 1/3 choice: almost never triggered.
 - Zstd effort by output level: fast levels store weak-locality blocks raw, and
   level 3 gains almost nothing on dictionary blocks.
+- Literals stored uncompressed (`ZstdFastDecode`): an opt-in, not the default.
+  Decoding skips the per-frame Huffman table, but stored bytes grow in
+  proportion to the data, by about a fifth on compressible data.
 
 **Frame CRCs on every decode; dictionaries trusted after build or validation.**
 - Verifying each dictionary's CRC on every decode: about a tenth of write CPU

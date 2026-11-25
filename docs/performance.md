@@ -124,6 +124,14 @@ bottom level, data that does not compress, or data larger than memory.
 `compression: Uncompressed` stores raw 16 KiB blocks: little write CPU and
 cheap decoding, at the cost of memory close to the raw data size.
 
+`compression: ZstdFastDecode` keeps Zstandard's matches but stores literals
+uncompressed, so a decode builds no Huffman table and encoding costs less. On
+the benchmark's compressible datasets, point reads ran about 1.6–2.1× as fast
+and writes no slower, for about a sixth to a quarter more stored bytes. Blocks
+keep their stored target, so each holds less raw data and the index grows. On
+weakly compressible data the blocks come out nearly raw and larger than with
+`Uncompressed`, which is then the better choice.
+
 ## Linux resident memory
 
 With glibc, freed buffers can stay resident after compaction, so the
