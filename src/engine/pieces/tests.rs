@@ -695,3 +695,75 @@ fn a_read_charge_covers_bounding_every_input() {
     drop(charge);
     assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
 }
+
+/// What `pinned` alone keeps, each storage once, equals what the state
+/// counts as retained.
+fn assert_retained_exact(engine: &Engine, pinned: &[SharedRun]) {
+    let state = engine.core.read_state();
+    let live: HashSet<_> = state
+        .only()
+        .runs
+        .iter()
+        .map(|run| run.run.storage_id())
+        .collect();
+    let expected = physical_runs(pinned)
+        .filter(|run| !live.contains(&run.run.storage_id()))
+        .fold((0, 0), |(stored, held), run| {
+            (stored + run.run.stored_len(), held + run.run.held_bytes())
+        });
+    let retained = state.retained();
+    assert_eq!((retained.run_bytes, retained.held_bytes), expected);
+}
+
+/// Concurrent pieces publish aliases of each source, sharing its storage,
+/// without retiring it. A snapshot holding the sources and every bottom run
+/// is counted exactly at each piece and after the job.
+#[test]
+fn retained_bytes_stay_exact_while_split_aliases_and_a_snapshot_coexist() {
+    enum Step {
+        Piece,
+        Done,
+    }
+    struct SendsDone(mpsc::Sender<Step>);
+    impl Drop for SendsDone {
+        fn drop(&mut self) {
+            let _ = self.0.send(Step::Done);
+        }
+    }
+    let engine = fixture_with_threads(4);
+    let pinned = engine.core.read_state().only().runs.clone();
+    let before = engine.snapshot();
+    let (step, steps) = mpsc::channel();
+    let (go, gate) = mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let piece = step.clone();
+    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(move |_| {
+        piece.send(Step::Piece).unwrap();
+        gate.lock().unwrap().recv().unwrap();
+    }));
+    let pieces = std::thread::scope(|scope| {
+        let done = SendsDone(step);
+        let engine = &engine;
+        scope.spawn(move || {
+            let _done = done;
+            engine.compact(&mut MergeWorkspace::new()).unwrap().unwrap();
+        });
+        let mut pieces = 0;
+        while let Step::Piece = steps.recv().unwrap() {
+            pieces += 1;
+            if pieces == 1 {
+                let state = engine.core.read_state();
+                let runs = &state.only().runs;
+                assert!(physical_runs(runs).count() < runs.len(), "aliases share storage");
+            }
+            assert_retained_exact(engine, &pinned);
+            go.send(()).unwrap();
+        }
+        pieces
+    });
+    assert!(pieces > 1, "the job ran in {pieces} pieces");
+    assert_retained_exact(&engine, &pinned);
+    assert!(engine.engine_stats().retained_run_bytes > 0);
+    drop((before, pinned));
+    assert_eq!(engine.engine_stats().retained_run_bytes, 0);
+}
