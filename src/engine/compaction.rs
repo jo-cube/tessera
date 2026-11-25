@@ -180,19 +180,12 @@ pub(super) struct CompactionJob<'e> {
     /// Output into the bottom level, which erases uncontested sequences.
     pub(super) zero_seq: bool,
     pub(super) cuts: OutputCuts,
-    /// Where the source level's next job starts once this publishes.
-    pub(super) cursor: Option<Cursor>,
+    /// The source's largest key to advance the source level's cursor past.
+    pub(super) cursor: Option<Vec<u8>>,
     /// Stored size of a full target-length run, using the planner estimate.
     pub(super) estimated_run_bytes: usize,
     /// Number of leading level-0 sources, for bottom-range publication.
     pub(super) source_count: usize,
-}
-
-/// How a published job moves its source level's cursor.
-#[derive(Debug)]
-pub(super) enum Cursor {
-    /// Past this key, the source's largest.
-    After(Vec<u8>),
 }
 
 /// A compaction step chosen under the lock: a job to build, or a move,
@@ -508,9 +501,8 @@ impl<'e> CompactionJob<'e> {
         if space.levels.replace(inputs, &outputs, self.dest).is_err() {
             return Err(CompactionError::Stale);
         }
-        match &self.cursor {
-            Some(Cursor::After(key)) => space.levels.advance(self.level, key),
-            None => {}
+        if let Some(key) = &self.cursor {
+            space.levels.advance(self.level, key);
         }
         #[cfg(feature = "diagnostics")]
         #[allow(irrefutable_let_patterns, reason = "test-only destinations")]

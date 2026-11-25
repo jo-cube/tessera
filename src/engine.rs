@@ -55,7 +55,7 @@ use checkpoint::CheckpointReport;
 use checkpoint::{CheckpointError, OpenError};
 #[cfg(test)]
 pub(crate) use compaction::CompactionKind;
-use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob, Cursor};
+use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob};
 pub(crate) use compaction::{CompactionPolicy, CompactionReport};
 pub use error::{Error, ErrorKind, Result};
 use errors::{UpdateError, WriteError};
@@ -990,7 +990,7 @@ impl Core {
                 below,
             } => {
                 let cursor =
-                    Cursor::After(sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
+                    (level > 0).then(|| sources[0].run.key_range().expect(NOT_EMPTY).max.to_vec());
                 let cuts = OutputCuts {
                     overlapped: below,
                     // A run reaching `level_ratio` runs below has crossed the
@@ -1003,7 +1003,7 @@ impl Core {
                 }
                 let inputs = sources.into_iter().chain(dests).collect();
                 let dest = Dest::Level(level + 1);
-                (level, inputs, dest, cuts, Some(cursor))
+                (level, inputs, dest, cuts, cursor)
             }
             Plan::Clean { level, run } => (
                 level,
