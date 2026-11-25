@@ -163,10 +163,12 @@ the pool reserve and unused checked-out capacity, and estimates of in-flight
 build output and workspace. Shared sources count once. Below 90% writers
 proceed; above it they wait briefly on publication; at 100% they request
 reclamation and fail with `MemoryLimit` only when live data and held
-snapshots cannot shrink. Flushes, compactions, snapshots and checkpoints are
-never refused, so maintenance can always finish and free space. Quiet
-level-0 compaction uses the same estimates and charges for pieces and
-retired sources. Snapshots and checkpoints may retain the inputs after
+snapshots cannot shrink. Admission checks usage as it is before a write and
+reserves nothing for it, so one write, or one ingested batch with its build
+charge, can take usage past the limit by its own size. Flushes, compactions,
+snapshots and checkpoints are never refused, so maintenance can always finish
+and free space. Quiet level-0 compaction uses the same estimates and charges
+for pieces and retired sources. Snapshots and checkpoints may retain the inputs after
 publication. Readers' buffers, queued write-combiner copies (up to 1 MiB per
 waiting writer) and allocator overhead are outside the budget.
 
