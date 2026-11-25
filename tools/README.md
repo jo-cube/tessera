@@ -75,6 +75,9 @@ Native Zstandard allocations are outside the Rust counter. `--threads COUNT`
 sets builders; `--threads default` uses the engine default (otherwise one).
 `TESSERA_COUNTERS_MEMTABLE_MIB` sets `Options::memtable_size` in MiB for
 every scenario and variant. Use the same value on both sides of a comparison.
+`--compression zstd|fast-decode|uncompressed` sets `Options::compression`
+(`Zstd`, the default; `ZstdFastDecode`; `Uncompressed`); the `config` line
+records it.
 
 ## Zstandard entropy measurements
 

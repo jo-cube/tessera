@@ -135,3 +135,6 @@ capacity. `TESSERA_BENCH_LEVEL_RATIO` and `TESSERA_BENCH_BACKGROUND_THREADS`
 override Tessera options for controlled comparisons. `TESSERA_BENCH_MEMTABLE_MIB`
 sets `Options::memtable_size` in MiB for every Tessera store in both regular
 and streaming modes. Use the same value on both sides of a comparison.
+`TESSERA_BENCH_COMPRESSION=zstd|fast-decode|uncompressed` sets
+`Options::compression` (`Zstd`, the default; `ZstdFastDecode`;
+`Uncompressed`) for every Tessera store; `environment.txt` records it.

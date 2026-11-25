@@ -17,7 +17,7 @@ use std::time::Instant;
 use tessera::diagnostics::{
     self, EngineDiagnostics, MergeWorkspace, ReaderDiagnostics, SegmentSample,
 };
-use tessera::{Engine, Keyspace, Options};
+use tessera::{Compression, Engine, Keyspace, Options};
 
 pub(crate) mod c2;
 #[cfg(all(feature = "tools-memory", target_os = "linux"))]
@@ -190,6 +190,7 @@ struct Flags {
     read_shapes: bool,
     reuse: bool,
     keyspaces: usize,
+    compression: Compression,
 }
 
 impl Default for Flags {
@@ -205,6 +206,7 @@ impl Default for Flags {
             read_shapes: false,
             reuse: false,
             keyspaces: 1,
+            compression: Compression::Zstd,
         }
     }
 }
@@ -785,6 +787,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                     .expect("memtable size fits usize");
             }
             options.background_threads = threads;
+            options.compression = flags.compression;
             options
         })
         .unwrap(),
@@ -1263,6 +1266,14 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             }
             "--memtable" => memtable = Some(args.next().expect("VALUE_LEN").parse().unwrap()),
             "--memtable-key" => memtable_key = args.next().expect("KEY_LEN").parse().unwrap(),
+            "--compression" => {
+                flags.compression = match args.next().as_deref() {
+                    Some("zstd") => Compression::Zstd,
+                    Some("fast-decode") => Compression::ZstdFastDecode,
+                    Some("uncompressed") => Compression::Uncompressed,
+                    other => panic!("--compression zstd|fast-decode|uncompressed, not {other:?}"),
+                }
+            }
             _ => names.push(arg),
         }
     }
@@ -1395,8 +1406,8 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
         let default = !s.clustered && s.kind != Kind::GroupedRandom;
         if (names.is_empty() && default) || names.iter().any(|n| n == s.name) {
             eprintln!(
-                "config,{},{variant},records={},background_threads={threads}",
-                s.name, s.records
+                "config,{},{variant},records={},background_threads={threads},compression={:?}",
+                s.name, s.records, flags.compression
             );
             run(s, &variant, settle, threads, &flags);
         }

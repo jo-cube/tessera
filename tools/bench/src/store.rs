@@ -1,7 +1,7 @@
 //! One interface over Tessera and the RocksDB adapter in native.cc.
 use std::ffi::{CStr, CString, c_char, c_void};
 use tessera::diagnostics::{EngineDiagnostics, ReaderDiagnostics};
-use tessera::{Engine, Keyspace, Options, WriteBatch};
+use tessera::{Compression, Engine, Keyspace, Options, WriteBatch};
 
 #[repr(C)]
 struct Rec {
@@ -183,9 +183,19 @@ impl Store {
         if let Ok(threads) = std::env::var("TESSERA_BENCH_BACKGROUND_THREADS") {
             options.background_threads = threads.parse().expect("integer builder count");
         }
+        if let Ok(compression) = std::env::var("TESSERA_BENCH_COMPRESSION") {
+            options.compression = match compression.as_str() {
+                "zstd" => Compression::Zstd,
+                "fast-decode" => Compression::ZstdFastDecode,
+                "uncompressed" => Compression::Uncompressed,
+                other => {
+                    panic!("TESSERA_BENCH_COMPRESSION=zstd|fast-decode|uncompressed, not {other}")
+                }
+            };
+        }
         eprintln!(
-            "Tessera: level_ratio={}, background_threads={}",
-            options.level_ratio, options.background_threads
+            "Tessera: level_ratio={}, background_threads={}, compression={:?}",
+            options.level_ratio, options.background_threads, options.compression
         );
         let engine = Engine::in_memory(options).unwrap();
         let ks = engine.keyspace("bench").unwrap();
