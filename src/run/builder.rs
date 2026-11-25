@@ -134,6 +134,9 @@ impl RunBuilder {
         Self::with_target_block_compressed(encoding, TARGET_BLOCK_COMPRESSED)
     }
     pub fn with_target_block_compressed(encoding: impl Into<Encoding>, target: usize) -> Self {
+        Self::in_pool(encoding, target, &ChunkPool::new(0))
+    }
+    pub(crate) fn in_pool(encoding: impl Into<Encoding>, target: usize, pool: &ChunkPool) -> Self {
         let encoding = encoding.into();
         Self {
             target: target.clamp(1, RAW_BLOCK_CAP),
@@ -146,7 +149,7 @@ impl RunBuilder {
             pending_key_bytes: 0,
             pending_blocks: Vec::new(),
             frames: Vec::new(),
-            storage: Packing::new(&ChunkPool::new(0)),
+            storage: Packing::new(pool),
             scratch: Vec::new(),
             segments: Vec::new(),
             table: Vec::new(),
@@ -166,11 +169,6 @@ impl RunBuilder {
             open_settled: true,
             open: None,
         }
-    }
-    pub(crate) fn in_pool(encoding: impl Into<Encoding>, target: usize, pool: &ChunkPool) -> Self {
-        let mut builder = Self::with_target_block_compressed(encoding, target);
-        builder.storage = Packing::new(pool);
-        builder
     }
     /// Fixed targets used by physical reader tests, including tiny blocks.
     #[cfg(test)]

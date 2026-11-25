@@ -754,19 +754,15 @@ fn compact_range_checked<'a>(
     range: BuildRange<'_>,
     budget: Option<Arc<OutputBudget>>,
 ) -> Result<Compacted, CompactBuildError> {
-    let needed = range.needed;
     let limits = CompactLimits {
-        max_workspace_bytes: limits.max_workspace_bytes.max(needed),
+        max_workspace_bytes: limits.max_workspace_bytes.max(range.needed),
         ..limits
     };
     let mut merge = MergeCursor::new(inputs.iter().copied(), workspace);
     if let Some(start) = range.start {
         merge.seek(start)?;
     }
-    let mut output = Output::new(limits, limits.max_workspace_bytes - needed, cuts);
-    output.pool = range.pool.clone();
-    output.segment_len = range.segment_len;
-    output.budget = budget.clone();
+    let mut output = Output::new(&range, limits, cuts, budget.clone());
     let refused = || {
         let budget = budget.as_ref().expect("only bounded output refuses");
         CompactBuildError::OutputLimit {
@@ -882,7 +878,7 @@ fn compact_range_checked<'a>(
         runs: output.runs,
         output_bytes: output.bytes - output.held_bytes,
         held_bytes: output.held_bytes,
-        workspace_bytes: needed,
+        workspace_bytes: range.needed,
         stats,
         copied: forward.stats,
     })
@@ -1070,30 +1066,35 @@ struct Output<'c> {
 }
 
 impl<'c> Output<'c> {
-    fn new(limits: CompactLimits, hash_bytes: usize, cuts: &'c OutputCuts) -> Self {
+    fn new(
+        range: &BuildRange<'_>,
+        limits: CompactLimits,
+        cuts: &'c OutputCuts,
+        budget: Option<Arc<OutputBudget>>,
+    ) -> Self {
         let target_run_len = if cuts.single {
             MAX_TARGET_RUN_LEN
         } else {
             limits.target_run_len.min(MAX_TARGET_RUN_LEN)
         };
         Self {
-            pool: ChunkPool::new(0),
+            pool: range.pool.clone(),
             limits: CompactLimits {
                 target_run_len,
                 ..limits
             },
             cuts,
-            segment_len: SEGMENT_RAW_LEN,
+            segment_len: range.segment_len,
             next_cut: 0,
             next_overlapped: 0,
             overlapped: 0,
-            hash_bytes,
+            hash_bytes: limits.max_workspace_bytes - range.needed,
             builder: None,
             input: 0,
             runs: Vec::new(),
             bytes: 0,
             held_bytes: 0,
-            budget: None,
+            budget,
             inherited_last: None,
         }
     }
