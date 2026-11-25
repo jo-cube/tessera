@@ -136,8 +136,8 @@ impl Progress {
 
     pub(super) fn build(&self, output: usize, workspace: usize) -> BuildCharge<'_> {
         let mut estimates = self.event.lock().unwrap_or_else(PoisonError::into_inner);
-        estimates.output += output;
-        estimates.workspace += workspace;
+        estimates.output = estimates.output.saturating_add(output);
+        estimates.workspace = estimates.workspace.saturating_add(workspace);
         BuildCharge {
             progress: self,
             output,
@@ -179,8 +179,8 @@ impl Drop for BuildCharge<'_> {
             .event
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        estimates.output -= self.output;
-        estimates.workspace -= self.workspace;
+        estimates.output = estimates.output.saturating_sub(self.output);
+        estimates.workspace = estimates.workspace.saturating_sub(self.workspace);
         drop(estimates);
         self.progress.changed.notify_all();
     }
@@ -393,6 +393,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Barrier, mpsc};
     use std::time::{Duration, Instant};
+
+    /// Estimates as large as an unlimited allowance saturate instead of
+    /// overflowing, and release back to zero.
+    #[test]
+    fn build_estimates_saturate() {
+        let progress = Progress::default();
+        let large = progress.build(usize::MAX, usize::MAX);
+        let small = progress.build(1, 1);
+        assert_eq!(progress.estimates(), (usize::MAX, usize::MAX));
+        drop(large);
+        assert_eq!(progress.estimates(), (0, 0));
+        drop(small);
+        assert_eq!(progress.estimates(), (0, 0));
+    }
 
     fn fixture(rounds: u8) -> Core {
         let core = Core::new(&Options {
