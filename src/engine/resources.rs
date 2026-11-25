@@ -193,18 +193,13 @@ pub(super) struct Usage {
 
 impl Core {
     pub(super) fn usage(&self, state: &State) -> Usage {
-        let active = state.active.memory();
-        let (memtables, pinned) = state.frozen.iter().fold(
-            (active.charged, active.pinned),
-            |(charged, pinned), table| {
-                let memory = table.memory();
-                (
-                    charged.saturating_add(memory.charged),
-                    pinned.saturating_add(memory.pinned),
-                )
-            },
-        );
-        let snapshots = state.retained().bytes.saturating_sub(pinned);
+        let memtables = state
+            .frozen
+            .iter()
+            .fold(state.active.memory().charged, |sum, table| {
+                sum.saturating_add(table.memory().charged)
+            });
+        let snapshots = state.retained().bytes;
         let (pool_reserve, pool_in_use, pool_cap, pool_unaccounted) = self.chunks.accounting();
         let (build_output, build_workspace) = self.resources.estimates();
         let used = [

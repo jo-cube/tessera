@@ -234,39 +234,25 @@ impl State {
     }
 
     /// Released sources still held, each counted once however many snapshots
-    /// hold it, and the history pinned in the engine's memtables.
+    /// hold it.
     fn retained(&self) -> Retained {
-        let pinned = self.active.memory().pinned
-            + self
-                .frozen
-                .iter()
-                .map(|table| table.memory().pinned)
-                .sum::<usize>();
         self.retired
             .iter()
             .filter(|retired| retired.source.strong_count() > 0)
-            .fold(
+            .fold(Retained::default(), |sum, retired| {
+                let filter = retired.held_bytes.unwrap_or(0);
+                let run = if retired.held_bytes.is_some() {
+                    retired.bytes
+                } else {
+                    0
+                };
                 Retained {
-                    sources: 0,
-                    bytes: pinned,
-                    run_bytes: 0,
-                    held_bytes: 0,
-                },
-                |sum, retired| {
-                    let filter = retired.held_bytes.unwrap_or(0);
-                    let run = if retired.held_bytes.is_some() {
-                        retired.bytes
-                    } else {
-                        0
-                    };
-                    Retained {
-                        sources: sum.sources + 1,
-                        bytes: sum.bytes + retired.bytes + filter,
-                        run_bytes: sum.run_bytes + run,
-                        held_bytes: sum.held_bytes + filter,
-                    }
-                },
-            )
+                    sources: sum.sources + 1,
+                    bytes: sum.bytes + retired.bytes + filter,
+                    run_bytes: sum.run_bytes + run,
+                    held_bytes: sum.held_bytes + filter,
+                }
+            })
     }
 }
 
@@ -1159,6 +1145,18 @@ impl Core {
         let sum = |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).sum::<usize>();
         let most =
             |field: fn(&KeyspaceDetail) -> usize| spaces.iter().map(field).max().unwrap_or(0);
+        let active = state.active.memory();
+        let frozen = state
+            .frozen
+            .iter()
+            .map(|table| table.memory())
+            .reduce(|sum, table| MemoryUsage {
+                payload: sum.payload + table.payload,
+                arena_bytes: sum.arena_bytes + table.arena_bytes,
+                charged: sum.charged + table.charged,
+                pinned: sum.pinned + table.pinned,
+                budget: sum.budget + table.budget,
+            });
 
         EngineStats {
             build: self.chunks.counters(),
@@ -1177,18 +1175,8 @@ impl Core {
             pool_in_use_bytes: usage.pool_in_use,
             pool_reserve_limit: usage.pool_cap,
             last_seq: state.last_seq,
-            active: state.active.memory(),
-            frozen: state
-                .frozen
-                .iter()
-                .map(|table| table.memory())
-                .reduce(|sum, table| MemoryUsage {
-                    payload: sum.payload + table.payload,
-                    arena_bytes: sum.arena_bytes + table.arena_bytes,
-                    charged: sum.charged + table.charged,
-                    pinned: sum.pinned + table.pinned,
-                    budget: sum.budget + table.budget,
-                }),
+            active,
+            frozen,
             frozen_tables: state.frozen.len(),
             runs: sum(|space| space.runs),
             run_bytes: state.run_bytes,
@@ -1196,7 +1184,7 @@ impl Core {
             max_overlap: most(|space| space.max_overlap),
             snapshots: Arc::strong_count(&self.snapshots) - 1,
             retained_sources: retained.sources,
-            retained_bytes: retained.bytes,
+            retained_bytes: retained.bytes + active.pinned + frozen.map_or(0, |f| f.pinned),
             retained_run_bytes: retained.run_bytes,
             retained_held_bytes: retained.held_bytes,
             level0_flushes: state.level0_flushes,
