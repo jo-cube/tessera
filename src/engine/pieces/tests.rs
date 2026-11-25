@@ -577,6 +577,95 @@ fn piecewise_compaction_and_ingestion_record_diagnostics() {
     );
 }
 
+/// Levels and the run set agree, every key reads once with its newest
+/// value, and no build charge is left behind.
+fn assert_valid_after_abandon(engine: &Engine) {
+    {
+        let state = engine.core.read_state();
+        state.only().levels.check(&state.only().runs);
+        assert_eq!(
+            state.level0_flushes,
+            state.only().levels.level0_flushes(),
+            "the published level-0 count follows the levels"
+        );
+    }
+    assert_eq!(engine.engine_stats().build_output_bytes, 0);
+    assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
+    check(&engine.snapshot(), &engine.ks(), ones);
+}
+
+#[test]
+fn a_panic_after_two_serial_pieces_keeps_them_and_the_next_job_completes() {
+    let engine = fixture();
+    let before = engine.snapshot();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    // The third build panics outside the state lock, after two publications.
+    *engine.core.after_build.lock().unwrap() = Some(Arc::new(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 2 {
+            panic!("injected piece build failure");
+        }
+    }));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.compact(&mut MergeWorkspace::new())
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    *engine.core.after_build.lock().unwrap() = None;
+    {
+        let state = engine.core.read_state();
+        // Two bottom inputs were replaced; the source remains as one sliced view.
+        assert!(
+            state.only().levels.runs()[0]
+                .iter()
+                .any(|r| r.run.slice().is_some_and(|(min, _)| min == 64u16.to_be_bytes()))
+        );
+    }
+    assert_valid_after_abandon(&engine);
+    check(&before, &engine.ks(), ones);
+    // The state lock is not poisoned and the next jobs finish the range.
+    engine.ks().put(&7u16.to_be_bytes(), &[1; 128]).unwrap();
+    while engine
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    assert_valid_after_abandon(&engine);
+}
+
+#[test]
+fn a_panicking_concurrent_piece_leaves_a_valid_tree_and_the_next_job_completes() {
+    let engine = fixture_with_threads(4);
+    engine
+        .core
+        .piece_output_budget
+        .store(32 << 10, Ordering::Relaxed);
+    let before = engine.snapshot();
+    // Whichever other pieces publish first, the outcome below is the same.
+    *engine.core.before_piece.lock().unwrap() = Some(Arc::new(|index| {
+        if index == 2 {
+            panic!("injected concurrent piece failure");
+        }
+    }));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.compact(&mut MergeWorkspace::new())
+    }));
+    assert!(unwound.is_err());
+    *engine.core.before_piece.lock().unwrap() = None;
+    assert_valid_after_abandon(&engine);
+    check(&before, &engine.ks(), ones);
+    let scratch = Scratch::new("panicked-concurrent-piece");
+    engine.checkpoint_to(&scratch.0).unwrap();
+    let recovered = Engine::open(&scratch.0, options()).unwrap();
+    check(&recovered.snapshot(), &recovered.ks(), ones);
+    while engine
+        .compact(&mut MergeWorkspace::new())
+        .unwrap()
+        .is_some()
+    {}
+    assert_valid_after_abandon(&engine);
+}
+
 /// The charge held while sources are split covers what bounding them keeps.
 #[test]
 fn a_read_charge_covers_bounding_every_input() {
