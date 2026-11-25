@@ -61,20 +61,7 @@ impl<'e> CompactionJob<'e> {
         mut self,
         workspace: &mut MergeWorkspace,
     ) -> Result<CompactionReport, CompactionError> {
-        let mut report = CompactionReport {
-            kind: self.kind,
-            level: self.level,
-            inputs: self.inputs.len(),
-            input_bytes: self.input_bytes(),
-            input_held_bytes: self.input_held_bytes(),
-            outputs: 0,
-            output_bytes: 0,
-            output_held_bytes: 0,
-            filter_build_bytes: 0,
-            complete: self.is_complete(),
-            stats: CompactStats::default(),
-            workspace_bytes: 0,
-        };
+        let mut report = self.begin_report();
         let budget = self.piece_budget();
         let mut sources: Vec<_> = self.inputs.drain(..self.source_count).collect();
         let mut bottom: VecDeque<_> = std::mem::take(&mut self.inputs).into();
@@ -172,16 +159,17 @@ fn view_of(source: &SharedRun, run: Run<Vec<u8>>) -> SharedRun {
 }
 
 fn add_report(sum: &mut CompactionReport, part: CompactionReport) {
-    sum.outputs += part.outputs;
     sum.output_bytes += part.output_bytes;
     sum.output_held_bytes += part.output_held_bytes;
-    sum.filter_build_bytes = sum.filter_build_bytes.max(part.filter_build_bytes);
-    sum.workspace_bytes = sum.workspace_bytes.max(part.workspace_bytes);
-    sum.stats.records_read += part.stats.records_read;
-    sum.stats.records_written += part.stats.records_written;
-    sum.stats.versions_dropped += part.stats.versions_dropped;
-    sum.stats.copies_collapsed += part.stats.copies_collapsed;
-    sum.stats.tombstones_dropped += part.stats.tombstones_dropped;
+    #[cfg(test)]
+    {
+        sum.outputs += part.outputs;
+        sum.stats.records_read += part.stats.records_read;
+        sum.stats.records_written += part.stats.records_written;
+        sum.stats.versions_dropped += part.stats.versions_dropped;
+        sum.stats.copies_collapsed += part.stats.copies_collapsed;
+        sum.stats.tombstones_dropped += part.stats.tombstones_dropped;
+    }
 }
 
 impl<'e> BuiltCompaction<'e> {
@@ -195,25 +183,7 @@ impl<'e> BuiltCompaction<'e> {
             output,
             charge,
         } = self;
-        let report = CompactionReport {
-            kind: job.kind,
-            level: job.level,
-            inputs: job.inputs.len(),
-            input_bytes: job.input_bytes(),
-            input_held_bytes: job.input_held_bytes(),
-            outputs: output.runs.len(),
-            output_bytes: output.output_bytes,
-            output_held_bytes: output.held_bytes,
-            filter_build_bytes: output
-                .runs
-                .iter()
-                .map(Run::filter_build_bytes)
-                .max()
-                .unwrap_or(0),
-            complete: job.is_complete(),
-            stats: output.stats,
-            workspace_bytes: output.workspace_bytes,
-        };
+        let report = job.report(&job.inputs, &output);
         #[cfg(feature = "diagnostics")]
         diagnostics::observe("piece_before_publish", job.engine.stats());
         let outputs: Vec<_> = published(output.runs).collect();

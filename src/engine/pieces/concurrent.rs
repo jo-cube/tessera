@@ -86,20 +86,7 @@ impl Pipeline {
 
 impl CompactionJob<'_> {
     pub(super) fn execute_concurrent(mut self) -> Result<CompactionReport, CompactionError> {
-        let mut report = CompactionReport {
-            kind: self.kind,
-            level: self.level,
-            inputs: self.inputs.len(),
-            input_bytes: self.input_bytes(),
-            input_held_bytes: self.input_held_bytes(),
-            outputs: 0,
-            output_bytes: 0,
-            output_held_bytes: 0,
-            filter_build_bytes: 0,
-            complete: self.is_complete(),
-            stats: CompactStats::default(),
-            workspace_bytes: 0,
-        };
+        let mut report = self.begin_report();
         let bottom_bytes: usize = self.inputs[self.source_count..]
             .iter()
             .map(|r| r.run.stored_len())

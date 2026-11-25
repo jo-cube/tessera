@@ -113,11 +113,13 @@ impl fmt::Display for CompactionError {
 impl std::error::Error for CompactionError {}
 
 /// What kind of step a compaction took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum CompactionKind {
     /// Runs of one level merged with the runs of the next that they
     /// overlap, into the next.
+    #[default]
     Merge,
     /// A run relabelled to the next level, which it overlaps nowhere:
     /// nothing was read or written.
@@ -127,35 +129,37 @@ pub(crate) enum CompactionKind {
 }
 
 /// What a compaction replaced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompactionReport {
     /// What kind of step it was. A move replaces nothing, and every count
     /// below is 0.
+    #[cfg(test)]
     pub kind: CompactionKind,
     /// The level the step took its runs from.
+    #[cfg(test)]
     pub level: usize,
     /// Runs removed.
+    #[cfg(test)]
     pub inputs: usize,
     /// Their stored bytes.
     pub input_bytes: usize,
     /// What they held beside that: key filters and physical segment metadata.
+    #[cfg(test)]
     pub input_held_bytes: usize,
     /// Runs published in their place.
+    #[cfg(test)]
     pub outputs: usize,
     /// Their stored bytes.
     pub output_bytes: usize,
     /// What they hold beside that: key filters and physical segment metadata.
     pub output_held_bytes: usize,
-    /// The most bytes one output's filter construction held for key hashes,
-    /// freed when that run was finished.
-    pub filter_build_bytes: usize,
     /// Whether no other run overlapped the inputs, so that every tombstone
     /// could be dropped.
+    #[cfg(test)]
     pub complete: bool,
     /// What the merge read and wrote.
+    #[cfg(test)]
     pub stats: CompactStats,
-    /// The workspace estimate checked before merging.
-    pub workspace_bytes: usize,
 }
 
 /// A compaction whose inputs are chosen and whose output is not built yet.
@@ -175,6 +179,7 @@ pub(super) struct CompactionJob<'e> {
     /// hold older versions that the inputs' tombstones hide.
     pub(super) others: Vec<SharedRun>,
     pub(super) options: CompactionPolicy,
+    #[cfg(test)]
     pub(super) kind: CompactionKind,
     pub(super) level: usize,
     /// Where the output goes.
@@ -211,14 +216,59 @@ impl<'e> CompactionJob<'e> {
             .sum()
     }
 
+    #[cfg(test)]
     pub(super) fn input_held_bytes(&self) -> usize {
         physical_runs(&self.inputs)
             .map(|run| run.run.held_bytes())
             .sum()
     }
 
+    pub(super) fn begin_report(&self) -> CompactionReport {
+        CompactionReport {
+            #[cfg(test)]
+            kind: self.kind,
+            #[cfg(test)]
+            level: self.level,
+            #[cfg(test)]
+            inputs: self.inputs.len(),
+            input_bytes: self.input_bytes(),
+            #[cfg(test)]
+            input_held_bytes: self.input_held_bytes(),
+            #[cfg(test)]
+            complete: self.is_complete(),
+            ..CompactionReport::default()
+        }
+    }
+
+    pub(super) fn report(
+        &self,
+        inputs: &[SharedRun],
+        output: &crate::run::Compacted,
+    ) -> CompactionReport {
+        CompactionReport {
+            #[cfg(test)]
+            kind: self.kind,
+            #[cfg(test)]
+            level: self.level,
+            #[cfg(test)]
+            inputs: inputs.len(),
+            input_bytes: physical_runs(inputs).map(|r| r.run.stored_len()).sum(),
+            #[cfg(test)]
+            input_held_bytes: physical_runs(inputs).map(|r| r.run.held_bytes()).sum(),
+            #[cfg(test)]
+            outputs: output.runs.len(),
+            output_bytes: output.output_bytes,
+            output_held_bytes: output.held_bytes,
+            #[cfg(test)]
+            complete: self.is_complete(),
+            #[cfg(test)]
+            stats: output.stats,
+        }
+    }
+
     /// Returns whether no other run overlaps the inputs, so that every
     /// tombstone can be dropped.
+    #[cfg(test)]
     pub(super) fn is_complete(&self) -> bool {
         self.others.is_empty()
     }
@@ -396,7 +446,6 @@ impl<'e> CompactionJob<'e> {
 impl fmt::Debug for CompactionJob<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompactionJob")
-            .field("kind", &self.kind)
             .field("level", &self.level)
             .field("inputs", &self.inputs.len())
             .field("input_bytes", &self.input_bytes())
@@ -428,25 +477,7 @@ impl<'e> CompactionJob<'e> {
         charge: resources::BuildCharge<'e>,
         _record_job: bool,
     ) -> Result<CompactionReport, CompactionError> {
-        let report = CompactionReport {
-            kind: self.kind,
-            level: self.level,
-            inputs: inputs.len(),
-            input_bytes: physical_runs(inputs).map(|r| r.run.stored_len()).sum(),
-            input_held_bytes: physical_runs(inputs).map(|run| run.run.held_bytes()).sum(),
-            outputs: output.runs.len(),
-            output_bytes: output.output_bytes,
-            output_held_bytes: output.held_bytes,
-            filter_build_bytes: output
-                .runs
-                .iter()
-                .map(Run::filter_build_bytes)
-                .max()
-                .unwrap_or(0),
-            complete: self.is_complete(),
-            stats: output.stats,
-            workspace_bytes: output.workspace_bytes,
-        };
+        let report = self.report(inputs, &output);
         #[cfg(feature = "diagnostics")]
         diagnostics::observe("job_before_publish", self.engine.stats());
         let is_input = |run: &SharedRun| inputs.iter().any(|input| Arc::ptr_eq(input, run));

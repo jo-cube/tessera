@@ -106,12 +106,14 @@ use crate::block::Corruption;
 
 pub use builder::RunBuilder;
 pub use codec::{Codec, Encoding};
+#[cfg(test)]
+pub use compact::CompactStats;
 #[cfg(feature = "diagnostics")]
 pub(crate) use compact::CopyStats;
 #[cfg(test)]
 pub(crate) use compact::compact_parallel;
 pub(crate) use compact::{CompactBuildError, SeqFloor, compact_limited_in, compact_parallel_in};
-pub use compact::{CompactLimits, CompactStats, Compacted, OutputCuts, workspace_estimate};
+pub use compact::{CompactLimits, Compacted, OutputCuts, workspace_estimate};
 #[cfg(test)]
 pub(crate) use compact::{compact_erasing, compact_with};
 pub(crate) use filter::MAX_FILTER_BYTES;

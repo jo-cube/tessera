@@ -53,8 +53,10 @@ pub use batch::WriteBatch;
 #[cfg(feature = "diagnostics")]
 use checkpoint::CheckpointReport;
 use checkpoint::{CheckpointError, OpenError};
+#[cfg(test)]
+pub(crate) use compaction::CompactionKind;
 use compaction::{Begun, BuiltCompaction, CompactionError, CompactionJob, Cursor};
-pub(crate) use compaction::{CompactionKind, CompactionPolicy, CompactionReport};
+pub(crate) use compaction::{CompactionPolicy, CompactionReport};
 pub use error::{Error, ErrorKind, Result};
 use errors::{UpdateError, WriteError};
 #[cfg(test)]
@@ -73,7 +75,9 @@ use worker::BackgroundStatus;
 pub use crate::block::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub(crate) use crate::chunk::BuildCounters;
 pub(crate) use crate::memtable::{ENTRY_OVERHEAD, MemoryUsage};
-pub(crate) use crate::run::{CompactStats, MergeWorkspace};
+#[cfg(test)]
+use crate::run::CompactStats;
+pub(crate) use crate::run::MergeWorkspace;
 use crate::run::{ConflictingCopies, LiveRecord, LiveValue, ReadError};
 
 use std::collections::{BTreeMap, HashSet};
@@ -969,7 +973,12 @@ impl Core {
             space.levels.plan(&fit)
         };
         let mut source_count = 0;
-        let (kind, level, inputs, dest, mut cuts, cursor) = match plan {
+        #[cfg(test)]
+        let kind = match &plan {
+            Plan::Neighbours { .. } => CompactionKind::Neighbours,
+            _ => CompactionKind::Merge,
+        };
+        let (level, inputs, dest, mut cuts, cursor) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Move { level, run } => {
                 if space.levels.move_down(level, &run).is_err() {
@@ -981,18 +990,11 @@ impl Core {
                 state.levels_changed();
                 self.flush_signal.request();
                 return Ok(Some(Begun::Done(CompactionReport {
+                    #[cfg(test)]
                     kind: CompactionKind::Move,
+                    #[cfg(test)]
                     level,
-                    inputs: 0,
-                    input_bytes: 0,
-                    input_held_bytes: 0,
-                    outputs: 0,
-                    output_bytes: 0,
-                    output_held_bytes: 0,
-                    filter_build_bytes: 0,
-                    complete: false,
-                    stats: CompactStats::default(),
-                    workspace_bytes: 0,
+                    ..CompactionReport::default()
                 })));
             }
             Plan::Merge {
@@ -1015,17 +1017,9 @@ impl Core {
                 }
                 let inputs = sources.into_iter().chain(dests).collect();
                 let dest = Dest::Level(level + 1);
-                (
-                    CompactionKind::Merge,
-                    level,
-                    inputs,
-                    dest,
-                    cuts,
-                    Some(cursor),
-                )
+                (level, inputs, dest, cuts, Some(cursor))
             }
             Plan::Clean { level, run } => (
-                CompactionKind::Merge,
                 level,
                 vec![run],
                 Dest::Level(level),
@@ -1038,14 +1032,7 @@ impl Core {
                     ..OutputCuts::default()
                 };
                 let inputs = runs.into_iter().collect();
-                (
-                    CompactionKind::Neighbours,
-                    level,
-                    inputs,
-                    Dest::Level(level),
-                    cuts,
-                    None,
-                )
+                (level, inputs, Dest::Level(level), cuts, None)
             }
         };
         let space = state.space_mut(keyspace);
@@ -1064,6 +1051,7 @@ impl Core {
             inputs,
             others,
             options,
+            #[cfg(test)]
             kind,
             level,
             dest,
