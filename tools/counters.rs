@@ -967,7 +967,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
     let depth = levels.len() - 1;
     for (level, m) in levels.iter().enumerate() {
         println!(
-            "level,{name},{variant},{level}{},{},{},{},{},{},{},{},{},{},{}",
+            "level,{name},{variant},{level}{},{},{},{},{},{},{},{},{},{},{},{}",
             if level == depth { "-bottom" } else { "" },
             m.runs,
             m.records,
@@ -978,7 +978,8 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
             m.index,
             m.filters,
             m.footer,
-            m.physical
+            m.physical,
+            m.blocks
         );
     }
     emit_per_record(name, variant, &levels);
@@ -1106,7 +1107,7 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
         let depth = levels.len() - 1;
         for (level, m) in levels.iter().enumerate() {
             println!(
-                "level,{name},{variant}+settled,{level}{},{},{},{},{},{},{},{},{},{},{}",
+                "level,{name},{variant}+settled,{level}{},{},{},{},{},{},{},{},{},{},{},{}",
                 if level == depth { "-bottom" } else { "" },
                 m.runs,
                 m.records,
@@ -1117,7 +1118,8 @@ fn run(s: &Scenario, variant: &str, settle: bool, threads: usize, flags: &Flags)
                 m.index,
                 m.filters,
                 m.footer,
-                m.physical
+                m.physical,
+                m.blocks
             );
         }
         emit_per_record(name, &format!("{variant}+settled"), &levels);
@@ -1350,7 +1352,7 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
     );
     println!("erasure,scenario,variant,records,erased,probes,kept_unfiltered,kept_filtered");
     println!(
-        "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical"
+        "level,scenario,variant,level,runs,records,raw,frames,dictionaries,segment_table,index,filters,footer,physical,blocks"
     );
     println!(
         "per_record,scenario,variant,records,raw_per_rec,stored_per_rec,frames_per_rec,dicts_per_rec,seg_table_per_rec,index_per_rec,filters_per_rec,footer_per_rec,physical_per_rec,total_per_rec"

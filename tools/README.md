@@ -10,8 +10,8 @@ compaction and checks every read path against an independent value oracle.
 
 Long-format CSV rows report raw bytes decoded and compressed and stored bytes
 written by flush and by compaction into each level; stored bytes by component
-(frames, dictionaries, segment table, index, filters, footer, physical) and
-records per level, plus per-record component breakdown (`per_record`); records
+(frames, dictionaries, segment table, index, filters, footer, physical),
+blocks and records per level, plus per-record component breakdown (`per_record`); records
 written into the bottom level, how many had their sequence erased, the filter
 probes that took and why the rest kept theirs; decoded bytes per get, blocks
 per scan, write amplification and writer wait / lock counters (`waits`).
