@@ -1294,4 +1294,56 @@ mod tests {
         assert_eq!(ks.get(b"after").unwrap().as_deref(), Some(&b"ok"[..]));
         engine.close().unwrap();
     }
+
+    #[test]
+    fn byte_cap_break_in_drain_shards_hands_off_without_stranding() {
+        let engine = Engine::in_memory(Options {
+            memtable_size: 4 << 20,
+            ..manual()
+        })
+        .unwrap();
+        let ks = engine.ks();
+        let big_a = vec![b'a'; 600 << 10];
+        let big_b = vec![b'b'; 600 << 10];
+
+        let (entered_rx, release_tx) = pause_leader(&engine.core);
+        let direct = engine.core.combiner.try_enter_direct().unwrap();
+
+        let (r1, r2, r3) = std::thread::scope(|scope| {
+            let (core, ks, big_a, big_b) = (&engine.core, &ks, &big_a, &big_b);
+            let t1 = scope.spawn(move || core.update(ks.id(), b"l0", Value::Bytes(big_a)));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait_for_combining(core);
+
+            let t2 = scope.spawn(move || core.update(ks.id(), b"f1", Value::Bytes(big_b)));
+            wait_for_queued(core, 1);
+            let t3 = scope.spawn(move || core.update(ks.id(), b"f2", Value::Bytes(b"tiny")));
+            wait_for_queued(core, 2);
+
+            drop(direct);
+            release_tx.send(()).unwrap();
+            (
+                t1.join().unwrap().unwrap(),
+                t2.join().unwrap().unwrap(),
+                t3.join().unwrap().unwrap(),
+            )
+        });
+
+        let mut seqs = [r1, r2, r3];
+        seqs.sort_unstable();
+        assert_eq!(seqs, [1, 2, 3]);
+        assert_eq!(engine.core.combiner.queued_len(), 0);
+        assert_eq!(
+            engine.core.resources.write_groups.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            engine.core.resources.grouped_writes.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(ks.get(b"l0").unwrap().as_deref(), Some(big_a.as_slice()));
+        assert_eq!(ks.get(b"f1").unwrap().as_deref(), Some(big_b.as_slice()));
+        assert_eq!(ks.get(b"f2").unwrap().as_deref(), Some(&b"tiny"[..]));
+        engine.close().unwrap();
+    }
 }
