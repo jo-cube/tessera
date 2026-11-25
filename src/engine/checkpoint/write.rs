@@ -212,7 +212,7 @@ impl Core {
     /// Use the normal flush job, keeping precisely the run image at rotation.
     /// Taking a later snapshot of the state would include runs published by
     /// concurrent ingestion, or miss pre-ceiling runs replaced by compaction.
-    fn checkpoint_image(&self) -> Result<Image, CheckpointError> {
+    fn checkpoint_image(&self) -> Image {
         loop {
             let serial = self.serialize_flush();
             let mut state = self.write_state();
@@ -243,7 +243,7 @@ impl Core {
                 self.freeze_active(&mut state);
             }
             if state.frozen.is_empty() {
-                return Ok(image);
+                return image;
             }
             let job = FlushJob::new(self, serial, &state);
             drop(state);
@@ -267,7 +267,7 @@ impl Core {
                     .extend(kept.runs.into_iter().map(|run| (0, kept.flush, run)));
                 space.runs.sort_by_key(|(level, _, _)| *level);
             }
-            return Ok(image);
+            return image;
         }
     }
 }
@@ -511,24 +511,20 @@ impl Core {
         let _ = fs::remove_file(dir.join(CURRENT_TMP));
         let path = checkpoint_dir(dir, generation);
         fs::create_dir(&path).map_err(io_error(&path))?;
-        let built = self
-            .checkpoint_image()
-            .map_err(Failure::Error)
-            .and_then(|image| {
-                #[cfg(test)]
-                AFTER_IMAGE.with(|hook| {
-                    if let Some(hook) = hook.borrow_mut().take() {
-                        hook();
-                    }
-                });
-                write_runs(
-                    &image,
-                    dir,
-                    generation,
-                    previous.as_ref().map_or(0, |m| m.generation),
-                    metadata,
-                )
-            });
+        let image = self.checkpoint_image();
+        #[cfg(test)]
+        AFTER_IMAGE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let built = write_runs(
+            &image,
+            dir,
+            generation,
+            previous.as_ref().map_or(0, |m| m.generation),
+            metadata,
+        );
         let written = match built {
             Ok(written) => written,
             Err(Failure::Error(error)) => {
