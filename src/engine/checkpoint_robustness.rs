@@ -135,7 +135,11 @@ fn mutations(iterations: usize) {
     let started = Instant::now();
     let mut rng = Rng(0x6861_7264_656e_696e);
     let (mut changed, mut accepted, mut accepted_runs, mut unrepaired_runs) = (0, 0, 0, 0);
-    for compression in [Compression::Uncompressed, Compression::Zstd] {
+    for compression in [
+        Compression::Uncompressed,
+        Compression::Zstd,
+        Compression::ZstdFastDecode,
+    ] {
         for filters in [true, false] {
             let scratch = Scratch::new("mutation");
             let options = Options {
