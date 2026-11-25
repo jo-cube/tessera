@@ -806,6 +806,13 @@ impl ReadWorkspace {
         Self::default()
     }
 
+    /// An upper estimate of what a workspace retains once it has read runs
+    /// whose largest decoded block is `largest_block`: that block, a
+    /// decompression context and a cursor's prefix and end keys.
+    pub(crate) fn estimate(largest_block: usize) -> usize {
+        largest_block + super::compact::CONTEXT_ALLOWANCE + 2 * MAX_KEY_LEN
+    }
+
     /// Returns the bytes retained for decoded blocks.
     pub fn capacity(&self) -> usize {
         self.scratch.capacity()

@@ -150,6 +150,7 @@ impl CompactionJob<'_> {
             })
             .collect();
         let mut split = Vec::with_capacity(sources.len());
+        let workspace_charge = self.read_charge(&sources);
         let mut workspace = crate::run::ReadWorkspace::new();
         for source in sources {
             let mut aliases = Vec::new();
@@ -188,6 +189,7 @@ impl CompactionJob<'_> {
         drop(split);
         drop(starts);
         drop(workspace);
+        drop(workspace_charge);
         for piece in &mut tasks {
             let estimate = piece.inputs.iter().fold(0usize, |sum, r| {
                 sum.saturating_add(r.run.range_stored_estimate())

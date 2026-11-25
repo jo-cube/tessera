@@ -576,3 +576,31 @@ fn piecewise_compaction_and_ingestion_record_diagnostics() {
         "ingestion should record stored output"
     );
 }
+
+/// The charge held while sources are split covers what bounding them keeps.
+#[test]
+fn a_read_charge_covers_bounding_every_input() {
+    let engine = fixture();
+    let job = engine
+        .core
+        .begin_job(CompactionPolicy {
+            max_overlap: 1,
+            ..CompactionPolicy::default()
+        })
+        .unwrap()
+        .unwrap();
+    let charge = job.read_charge(&job.inputs);
+    let charged = engine.engine_stats().build_workspace_bytes;
+    let mut reader = crate::run::ReadWorkspace::new();
+    for run in &job.inputs {
+        for key in (0..KEYS).step_by(17) {
+            let key = key.to_be_bytes();
+            run.run.bounded(Some(&key), None, &mut reader).unwrap();
+            run.run.bounded(None, Some(&key), &mut reader).unwrap();
+        }
+    }
+    let held = reader.capacity() + reader.context_bytes();
+    assert!(0 < held && held <= charged, "held {held}, charged {charged}");
+    drop(charge);
+    assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
+}
