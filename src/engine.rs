@@ -514,11 +514,11 @@ impl Core {
                 Err(error) => return (Err(error), Some(state)),
             };
             match self.write(&mut state, prefix.key(key), value) {
-                Err(Refusal::Full) => match self.admit(self.make_room(state)) {
+                None => match self.admit(self.make_room(state)) {
                     Ok(next) => state = next,
                     Err(error) => return (Err(error), None),
                 },
-                written => return (written.map_err(Refusal::into_error), Some(state)),
+                Some(seq) => return (Ok(seq), Some(state)),
             }
         }
     }
@@ -608,14 +608,16 @@ impl Core {
         self.flushing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Applies a RAM-only write to the active table.
-    fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Result<u64, Refusal> {
+    /// Applies a validated RAM-only write to the active table, returning
+    /// `None` if the active table must rotate first.
+    fn write(&self, state: &mut State, key: Key<'_>, value: Value<'_>) -> Option<u64> {
         let was_below = !self.quiet_tail_ready(state);
         let seq = state.last_seq.checked_add(1).expect(SEQUENCES);
-        state
-            .active
-            .write(key, seq, value)
-            .map_err(|error| self.refusal(error))?;
+        match state.active.write(key, seq, value) {
+            Ok(()) => {}
+            Err(TableError::BudgetExceeded { .. }) => return None,
+            Err(error) => unreachable!("validated record rejected by memtable: {error:?}"),
+        }
         // Set only now: a rejected write must not use up a number.
         state.last_seq = seq;
         self.chunks.ingested(
@@ -628,26 +630,7 @@ impl Core {
         if was_below && self.quiet_tail_ready(state) {
             self.arm_quiet_tail(state);
         }
-        Ok(seq)
-    }
-
-    /// Distinguishes invalid records from an active table needing rotation.
-    fn refusal(&self, error: TableError) -> Refusal {
-        let rejected = |error| Refusal::Error(UpdateError::Rejected(error));
-        match error {
-            TableError::KeyTooLong { len } => rejected(WriteError::KeyTooLong { len }),
-            TableError::ValueTooLong { len } => rejected(WriteError::ValueTooLong { len }),
-            TableError::RecordExceedsBudget { charge, .. } => {
-                rejected(WriteError::RecordExceedsBudget {
-                    charge,
-                    budget: self.memtable_budget,
-                })
-            }
-            TableError::BudgetExceeded { .. } => Refusal::Full,
-            TableError::SequenceNotIncreasing { .. } => {
-                unreachable!("the engine assigns increasing sequence numbers")
-            }
-        }
+        Some(seq)
     }
 
     /// Freezes the active table and replaces it, in constant time.
@@ -1316,32 +1299,6 @@ impl Core {
     fn pass_gate(&self) -> MutexGuard<'_, ()> {
         // The gate guards no data, so a panic elsewhere leaves nothing wrong.
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Why a write did not land.
-#[derive(Clone, Debug)]
-enum Refusal {
-    /// The memtables have no room for the record until a flush makes some.
-    /// Never returned to a caller.
-    Full,
-    /// A refusal for the caller.
-    Error(UpdateError),
-}
-
-impl Refusal {
-    /// The caller's error, for a refusal that cannot be [`Refusal::Full`].
-    fn into_error(self) -> UpdateError {
-        match self {
-            Self::Error(error) => error,
-            Self::Full => unreachable!("a write with no room flushes"),
-        }
-    }
-}
-
-impl From<UpdateError> for Refusal {
-    fn from(error: UpdateError) -> Self {
-        Self::Error(error)
     }
 }
 

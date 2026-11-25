@@ -247,7 +247,7 @@ impl Core {
         }
         if batch.len() == 1 {
             let (keyspace, key, value) = batch.records().next().unwrap();
-            return self.update(keyspace, key, value);
+            return self.combine_single(keyspace, key, value);
         }
         self.combine_batch(batch, charge)
     }
