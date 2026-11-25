@@ -101,7 +101,7 @@ struct OpenSegment {
 
 #[derive(Debug)]
 enum SegmentMode {
-    Inherited { dictionary: Vec<u8> },
+    Inherited(Vec<u8>),
     Continued(Continuation),
 }
 
@@ -344,7 +344,7 @@ impl RunBuilder {
         matches!(
             self.open,
             Some(OpenSegment {
-                mode: SegmentMode::Inherited { .. },
+                mode: SegmentMode::Inherited(_),
                 ..
             })
         )
@@ -378,9 +378,7 @@ impl RunBuilder {
         self.compressor.begin_segment(dictionary, target);
         self.block_target = Some(target);
         self.open = Some(OpenSegment {
-            mode: SegmentMode::Inherited {
-                dictionary: dictionary.to_vec(),
-            },
+            mode: SegmentMode::Inherited(dictionary.to_vec()),
             reference: None,
             raw: 0,
             raw_cap,
@@ -423,7 +421,7 @@ impl RunBuilder {
         let Some(open) = &self.open else {
             return Ok(false);
         };
-        if !matches!(open.mode, SegmentMode::Inherited { .. }) {
+        if !matches!(open.mode, SegmentMode::Inherited(_)) {
             return Ok(false);
         }
         if self.output_refused
@@ -508,7 +506,7 @@ impl RunBuilder {
         if let Some(reference) = open.reference {
             return Some(reference);
         }
-        let SegmentMode::Inherited { dictionary } = &open.mode else {
+        let SegmentMode::Inherited(dictionary) = &open.mode else {
             unreachable!("continued segments assign their reference on cut");
         };
         let len = dictionary.len();
@@ -516,17 +514,18 @@ impl RunBuilder {
             return None;
         }
         let open = self.open.as_mut().expect("checked above");
-        let SegmentMode::Inherited { dictionary } = &open.mode else {
+        let SegmentMode::Inherited(dictionary) = &mut open.mode else {
             unreachable!("checked above");
         };
+        let dictionary = std::mem::take(dictionary);
         let id = self.segments.len() / SEGMENT_ENTRY_LEN + 1;
         assert!(id < 1 << 24, "segment reference fits in 24 bits");
         self.segments
             .extend_from_slice(&(self.storage.dictionaries_len as u64).to_le_bytes());
         self.segments.extend_from_slice(&(len as u32).to_le_bytes());
         self.segments
-            .extend_from_slice(&crc32fast::hash(dictionary).to_le_bytes());
-        self.storage.dictionary(dictionary);
+            .extend_from_slice(&crc32fast::hash(&dictionary).to_le_bytes());
+        self.storage.dictionary(&dictionary);
         open.reference = Some(id as u32);
         Some(id as u32)
     }
@@ -731,7 +730,7 @@ impl RunBuilder {
         let close = if let Some(open) = &mut self.open {
             open.raw += len;
             match &mut open.mode {
-                SegmentMode::Inherited { .. } => false,
+                SegmentMode::Inherited(_) => false,
                 SegmentMode::Continued(c) => {
                     c.stored += stored_len;
                     c.window_raw += len;
