@@ -635,8 +635,11 @@ mod tests {
         });
         for round in 0..3u32 {
             for key in 0..64u32 {
-                core.put(&key.to_be_bytes(), format!("{round}-{key}-{}", "v".repeat(64)).as_bytes())
-                    .unwrap();
+                core.put(
+                    &key.to_be_bytes(),
+                    format!("{round}-{key}-{}", "v".repeat(64)).as_bytes(),
+                )
+                .unwrap();
             }
             core.begin_flush().unwrap().build().publish();
         }

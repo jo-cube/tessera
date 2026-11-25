@@ -617,11 +617,11 @@ fn a_panic_after_two_serial_pieces_keeps_them_and_the_next_job_completes() {
     {
         let state = engine.core.read_state();
         // Two bottom inputs were replaced; the source remains as one sliced view.
-        assert!(
-            state.only().levels.runs()[0]
-                .iter()
-                .any(|r| r.run.slice().is_some_and(|(min, _)| min == 64u16.to_be_bytes()))
-        );
+        assert!(state.only().levels.runs()[0].iter().any(|r| {
+            r.run
+                .slice()
+                .is_some_and(|(min, _)| min == 64u16.to_be_bytes())
+        }));
     }
     assert_valid_after_abandon(&engine);
     check(&before, &engine.ks(), ones);
@@ -691,7 +691,10 @@ fn a_read_charge_covers_bounding_every_input() {
         }
     }
     let held = reader.capacity() + reader.context_bytes();
-    assert!(0 < held && held <= charged, "held {held}, charged {charged}");
+    assert!(
+        0 < held && held <= charged,
+        "held {held}, charged {charged}"
+    );
     drop(charge);
     assert_eq!(engine.engine_stats().build_workspace_bytes, 0);
 }
@@ -754,7 +757,10 @@ fn retained_bytes_stay_exact_while_split_aliases_and_a_snapshot_coexist() {
             if pieces == 1 {
                 let state = engine.core.read_state();
                 let runs = &state.only().runs;
-                assert!(physical_runs(runs).count() < runs.len(), "aliases share storage");
+                assert!(
+                    physical_runs(runs).count() < runs.len(),
+                    "aliases share storage"
+                );
             }
             assert_retained_exact(engine, &pinned);
             go.send(()).unwrap();

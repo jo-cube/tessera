@@ -475,11 +475,7 @@ fn a_reused_active_view_is_never_stale_across_rotation_ingestion_and_refusal() {
     let ks = engine.ks();
     let extra = engine.keyspace("extra").unwrap();
     let value = |snapshot: &Snapshot, key: &[u8]| {
-        snapshot
-            .reader()
-            .get(&ks, key)
-            .unwrap()
-            .map(<[u8]>::to_vec)
+        snapshot.reader().get(&ks, key).unwrap().map(<[u8]>::to_vec)
     };
     ks.put(b"a", b"1").unwrap();
     let cached = engine.snapshot();

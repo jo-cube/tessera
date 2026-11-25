@@ -82,7 +82,11 @@ fn check_bounds(reader: &mut Reader<'_>, ks: &Keyspace, what: &str) {
         }
         drop(scan);
         let expected: Vec<_> = keys.iter().filter(|k| k.starts_with(prefix)).collect();
-        assert_eq!(seen.iter().collect::<Vec<_>>(), expected, "{what} {prefix:?}");
+        assert_eq!(
+            seen.iter().collect::<Vec<_>>(),
+            expected,
+            "{what} {prefix:?}"
+        );
     }
     // A sorted multi-get of keys and absent probes agrees with single gets.
     let singles: Vec<Option<Vec<u8>>> = probes
@@ -116,9 +120,10 @@ fn bounds_on_piece_and_slice_boundaries_scan_exactly_their_keys() {
     {
         let state = engine.core.read_state();
         assert!(
-            state.only().levels.runs()[0]
-                .iter()
-                .any(|r| r.run.slice().is_some_and(|(min, _)| min == 64u16.to_be_bytes())),
+            state.only().levels.runs()[0].iter().any(|r| r
+                .run
+                .slice()
+                .is_some_and(|(min, _)| min == 64u16.to_be_bytes())),
             "the stopped job leaves its source sliced at the third bottom run"
         );
     }
