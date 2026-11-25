@@ -940,7 +940,12 @@ mod tests {
             );
             ends.extend(round_ends);
             let post = engine.snapshot();
-            check_oracle(&post, &payload, prev_payload.as_ref().map(|p| &p[..]), false);
+            check_oracle(
+                &post,
+                &payload,
+                prev_payload.as_ref().map(|p| &p[..]),
+                false,
+            );
             drop(post);
             engine.flush().unwrap();
         }
@@ -1425,12 +1430,7 @@ mod tests {
             wait_for_queued(&engine.core, 2);
 
             abort_release_tx.send(()).unwrap();
-            (
-                l1.join(),
-                r_f1,
-                s1.join().unwrap(),
-                s2.join().unwrap(),
-            )
+            (l1.join(), r_f1, s1.join().unwrap(), s2.join().unwrap())
         });
 
         assert!(r_l1.is_err());

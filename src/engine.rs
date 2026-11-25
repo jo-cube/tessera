@@ -1584,7 +1584,10 @@ mod tests {
         drop(held_read);
         assert_eq!(write_locks(), before + 1);
         assert_eq!(snap2.reader().get(&ks, b"k1").unwrap(), Some(&b"v1"[..]));
-        assert_eq!(snap3.reader().get(&extra, b"e1").unwrap(), Some(&b"ev1"[..]));
+        assert_eq!(
+            snap3.reader().get(&extra, b"e1").unwrap(),
+            Some(&b"ev1"[..])
+        );
 
         // Dropping a keyspace leaves `active` and `last_seq` unchanged, so reusing
         // `last_view` under the read lock still observes the updated directory.
@@ -1592,7 +1595,10 @@ mod tests {
         let after_drop = write_locks();
         let snap_after_drop = engine.snapshot();
         assert_eq!(write_locks(), after_drop);
-        assert_eq!(snap1.reader().get(&extra, b"e1").unwrap(), Some(&b"ev1"[..]));
+        assert_eq!(
+            snap1.reader().get(&extra, b"e1").unwrap(),
+            Some(&b"ev1"[..])
+        );
         assert_eq!(
             snap_after_drop
                 .reader()
