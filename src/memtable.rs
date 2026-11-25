@@ -917,17 +917,18 @@ impl Memtable {
     }
 
     /// A conservative upper bound on the charge of one additional update,
-    /// including nodes and records a live snapshot could pin.
-    pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> usize {
+    /// split into its per-operation cost (including nodes a live snapshot
+    /// could pin) and the one-time copy of a shared active arena chunk.
+    pub(crate) fn write_charge(&self, key: Key<'_>, value: Value<'_>) -> (usize, usize) {
         let bytes = match value {
             Value::Bytes(bytes) => bytes.len(),
             Value::Tombstone => 0,
         };
-        key.len()
-            .saturating_add(bytes)
+        let len = key.len().saturating_add(bytes);
+        let op = len
             .saturating_add(ENTRY_OVERHEAD)
-            .saturating_add(self.0.plan(key).2)
-            .saturating_add(self.0.arena.copy_charge(key.len().saturating_add(bytes)))
+            .saturating_add(self.0.plan(key).2);
+        (op, self.0.arena.copy_charge(len))
     }
 
     /// Shares every tree node and copies the arena chunk handles, leaving the

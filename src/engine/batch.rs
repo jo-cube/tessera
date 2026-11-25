@@ -282,10 +282,15 @@ impl Core {
             // append and a new slot for every operation. Only snapshots can
             // add copy-on-write costs, and none can start under the state lock.
             let needed = if state.active.has_shared_storage() {
-                batch.records().fold(0usize, |sum, (keyspace, key, value)| {
-                    let prefix = KeyPrefix::new(keyspace);
-                    sum.saturating_add(state.active.write_charge(prefix.key(key), value))
-                })
+                let (ops, copy) = batch.records().fold(
+                    (0usize, 0usize),
+                    |(ops, copy), (keyspace, key, value)| {
+                        let prefix = KeyPrefix::new(keyspace);
+                        let (op, chunk) = state.active.write_charge(prefix.key(key), value);
+                        (ops.saturating_add(op), copy.max(chunk))
+                    },
+                );
+                ops.saturating_add(copy)
             } else {
                 charge
             };
@@ -353,6 +358,39 @@ mod tests {
         assert!(
             error.to_string().contains("\"foreign\""),
             "expected foreign keyspace in error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn small_batch_under_snapshot_does_not_flush_partly_filled_memtable() {
+        let engine = Engine::in_memory(Options {
+            memtable_size: 1 << 20,
+            background_compaction: None,
+            ..Options::default()
+        })
+        .unwrap();
+        let ks = engine.keyspace("data").unwrap();
+        ks.put(b"seed", &[1u8; 64 << 10]).unwrap();
+        let snapshot = engine.snapshot();
+        let before = engine.engine_stats();
+
+        let mut batch = WriteBatch::new();
+        for i in 0..100u32 {
+            batch.put(&ks, &i.to_be_bytes(), b"val");
+        }
+        engine.write(&batch).unwrap();
+
+        let after = engine.engine_stats();
+        assert_eq!(after.flushes, before.flushes);
+        assert!(after.frozen.is_none());
+        assert_eq!(after.runs, 0);
+        assert_eq!(
+            snapshot.reader().get(&ks, b"seed").unwrap(),
+            Some(&[1u8; 64 << 10][..])
+        );
+        assert_eq!(
+            ks.get(&99u32.to_be_bytes()).unwrap().as_deref(),
+            Some(&b"val"[..])
         );
     }
 }
