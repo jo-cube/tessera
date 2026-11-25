@@ -232,18 +232,7 @@ impl Core {
         state.last_seq = seq;
         #[cfg(feature = "diagnostics")]
         self.chunks.work(0, 0, raw, bytes);
-        self.chunks.ingested(
-            batch
-                .records()
-                .map(|(_, key, value)| {
-                    key.len()
-                        + match value {
-                            Value::Bytes(bytes) => bytes.len(),
-                            Value::Tombstone => 0,
-                        }
-                })
-                .sum(),
-        );
+        self.chunks.ingested(batch.payload_bytes());
         drop(charge);
         drop(state);
         self.resources.changed();
