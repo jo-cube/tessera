@@ -261,6 +261,9 @@ each key.
 - A per-segment adaptive level 1/3 choice: almost never triggered.
 - Zstd effort by output level: fast levels store weak-locality blocks raw, and
   level 3 gains almost nothing on dictionary blocks.
+- Higher levels (6–12) for the bottom: on small records they save up to a
+  fifth of stored bytes, but weak-locality and large grouped records grow
+  with a dictionary, for 3–9× the compression CPU.
 - Literals stored uncompressed (`ZstdFastDecode`): an opt-in, not the default.
   Decoding skips the per-frame Huffman table, but stored bytes grow in
   proportion to the data, by about a fifth on compressible data.
