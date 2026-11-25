@@ -622,6 +622,43 @@ mod tests {
         assert_eq!(core.stats().snapshot_bytes, 0);
     }
 
+    /// A merge workspace's decode buffers and contexts are charged with its
+    /// build, so they are released with it, before publication.
+    #[test]
+    fn a_merge_workspace_holds_nothing_past_its_charged_build() {
+        // Compressed blocks are decoded into the workspace's buffers.
+        let core = Core::new(&Options {
+            memtable_size: 64 << 10,
+            target_run_len: 8 << 10,
+            compression: Compression::Zstd,
+            ..Options::default()
+        });
+        for round in 0..3u32 {
+            for key in 0..64u32 {
+                core.put(&key.to_be_bytes(), format!("{round}-{key}-{}", "v".repeat(64)).as_bytes())
+                    .unwrap();
+            }
+            core.begin_flush().unwrap().build().publish();
+        }
+        let policy = CompactionPolicy {
+            max_overlap: 1,
+            ..core.policy
+        };
+        let job = core.begin_job(policy).unwrap().unwrap();
+        let mut workspace = MergeWorkspace::new();
+        let built = job.build_with_threads(&mut workspace, 1).unwrap();
+        assert!(built.output.workspace_bytes > 0, "the merge decoded blocks");
+        let held = workspace.capacity() + workspace.context_bytes();
+        let charged = core.stats().build_workspace_bytes;
+        built.publish().unwrap();
+        let after = core.stats().build_workspace_bytes;
+        assert!(
+            held <= charged && held <= after,
+            "workspace holds {held} bytes; charged {charged} before and {after} after publication"
+        );
+        assert_eq!(held, 0);
+    }
+
     #[test]
     fn pinned_history_is_counted_once_and_build_charges_unwind() {
         let core = fixture(0);

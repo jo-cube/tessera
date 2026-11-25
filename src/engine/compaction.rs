@@ -350,7 +350,8 @@ impl<'e> CompactionJob<'e> {
                 &self.cuts,
                 (workspace, &self.engine.chunks, &floors),
                 budget,
-            )?
+            )
+            .map_err(CompactionError::from)
         } else {
             compact_parallel_in(
                 &views,
@@ -360,8 +361,13 @@ impl<'e> CompactionJob<'e> {
                 threads,
                 self.estimated_run_bytes,
                 (workspace, &self.engine.chunks, &floors),
-            )?
+            )
+            .map_err(CompactionError::from)
         };
+        // The workspace's buffers and contexts are charged only as part of
+        // this build, so they do not outlive it.
+        *workspace = MergeWorkspace::new();
+        let output = output?;
         #[cfg(feature = "diagnostics")]
         crate::run::copy_audit::set_bottom_inputs(None);
         #[cfg(test)]
