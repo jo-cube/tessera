@@ -46,6 +46,8 @@ impl Rng {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Grouped,
+    /// Grouped JSON whose members share their group's random strings.
+    GroupedRandom,
     Weak,
     Small,
 }
@@ -60,7 +62,7 @@ fn key_bytes(i: usize, kind: Kind) -> Vec<u8> {
             key[16..20].copy_from_slice(&((i % 4) as u32).to_be_bytes());
             key
         }
-        Kind::Grouped | Kind::Weak => {
+        Kind::Grouped | Kind::GroupedRandom | Kind::Weak => {
             let mut key = vec![0u8; 16];
             key[..8].copy_from_slice(&(i as u64 / MEMBERS as u64).to_be_bytes());
             key[8..16].copy_from_slice(&(i as u64 % MEMBERS as u64).to_be_bytes());
@@ -86,6 +88,7 @@ fn value(i: usize, version: u8, kind: Kind, len: usize) -> Vec<u8> {
             )
             .into_bytes()
         }
+        Kind::GroupedRandom => grouped_random(i, version),
         Kind::Weak => {
             let mut rng = Rng(
                 (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (u64::from(version) << 40)
@@ -115,6 +118,39 @@ fn value(i: usize, version: u8, kind: Kind, len: usize) -> Vec<u8> {
             out
         }
     }
+}
+/// The comparison harness's grouped JSON (dataset A): 360-, 260- and 60-byte
+/// random strings shared by the group's members, then per-member fields and a
+/// random token. Updates redraw the timestamp, quantity, price, status and
+/// token. Groups have `MEMBERS` members.
+fn grouped_random(i: usize, version: u8) -> Vec<u8> {
+    fn text(rng: &mut Rng, n: usize) -> String {
+        (0..n)
+            .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[rng.next() as usize % 36] as char)
+            .collect()
+    }
+    let (group, member) = (i / MEMBERS, i % MEMBERS);
+    let mut shared = Rng((group as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let (a, b, c) = (
+        text(&mut shared, 360),
+        text(&mut shared, 260),
+        text(&mut shared, 60),
+    );
+    let mut rng =
+        Rng((i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (u64::from(version) << 40));
+    const STATUS: [&str; 3] = ["active", "pending", "paused"];
+    let (ts, q, p, st) = if version == 0 {
+        (1_700_000_000 + member, member % 17, 1000 + member % 250, member % 3)
+    } else {
+        let mut n = |m: u64| (rng.next() % m) as usize;
+        (1_700_086_400 + n(86_400), n(17), 1000 + n(250), n(3))
+    };
+    let token = text(&mut rng, 8);
+    format!(
+        r#"{{"group_id":{group},"description":"{a}","attributes":"{b}","category_text":"{c}","member_id":{member},"timestamp":{ts},"quantity":{q},"price":{p},"status":"{}","token":"{token}","preferences":{{"notifications":true,"locale":"en-US","timezone":"UTC","delivery":"standard","visibility":"members","version":1}},"source":"synthetic-group-members","kind":"membership-record"}}"#,
+        STATUS[st]
+    )
+    .into_bytes()
 }
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 0.0 } else { a as f64 / b as f64 }
@@ -1234,6 +1270,13 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
             clustered: false,
         },
         Scenario {
+            name: "grouped-random",
+            kind: Kind::GroupedRandom,
+            records: 1_048_576 >> scale,
+            value_len: 0,
+            clustered: false,
+        },
+        Scenario {
             name: "B",
             kind: Kind::Weak,
             records: 2_097_152 >> scale,
@@ -1344,7 +1387,8 @@ pub fn entry(sample_probe: Option<SampleProbe>) {
         );
     }
     for s in &scenarios {
-        if (names.is_empty() && !s.clustered) || names.iter().any(|n| n == s.name) {
+        let default = !s.clustered && s.kind != Kind::GroupedRandom;
+        if (names.is_empty() && default) || names.iter().any(|n| n == s.name) {
             eprintln!(
                 "config,{},{variant},records={},background_threads={threads}",
                 s.name, s.records

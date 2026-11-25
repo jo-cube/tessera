@@ -18,7 +18,10 @@ per scan, write amplification and writer wait / lock counters (`waits`).
 `--settle` then compacts everything into the bottom level and measures again,
 `--variant LABEL` labels the rows and `--scale SHIFT` runs smaller scenarios;
 name scenarios to run only those. `clustered` (time-ordered load of grouped
-JSON, then updates to the newest 10% of entities) runs only when named.
+JSON, then updates to the newest 10% of entities) and `grouped-random`
+(1,048,576 keys with the comparison harness's dataset A values, ~1 KiB JSON
+whose 360-, 260- and 60-byte random strings are shared by each group of 64
+members) run only when named.
 
 Workload-shape flags: `--zipf` runs scrambled Zipfian gets at θ = 0.99 and
 θ = 0.80, reporting decoded bytes, CRC bytes, filter probes and a block-reuse
